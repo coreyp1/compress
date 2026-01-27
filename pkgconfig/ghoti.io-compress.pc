@@ -1,0 +1,7 @@
+Name: Ghoti.io Compress(BRANCH)
+Description: Cross-platform C library implementing streaming compression with no external dependencies
+Version: (VERSION)
+URL: https://github.com/Ghoti-io/compress
+Libs: -L(LIB)/(SUITE) -l(SUITE)-(PROJECT)(BRANCH)
+CFlags: -I(INCLUDE)/(SUITE)/(PROJECT)(BRANCH)
+Requires: 
