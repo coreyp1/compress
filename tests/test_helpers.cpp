@@ -112,7 +112,7 @@ bool test_helpers_load_file(
   return true;
 }
 
-} /* extern "C" */
+} // extern "C"
 
 #ifdef __cplusplus
 
@@ -139,4 +139,4 @@ size_t test_helpers_find_first_diff(const uint8_t * expected,
   return expected_len; // Buffers are equal
 }
 
-#endif /* __cplusplus */
+#endif // __cplusplus

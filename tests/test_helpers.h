@@ -118,6 +118,6 @@ bool test_helpers_load_file(
 size_t test_helpers_find_first_diff(const uint8_t * expected,
     size_t expected_len, const uint8_t * actual, size_t actual_len);
 
-#endif /* __cplusplus */
+#endif // __cplusplus
 
-#endif /* GHOTI_IO_GCOMP_TEST_HELPERS_H */
+#endif // GHOTI_IO_GCOMP_TEST_HELPERS_H

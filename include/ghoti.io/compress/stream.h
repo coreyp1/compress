@@ -214,4 +214,4 @@ GCOMP_API gcomp_status_t gcomp_decode_stream_cb(gcomp_registry_t * registry,
 }
 #endif
 
-#endif /* GHOTI_IO_GCOMP_STREAM_H */
+#endif // GHOTI_IO_GCOMP_STREAM_H

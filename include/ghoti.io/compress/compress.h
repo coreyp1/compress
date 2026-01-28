@@ -102,4 +102,4 @@ GCOMP_API gcomp_status_t gcomp_decode_buffer(gcomp_registry_t * registry,
 }
 #endif
 
-#endif /* GHOTI_IO_GCOMP_H */
+#endif // GHOTI_IO_GCOMP_H

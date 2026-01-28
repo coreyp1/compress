@@ -105,4 +105,4 @@ typedef struct {
 }
 #endif
 
-#endif /* GHOTI_IO_GCOMP_METHOD_H */
+#endif // GHOTI_IO_GCOMP_METHOD_H

@@ -241,4 +241,4 @@ extern "C" {
 }
 #endif
 
-#endif /* GHOTI_IO_GCOMP_MACROS_H */
+#endif // GHOTI_IO_GCOMP_MACROS_H

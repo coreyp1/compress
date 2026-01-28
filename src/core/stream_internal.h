@@ -16,7 +16,7 @@
 
 #include <ghoti.io/compress/errors.h>
 
-/* Forward declarations */
+// Forward declarations
 struct gcomp_buffer_s;
 
 /**
@@ -53,7 +53,7 @@ struct gcomp_encoder_s {
   const gcomp_method_t * method;
   gcomp_registry_t * registry;
   gcomp_options_t * options;
-  void * method_state; /* Method-specific encoder state */
+  void * method_state; // Method-specific encoder state
   gcomp_encoder_update_fn_t update_fn;
   gcomp_encoder_finish_fn_t finish_fn;
 };
@@ -68,9 +68,9 @@ struct gcomp_decoder_s {
   const gcomp_method_t * method;
   gcomp_registry_t * registry;
   gcomp_options_t * options;
-  void * method_state; /* Method-specific decoder state */
+  void * method_state; // Method-specific decoder state
   gcomp_decoder_update_fn_t update_fn;
   gcomp_decoder_finish_fn_t finish_fn;
 };
 
-#endif /* GHOTI_IO_GCOMP_STREAM_INTERNAL_H */
+#endif // GHOTI_IO_GCOMP_STREAM_INTERNAL_H

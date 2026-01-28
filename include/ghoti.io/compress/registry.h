@@ -9,9 +9,10 @@
 #ifndef GHOTI_IO_GCOMP_REGISTRY_H
 #define GHOTI_IO_GCOMP_REGISTRY_H
 
+#include <ghoti.io/compress/allocator.h>
+#include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/method.h>
-#include <ghoti.io/compress/errors.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -30,7 +31,7 @@ typedef struct gcomp_registry_s gcomp_registry_t;
  *
  * @return Pointer to the default registry (never NULL)
  */
-GCOMP_API gcomp_registry_t *gcomp_registry_default(void);
+GCOMP_API gcomp_registry_t * gcomp_registry_default(void);
 
 /**
  * @brief Create a new registry
@@ -39,13 +40,13 @@ GCOMP_API gcomp_registry_t *gcomp_registry_default(void);
  * methods. The registry uses the provided allocator (if any) for
  * memory management.
  *
- * @param allocator Optional allocator (NULL for default)
+ * @param allocator Optional allocator (NULL for default). Pass a pointer to a
+ *                  `gcomp_allocator_t` instance.
  * @param registry_out Output parameter for the created registry
  * @return Status code
  */
-GCOMP_API gcomp_status_t
-gcomp_registry_create(void *allocator,
-                          gcomp_registry_t **registry_out);
+GCOMP_API gcomp_status_t gcomp_registry_create(
+    void * allocator, gcomp_registry_t ** registry_out);
 
 /**
  * @brief Destroy a registry
@@ -55,8 +56,7 @@ gcomp_registry_create(void *allocator,
  *
  * @param registry The registry to destroy
  */
-GCOMP_API void
-gcomp_registry_destroy(gcomp_registry_t *registry);
+GCOMP_API void gcomp_registry_destroy(gcomp_registry_t * registry);
 
 /**
  * @brief Register a compression method
@@ -68,9 +68,8 @@ gcomp_registry_destroy(gcomp_registry_t *registry);
  * @param method The method to register
  * @return Status code
  */
-GCOMP_API gcomp_status_t
-gcomp_registry_register(gcomp_registry_t *registry,
-                             const gcomp_method_t *method);
+GCOMP_API gcomp_status_t gcomp_registry_register(
+    gcomp_registry_t * registry, const gcomp_method_t * method);
 
 /**
  * @brief Find a compression method by name
@@ -79,11 +78,11 @@ gcomp_registry_register(gcomp_registry_t *registry,
  * @param name The method name (e.g., "deflate", "gzip", "zstd")
  * @return Pointer to the method, or NULL if not found
  */
-GCOMP_API const gcomp_method_t *
-gcomp_registry_find(gcomp_registry_t *registry, const char *name);
+GCOMP_API const gcomp_method_t * gcomp_registry_find(
+    gcomp_registry_t * registry, const char * name);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* GHOTI_IO_GCOMP_REGISTRY_H */
+#endif // GHOTI_IO_GCOMP_REGISTRY_H

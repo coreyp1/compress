@@ -15,7 +15,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Option key names for limits */
+// Option key names for limits
 #define GCOMP_LIMIT_KEY_OUTPUT_MAX "limits.max_output_bytes"
 #define GCOMP_LIMIT_KEY_MEMORY_MAX "limits.max_memory_bytes"
 #define GCOMP_LIMIT_KEY_WINDOW_MAX "limits.max_window_bytes"
@@ -69,12 +69,12 @@ uint64_t gcomp_limits_read_window_max(
 }
 
 gcomp_status_t gcomp_limits_check_output(size_t current, uint64_t limit) {
-  /* 0 means unlimited */
+  // 0 means unlimited
   if (limit == 0) {
     return GCOMP_OK;
   }
 
-  /* Check for overflow: if current > limit, we've exceeded */
+  // Check for overflow: if current > limit, we've exceeded
   if (current > limit) {
     return GCOMP_ERR_LIMIT;
   }
@@ -83,12 +83,12 @@ gcomp_status_t gcomp_limits_check_output(size_t current, uint64_t limit) {
 }
 
 gcomp_status_t gcomp_limits_check_memory(size_t current, uint64_t limit) {
-  /* 0 means unlimited */
+  // 0 means unlimited
   if (limit == 0) {
     return GCOMP_OK;
   }
 
-  /* Check for overflow: if current > limit, we've exceeded */
+  // Check for overflow: if current > limit, we've exceeded
   if (current > limit) {
     return GCOMP_ERR_LIMIT;
   }
@@ -101,9 +101,9 @@ void gcomp_memory_track_alloc(gcomp_memory_tracker_t * tracker, size_t size) {
     return;
   }
 
-  /* Check for overflow before adding */
+  // Check for overflow before adding
   if (tracker->current_bytes > SIZE_MAX - size) {
-    /* Overflow would occur - set to maximum */
+    // Overflow would occur - set to maximum
     tracker->current_bytes = SIZE_MAX;
   }
   else {
@@ -116,9 +116,9 @@ void gcomp_memory_track_free(gcomp_memory_tracker_t * tracker, size_t size) {
     return;
   }
 
-  /* Check for underflow before subtracting */
+  // Check for underflow before subtracting
   if (tracker->current_bytes < size) {
-    /* Underflow would occur - set to zero */
+    // Underflow would occur - set to zero
     tracker->current_bytes = 0;
   }
   else {

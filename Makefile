@@ -13,6 +13,7 @@ BASE_NAME_PREFIX := lib$(SUITE)-$(PROJECT)$(BRANCH)
 MAJOR_VERSION := 0
 MINOR_VERSION := 0.0
 SO_NAME := $(BASE_NAME).$(MAJOR_VERSION)
+STATIC_TARGET := $(BASE_NAME_PREFIX).a
 ENV_VARS :=
 
 # Detect OS
@@ -144,7 +145,7 @@ EXAMPLE_SOURCES := $(shell find examples -type f -name '*.c' 2>/dev/null)
 EXAMPLES := $(patsubst examples/%.c,$(APP_DIR)/examples/%$(EXE_EXTENSION),$(EXAMPLE_SOURCES))
 
 
-all: $(APP_DIR)/$(TARGET) ## Build the shared library
+all: $(APP_DIR)/$(TARGET) $(APP_DIR)/$(STATIC_TARGET) ## Build shared + static libraries
 
 ####################################################################
 # Dependency Inclusion
@@ -194,6 +195,16 @@ ifeq ($(OS_NAME), Linux)
 	@ln -f -s $(TARGET) $(APP_DIR)/$(SO_NAME)
 	@ln -f -s $(SO_NAME) $(APP_DIR)/$(BASE_NAME)
 endif
+
+####################################################################
+# Static Library
+####################################################################
+
+$(APP_DIR)/$(STATIC_TARGET): \
+		$(LIBOBJECTS)
+	@printf "\n### Archiving Compress Static Library ###\n"
+	@mkdir -p $(@D)
+	ar rcs $@ $^
 
 ####################################################################
 # Unit Tests

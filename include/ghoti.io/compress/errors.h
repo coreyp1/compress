@@ -29,8 +29,19 @@ typedef enum {
   GCOMP_ERR_IO,              /**< I/O error */
 } gcomp_status_t;
 
+/**
+ * @brief Convert a status code to a constant string.
+ *
+ * The returned pointer is to a statically allocated string and must not be
+ * freed. This function is safe to call from multiple threads.
+ *
+ * @param status Status code.
+ * @return Human-readable string for the status code.
+ */
+GCOMP_API const char * gcomp_status_to_string(gcomp_status_t status);
+
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* GHOTI_IO_GCOMP_ERRORS_H */
+#endif // GHOTI_IO_GCOMP_ERRORS_H

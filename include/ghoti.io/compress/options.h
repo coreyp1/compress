@@ -9,8 +9,9 @@
 #ifndef GHOTI_IO_GCOMP_OPTIONS_H
 #define GHOTI_IO_GCOMP_OPTIONS_H
 
-#include <ghoti.io/compress/macros.h>
+#include <ghoti.io/compress/allocator.h>
 #include <ghoti.io/compress/errors.h>
+#include <ghoti.io/compress/macros.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -27,12 +28,12 @@ typedef struct gcomp_options_s gcomp_options_t;
  * @brief Option value types
  */
 typedef enum {
-  GCOMP_OPT_INT64,    /**< 64-bit signed integer */
-  GCOMP_OPT_UINT64,   /**< 64-bit unsigned integer */
-  GCOMP_OPT_BOOL,     /**< Boolean */
-  GCOMP_OPT_STRING,   /**< String (null-terminated) */
-  GCOMP_OPT_BYTES,    /**< Byte array */
-  GCOMP_OPT_FLOAT,    /**< Floating point (optional) */
+  GCOMP_OPT_INT64,  /**< 64-bit signed integer */
+  GCOMP_OPT_UINT64, /**< 64-bit unsigned integer */
+  GCOMP_OPT_BOOL,   /**< Boolean */
+  GCOMP_OPT_STRING, /**< String (null-terminated) */
+  GCOMP_OPT_BYTES,  /**< Byte array */
+  GCOMP_OPT_FLOAT,  /**< Floating point (optional) */
 } gcomp_option_type_t;
 
 /**
@@ -41,15 +42,24 @@ typedef enum {
  * @param options_out Output parameter for the created options object
  * @return Status code
  */
-GCOMP_API gcomp_status_t
-gcomp_options_create(gcomp_options_t **options_out);
+GCOMP_API gcomp_status_t gcomp_options_create(gcomp_options_t ** options_out);
+
+/**
+ * @brief Create a new options object using a specific allocator.
+ *
+ * @param allocator Optional allocator (NULL for default).
+ * @param options_out Output parameter for the created options object.
+ * @return Status code.
+ */
+GCOMP_API gcomp_status_t gcomp_options_create_with_allocator(
+    const gcomp_allocator_t * allocator, gcomp_options_t ** options_out);
 
 /**
  * @brief Destroy an options object
  *
  * @param options The options object to destroy
  */
-GCOMP_API void gcomp_options_destroy(gcomp_options_t *options);
+GCOMP_API void gcomp_options_destroy(gcomp_options_t * options);
 
 /**
  * @brief Clone an options object
@@ -58,9 +68,8 @@ GCOMP_API void gcomp_options_destroy(gcomp_options_t *options);
  * @param cloned_out Output parameter for the cloned options object
  * @return Status code
  */
-GCOMP_API gcomp_status_t
-gcomp_options_clone(const gcomp_options_t *options,
-                        gcomp_options_t **cloned_out);
+GCOMP_API gcomp_status_t gcomp_options_clone(
+    const gcomp_options_t * options, gcomp_options_t ** cloned_out);
 
 /**
  * @brief Set an integer option value
@@ -70,9 +79,8 @@ gcomp_options_clone(const gcomp_options_t *options,
  * @param value The integer value
  * @return Status code
  */
-GCOMP_API gcomp_status_t
-gcomp_options_set_int64(gcomp_options_t *options, const char *key,
-                             int64_t value);
+GCOMP_API gcomp_status_t gcomp_options_set_int64(
+    gcomp_options_t * options, const char * key, int64_t value);
 
 /**
  * @brief Set an unsigned integer option value
@@ -82,9 +90,8 @@ gcomp_options_set_int64(gcomp_options_t *options, const char *key,
  * @param value The unsigned integer value
  * @return Status code
  */
-GCOMP_API gcomp_status_t
-gcomp_options_set_uint64(gcomp_options_t *options, const char *key,
-                              uint64_t value);
+GCOMP_API gcomp_status_t gcomp_options_set_uint64(
+    gcomp_options_t * options, const char * key, uint64_t value);
 
 /**
  * @brief Set a boolean option value
@@ -94,9 +101,8 @@ gcomp_options_set_uint64(gcomp_options_t *options, const char *key,
  * @param value The boolean value
  * @return Status code
  */
-GCOMP_API gcomp_status_t
-gcomp_options_set_bool(gcomp_options_t *options, const char *key,
-                            int value);
+GCOMP_API gcomp_status_t gcomp_options_set_bool(
+    gcomp_options_t * options, const char * key, int value);
 
 /**
  * @brief Set a string option value
@@ -106,9 +112,8 @@ gcomp_options_set_bool(gcomp_options_t *options, const char *key,
  * @param value The string value (copied)
  * @return Status code
  */
-GCOMP_API gcomp_status_t
-gcomp_options_set_string(gcomp_options_t *options, const char *key,
-                               const char *value);
+GCOMP_API gcomp_status_t gcomp_options_set_string(
+    gcomp_options_t * options, const char * key, const char * value);
 
 /**
  * @brief Set a bytes option value
@@ -119,9 +124,8 @@ gcomp_options_set_string(gcomp_options_t *options, const char *key,
  * @param size The size of the data
  * @return Status code
  */
-GCOMP_API gcomp_status_t
-gcomp_options_set_bytes(gcomp_options_t *options, const char *key,
-                              const void *data, size_t size);
+GCOMP_API gcomp_status_t gcomp_options_set_bytes(gcomp_options_t * options,
+    const char * key, const void * data, size_t size);
 
 /**
  * @brief Get an integer option value
@@ -131,9 +135,8 @@ gcomp_options_set_bytes(gcomp_options_t *options, const char *key,
  * @param value_out Output parameter for the value
  * @return Status code
  */
-GCOMP_API gcomp_status_t
-gcomp_options_get_int64(const gcomp_options_t *options,
-                             const char *key, int64_t *value_out);
+GCOMP_API gcomp_status_t gcomp_options_get_int64(
+    const gcomp_options_t * options, const char * key, int64_t * value_out);
 
 /**
  * @brief Get an unsigned integer option value
@@ -143,9 +146,8 @@ gcomp_options_get_int64(const gcomp_options_t *options,
  * @param value_out Output parameter for the value
  * @return Status code
  */
-GCOMP_API gcomp_status_t
-gcomp_options_get_uint64(const gcomp_options_t *options,
-                              const char *key, uint64_t *value_out);
+GCOMP_API gcomp_status_t gcomp_options_get_uint64(
+    const gcomp_options_t * options, const char * key, uint64_t * value_out);
 
 /**
  * @brief Get a boolean option value
@@ -155,9 +157,8 @@ gcomp_options_get_uint64(const gcomp_options_t *options,
  * @param value_out Output parameter for the value
  * @return Status code
  */
-GCOMP_API gcomp_status_t
-gcomp_options_get_bool(const gcomp_options_t *options, const char *key,
-                            int *value_out);
+GCOMP_API gcomp_status_t gcomp_options_get_bool(
+    const gcomp_options_t * options, const char * key, int * value_out);
 
 /**
  * @brief Get a string option value
@@ -167,9 +168,8 @@ gcomp_options_get_bool(const gcomp_options_t *options, const char *key,
  * @param value_out Output parameter for the value (pointer to internal storage)
  * @return Status code
  */
-GCOMP_API gcomp_status_t
-gcomp_options_get_string(const gcomp_options_t *options,
-                              const char *key, const char **value_out);
+GCOMP_API gcomp_status_t gcomp_options_get_string(
+    const gcomp_options_t * options, const char * key, const char ** value_out);
 
 /**
  * @brief Get a bytes option value
@@ -180,9 +180,9 @@ gcomp_options_get_string(const gcomp_options_t *options,
  * @param size_out Output parameter for the size
  * @return Status code
  */
-GCOMP_API gcomp_status_t
-gcomp_options_get_bytes(const gcomp_options_t *options, const char *key,
-                             const void **data_out, size_t *size_out);
+GCOMP_API gcomp_status_t gcomp_options_get_bytes(
+    const gcomp_options_t * options, const char * key, const void ** data_out,
+    size_t * size_out);
 
 /**
  * @brief Freeze an options object, making it immutable
@@ -194,11 +194,10 @@ gcomp_options_get_bytes(const gcomp_options_t *options, const char *key,
  * @param options The options object to freeze
  * @return Status code
  */
-GCOMP_API gcomp_status_t
-gcomp_options_freeze(gcomp_options_t *options);
+GCOMP_API gcomp_status_t gcomp_options_freeze(gcomp_options_t * options);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* GHOTI_IO_GCOMP_OPTIONS_H */
+#endif // GHOTI_IO_GCOMP_OPTIONS_H

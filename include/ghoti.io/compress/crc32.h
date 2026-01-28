@@ -105,4 +105,4 @@ GCOMP_API uint32_t gcomp_crc32_finalize(uint32_t crc);
 }
 #endif
 
-#endif /* GHOTI_IO_GCOMP_CRC32_H */
+#endif // GHOTI_IO_GCOMP_CRC32_H

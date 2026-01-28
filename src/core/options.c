@@ -9,16 +9,16 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+#include "alloc_internal.h"
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/options.h>
-#include <stdlib.h>
 #include <string.h>
 
-/* Simple hash table implementation for options */
+// Simple hash table implementation for options
 #define GCOMP_OPTIONS_HASH_SIZE 64
 
-/* Hash table entry */
+// Hash table entry
 typedef struct gcomp_option_entry_s {
   char * key;
   gcomp_option_type_t type;
@@ -33,26 +33,27 @@ typedef struct gcomp_option_entry_s {
     } bytes;
     double f;
   } value;
-  struct gcomp_option_entry_s * next; /* For chaining */
+  struct gcomp_option_entry_s * next; // For chaining
 } gcomp_option_entry_t;
 
-/* Options structure */
+// Options structure
 struct gcomp_options_s {
   gcomp_option_entry_t * buckets[GCOMP_OPTIONS_HASH_SIZE];
-  int frozen; /* 1 if frozen (immutable), 0 otherwise */
+  int frozen; // 1 if frozen (immutable), 0 otherwise
+  const gcomp_allocator_t * allocator;
 };
 
-/* Simple djb2 hash function */
+// Simple djb2 hash function
 static uint32_t hash_string(const char * str) {
   uint32_t hash = 5381;
   int c;
   while ((c = *str++)) {
-    hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
+    hash = ((hash << 5) + hash) + c; // hash * 33 + c
   }
   return hash;
 }
 
-/* Find an entry in the hash table */
+// Find an entry in the hash table
 static gcomp_option_entry_t * find_entry(
     gcomp_options_t * opts, const char * key) {
   if (!opts || !key) {
@@ -73,45 +74,48 @@ static gcomp_option_entry_t * find_entry(
   return NULL;
 }
 
-/* Create a new entry */
-static gcomp_option_entry_t * create_entry(const char * key) {
+// Create a new entry
+static gcomp_option_entry_t * create_entry(
+    const gcomp_allocator_t * allocator, const char * key) {
   if (!key) {
     return NULL;
   }
 
-  gcomp_option_entry_t * entry = calloc(1, sizeof(gcomp_option_entry_t));
+  gcomp_option_entry_t * entry =
+      gcomp_calloc(allocator, 1, sizeof(gcomp_option_entry_t));
   if (!entry) {
     return NULL;
   }
 
-  entry->key = strdup(key);
+  entry->key = gcomp_strdup(allocator, key);
   if (!entry->key) {
-    free(entry);
+    gcomp_free(allocator, entry);
     return NULL;
   }
 
   return entry;
 }
 
-/* Free an entry and its value */
-static void free_entry(gcomp_option_entry_t * entry) {
+// Free an entry and its value
+static void free_entry(
+    const gcomp_allocator_t * allocator, gcomp_option_entry_t * entry) {
   if (!entry) {
     return;
   }
 
-  free(entry->key);
+  gcomp_free(allocator, entry->key);
 
   if (entry->type == GCOMP_OPT_STRING && entry->value.str) {
-    free(entry->value.str);
+    gcomp_free(allocator, entry->value.str);
   }
   else if (entry->type == GCOMP_OPT_BYTES && entry->value.bytes.data) {
-    free(entry->value.bytes.data);
+    gcomp_free(allocator, entry->value.bytes.data);
   }
 
-  free(entry);
+  gcomp_free(allocator, entry);
 }
 
-/* Set an entry in the hash table */
+// Set an entry in the hash table
 static gcomp_status_t set_entry(gcomp_options_t * opts, const char * key,
     gcomp_option_type_t type, const void * value_ptr) {
   if (!opts || !key) {
@@ -119,40 +123,42 @@ static gcomp_status_t set_entry(gcomp_options_t * opts, const char * key,
   }
 
   if (opts->frozen) {
-    return GCOMP_ERR_INVALID_ARG; /* Cannot modify frozen options */
+    return GCOMP_ERR_INVALID_ARG; // Cannot modify frozen options
   }
+
+  const gcomp_allocator_t * alloc = gcomp_alloc_or_default(opts->allocator);
 
   uint32_t hash = hash_string(key);
   uint32_t bucket = hash % GCOMP_OPTIONS_HASH_SIZE;
 
-  /* Check if entry exists */
+  // Check if entry exists
   gcomp_option_entry_t * entry = find_entry(opts, key);
 
   if (entry) {
-    /* Update existing entry - free old value if needed */
+    // Update existing entry - free old value if needed
     if (entry->type == GCOMP_OPT_STRING && entry->value.str) {
-      free(entry->value.str);
+      gcomp_free(alloc, entry->value.str);
       entry->value.str = NULL;
     }
     else if (entry->type == GCOMP_OPT_BYTES && entry->value.bytes.data) {
-      free(entry->value.bytes.data);
+      gcomp_free(alloc, entry->value.bytes.data);
       entry->value.bytes.data = NULL;
       entry->value.bytes.size = 0;
     }
   }
   else {
-    /* Create new entry */
-    entry = create_entry(key);
+    // Create new entry
+    entry = create_entry(alloc, key);
     if (!entry) {
       return GCOMP_ERR_MEMORY;
     }
 
-    /* Insert at head of bucket */
+    // Insert at head of bucket
     entry->next = opts->buckets[bucket];
     opts->buckets[bucket] = entry;
   }
 
-  /* Set the value */
+  // Set the value
   entry->type = type;
   switch (type) {
   case GCOMP_OPT_INT64:
@@ -166,7 +172,7 @@ static gcomp_status_t set_entry(gcomp_options_t * opts, const char * key,
     break;
   case GCOMP_OPT_STRING: {
     const char * str = *(const char **)value_ptr;
-    entry->value.str = strdup(str);
+    entry->value.str = gcomp_strdup(alloc, str);
     if (!entry->value.str) {
       return GCOMP_ERR_MEMORY;
     }
@@ -177,7 +183,7 @@ static gcomp_status_t set_entry(gcomp_options_t * opts, const char * key,
       const void * data;
       size_t size;
     } * bytes = value_ptr;
-    entry->value.bytes.data = malloc(bytes->size);
+    entry->value.bytes.data = gcomp_malloc(alloc, bytes->size);
     if (!entry->value.bytes.data) {
       return GCOMP_ERR_MEMORY;
     }
@@ -195,18 +201,25 @@ static gcomp_status_t set_entry(gcomp_options_t * opts, const char * key,
   return GCOMP_OK;
 }
 
-gcomp_status_t gcomp_options_create(gcomp_options_t ** options_out) {
+gcomp_status_t gcomp_options_create_with_allocator(
+    const gcomp_allocator_t * allocator, gcomp_options_t ** options_out) {
   if (!options_out) {
     return GCOMP_ERR_INVALID_ARG;
   }
 
-  gcomp_options_t * opts = calloc(1, sizeof(gcomp_options_t));
+  const gcomp_allocator_t * alloc = gcomp_alloc_or_default(allocator);
+  gcomp_options_t * opts = gcomp_calloc(alloc, 1, sizeof(gcomp_options_t));
   if (!opts) {
     return GCOMP_ERR_MEMORY;
   }
 
+  opts->allocator = alloc;
   *options_out = opts;
   return GCOMP_OK;
+}
+
+gcomp_status_t gcomp_options_create(gcomp_options_t ** options_out) {
+  return gcomp_options_create_with_allocator(NULL, options_out);
 }
 
 void gcomp_options_destroy(gcomp_options_t * options) {
@@ -214,17 +227,19 @@ void gcomp_options_destroy(gcomp_options_t * options) {
     return;
   }
 
-  /* Free all entries */
+  const gcomp_allocator_t * alloc = gcomp_alloc_or_default(options->allocator);
+
+  // Free all entries
   for (size_t i = 0; i < GCOMP_OPTIONS_HASH_SIZE; i++) {
     gcomp_option_entry_t * entry = options->buckets[i];
     while (entry) {
       gcomp_option_entry_t * next = entry->next;
-      free_entry(entry);
+      free_entry(alloc, entry);
       entry = next;
     }
   }
 
-  free(options);
+  gcomp_free(alloc, options);
 }
 
 gcomp_status_t gcomp_options_clone(
@@ -233,13 +248,14 @@ gcomp_status_t gcomp_options_clone(
     return GCOMP_ERR_INVALID_ARG;
   }
 
+  const gcomp_allocator_t * alloc = gcomp_alloc_or_default(options->allocator);
   gcomp_options_t * cloned = NULL;
-  gcomp_status_t status = gcomp_options_create(&cloned);
+  gcomp_status_t status = gcomp_options_create_with_allocator(alloc, &cloned);
   if (status != GCOMP_OK) {
     return status;
   }
 
-  /* Copy all entries */
+  // Copy all entries
   for (size_t i = 0; i < GCOMP_OPTIONS_HASH_SIZE; i++) {
     gcomp_option_entry_t * entry = options->buckets[i];
     while (entry) {
@@ -262,7 +278,7 @@ gcomp_status_t gcomp_options_clone(
             entry->value.bytes.data, entry->value.bytes.size);
         break;
       case GCOMP_OPT_FLOAT:
-        /* Not yet implemented in public API */
+        // Not yet implemented in public API
         status = GCOMP_ERR_UNSUPPORTED;
         break;
       default:

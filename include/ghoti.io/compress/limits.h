@@ -145,4 +145,4 @@ GCOMP_API gcomp_status_t gcomp_memory_check_limit(
 }
 #endif
 
-#endif /* GHOTI_IO_GCOMP_LIMITS_H */
+#endif // GHOTI_IO_GCOMP_LIMITS_H
