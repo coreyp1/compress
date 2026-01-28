@@ -184,6 +184,19 @@ GCOMP_API gcomp_status_t
 gcomp_options_get_bytes(const gcomp_options_t *options, const char *key,
                              const void **data_out, size_t *size_out);
 
+/**
+ * @brief Freeze an options object, making it immutable
+ *
+ * After calling this function, the options object becomes immutable and
+ * cannot be modified. This is useful for thread-safety when sharing
+ * options across multiple threads.
+ *
+ * @param options The options object to freeze
+ * @return Status code
+ */
+GCOMP_API gcomp_status_t
+gcomp_options_freeze(gcomp_options_t *options);
+
 #ifdef __cplusplus
 }
 #endif

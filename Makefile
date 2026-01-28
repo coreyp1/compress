@@ -119,6 +119,8 @@ LIBOBJECTS := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(SOURCES))
 
 TESTFLAGS := `PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --libs --cflags gtest`
 
+# Test helper object file
+TEST_HELPER_OBJ := $(OBJ_DIR)/tests/test_helpers.o
 
 COMPRESSLIBRARY := -L $(APP_DIR) -l$(SUITE)-$(PROJECT)$(BRANCH)
 
@@ -137,6 +139,7 @@ all: $(APP_DIR)/$(TARGET) ## Build the shared library
 
 # Automatically include all generated dependency files.
 -include $(wildcard $(OBJ_DIR)/*.d)
+-include $(wildcard $(OBJ_DIR)/**/*.d)
 -include $(wildcard $(APP_DIR)/test*.d)
 
 
@@ -152,6 +155,12 @@ $(OBJ_DIR)/%.o: src/%.c
 
 # Pattern rule for C++ source files (if any):
 $(OBJ_DIR)/%.o: src/%.cpp
+	@printf "\n### Compiling $@ ###\n"
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) $(INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
+
+# Pattern rule for test helper C++ files:
+$(OBJ_DIR)/tests/%.o: tests/%.cpp
 	@printf "\n### Compiling $@ ###\n"
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
@@ -176,12 +185,37 @@ endif
 # Unit Tests
 ####################################################################
 
+# Test helper object (compiled once, linked into all tests)
+$(TEST_HELPER_OBJ): tests/test_helpers.cpp
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) $(INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
+
+# Main library test
 $(APP_DIR)/testCompress$(EXE_EXTENSION): \
 		tests/test.cpp \
+		$(TEST_HELPER_OBJ) \
 		| $(APP_DIR)/$(TARGET)
 	@printf "\n### Compiling Compress Test ###\n"
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(INCLUDE) -MMD -MP -MF $(APP_DIR)/testCompress.d -o $@ $< $(LDFLAGS) $(TESTFLAGS) $(COMPRESSLIBRARY)
+	$(CXX) $(CXXFLAGS) $(INCLUDE) -MMD -MP -MF $(APP_DIR)/testCompress.d -o $@ $< $(TEST_HELPER_OBJ) $(LDFLAGS) $(TESTFLAGS) $(COMPRESSLIBRARY)
+
+# Options test
+$(APP_DIR)/testOptions$(EXE_EXTENSION): \
+		tests/test_options.cpp \
+		$(TEST_HELPER_OBJ) \
+		| $(APP_DIR)/$(TARGET)
+	@printf "\n### Compiling Options Test ###\n"
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) $(INCLUDE) -MMD -MP -MF $(APP_DIR)/testOptions.d -o $@ $< $(TEST_HELPER_OBJ) $(LDFLAGS) $(TESTFLAGS) $(COMPRESSLIBRARY)
+
+# Registry test
+$(APP_DIR)/testRegistry$(EXE_EXTENSION): \
+		tests/test_registry.cpp \
+		$(TEST_HELPER_OBJ) \
+		| $(APP_DIR)/$(TARGET)
+	@printf "\n### Compiling Registry Test ###\n"
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) $(INCLUDE) -MMD -MP -MF $(APP_DIR)/testRegistry.d -o $@ $< $(TEST_HELPER_OBJ) $(LDFLAGS) $(TESTFLAGS) $(COMPRESSLIBRARY)
 
 ####################################################################
 # Examples
@@ -200,9 +234,9 @@ $(APP_DIR)/examples/%$(EXE_EXTENSION): examples/%.c $(APP_DIR)/$(TARGET)
 # General commands
 .PHONY: clean cloc docs docs-pdf examples
 # Release build commands
-.PHONY: all install test test-watch uninstall watch
+.PHONY: all install test test-valgrind test-watch uninstall watch
 # Debug build commands
-.PHONY: all-debug install-debug test-debug test-watch-debug uninstall-debug watch-debug
+.PHONY: all-debug install-debug test-debug test-valgrind-debug test-watch-debug uninstall-debug watch-debug
 
 
 watch: ## Watch the file directory for changes and compile the target
@@ -263,14 +297,64 @@ endif
 test: ## Make and run the Unit tests
 test: \
 		$(APP_DIR)/$(TARGET) \
-		$(APP_DIR)/testCompress$(EXE_EXTENSION)
+		$(APP_DIR)/testCompress$(EXE_EXTENSION) \
+		$(APP_DIR)/testOptions$(EXE_EXTENSION) \
+		$(APP_DIR)/testRegistry$(EXE_EXTENSION)
 
 	@printf "\033[0;30;43m\n"
 	@printf "############################\n"
-	@printf "### Running tests        ###\n"
+	@printf "### Running Compress tests ###\n"
 	@printf "############################\n"
 	@printf "\033[0m\n\n"
 	LD_LIBRARY_PATH="$(APP_DIR)" $(APP_DIR)/testCompress$(EXE_EXTENSION) --gtest_brief=1
+
+	@printf "\033[0;30;43m\n"
+	@printf "############################\n"
+	@printf "### Running Options tests ###\n"
+	@printf "############################\n"
+	@printf "\033[0m\n\n"
+	LD_LIBRARY_PATH="$(APP_DIR)" $(APP_DIR)/testOptions$(EXE_EXTENSION) --gtest_brief=1
+
+	@printf "\033[0;30;43m\n"
+	@printf "############################\n"
+	@printf "### Running Registry tests ###\n"
+	@printf "############################\n"
+	@printf "\033[0m\n\n"
+	LD_LIBRARY_PATH="$(APP_DIR)" $(APP_DIR)/testRegistry$(EXE_EXTENSION) --gtest_brief=1
+
+test-valgrind: ## Run all tests under valgrind (Linux only)
+test-valgrind: \
+		$(APP_DIR)/$(TARGET) \
+		$(APP_DIR)/testCompress$(EXE_EXTENSION) \
+		$(APP_DIR)/testOptions$(EXE_EXTENSION) \
+		$(APP_DIR)/testRegistry$(EXE_EXTENSION)
+ifeq ($(OS_NAME), Linux)
+	@printf "\033[0;30;43m\n"
+	@printf "############################\n"
+	@printf "### Running Compress tests under Valgrind ###\n"
+	@printf "############################\n"
+	@printf "\033[0m\n\n"
+	LD_LIBRARY_PATH="$(APP_DIR)" valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes --error-exitcode=1 $(APP_DIR)/testCompress$(EXE_EXTENSION) --gtest_brief=1
+
+	@printf "\033[0;30;43m\n"
+	@printf "############################\n"
+	@printf "### Running Options tests under Valgrind ###\n"
+	@printf "############################\n"
+	@printf "\033[0m\n\n"
+	LD_LIBRARY_PATH="$(APP_DIR)" valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes --error-exitcode=1 $(APP_DIR)/testOptions$(EXE_EXTENSION) --gtest_brief=1
+
+	@printf "\033[0;30;43m\n"
+	@printf "############################\n"
+	@printf "### Running Registry tests under Valgrind ###\n"
+	@printf "############################\n"
+	@printf "\033[0m\n\n"
+	LD_LIBRARY_PATH="$(APP_DIR)" valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes --error-exitcode=1 $(APP_DIR)/testRegistry$(EXE_EXTENSION) --gtest_brief=1
+else
+	@printf "\033[0;31m\n"
+	@printf "Valgrind is only available on Linux\n"
+	@printf "\033[0m\n"
+	@exit 1
+endif
 
 clean: ## Remove all contents of the build directories.
 	-@rm -rvf $(BUILD_DIR)
@@ -356,6 +440,9 @@ uninstall-debug: ## Delete the DEBUG globally-installed files.  Requires sudo.
 
 test-debug: ## Make and run the Unit tests in DEBUG mode
 	make test BUILD=debug
+
+test-valgrind-debug: ## Run all tests under valgrind in DEBUG mode (Linux only)
+	make test-valgrind BUILD=debug
 
 watch-debug: ## Watch the file directory for changes and compile the target in DEBUG mode
 	make watch BUILD=debug
