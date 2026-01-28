@@ -137,3 +137,25 @@ const gcomp_method_t * gcomp_registry_find(
 
   return NULL;
 }
+
+/* Cleanup function to free default registry at library shutdown */
+GCOMP_CLEANUP_FUNCTION(gcomp_registry_cleanup) {
+  if (!g_default_registry) {
+    return;
+  }
+
+  /* Free all entries */
+  for (size_t i = 0; i < GCOMP_REGISTRY_HASH_SIZE; i++) {
+    gcomp_registry_entry_t * entry = g_default_registry->buckets[i];
+    while (entry) {
+      gcomp_registry_entry_t * next = entry->next;
+      free(entry);
+      entry = next;
+    }
+    g_default_registry->buckets[i] = NULL;
+  }
+
+  /* Free the default registry itself */
+  free(g_default_registry);
+  g_default_registry = NULL;
+}

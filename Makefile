@@ -119,6 +119,9 @@ LIBOBJECTS := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(SOURCES))
 
 TESTFLAGS := `PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --libs --cflags gtest`
 
+# Valgrind flags (exclude "still reachable" as it's not a leak)
+VALGRIND_FLAGS := --leak-check=full --show-leak-kinds=definite,indirect,possible --track-origins=yes --error-exitcode=1
+
 # Test helper object file
 TEST_HELPER_OBJ := $(OBJ_DIR)/tests/test_helpers.o
 
@@ -334,21 +337,21 @@ ifeq ($(OS_NAME), Linux)
 	@printf "### Running Compress tests under Valgrind ###\n"
 	@printf "############################\n"
 	@printf "\033[0m\n\n"
-	LD_LIBRARY_PATH="$(APP_DIR)" valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes --error-exitcode=1 $(APP_DIR)/testCompress$(EXE_EXTENSION) --gtest_brief=1
+	LD_LIBRARY_PATH="$(APP_DIR)" valgrind $(VALGRIND_FLAGS) $(APP_DIR)/testCompress$(EXE_EXTENSION) --gtest_brief=1
 
 	@printf "\033[0;30;43m\n"
 	@printf "############################\n"
 	@printf "### Running Options tests under Valgrind ###\n"
 	@printf "############################\n"
 	@printf "\033[0m\n\n"
-	LD_LIBRARY_PATH="$(APP_DIR)" valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes --error-exitcode=1 $(APP_DIR)/testOptions$(EXE_EXTENSION) --gtest_brief=1
+	LD_LIBRARY_PATH="$(APP_DIR)" valgrind $(VALGRIND_FLAGS) $(APP_DIR)/testOptions$(EXE_EXTENSION) --gtest_brief=1
 
 	@printf "\033[0;30;43m\n"
 	@printf "############################\n"
 	@printf "### Running Registry tests under Valgrind ###\n"
 	@printf "############################\n"
 	@printf "\033[0m\n\n"
-	LD_LIBRARY_PATH="$(APP_DIR)" valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes --error-exitcode=1 $(APP_DIR)/testRegistry$(EXE_EXTENSION) --gtest_brief=1
+	LD_LIBRARY_PATH="$(APP_DIR)" valgrind $(VALGRIND_FLAGS) $(APP_DIR)/testRegistry$(EXE_EXTENSION) --gtest_brief=1
 else
 	@printf "\033[0;31m\n"
 	@printf "Valgrind is only available on Linux\n"
