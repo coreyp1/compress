@@ -127,6 +127,16 @@ TEST_HELPER_OBJ := $(OBJ_DIR)/tests/test_helpers.o
 
 COMPRESSLIBRARY := -L $(APP_DIR) -l$(SUITE)-$(PROJECT)$(BRANCH)
 
+# Automatically discover all test source files (excluding test_helpers.cpp)
+TEST_SOURCES := $(filter-out tests/test_helpers.cpp, $(shell find tests -type f -name 'test*.cpp' 2>/dev/null))
+
+# Function to convert test source file to executable name
+# test.cpp -> testCompress, test_*.cpp -> test* (capitalized first letter, underscores removed)
+test-name = $(if $(filter tests/test.cpp,$1),testCompress,$(shell echo $(basename $(notdir $1)) | sed 's/test_/test/; s/^test\([a-z]\)/test\U\1/'))
+
+# Generate list of test executables
+TEST_EXECUTABLES := $(foreach test,$(TEST_SOURCES),$(APP_DIR)/$(call test-name,$(test))$(EXE_EXTENSION))
+
 # Automatically collect all example .c files under examples directories.
 EXAMPLE_SOURCES := $(shell find examples -type f -name '*.c' 2>/dev/null)
 
@@ -193,59 +203,20 @@ $(TEST_HELPER_OBJ): tests/test_helpers.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
 
-# Main library test
-$(APP_DIR)/testCompress$(EXE_EXTENSION): \
-		tests/test.cpp \
+# Pattern rule for building test executables
+# This automatically handles all test_*.cpp files
+define test-executable-rule
+$(APP_DIR)/$(call test-name,$1)$(EXE_EXTENSION): \
+		$1 \
 		$(TEST_HELPER_OBJ) \
 		| $(APP_DIR)/$(TARGET)
-	@printf "\n### Compiling Compress Test ###\n"
-	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(INCLUDE) -MMD -MP -MF $(APP_DIR)/testCompress.d -o $@ $< $(TEST_HELPER_OBJ) $(LDFLAGS) $(TESTFLAGS) $(COMPRESSLIBRARY)
+	@printf "\n### Compiling %s Test ###\n" "$(call test-name,$1)"
+	@mkdir -p $$(@D)
+	$$(CXX) $$(CXXFLAGS) $$(INCLUDE) -MMD -MP -MF $$(APP_DIR)/$$(call test-name,$1).d -o $$@ $$< $$(TEST_HELPER_OBJ) $$(LDFLAGS) $$(TESTFLAGS) $$(COMPRESSLIBRARY)
+endef
 
-# Options test
-$(APP_DIR)/testOptions$(EXE_EXTENSION): \
-		tests/test_options.cpp \
-		$(TEST_HELPER_OBJ) \
-		| $(APP_DIR)/$(TARGET)
-	@printf "\n### Compiling Options Test ###\n"
-	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(INCLUDE) -MMD -MP -MF $(APP_DIR)/testOptions.d -o $@ $< $(TEST_HELPER_OBJ) $(LDFLAGS) $(TESTFLAGS) $(COMPRESSLIBRARY)
-
-# Registry test
-$(APP_DIR)/testRegistry$(EXE_EXTENSION): \
-		tests/test_registry.cpp \
-		$(TEST_HELPER_OBJ) \
-		| $(APP_DIR)/$(TARGET)
-	@printf "\n### Compiling Registry Test ###\n"
-	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(INCLUDE) -MMD -MP -MF $(APP_DIR)/testRegistry.d -o $@ $< $(TEST_HELPER_OBJ) $(LDFLAGS) $(TESTFLAGS) $(COMPRESSLIBRARY)
-
-# Stream test
-$(APP_DIR)/testStream$(EXE_EXTENSION): \
-		tests/test_stream.cpp \
-		$(TEST_HELPER_OBJ) \
-		| $(APP_DIR)/$(TARGET)
-	@printf "\n### Compiling Stream Test ###\n"
-	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(INCLUDE) -MMD -MP -MF $(APP_DIR)/testStream.d -o $@ $< $(TEST_HELPER_OBJ) $(LDFLAGS) $(TESTFLAGS) $(COMPRESSLIBRARY)
-
-# Limits test
-$(APP_DIR)/testLimits$(EXE_EXTENSION): \
-		tests/test_limits.cpp \
-		$(TEST_HELPER_OBJ) \
-		| $(APP_DIR)/$(TARGET)
-	@printf "\n### Compiling Limits Test ###\n"
-	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(INCLUDE) -MMD -MP -MF $(APP_DIR)/testLimits.d -o $@ $< $(TEST_HELPER_OBJ) $(LDFLAGS) $(TESTFLAGS) $(COMPRESSLIBRARY)
-
-# CRC32 test
-$(APP_DIR)/testCrc32$(EXE_EXTENSION): \
-		tests/test_crc32.cpp \
-		$(TEST_HELPER_OBJ) \
-		| $(APP_DIR)/$(TARGET)
-	@printf "\n### Compiling CRC32 Test ###\n"
-	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(INCLUDE) -MMD -MP -MF $(APP_DIR)/testCrc32.d -o $@ $< $(TEST_HELPER_OBJ) $(LDFLAGS) $(TESTFLAGS) $(COMPRESSLIBRARY)
+# Generate build rules for all test sources
+$(foreach test,$(TEST_SOURCES),$(eval $(call test-executable-rule,$(test))))
 
 ####################################################################
 # Examples
@@ -325,108 +296,29 @@ endif
 	@printf "\n"
 
 test: ## Make and run the Unit tests
-test: \
-		$(APP_DIR)/$(TARGET) \
-		$(APP_DIR)/testCompress$(EXE_EXTENSION) \
-		$(APP_DIR)/testOptions$(EXE_EXTENSION) \
-		$(APP_DIR)/testRegistry$(EXE_EXTENSION) \
-		$(APP_DIR)/testStream$(EXE_EXTENSION) \
-		$(APP_DIR)/testLimits$(EXE_EXTENSION) \
-		$(APP_DIR)/testCrc32$(EXE_EXTENSION)
-
-	@printf "\033[0;30;43m\n"
-	@printf "############################\n"
-	@printf "### Running Compress tests ###\n"
-	@printf "############################\n"
-	@printf "\033[0m\n\n"
-	LD_LIBRARY_PATH="$(APP_DIR)" $(APP_DIR)/testCompress$(EXE_EXTENSION) --gtest_brief=1
-
-	@printf "\033[0;30;43m\n"
-	@printf "############################\n"
-	@printf "### Running Options tests ###\n"
-	@printf "############################\n"
-	@printf "\033[0m\n\n"
-	LD_LIBRARY_PATH="$(APP_DIR)" $(APP_DIR)/testOptions$(EXE_EXTENSION) --gtest_brief=1
-
-	@printf "\033[0;30;43m\n"
-	@printf "############################\n"
-	@printf "### Running Registry tests ###\n"
-	@printf "############################\n"
-	@printf "\033[0m\n\n"
-	LD_LIBRARY_PATH="$(APP_DIR)" $(APP_DIR)/testRegistry$(EXE_EXTENSION) --gtest_brief=1
-
-	@printf "\033[0;30;43m\n"
-	@printf "############################\n"
-	@printf "### Running Stream tests ###\n"
-	@printf "############################\n"
-	@printf "\033[0m\n\n"
-	LD_LIBRARY_PATH="$(APP_DIR)" $(APP_DIR)/testStream$(EXE_EXTENSION) --gtest_brief=1
-
-	@printf "\033[0;30;43m\n"
-	@printf "############################\n"
-	@printf "### Running Limits tests ###\n"
-	@printf "############################\n"
-	@printf "\033[0m\n\n"
-	LD_LIBRARY_PATH="$(APP_DIR)" $(APP_DIR)/testLimits$(EXE_EXTENSION) --gtest_brief=1
-
-	@printf "\033[0;30;43m\n"
-	@printf "############################\n"
-	@printf "### Running CRC32 tests ###\n"
-	@printf "############################\n"
-	@printf "\033[0m\n\n"
-	LD_LIBRARY_PATH="$(APP_DIR)" $(APP_DIR)/testCrc32$(EXE_EXTENSION) --gtest_brief=1
+test: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES)
+	@for test_exe in $(TEST_EXECUTABLES); do \
+		test_name=$$(basename $$test_exe $(EXE_EXTENSION) | sed 's/test/\u&/'); \
+		printf "\033[0;30;43m\n"; \
+		printf "############################\n"; \
+		printf "### Running %s tests ###\n" "$$test_name"; \
+		printf "############################"; \
+		printf "\033[0m\n\n"; \
+		LD_LIBRARY_PATH="$(APP_DIR)" $$test_exe --gtest_brief=1; \
+	done
 
 test-valgrind: ## Run all tests under valgrind (Linux only)
-test-valgrind: \
-		$(APP_DIR)/$(TARGET) \
-		$(APP_DIR)/testCompress$(EXE_EXTENSION) \
-		$(APP_DIR)/testOptions$(EXE_EXTENSION) \
-		$(APP_DIR)/testRegistry$(EXE_EXTENSION) \
-		$(APP_DIR)/testStream$(EXE_EXTENSION) \
-		$(APP_DIR)/testLimits$(EXE_EXTENSION) \
-		$(APP_DIR)/testCrc32$(EXE_EXTENSION)
+test-valgrind: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES)
 ifeq ($(OS_NAME), Linux)
-	@printf "\033[0;30;43m\n"
-	@printf "############################\n"
-	@printf "### Running Compress tests under Valgrind ###\n"
-	@printf "############################\n"
-	@printf "\033[0m\n\n"
-	LD_LIBRARY_PATH="$(APP_DIR)" valgrind $(VALGRIND_FLAGS) $(APP_DIR)/testCompress$(EXE_EXTENSION) --gtest_brief=1
-
-	@printf "\033[0;30;43m\n"
-	@printf "############################\n"
-	@printf "### Running Options tests under Valgrind ###\n"
-	@printf "############################\n"
-	@printf "\033[0m\n\n"
-	LD_LIBRARY_PATH="$(APP_DIR)" valgrind $(VALGRIND_FLAGS) $(APP_DIR)/testOptions$(EXE_EXTENSION) --gtest_brief=1
-
-	@printf "\033[0;30;43m\n"
-	@printf "############################\n"
-	@printf "### Running Registry tests under Valgrind ###\n"
-	@printf "############################\n"
-	@printf "\033[0m\n\n"
-	LD_LIBRARY_PATH="$(APP_DIR)" valgrind $(VALGRIND_FLAGS) $(APP_DIR)/testRegistry$(EXE_EXTENSION) --gtest_brief=1
-
-	@printf "\033[0;30;43m\n"
-	@printf "############################\n"
-	@printf "### Running Stream tests under Valgrind ###\n"
-	@printf "############################\n"
-	@printf "\033[0m\n\n"
-	LD_LIBRARY_PATH="$(APP_DIR)" valgrind $(VALGRIND_FLAGS) $(APP_DIR)/testStream$(EXE_EXTENSION) --gtest_brief=1
-
-	@printf "\033[0;30;43m\n"
-	@printf "############################\n"
-	@printf "### Running Limits tests under Valgrind ###\n"
-	@printf "############################\n"
-	@printf "\033[0m\n\n"
-	LD_LIBRARY_PATH="$(APP_DIR)" valgrind $(VALGRIND_FLAGS) $(APP_DIR)/testLimits$(EXE_EXTENSION) --gtest_brief=1
-
-	@printf "\033[0;30;43m\n"
-	@printf "############################\n"
-	@printf "### Running CRC32 tests under Valgrind ###\n"
-	@printf "############################\n"
-	@printf "\033[0m\n\n"
-	LD_LIBRARY_PATH="$(APP_DIR)" valgrind $(VALGRIND_FLAGS) $(APP_DIR)/testCrc32$(EXE_EXTENSION) --gtest_brief=1
+	@for test_exe in $(TEST_EXECUTABLES); do \
+		test_name=$$(basename $$test_exe $(EXE_EXTENSION) | sed 's/test/\u&/'); \
+		printf "\033[0;30;43m\n"; \
+		printf "############################\n"; \
+		printf "### Running %s tests under Valgrind ###\n" "$$test_name"; \
+		printf "############################"; \
+		printf "\033[0m\n\n"; \
+		LD_LIBRARY_PATH="$(APP_DIR)" valgrind $(VALGRIND_FLAGS) $$test_exe --gtest_brief=1; \
+	done
 else
 	@printf "\033[0;31m\n"
 	@printf "Valgrind is only available on Linux\n"
