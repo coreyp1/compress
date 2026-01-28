@@ -153,6 +153,7 @@ all: $(APP_DIR)/$(TARGET) ## Build the shared library
 # Automatically include all generated dependency files.
 -include $(wildcard $(OBJ_DIR)/*.d)
 -include $(wildcard $(OBJ_DIR)/**/*.d)
+-include $(wildcard $(OBJ_DIR)/tests/*.d)
 -include $(wildcard $(APP_DIR)/test*.d)
 
 
@@ -203,16 +204,31 @@ $(TEST_HELPER_OBJ): tests/test_helpers.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
 
+# Pattern rule for compiling test source files to object files
+# This allows tests to be compiled separately from linking
+$(OBJ_DIR)/tests/%.o: tests/%.cpp
+	@printf "\n### Compiling Test Object: $* ###\n"
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) $(INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
+
 # Pattern rule for building test executables
 # This automatically handles all test_*.cpp files
+# Tests are compiled to .o files first, then linked separately
+# This optimization allows tests to only relink (fast) when library changes but headers don't
 define test-executable-rule
+# Generate test object file path from test source path
+# e.g., tests/test_callback_api.cpp -> build/linux/release/objects/tests/test_callback_api.o
+# The object file is built by the pattern rule $(OBJ_DIR)/tests/%.o: tests/%.cpp above
+TEST_OBJ_$1 := $(OBJ_DIR)/tests/$(basename $(notdir $1)).o
+
+# Rule to link test object file into executable
 $(APP_DIR)/$(call test-name,$1)$(EXE_EXTENSION): \
-		$1 \
+		$$(TEST_OBJ_$1) \
 		$(TEST_HELPER_OBJ) \
 		| $(APP_DIR)/$(TARGET)
-	@printf "\n### Compiling %s Test ###\n" "$(call test-name,$1)"
+	@printf "\n### Linking %s Test ###\n" "$(call test-name,$1)"
 	@mkdir -p $$(@D)
-	$$(CXX) $$(CXXFLAGS) $$(INCLUDE) -MMD -MP -MF $$(APP_DIR)/$$(call test-name,$1).d -o $$@ $$< $$(TEST_HELPER_OBJ) $$(LDFLAGS) $$(TESTFLAGS) $$(COMPRESSLIBRARY)
+	$$(CXX) $$(CXXFLAGS) -o $$@ $$(TEST_OBJ_$1) $$(TEST_HELPER_OBJ) $$(LDFLAGS) $$(TESTFLAGS) $$(COMPRESSLIBRARY)
 endef
 
 # Generate build rules for all test sources
