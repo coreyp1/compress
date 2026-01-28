@@ -229,6 +229,15 @@ $(APP_DIR)/testStream$(EXE_EXTENSION): \
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(INCLUDE) -MMD -MP -MF $(APP_DIR)/testStream.d -o $@ $< $(TEST_HELPER_OBJ) $(LDFLAGS) $(TESTFLAGS) $(COMPRESSLIBRARY)
 
+# Limits test
+$(APP_DIR)/testLimits$(EXE_EXTENSION): \
+		tests/test_limits.cpp \
+		$(TEST_HELPER_OBJ) \
+		| $(APP_DIR)/$(TARGET)
+	@printf "\n### Compiling Limits Test ###\n"
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) $(INCLUDE) -MMD -MP -MF $(APP_DIR)/testLimits.d -o $@ $< $(TEST_HELPER_OBJ) $(LDFLAGS) $(TESTFLAGS) $(COMPRESSLIBRARY)
+
 ####################################################################
 # Examples
 ####################################################################
@@ -312,7 +321,8 @@ test: \
 		$(APP_DIR)/testCompress$(EXE_EXTENSION) \
 		$(APP_DIR)/testOptions$(EXE_EXTENSION) \
 		$(APP_DIR)/testRegistry$(EXE_EXTENSION) \
-		$(APP_DIR)/testStream$(EXE_EXTENSION)
+		$(APP_DIR)/testStream$(EXE_EXTENSION) \
+		$(APP_DIR)/testLimits$(EXE_EXTENSION)
 
 	@printf "\033[0;30;43m\n"
 	@printf "############################\n"
@@ -342,13 +352,21 @@ test: \
 	@printf "\033[0m\n\n"
 	LD_LIBRARY_PATH="$(APP_DIR)" $(APP_DIR)/testStream$(EXE_EXTENSION) --gtest_brief=1
 
+	@printf "\033[0;30;43m\n"
+	@printf "############################\n"
+	@printf "### Running Limits tests ###\n"
+	@printf "############################\n"
+	@printf "\033[0m\n\n"
+	LD_LIBRARY_PATH="$(APP_DIR)" $(APP_DIR)/testLimits$(EXE_EXTENSION) --gtest_brief=1
+
 test-valgrind: ## Run all tests under valgrind (Linux only)
 test-valgrind: \
 		$(APP_DIR)/$(TARGET) \
 		$(APP_DIR)/testCompress$(EXE_EXTENSION) \
 		$(APP_DIR)/testOptions$(EXE_EXTENSION) \
 		$(APP_DIR)/testRegistry$(EXE_EXTENSION) \
-		$(APP_DIR)/testStream$(EXE_EXTENSION)
+		$(APP_DIR)/testStream$(EXE_EXTENSION) \
+		$(APP_DIR)/testLimits$(EXE_EXTENSION)
 ifeq ($(OS_NAME), Linux)
 	@printf "\033[0;30;43m\n"
 	@printf "############################\n"
@@ -377,6 +395,13 @@ ifeq ($(OS_NAME), Linux)
 	@printf "############################\n"
 	@printf "\033[0m\n\n"
 	LD_LIBRARY_PATH="$(APP_DIR)" valgrind $(VALGRIND_FLAGS) $(APP_DIR)/testStream$(EXE_EXTENSION) --gtest_brief=1
+
+	@printf "\033[0;30;43m\n"
+	@printf "############################\n"
+	@printf "### Running Limits tests under Valgrind ###\n"
+	@printf "############################\n"
+	@printf "\033[0m\n\n"
+	LD_LIBRARY_PATH="$(APP_DIR)" valgrind $(VALGRIND_FLAGS) $(APP_DIR)/testLimits$(EXE_EXTENSION) --gtest_brief=1
 else
 	@printf "\033[0;31m\n"
 	@printf "Valgrind is only available on Linux\n"
