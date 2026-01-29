@@ -12,6 +12,7 @@
 #include "alloc_internal.h"
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/macros.h>
+#include <ghoti.io/compress/method.h>
 #include <ghoti.io/compress/options.h>
 #include <string.h>
 
@@ -417,5 +418,135 @@ gcomp_status_t gcomp_options_freeze(gcomp_options_t * options) {
   }
 
   options->frozen = 1;
+  return GCOMP_OK;
+}
+
+GCOMP_API gcomp_status_t gcomp_options_validate(
+    const gcomp_options_t * options, const struct gcomp_method_s * method) {
+  const gcomp_method_t * typed_method = (const gcomp_method_t *)method;
+
+  if (!typed_method) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  /* No options means nothing to validate. */
+  if (!options) {
+    return GCOMP_OK;
+  }
+
+  const gcomp_method_schema_t * schema = NULL;
+  gcomp_status_t status = gcomp_method_get_all_schemas(typed_method, &schema);
+  if (status != GCOMP_OK) {
+    return status;
+  }
+
+  if (!schema) {
+    return GCOMP_ERR_INTERNAL;
+  }
+
+  gcomp_unknown_key_policy_t policy = schema->unknown_key_policy;
+  if (policy != GCOMP_UNKNOWN_KEY_ERROR && policy != GCOMP_UNKNOWN_KEY_IGNORE) {
+    /* Defensive default if schema provides an unknown policy. */
+    policy = GCOMP_UNKNOWN_KEY_ERROR;
+  }
+
+  /* Iterate through all stored options and validate them. */
+  for (size_t i = 0; i < GCOMP_OPTIONS_HASH_SIZE; ++i) {
+    gcomp_option_entry_t * entry = options->buckets[i];
+    while (entry) {
+      const gcomp_option_schema_t * opt_schema = NULL;
+      status =
+          gcomp_method_get_option_schema(typed_method, entry->key, &opt_schema);
+
+      if (status != GCOMP_OK) {
+        /* If the key is unknown and the policy is IGNORE, skip it. */
+        if (status == GCOMP_ERR_INVALID_ARG &&
+            policy == GCOMP_UNKNOWN_KEY_IGNORE) {
+          entry = entry->next;
+          continue;
+        }
+        return status;
+      }
+
+      if (!opt_schema) {
+        return GCOMP_ERR_INTERNAL;
+      }
+
+      /* Type must match the schema. */
+      if (opt_schema->type != entry->type) {
+        return GCOMP_ERR_INVALID_ARG;
+      }
+
+      /* Range checks for integer and unsigned integer options. */
+      if (entry->type == GCOMP_OPT_INT64) {
+        if (opt_schema->has_min && entry->value.i64 < opt_schema->min_int) {
+          return GCOMP_ERR_INVALID_ARG;
+        }
+        if (opt_schema->has_max && entry->value.i64 > opt_schema->max_int) {
+          return GCOMP_ERR_INVALID_ARG;
+        }
+      }
+      else if (entry->type == GCOMP_OPT_UINT64) {
+        if (opt_schema->has_min && entry->value.ui64 < opt_schema->min_uint) {
+          return GCOMP_ERR_INVALID_ARG;
+        }
+        if (opt_schema->has_max && entry->value.ui64 > opt_schema->max_uint) {
+          return GCOMP_ERR_INVALID_ARG;
+        }
+      }
+
+      entry = entry->next;
+    }
+  }
+
+  return GCOMP_OK;
+}
+
+GCOMP_API gcomp_status_t gcomp_options_validate_key(
+    const gcomp_options_t * options, const struct gcomp_method_s * method,
+    const char * key) {
+  const gcomp_method_t * typed_method = (const gcomp_method_t *)method;
+
+  if (!options || !typed_method || !key) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  gcomp_option_entry_t * entry = find_entry((gcomp_options_t *)options, key);
+  if (!entry) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  const gcomp_option_schema_t * opt_schema = NULL;
+  gcomp_status_t status =
+      gcomp_method_get_option_schema(typed_method, key, &opt_schema);
+  if (status != GCOMP_OK) {
+    return status;
+  }
+
+  if (!opt_schema) {
+    return GCOMP_ERR_INTERNAL;
+  }
+
+  if (opt_schema->type != entry->type) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  if (entry->type == GCOMP_OPT_INT64) {
+    if (opt_schema->has_min && entry->value.i64 < opt_schema->min_int) {
+      return GCOMP_ERR_INVALID_ARG;
+    }
+    if (opt_schema->has_max && entry->value.i64 > opt_schema->max_int) {
+      return GCOMP_ERR_INVALID_ARG;
+    }
+  }
+  else if (entry->type == GCOMP_OPT_UINT64) {
+    if (opt_schema->has_min && entry->value.ui64 < opt_schema->min_uint) {
+      return GCOMP_ERR_INVALID_ARG;
+    }
+    if (opt_schema->has_max && entry->value.ui64 > opt_schema->max_uint) {
+      return GCOMP_ERR_INVALID_ARG;
+    }
+  }
+
   return GCOMP_OK;
 }

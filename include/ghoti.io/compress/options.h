@@ -20,9 +20,17 @@ extern "C" {
 #endif
 
 /**
- * @brief Forward declaration
+ * @brief Forward declarations
  */
 typedef struct gcomp_options_s gcomp_options_t;
+
+/**
+ * @brief Forward declaration for method type (defined in method.h).
+ *
+ * This allows the options validation helpers to reference the method type
+ * without creating a circular include between options.h and method.h.
+ */
+struct gcomp_method_s;
 
 /**
  * @brief Option value types
@@ -35,6 +43,30 @@ typedef enum {
   GCOMP_OPT_BYTES,  /**< Byte array */
   GCOMP_OPT_FLOAT,  /**< Floating point (optional) */
 } gcomp_option_type_t;
+
+/**
+ * @brief Policy for handling unknown option keys during validation.
+ *
+ * This controls how @ref gcomp_options_validate() treats keys that are present
+ * in a @ref gcomp_options_t instance but not described by a method's option
+ * schema.
+ */
+typedef enum {
+  /**
+   * @brief Treat unknown keys as an error.
+   *
+   * Validation functions will return ::GCOMP_ERR_INVALID_ARG if any unknown
+   * keys are encountered.
+   */
+  GCOMP_UNKNOWN_KEY_ERROR = 0,
+
+  /**
+   * @brief Silently ignore unknown keys.
+   *
+   * Validation functions will skip keys that are not present in the schema.
+   */
+  GCOMP_UNKNOWN_KEY_IGNORE = 1,
+} gcomp_unknown_key_policy_t;
 
 /**
  * @brief Create a new options object
@@ -195,6 +227,41 @@ GCOMP_API gcomp_status_t gcomp_options_get_bytes(
  * @return Status code
  */
 GCOMP_API gcomp_status_t gcomp_options_freeze(gcomp_options_t * options);
+
+/**
+ * @brief Validate all options against a method's option schema.
+ *
+ * This function checks that:
+ * - All option keys conform to the method's unknown key policy.
+ * - All option value types match the schema type.
+ * - Integer/unsigned integer values fall within any min/max constraints.
+ *
+ * The method must provide a schema via its @c get_schema vtable hook;
+ * otherwise this function will return ::GCOMP_ERR_UNSUPPORTED.
+ *
+ * @param options The options object to validate (may be NULL to indicate
+ *   "no options", which is always valid).
+ * @param method The method whose schema should be used for validation.
+ * @return ::GCOMP_OK on success, or an error code on failure.
+ */
+GCOMP_API gcomp_status_t gcomp_options_validate(
+    const gcomp_options_t * options, const struct gcomp_method_s * method);
+
+/**
+ * @brief Validate a single option key against a method's option schema.
+ *
+ * This behaves similarly to @ref gcomp_options_validate(), but only checks
+ * the specified key. If the key is not present in @p options, this function
+ * returns ::GCOMP_ERR_INVALID_ARG.
+ *
+ * @param options The options object containing the key to validate.
+ * @param method The method whose schema should be used for validation.
+ * @param key The option key to validate.
+ * @return ::GCOMP_OK on success, or an error code on failure.
+ */
+GCOMP_API gcomp_status_t gcomp_options_validate_key(
+    const gcomp_options_t * options, const struct gcomp_method_s * method,
+    const char * key);
 
 #ifdef __cplusplus
 }
