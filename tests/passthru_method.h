@@ -6,6 +6,47 @@
  * test_buffer_wrappers.cpp, and test_callback_api.cpp to validate the stream
  * API and infrastructure.
  *
+ * ## Purpose
+ *
+ * The passthru method is a minimal, correct implementation of the library's
+ * method vtable. It does not compress or decompress; it only copies bytes from
+ * the input buffer to the output buffer. This allows tests to exercise the
+ * full pipeline (registry, stream creation, update/finish, buffer wrappers,
+ * callback API) without depending on a real codec.
+ *
+ * ## How it works
+ *
+ * - **Encoder and decoder are identical.** Both update functions copy
+ *   `min(available input, available output)` bytes and advance `input->used`
+ *   and `output->used` accordingly.
+ *
+ * - **Buffer semantics:** Input and output use the standard gcomp_buffer_t
+ *   convention: `data` points to the buffer, `size` is its capacity, and
+ *   `used` is the number of bytes consumed (input) or produced (output).
+ *   "Available" input is `size - used`; the method never reads past that.
+ *
+ * - **Partial I/O:** If the output buffer is smaller than the remaining
+ *   input, only as many bytes as fit are copied. The caller can call update
+ *   again with more output space or more input. No internal buffering is
+ *   required.
+ *
+ * - **Finish:** Both encoder_finish and decoder_finish are no-ops and return
+ *   GCOMP_OK. There is no trailing data to flush.
+ *
+ * - **Lifecycle:** create_encoder/create_decoder receive a pre-allocated
+ *   gcomp_encoder_t/gcomp_decoder_t and only assign update_fn and finish_fn.
+ *   destroy_encoder/destroy_decoder do nothing (no method-specific state).
+ *
+ * ## Using as a reference
+ *
+ * When implementing a new compression method (e.g. deflate), use this file
+ * as a reference for:
+ * - Filling the method descriptor (create_passthru_method) with the correct
+ *   vtable hooks and capabilities.
+ * - Implementing update to respect buffer boundaries and advance ->used.
+ * - Implementing finish when there is no final payload.
+ * - Handling NULL and invalid arguments defensively.
+ *
  * Copyright 2026 by Corey Pennycuff
  */
 
@@ -20,6 +61,8 @@
 #include "../src/core/stream_internal.h"
 
 namespace gcomp_test {
+
+// --- Encoder: update and finish ---
 
 inline static gcomp_status_t passthru_encoder_update(gcomp_encoder_t * encoder,
     gcomp_buffer_t * input, gcomp_buffer_t * output) {
@@ -55,6 +98,8 @@ inline static gcomp_status_t passthru_encoder_finish(
   return GCOMP_OK;
 }
 
+// --- Decoder: update and finish (same logic as encoder) ---
+
 inline static gcomp_status_t passthru_decoder_update(gcomp_decoder_t * decoder,
     gcomp_buffer_t * input, gcomp_buffer_t * output) {
   (void)decoder;
@@ -88,6 +133,8 @@ inline static gcomp_status_t passthru_decoder_finish(
   }
   return GCOMP_OK;
 }
+
+// --- Lifecycle: create and destroy ---
 
 inline static gcomp_status_t passthru_create_encoder(
     gcomp_registry_t * registry, gcomp_options_t * options,
@@ -128,6 +175,8 @@ inline static void passthru_destroy_encoder(gcomp_encoder_t * encoder) {
 inline static void passthru_destroy_decoder(gcomp_decoder_t * decoder) {
   (void)decoder;
 }
+
+// --- Method descriptor factory ---
 
 inline static gcomp_method_t create_passthru_method(const char * name) {
   gcomp_method_t method = {};
