@@ -159,7 +159,7 @@ static int deflate_try_peek_bits(gcomp_deflate_decoder_state_t * st,
 
 static int deflate_try_read_bits(gcomp_deflate_decoder_state_t * st,
     gcomp_buffer_t * input, uint32_t nbits, uint32_t * out) {
-  if (!st || !input || !out || nbits == 0u || nbits > 24u) {
+  if (!st || !input || !out || nbits == 0u || nbits > 32u) {
     return 0;
   }
 
@@ -167,9 +167,15 @@ static int deflate_try_read_bits(gcomp_deflate_decoder_state_t * st,
     return 0;
   }
 
-  uint32_t mask = (1u << nbits) - 1u;
+  // Avoid undefined behavior: (1u << 32) is UB in C.
+  uint32_t mask = (nbits == 32u) ? 0xFFFFFFFFu : ((1u << nbits) - 1u);
   *out = st->bit_buffer & mask;
-  st->bit_buffer >>= nbits;
+  if (nbits == 32u) {
+    st->bit_buffer = 0;
+  }
+  else {
+    st->bit_buffer >>= nbits;
+  }
   st->bit_count -= nbits;
   return 1;
 }
@@ -340,28 +346,56 @@ static gcomp_status_t deflate_copy_match(
 // Huffman decode helpers
 //
 
+/**
+ * @brief Decode a Huffman symbol from the bit stream.
+ *
+ * @param decoded_out  Output flag: set to 1 if a symbol was decoded, 0 if more
+ *                     input is needed. Caller must check this before using
+ *                     sym_out.
+ */
 static gcomp_status_t deflate_huff_decode_symbol(
     gcomp_deflate_decoder_state_t * st, gcomp_buffer_t * input,
-    const gcomp_deflate_huffman_decode_table_t * table, uint16_t * sym_out) {
-  if (!st || !input || !table || !sym_out) {
+    const gcomp_deflate_huffman_decode_table_t * table, uint16_t * sym_out,
+    int * decoded_out) {
+  if (!st || !input || !table || !sym_out || !decoded_out) {
     return GCOMP_ERR_INVALID_ARG;
   }
 
-  uint32_t peek = 0;
-  if (!deflate_try_peek_bits(
-          st, input, GCOMP_DEFLATE_HUFFMAN_FAST_BITS, &peek)) {
+  *decoded_out = 0;
+
+  /* Try to fill the bit buffer with FAST_BITS bits. This may not succeed if
+   * input is exhausted, but we might still have enough bits for a short code.
+   */
+  (void)deflate_try_fill_bits(st, input, GCOMP_DEFLATE_HUFFMAN_FAST_BITS);
+
+  // If we have no bits at all, we need more input.
+  if (st->bit_count == 0) {
     return GCOMP_OK;
   }
 
-  uint32_t idx = reverse_bits(peek, GCOMP_DEFLATE_HUFFMAN_FAST_BITS);
+  /* Peek whatever bits we have, padding with zeros if needed. The fast table
+   * is designed so that short codes at index (code << (FAST_BITS - len)) work
+   * correctly even with partial bits. */
+  uint32_t avail_bits = (st->bit_count > GCOMP_DEFLATE_HUFFMAN_FAST_BITS)
+      ? GCOMP_DEFLATE_HUFFMAN_FAST_BITS
+      : st->bit_count;
+  uint32_t peek = st->bit_buffer & ((1u << avail_bits) - 1u);
+
+  uint32_t idx = reverse_bits(peek, avail_bits);
+  // Shift idx to align with FAST_BITS indexing.
+  idx <<= (GCOMP_DEFLATE_HUFFMAN_FAST_BITS - avail_bits);
+
   gcomp_deflate_huffman_fast_entry_t fe = table->fast_table[idx];
 
   if (fe.nbits > 0) {
-    uint32_t dummy = 0;
-    if (!deflate_try_read_bits(st, input, fe.nbits, &dummy)) {
-      return GCOMP_OK;
+    // Check if we have enough bits to actually read this code.
+    if (st->bit_count < fe.nbits) {
+      return GCOMP_OK; // Need more input
     }
+    st->bit_buffer >>= fe.nbits;
+    st->bit_count -= fe.nbits;
     *sym_out = fe.symbol;
+    *decoded_out = 1;
     return GCOMP_OK;
   }
 
@@ -395,6 +429,7 @@ static gcomp_status_t deflate_huff_decode_symbol(
   }
 
   *sym_out = le.symbol;
+  *decoded_out = 1;
   return GCOMP_OK;
 }
 
@@ -492,19 +527,15 @@ static gcomp_status_t deflate_dynamic_read_header(
     return GCOMP_ERR_INVALID_ARG;
   }
 
-  uint32_t hlit = 0;
-  uint32_t hdist = 0;
-  uint32_t hclen = 0;
+  // Read all 14 bits (5+5+4) atomically to avoid partial-read state bugs.
+  uint32_t header = 0;
+  if (!deflate_try_read_bits(st, input, 14u, &header)) {
+    return GCOMP_OK;
+  }
 
-  if (!deflate_try_read_bits(st, input, 5u, &hlit)) {
-    return GCOMP_OK;
-  }
-  if (!deflate_try_read_bits(st, input, 5u, &hdist)) {
-    return GCOMP_OK;
-  }
-  if (!deflate_try_read_bits(st, input, 4u, &hclen)) {
-    return GCOMP_OK;
-  }
+  uint32_t hlit = header & 0x1Fu;
+  uint32_t hdist = (header >> 5u) & 0x1Fu;
+  uint32_t hclen = (header >> 10u) & 0x0Fu;
 
   st->dyn_hlit = hlit + 257u;
   st->dyn_hdist = hdist + 1u;
@@ -558,15 +589,16 @@ static gcomp_status_t deflate_dynamic_decode_lengths(
   }
 
   while (st->dyn_lengths_index < st->dyn_lengths_total) {
+    int decoded = 0;
     uint16_t sym = 0;
-    gcomp_status_t ds =
-        deflate_huff_decode_symbol(st, input, &st->dyn_clen_table, &sym);
+    gcomp_status_t ds = deflate_huff_decode_symbol(
+        st, input, &st->dyn_clen_table, &sym, &decoded);
     if (ds != GCOMP_OK) {
       return ds;
     }
 
-    /* Not enough input to decode next symbol. */
-    if (input->used == input->size && st->bit_count == 0u) {
+    // Not enough input to decode a symbol.
+    if (!decoded) {
       return GCOMP_OK;
     }
 
@@ -637,12 +669,12 @@ static gcomp_status_t deflate_dynamic_decode_lengths(
     return GCOMP_ERR_CORRUPT;
   }
 
-  /* 256 (end-of-block) must exist. */
+  // 256 (end-of-block) must exist.
   if (st->dyn_litlen_lengths[256] == 0) {
     return GCOMP_ERR_CORRUPT;
   }
 
-  /* Distance tree must not be entirely empty. */
+  // Distance tree must not be entirely empty.
   {
     int any_dist = 0;
     for (uint32_t i = 0; i < st->dyn_hdist; i++) {
@@ -851,21 +883,20 @@ static gcomp_status_t deflate_process_block_header(
 
 static gcomp_status_t deflate_process_stored_len(
     gcomp_deflate_decoder_state_t * st, gcomp_buffer_t * input) {
-  uint32_t len = 0;
-  uint32_t nlen = 0;
-
-  if (!deflate_try_read_bits(st, input, 16u, &len)) {
-    return GCOMP_OK;
-  }
-  if (!deflate_try_read_bits(st, input, 16u, &nlen)) {
+  // Read all 32 bits (LEN + NLEN) atomically to avoid partial-read bugs.
+  uint32_t len_nlen = 0;
+  if (!deflate_try_read_bits(st, input, 32u, &len_nlen)) {
     return GCOMP_OK;
   }
 
-  if (((len ^ 0xFFFFu) & 0xFFFFu) != (nlen & 0xFFFFu)) {
+  uint32_t len = len_nlen & 0xFFFFu;
+  uint32_t nlen = (len_nlen >> 16u) & 0xFFFFu;
+
+  if (((len ^ 0xFFFFu) & 0xFFFFu) != nlen) {
     return GCOMP_ERR_CORRUPT;
   }
 
-  st->stored_remaining = len & 0xFFFFu;
+  st->stored_remaining = len;
   st->stage = DEFLATE_STAGE_STORED_COPY;
   return GCOMP_OK;
 }
@@ -877,20 +908,21 @@ static gcomp_status_t deflate_process_huffman_data(
     return GCOMP_ERR_INTERNAL;
   }
 
-  /* Drain any pending match first. */
+  // Drain any pending match first.
   if (st->match_remaining > 0) {
     return deflate_copy_match(st, output);
   }
 
+  int decoded = 0;
   uint16_t sym = 0;
   gcomp_status_t ds =
-      deflate_huff_decode_symbol(st, input, st->cur_litlen, &sym);
+      deflate_huff_decode_symbol(st, input, st->cur_litlen, &sym, &decoded);
   if (ds != GCOMP_OK) {
     return ds;
   }
 
-  /* Not enough input to decode next symbol. */
-  if (input->used == input->size && st->bit_count == 0u) {
+  /* Not enough input to decode a symbol. */
+  if (!decoded) {
     return GCOMP_OK;
   }
 
@@ -912,7 +944,7 @@ static gcomp_status_t deflate_process_huffman_data(
     return GCOMP_ERR_CORRUPT;
   }
 
-  /* Length code 257..285 */
+  // Length code 257..285
   uint32_t len_sym = sym - 257u;
   uint32_t length = k_len_base[len_sym];
   uint32_t le = k_len_extra[len_sym];
@@ -924,12 +956,16 @@ static gcomp_status_t deflate_process_huffman_data(
     length += extra;
   }
 
-  /* Distance symbol */
+  // Distance symbol
+  int dist_decoded = 0;
   uint16_t dist_sym = 0;
-  gcomp_status_t dd =
-      deflate_huff_decode_symbol(st, input, st->cur_dist, &dist_sym);
+  gcomp_status_t dd = deflate_huff_decode_symbol(
+      st, input, st->cur_dist, &dist_sym, &dist_decoded);
   if (dd != GCOMP_OK) {
     return dd;
+  }
+  if (!dist_decoded) {
+    return GCOMP_OK;
   }
   if (dist_sym >= 30u) {
     return GCOMP_ERR_CORRUPT;
@@ -971,7 +1007,7 @@ gcomp_status_t gcomp_deflate_decoder_update(gcomp_decoder_t * decoder,
       return GCOMP_OK;
     }
 
-    /* Snapshot state so we can detect lack of progress in this iteration. */
+    // Snapshot state so we can detect lack of progress in this iteration.
     size_t prev_in_used = input->used;
     size_t prev_out_used = output->used;
     gcomp_deflate_decoder_stage_t prev_stage = st->stage;
@@ -1049,7 +1085,7 @@ gcomp_status_t gcomp_deflate_decoder_finish(
     return GCOMP_ERR_INTERNAL;
   }
 
-  /* Drain any pending match with the provided output space. */
+  // Drain any pending match with the provided output space.
   if (st->match_remaining > 0) {
     gcomp_status_t s = deflate_copy_match(st, output);
     if (s != GCOMP_OK) {

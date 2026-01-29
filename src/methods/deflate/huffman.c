@@ -43,7 +43,7 @@ gcomp_status_t gcomp_deflate_huffman_validate(
     return GCOMP_ERR_INVALID_ARG;
   }
 
-  /* Step 1: count codes at each length. */
+  // Step 1: count codes at each length.
   memset(bl_count, 0, sizeof(bl_count));
   for (i = 0; i < num_symbols; i++) {
     uint32_t len = lengths[i];
@@ -55,7 +55,7 @@ gcomp_status_t gcomp_deflate_huffman_validate(
     }
   }
 
-  /* Step 2 (RFC 1951): smallest code for each length. */
+  // Step 2 (RFC 1951): smallest code for each length.
   code = 0;
   bl_count[0] = 0;
   for (bits = 1; bits <= max_bits; bits++) {
@@ -63,14 +63,14 @@ gcomp_status_t gcomp_deflate_huffman_validate(
     next_code[bits] = code;
   }
 
-  /* Over-subscribed: at length L we have at most 2^L code values. */
+  // Over-subscribed: at length L we have at most 2^L code values.
   for (bits = 1; bits <= max_bits; bits++) {
     if (next_code[bits] + bl_count[bits] > (1u << bits)) {
       return GCOMP_ERR_CORRUPT;
     }
   }
 
-  /* Incomplete trees allowed in DEFLATE; only over-subscribed is rejected. */
+  // Incomplete trees allowed in DEFLATE; only over-subscribed is rejected.
   return GCOMP_OK;
 }
 
@@ -137,6 +137,14 @@ gcomp_status_t gcomp_deflate_huffman_build_codes(const uint8_t * lengths,
         code_lens[i] = (uint8_t)len;
       }
     }
+    else {
+      /* Ensure zero-length symbols have zero codes/code_lens to avoid using
+       * uninitialized stack values. */
+      codes[i] = 0;
+      if (code_lens) {
+        code_lens[i] = 0;
+      }
+    }
   }
 
   return GCOMP_OK;
@@ -170,7 +178,7 @@ gcomp_status_t gcomp_deflate_huffman_build_codes(const uint8_t * lengths,
 gcomp_status_t gcomp_deflate_huffman_build_decode_table(const uint8_t * lengths,
     size_t num_symbols, unsigned max_bits,
     gcomp_deflate_huffman_decode_table_t * table) {
-  uint16_t codes[288]; /* DEFLATE literal/length max 286 + slack */
+  uint16_t codes[288]; // DEFLATE literal/length max 286 + slack
   uint8_t code_lens[288];
   size_t i;
   uint16_t long_offset;
@@ -201,7 +209,7 @@ gcomp_status_t gcomp_deflate_huffman_build_decode_table(const uint8_t * lengths,
     }
   }
 
-  /* Initialize fast table: nbits=0 means "use long table" or no code. */
+  // Initialize fast table: nbits=0 means "use long table" or no code.
   for (i = 0; i < GCOMP_DEFLATE_HUFFMAN_FAST_SIZE; i++) {
     table->fast_table[i].symbol = 0;
     table->fast_table[i].nbits = 0;
@@ -225,6 +233,9 @@ gcomp_status_t gcomp_deflate_huffman_build_decode_table(const uint8_t * lengths,
        * consecutive entries with (symbol i, nbits len). */
       unsigned step = 1u << (GCOMP_DEFLATE_HUFFMAN_FAST_BITS - len);
       unsigned start = code << (GCOMP_DEFLATE_HUFFMAN_FAST_BITS - len);
+      if (start + step > GCOMP_DEFLATE_HUFFMAN_FAST_SIZE) {
+        return GCOMP_ERR_CORRUPT;
+      }
       for (j = 0; j < step; j++) {
         table->fast_table[start + j].symbol = (uint16_t)i;
         table->fast_table[start + j].nbits = (uint8_t)len;
@@ -244,7 +255,7 @@ gcomp_status_t gcomp_deflate_huffman_build_decode_table(const uint8_t * lengths,
     }
   }
 
-  /* Allocate long_table and fill it in second pass. */
+  // Allocate long_table and fill it in second pass.
   if (long_offset > 0) {
     alloc = gcomp_allocator_default();
     table->long_table = (gcomp_deflate_huffman_fast_entry_t *)gcomp_calloc(
