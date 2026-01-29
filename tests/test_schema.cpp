@@ -8,9 +8,11 @@
  */
 
 #include "test_helpers.h"
+#include <ghoti.io/compress/deflate.h>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/method.h>
 #include <ghoti.io/compress/options.h>
+#include <ghoti.io/compress/registry.h>
 #include <gtest/gtest.h>
 
 /**
@@ -287,6 +289,84 @@ TEST_F(SchemaTest, OptionsValidateKey_TypeMismatch) {
       GCOMP_ERR_INVALID_ARG);
 
   gcomp_options_destroy(opts);
+}
+
+//
+// Deflate method schema tests (T2.8: "query schema for a method (deflate)")
+//
+
+TEST(SchemaDeflateTest, GetAllSchemas_DeflateMethod) {
+  gcomp_registry_t * reg = nullptr;
+  ASSERT_EQ(gcomp_registry_create(nullptr, &reg), GCOMP_OK);
+  ASSERT_EQ(gcomp_method_deflate_register(reg), GCOMP_OK);
+
+  const gcomp_method_t * deflate = gcomp_registry_find(reg, "deflate");
+  ASSERT_NE(deflate, nullptr);
+
+  const gcomp_method_schema_t * schema = nullptr;
+  gcomp_status_t status = gcomp_method_get_all_schemas(deflate, &schema);
+  ASSERT_EQ(status, GCOMP_OK);
+  ASSERT_NE(schema, nullptr);
+  EXPECT_GE(schema->num_options, 1u);
+  EXPECT_EQ(schema->unknown_key_policy, GCOMP_UNKNOWN_KEY_ERROR);
+
+  gcomp_registry_destroy(reg);
+}
+
+TEST(SchemaDeflateTest, GetOptionSchema_DeflateLevel) {
+  gcomp_registry_t * reg = nullptr;
+  ASSERT_EQ(gcomp_registry_create(nullptr, &reg), GCOMP_OK);
+  ASSERT_EQ(gcomp_method_deflate_register(reg), GCOMP_OK);
+
+  const gcomp_method_t * deflate = gcomp_registry_find(reg, "deflate");
+  ASSERT_NE(deflate, nullptr);
+
+  const gcomp_option_schema_t * opt_schema = nullptr;
+  gcomp_status_t status =
+      gcomp_method_get_option_schema(deflate, "deflate.level", &opt_schema);
+  ASSERT_EQ(status, GCOMP_OK);
+  ASSERT_NE(opt_schema, nullptr);
+  EXPECT_STREQ(opt_schema->key, "deflate.level");
+  EXPECT_EQ(opt_schema->type, GCOMP_OPT_INT64);
+  EXPECT_NE(opt_schema->help, nullptr);
+
+  gcomp_registry_destroy(reg);
+}
+
+TEST(SchemaDeflateTest, OptionsValidate_DeflateOptions) {
+  gcomp_registry_t * reg = nullptr;
+  ASSERT_EQ(gcomp_registry_create(nullptr, &reg), GCOMP_OK);
+  ASSERT_EQ(gcomp_method_deflate_register(reg), GCOMP_OK);
+
+  const gcomp_method_t * deflate = gcomp_registry_find(reg, "deflate");
+  ASSERT_NE(deflate, nullptr);
+
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  EXPECT_EQ(gcomp_options_set_int64(opts, "deflate.level", 6), GCOMP_OK);
+  EXPECT_EQ(
+      gcomp_options_set_uint64(opts, "deflate.window_bits", 15), GCOMP_OK);
+  EXPECT_EQ(gcomp_options_validate(opts, deflate), GCOMP_OK);
+
+  gcomp_options_destroy(opts);
+  gcomp_registry_destroy(reg);
+}
+
+TEST(SchemaDeflateTest, OptionsValidate_DeflateLevelOutOfRange) {
+  gcomp_registry_t * reg = nullptr;
+  ASSERT_EQ(gcomp_registry_create(nullptr, &reg), GCOMP_OK);
+  ASSERT_EQ(gcomp_method_deflate_register(reg), GCOMP_OK);
+
+  const gcomp_method_t * deflate = gcomp_registry_find(reg, "deflate");
+  ASSERT_NE(deflate, nullptr);
+
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  EXPECT_EQ(gcomp_options_set_int64(opts, "deflate.level", 99), GCOMP_OK);
+  EXPECT_EQ(gcomp_options_validate(opts, deflate), GCOMP_ERR_INVALID_ARG);
+
+  gcomp_options_destroy(opts);
+  gcomp_registry_destroy(reg);
 }
 
 int main(int argc, char ** argv) {

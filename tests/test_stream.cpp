@@ -8,6 +8,7 @@
 
 #include "test_helpers.h"
 #include <cstring>
+#include <ghoti.io/compress/deflate.h>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/method.h>
 #include <ghoti.io/compress/options.h>
@@ -19,8 +20,8 @@
 #include "../src/core/stream_internal.h"
 
 // Mock update/finish functions for testing
-static gcomp_status_t mock_encoder_update(
-    gcomp_encoder_t * encoder, gcomp_buffer_t * input, gcomp_buffer_t * output) {
+static gcomp_status_t mock_encoder_update(gcomp_encoder_t * encoder,
+    gcomp_buffer_t * input, gcomp_buffer_t * output) {
   (void)encoder;
   (void)input;
   (void)output;
@@ -34,8 +35,8 @@ static gcomp_status_t mock_encoder_finish(
   return GCOMP_OK;
 }
 
-static gcomp_status_t mock_decoder_update(
-    gcomp_decoder_t * decoder, gcomp_buffer_t * input, gcomp_buffer_t * output) {
+static gcomp_status_t mock_decoder_update(gcomp_decoder_t * decoder,
+    gcomp_buffer_t * input, gcomp_buffer_t * output) {
   (void)decoder;
   (void)input;
   (void)output;
@@ -146,8 +147,8 @@ protected:
 // Test gcomp_encoder_create()
 TEST_F(StreamTest, EncoderCreateSuccess) {
   gcomp_encoder_t * encoder = nullptr;
-  gcomp_status_t status = gcomp_encoder_create(
-      registry_, "test_method", nullptr, &encoder);
+  gcomp_status_t status =
+      gcomp_encoder_create(registry_, "test_method", nullptr, &encoder);
   EXPECT_EQ(status, GCOMP_OK);
   EXPECT_NE(encoder, nullptr);
 
@@ -187,7 +188,8 @@ TEST_F(StreamTest, EncoderCreateInvalidMethodName) {
 
 TEST_F(StreamTest, EncoderCreateMethodWithoutEncodeCapability) {
   // Register a method that only supports decode
-  gcomp_method_t decode_only = create_mock_method("decode_only", GCOMP_CAP_DECODE);
+  gcomp_method_t decode_only =
+      create_mock_method("decode_only", GCOMP_CAP_DECODE);
   ASSERT_EQ(gcomp_registry_register(registry_, &decode_only), GCOMP_OK);
 
   gcomp_encoder_t * encoder = nullptr;
@@ -213,8 +215,8 @@ TEST_F(StreamTest, EncoderCreateMethodWithoutCreateFunction) {
 // Test gcomp_decoder_create()
 TEST_F(StreamTest, DecoderCreateSuccess) {
   gcomp_decoder_t * decoder = nullptr;
-  gcomp_status_t status = gcomp_decoder_create(
-      registry_, "test_method", nullptr, &decoder);
+  gcomp_status_t status =
+      gcomp_decoder_create(registry_, "test_method", nullptr, &decoder);
   EXPECT_EQ(status, GCOMP_OK);
   EXPECT_NE(decoder, nullptr);
 
@@ -254,7 +256,8 @@ TEST_F(StreamTest, DecoderCreateInvalidMethodName) {
 
 TEST_F(StreamTest, DecoderCreateMethodWithoutDecodeCapability) {
   // Register a method that only supports encode
-  gcomp_method_t encode_only = create_mock_method("encode_only", GCOMP_CAP_ENCODE);
+  gcomp_method_t encode_only =
+      create_mock_method("encode_only", GCOMP_CAP_ENCODE);
   ASSERT_EQ(gcomp_registry_register(registry_, &encode_only), GCOMP_OK);
 
   gcomp_decoder_t * decoder = nullptr;
@@ -275,6 +278,80 @@ TEST_F(StreamTest, DecoderCreateMethodWithoutCreateFunction) {
       gcomp_decoder_create(registry_, "no_create", nullptr, &decoder);
   EXPECT_EQ(status, GCOMP_ERR_UNSUPPORTED);
   EXPECT_EQ(decoder, nullptr);
+}
+
+//
+// Deflate method (stub encoder/decoder until T3.5/T3.6)
+//
+
+TEST_F(StreamTest, DeflateEncoderCreateSuccess) {
+  gcomp_registry_t * reg = nullptr;
+  ASSERT_EQ(gcomp_registry_create(nullptr, &reg), GCOMP_OK);
+  ASSERT_EQ(gcomp_method_deflate_register(reg), GCOMP_OK);
+
+  gcomp_encoder_t * encoder = nullptr;
+  gcomp_status_t status =
+      gcomp_encoder_create(reg, "deflate", nullptr, &encoder);
+  EXPECT_EQ(status, GCOMP_OK);
+  EXPECT_NE(encoder, nullptr);
+
+  gcomp_encoder_destroy(encoder);
+  gcomp_registry_destroy(reg);
+}
+
+TEST_F(StreamTest, DeflateEncoderUpdateReturnsUnsupported) {
+  gcomp_registry_t * reg = nullptr;
+  ASSERT_EQ(gcomp_registry_create(nullptr, &reg), GCOMP_OK);
+  ASSERT_EQ(gcomp_method_deflate_register(reg), GCOMP_OK);
+
+  gcomp_encoder_t * encoder = nullptr;
+  ASSERT_EQ(gcomp_encoder_create(reg, "deflate", nullptr, &encoder), GCOMP_OK);
+
+  uint8_t input_buf[4] = {0x01, 0x02, 0x03, 0x04};
+  uint8_t output_buf[64] = {};
+  gcomp_buffer_t input = {input_buf, sizeof(input_buf), 0};
+  gcomp_buffer_t output = {output_buf, sizeof(output_buf), 0};
+
+  gcomp_status_t status = gcomp_encoder_update(encoder, &input, &output);
+  EXPECT_EQ(status, GCOMP_ERR_UNSUPPORTED);
+
+  gcomp_encoder_destroy(encoder);
+  gcomp_registry_destroy(reg);
+}
+
+TEST_F(StreamTest, DeflateDecoderCreateSuccess) {
+  gcomp_registry_t * reg = nullptr;
+  ASSERT_EQ(gcomp_registry_create(nullptr, &reg), GCOMP_OK);
+  ASSERT_EQ(gcomp_method_deflate_register(reg), GCOMP_OK);
+
+  gcomp_decoder_t * decoder = nullptr;
+  gcomp_status_t status =
+      gcomp_decoder_create(reg, "deflate", nullptr, &decoder);
+  EXPECT_EQ(status, GCOMP_OK);
+  EXPECT_NE(decoder, nullptr);
+
+  gcomp_decoder_destroy(decoder);
+  gcomp_registry_destroy(reg);
+}
+
+TEST_F(StreamTest, DeflateDecoderUpdateReturnsUnsupported) {
+  gcomp_registry_t * reg = nullptr;
+  ASSERT_EQ(gcomp_registry_create(nullptr, &reg), GCOMP_OK);
+  ASSERT_EQ(gcomp_method_deflate_register(reg), GCOMP_OK);
+
+  gcomp_decoder_t * decoder = nullptr;
+  ASSERT_EQ(gcomp_decoder_create(reg, "deflate", nullptr, &decoder), GCOMP_OK);
+
+  uint8_t input_buf[4] = {};
+  uint8_t output_buf[64] = {};
+  gcomp_buffer_t input = {input_buf, sizeof(input_buf), 0};
+  gcomp_buffer_t output = {output_buf, sizeof(output_buf), 0};
+
+  gcomp_status_t status = gcomp_decoder_update(decoder, &input, &output);
+  EXPECT_EQ(status, GCOMP_ERR_UNSUPPORTED);
+
+  gcomp_decoder_destroy(decoder);
+  gcomp_registry_destroy(reg);
 }
 
 // Test gcomp_encoder_destroy()
