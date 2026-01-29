@@ -8,6 +8,7 @@
  */
 
 #include "../../core/stream_internal.h"
+#include "deflate_internal.h"
 #include <ghoti.io/compress/deflate.h>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/method.h>
@@ -94,17 +95,12 @@ static gcomp_status_t deflate_encoder_finish(
 
 static gcomp_status_t deflate_decoder_update(gcomp_decoder_t * decoder,
     gcomp_buffer_t * input, gcomp_buffer_t * output) {
-  (void)decoder;
-  (void)input;
-  (void)output;
-  return GCOMP_ERR_UNSUPPORTED;
+  return gcomp_deflate_decoder_update(decoder, input, output);
 }
 
 static gcomp_status_t deflate_decoder_finish(
     gcomp_decoder_t * decoder, gcomp_buffer_t * output) {
-  (void)decoder;
-  (void)output;
-  return GCOMP_ERR_UNSUPPORTED;
+  return gcomp_deflate_decoder_finish(decoder, output);
 }
 
 static gcomp_status_t deflate_create_encoder(gcomp_registry_t * registry,
@@ -121,11 +117,16 @@ static gcomp_status_t deflate_create_encoder(gcomp_registry_t * registry,
 
 static gcomp_status_t deflate_create_decoder(gcomp_registry_t * registry,
     gcomp_options_t * options, gcomp_decoder_t ** decoder_out) {
-  (void)registry;
-  (void)options;
   if (!decoder_out || !*decoder_out) {
     return GCOMP_ERR_INVALID_ARG;
   }
+
+  gcomp_status_t status =
+      gcomp_deflate_decoder_init(registry, options, *decoder_out);
+  if (status != GCOMP_OK) {
+    return status;
+  }
+
   (*decoder_out)->update_fn = deflate_decoder_update;
   (*decoder_out)->finish_fn = deflate_decoder_finish;
   return GCOMP_OK;
@@ -136,7 +137,7 @@ static void deflate_destroy_encoder(gcomp_encoder_t * encoder) {
 }
 
 static void deflate_destroy_decoder(gcomp_decoder_t * decoder) {
-  (void)decoder;
+  gcomp_deflate_decoder_destroy(decoder);
 }
 
 //

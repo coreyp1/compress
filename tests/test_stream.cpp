@@ -334,7 +334,7 @@ TEST_F(StreamTest, DeflateDecoderCreateSuccess) {
   gcomp_registry_destroy(reg);
 }
 
-TEST_F(StreamTest, DeflateDecoderUpdateReturnsUnsupported) {
+TEST_F(StreamTest, DeflateDecoderUpdateSucceedsWithEmptyInput) {
   gcomp_registry_t * reg = nullptr;
   ASSERT_EQ(gcomp_registry_create(nullptr, &reg), GCOMP_OK);
   ASSERT_EQ(gcomp_method_deflate_register(reg), GCOMP_OK);
@@ -348,7 +348,7 @@ TEST_F(StreamTest, DeflateDecoderUpdateReturnsUnsupported) {
   gcomp_buffer_t output = {output_buf, sizeof(output_buf), 0};
 
   gcomp_status_t status = gcomp_decoder_update(decoder, &input, &output);
-  EXPECT_EQ(status, GCOMP_ERR_UNSUPPORTED);
+  EXPECT_EQ(status, GCOMP_OK);
 
   gcomp_decoder_destroy(decoder);
   gcomp_registry_destroy(reg);
