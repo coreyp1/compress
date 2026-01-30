@@ -57,7 +57,13 @@ typedef struct gcomp_deflate_decoder_state_s {
   //
   uint64_t max_output_bytes;
   uint64_t max_window_bytes;
+  uint64_t max_memory_bytes;
   uint64_t total_output_bytes;
+
+  //
+  // Memory tracking
+  //
+  gcomp_memory_tracker_t mem_tracker;
 
   //
   // Sliding window
@@ -127,6 +133,51 @@ typedef struct gcomp_deflate_decoder_state_s {
   gcomp_deflate_huffman_decode_table_t dyn_clen_table;
   int dyn_clen_ready;
 } gcomp_deflate_decoder_state_t;
+
+//
+// Memory tracking helpers
+//
+
+/**
+ * @brief Calculate the dynamic memory used by a Huffman decode table.
+ *
+ * This only counts the long_table allocation, not the embedded arrays.
+ */
+static size_t huffman_table_dynamic_memory(
+    const gcomp_deflate_huffman_decode_table_t * table) {
+  if (!table || !table->long_table) {
+    return 0;
+  }
+  return table->long_table_count * sizeof(gcomp_deflate_huffman_fast_entry_t);
+}
+
+/**
+ * @brief Track Huffman table memory after building.
+ */
+static void track_huffman_table_alloc(gcomp_deflate_decoder_state_t * st,
+    const gcomp_deflate_huffman_decode_table_t * table) {
+  if (!st || !table) {
+    return;
+  }
+  size_t mem = huffman_table_dynamic_memory(table);
+  if (mem > 0) {
+    gcomp_memory_track_alloc(&st->mem_tracker, mem);
+  }
+}
+
+/**
+ * @brief Untrack Huffman table memory before cleanup.
+ */
+static void track_huffman_table_free(gcomp_deflate_decoder_state_t * st,
+    const gcomp_deflate_huffman_decode_table_t * table) {
+  if (!st || !table) {
+    return;
+  }
+  size_t mem = huffman_table_dynamic_memory(table);
+  if (mem > 0) {
+    gcomp_memory_track_free(&st->mem_tracker, mem);
+  }
+}
 
 //
 // Bit helpers: streaming bit reads from gcomp_buffer_t
@@ -518,11 +569,14 @@ static gcomp_status_t deflate_dynamic_reset(
   memset(st->dyn_dist_lengths, 0, sizeof(st->dyn_dist_lengths));
 
   if (st->dyn_clen_ready) {
+    track_huffman_table_free(st, &st->dyn_clen_table);
     gcomp_deflate_huffman_decode_table_cleanup(&st->dyn_clen_table);
     st->dyn_clen_ready = 0;
   }
 
   if (st->dyn_ready) {
+    track_huffman_table_free(st, &st->dyn_litlen);
+    track_huffman_table_free(st, &st->dyn_dist);
     gcomp_deflate_huffman_decode_table_cleanup(&st->dyn_litlen);
     gcomp_deflate_huffman_decode_table_cleanup(&st->dyn_dist);
     st->dyn_ready = 0;
@@ -579,6 +633,18 @@ static gcomp_status_t deflate_dynamic_read_codelen_lengths(
       st->dyn_clen_lengths, 19u, 7u, &st->dyn_clen_table);
   if (st_build != GCOMP_OK) {
     return st_build == GCOMP_ERR_CORRUPT ? GCOMP_ERR_CORRUPT : st_build;
+  }
+
+  // Track clen table memory allocation
+  track_huffman_table_alloc(st, &st->dyn_clen_table);
+
+  // Check memory limit after allocation
+  gcomp_status_t mem_check =
+      gcomp_memory_check_limit(&st->mem_tracker, st->max_memory_bytes);
+  if (mem_check != GCOMP_OK) {
+    track_huffman_table_free(st, &st->dyn_clen_table);
+    gcomp_deflate_huffman_decode_table_cleanup(&st->dyn_clen_table);
+    return mem_check;
   }
 
   st->dyn_clen_ready = 1;
@@ -697,15 +763,33 @@ static gcomp_status_t deflate_dynamic_decode_lengths(
   if (a != GCOMP_OK) {
     return a;
   }
+  // Track litlen table memory allocation
+  track_huffman_table_alloc(st, &st->dyn_litlen);
 
   gcomp_status_t b = gcomp_deflate_huffman_build_decode_table(
       st->dyn_dist_lengths, DEFLATE_MAX_DIST_SYMBOLS, 15u, &st->dyn_dist);
   if (b != GCOMP_OK) {
+    track_huffman_table_free(st, &st->dyn_litlen);
     gcomp_deflate_huffman_decode_table_cleanup(&st->dyn_litlen);
     return b;
   }
+  // Track dist table memory allocation
+  track_huffman_table_alloc(st, &st->dyn_dist);
+
+  // Check memory limit after allocations
+  gcomp_status_t mem_check =
+      gcomp_memory_check_limit(&st->mem_tracker, st->max_memory_bytes);
+  if (mem_check != GCOMP_OK) {
+    track_huffman_table_free(st, &st->dyn_litlen);
+    track_huffman_table_free(st, &st->dyn_dist);
+    gcomp_deflate_huffman_decode_table_cleanup(&st->dyn_litlen);
+    gcomp_deflate_huffman_decode_table_cleanup(&st->dyn_dist);
+    return mem_check;
+  }
 
   st->dyn_ready = 1;
+  // Clean up clen table (no longer needed)
+  track_huffman_table_free(st, &st->dyn_clen_table);
   gcomp_deflate_huffman_decode_table_cleanup(&st->dyn_clen_table);
   st->dyn_clen_ready = 0;
   return GCOMP_OK;
@@ -737,12 +821,46 @@ gcomp_status_t gcomp_deflate_decoder_init(gcomp_registry_t * registry,
   }
 
   const gcomp_allocator_t * alloc = gcomp_registry_get_allocator(registry);
+
+  // Read memory limit early to check before allocations
+  uint64_t max_mem =
+      gcomp_limits_read_memory_max(options, GCOMP_DEFAULT_MAX_MEMORY_BYTES);
+
+  // Calculate initial memory requirement: state struct + window
+  uint64_t win_bits = DEFLATE_WINDOW_BITS_DEFAULT;
+  if (options) {
+    uint64_t v = 0;
+    if (gcomp_options_get_uint64(options, "deflate.window_bits", &v) ==
+        GCOMP_OK) {
+      win_bits = v;
+    }
+  }
+
+  if (win_bits < DEFLATE_WINDOW_BITS_MIN ||
+      win_bits > DEFLATE_WINDOW_BITS_MAX) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  size_t window_size = (size_t)1u << (size_t)win_bits;
+  size_t initial_mem = sizeof(gcomp_deflate_decoder_state_t) + window_size;
+
+  // Check memory limit before allocating
+  if (max_mem != 0 && initial_mem > max_mem) {
+    return GCOMP_ERR_LIMIT;
+  }
+
   gcomp_deflate_decoder_state_t * st =
       (gcomp_deflate_decoder_state_t *)gcomp_calloc(
           alloc, 1, sizeof(gcomp_deflate_decoder_state_t));
   if (!st) {
     return GCOMP_ERR_MEMORY;
   }
+
+  // Initialize memory tracker and track state struct allocation
+  st->mem_tracker.current_bytes = 0;
+  gcomp_memory_track_alloc(
+      &st->mem_tracker, sizeof(gcomp_deflate_decoder_state_t));
+  st->max_memory_bytes = max_mem;
 
   st->bit_buffer = 0;
   st->bit_count = 0;
@@ -757,22 +875,7 @@ gcomp_status_t gcomp_deflate_decoder_init(gcomp_registry_t * registry,
   st->pending_dist_valid = 0;
   st->pending_dist_sym = 0;
 
-  uint64_t win_bits = DEFLATE_WINDOW_BITS_DEFAULT;
-  if (options) {
-    uint64_t v = 0;
-    if (gcomp_options_get_uint64(options, "deflate.window_bits", &v) ==
-        GCOMP_OK) {
-      win_bits = v;
-    }
-  }
-
-  if (win_bits < DEFLATE_WINDOW_BITS_MIN ||
-      win_bits > DEFLATE_WINDOW_BITS_MAX) {
-    gcomp_free(alloc, st);
-    return GCOMP_ERR_INVALID_ARG;
-  }
-
-  st->window_size = (size_t)1u << (size_t)win_bits;
+  st->window_size = window_size;
   st->max_window_bytes =
       gcomp_limits_read_window_max(options, (uint64_t)st->window_size);
   if (st->max_window_bytes != 0 &&
@@ -786,6 +889,9 @@ gcomp_status_t gcomp_deflate_decoder_init(gcomp_registry_t * registry,
     gcomp_free(alloc, st);
     return GCOMP_ERR_MEMORY;
   }
+  // Track window allocation
+  gcomp_memory_track_alloc(&st->mem_tracker, st->window_size);
+
   st->window_pos = 0;
   st->window_filled = 0;
 
@@ -808,6 +914,9 @@ gcomp_status_t gcomp_deflate_decoder_init(gcomp_registry_t * registry,
     gcomp_free(alloc, st);
     return ft;
   }
+  // Track fixed Huffman table allocations
+  track_huffman_table_alloc(st, &st->fixed_litlen);
+  track_huffman_table_alloc(st, &st->fixed_dist);
 
   st->cur_litlen = NULL;
   st->cur_dist = NULL;
@@ -833,20 +942,29 @@ void gcomp_deflate_decoder_destroy(gcomp_decoder_t * decoder) {
       gcomp_registry_get_allocator(decoder->registry);
 
   if (st->fixed_ready) {
+    track_huffman_table_free(st, &st->fixed_litlen);
+    track_huffman_table_free(st, &st->fixed_dist);
     gcomp_deflate_huffman_decode_table_cleanup(&st->fixed_litlen);
     gcomp_deflate_huffman_decode_table_cleanup(&st->fixed_dist);
   }
 
   if (st->dyn_ready) {
+    track_huffman_table_free(st, &st->dyn_litlen);
+    track_huffman_table_free(st, &st->dyn_dist);
     gcomp_deflate_huffman_decode_table_cleanup(&st->dyn_litlen);
     gcomp_deflate_huffman_decode_table_cleanup(&st->dyn_dist);
   }
 
   if (st->dyn_clen_ready) {
+    track_huffman_table_free(st, &st->dyn_clen_table);
     gcomp_deflate_huffman_decode_table_cleanup(&st->dyn_clen_table);
   }
 
+  gcomp_memory_track_free(&st->mem_tracker, st->window_size);
   gcomp_free(alloc, st->window);
+
+  gcomp_memory_track_free(
+      &st->mem_tracker, sizeof(gcomp_deflate_decoder_state_t));
   gcomp_free(alloc, st);
   decoder->method_state = NULL;
 }
