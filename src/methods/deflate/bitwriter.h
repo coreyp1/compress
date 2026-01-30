@@ -14,6 +14,7 @@
 #define GCOMP_DEFLATE_BITWRITER_H
 
 #include <ghoti.io/compress/errors.h>
+#include <ghoti.io/compress/macros.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -41,7 +42,7 @@ typedef struct gcomp_deflate_bitwriter_s {
  * @param data   Output buffer (can be NULL if @p size is 0).
  * @param size   Capacity of @p data in bytes.
  */
-gcomp_status_t gcomp_deflate_bitwriter_init(
+GCOMP_INTERNAL_API gcomp_status_t gcomp_deflate_bitwriter_init(
     gcomp_deflate_bitwriter_t * writer, uint8_t * data, size_t size);
 
 /**
@@ -55,7 +56,7 @@ gcomp_status_t gcomp_deflate_bitwriter_init(
  * @return ::GCOMP_OK on success, ::GCOMP_ERR_INVALID_ARG on bad parameters,
  *         ::GCOMP_ERR_LIMIT if the output buffer is too small.
  */
-gcomp_status_t gcomp_deflate_bitwriter_write_bits(
+GCOMP_INTERNAL_API gcomp_status_t gcomp_deflate_bitwriter_write_bits(
     gcomp_deflate_bitwriter_t * writer, uint32_t bits, uint32_t num_bits);
 
 /**
@@ -69,7 +70,7 @@ gcomp_status_t gcomp_deflate_bitwriter_write_bits(
  * @return ::GCOMP_OK on success, ::GCOMP_ERR_INVALID_ARG on bad parameters,
  *         ::GCOMP_ERR_LIMIT if the output buffer is too small.
  */
-gcomp_status_t gcomp_deflate_bitwriter_flush_to_byte(
+GCOMP_INTERNAL_API gcomp_status_t gcomp_deflate_bitwriter_flush_to_byte(
     gcomp_deflate_bitwriter_t * writer);
 
 /**
@@ -81,7 +82,7 @@ gcomp_status_t gcomp_deflate_bitwriter_flush_to_byte(
  * @param writer Bit writer (must not be NULL).
  * @return Number of bytes written so far.
  */
-size_t gcomp_deflate_bitwriter_bytes_written(
+GCOMP_INTERNAL_API size_t gcomp_deflate_bitwriter_bytes_written(
     const gcomp_deflate_bitwriter_t * writer);
 
 /**
@@ -95,7 +96,7 @@ size_t gcomp_deflate_bitwriter_bytes_written(
  * @param size   Capacity of @p data in bytes.
  * @return ::GCOMP_OK on success, ::GCOMP_ERR_INVALID_ARG if writer is NULL.
  */
-gcomp_status_t gcomp_deflate_bitwriter_set_buffer(
+GCOMP_INTERNAL_API gcomp_status_t gcomp_deflate_bitwriter_set_buffer(
     gcomp_deflate_bitwriter_t * writer, uint8_t * data, size_t size);
 
 #ifdef __cplusplus

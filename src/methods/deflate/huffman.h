@@ -48,6 +48,7 @@
 #define GCOMP_DEFLATE_HUFFMAN_H
 
 #include <ghoti.io/compress/errors.h>
+#include <ghoti.io/compress/macros.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -142,7 +143,7 @@ typedef struct gcomp_deflate_huffman_decode_table_s {
  * @return ::GCOMP_OK if valid, ::GCOMP_ERR_CORRUPT if over-subscribed or
  *         incomplete, ::GCOMP_ERR_INVALID_ARG if parameters invalid.
  */
-gcomp_status_t gcomp_deflate_huffman_validate(
+GCOMP_INTERNAL_API gcomp_status_t gcomp_deflate_huffman_validate(
     const uint8_t * lengths, size_t num_symbols, unsigned max_bits);
 
 /**
@@ -164,9 +165,9 @@ gcomp_status_t gcomp_deflate_huffman_validate(
  *         invalid, ::GCOMP_ERR_CORRUPT if lengths are invalid (e.g.
  *         over-subscribed).
  */
-gcomp_status_t gcomp_deflate_huffman_build_codes(const uint8_t * lengths,
-    size_t num_symbols, unsigned max_bits, uint16_t * codes,
-    uint8_t * code_lens);
+GCOMP_INTERNAL_API gcomp_status_t gcomp_deflate_huffman_build_codes(
+    const uint8_t * lengths, size_t num_symbols, unsigned max_bits,
+    uint16_t * codes, uint8_t * code_lens);
 
 /**
  * @brief Build a two-level fast decode table from code lengths.
@@ -185,8 +186,8 @@ gcomp_status_t gcomp_deflate_huffman_build_codes(const uint8_t * lengths,
  * @return ::GCOMP_OK on success, ::GCOMP_ERR_INVALID_ARG or ::GCOMP_ERR_CORRUPT
  *         on failure. On failure, table state is undefined.
  */
-gcomp_status_t gcomp_deflate_huffman_build_decode_table(const uint8_t * lengths,
-    size_t num_symbols, unsigned max_bits,
+GCOMP_INTERNAL_API gcomp_status_t gcomp_deflate_huffman_build_decode_table(
+    const uint8_t * lengths, size_t num_symbols, unsigned max_bits,
     gcomp_deflate_huffman_decode_table_t * table);
 
 /**
@@ -198,7 +199,7 @@ gcomp_status_t gcomp_deflate_huffman_build_decode_table(const uint8_t * lengths,
  * @param table Decode table whose long_table was built by
  *              ::gcomp_deflate_huffman_build_decode_table(). Can be NULL.
  */
-void gcomp_deflate_huffman_decode_table_cleanup(
+GCOMP_INTERNAL_API void gcomp_deflate_huffman_decode_table_cleanup(
     gcomp_deflate_huffman_decode_table_t * table);
 
 #ifdef __cplusplus

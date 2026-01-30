@@ -252,19 +252,23 @@ TEST_F(RegistryTest, MultipleMethods) {
 
 // Test memory cleanup
 TEST_F(RegistryTest, MemoryCleanupManyMethods) {
+  // Use static storage so methods and names persist for the duration of the
+  // test. The registry stores pointers to methods, not copies, so the method
+  // structs must remain valid until the registry is destroyed.
+  static constexpr int kNumMethods = 100;
+  static char names[kNumMethods][32];
+  static gcomp_method_t methods[kNumMethods];
+
   // Register many methods
-  for (int i = 0; i < 100; ++i) {
-    char name[32];
-    std::snprintf(name, sizeof(name), "method_%d", i);
-    gcomp_method_t method = create_mock_method(name, GCOMP_CAP_ENCODE);
-    EXPECT_EQ(gcomp_registry_register(registry_, &method), GCOMP_OK);
+  for (int i = 0; i < kNumMethods; ++i) {
+    std::snprintf(names[i], sizeof(names[i]), "method_%d", i);
+    methods[i] = create_mock_method(names[i], GCOMP_CAP_ENCODE);
+    EXPECT_EQ(gcomp_registry_register(registry_, &methods[i]), GCOMP_OK);
   }
 
   // Verify all can be found
-  for (int i = 0; i < 100; ++i) {
-    char name[32];
-    std::snprintf(name, sizeof(name), "method_%d", i);
-    const gcomp_method_t * found = gcomp_registry_find(registry_, name);
+  for (int i = 0; i < kNumMethods; ++i) {
+    const gcomp_method_t * found = gcomp_registry_find(registry_, names[i]);
     EXPECT_NE(found, nullptr);
   }
 

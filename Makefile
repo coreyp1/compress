@@ -46,7 +46,7 @@ else ifeq ($(findstring MINGW32_NT,$(UNAME_S)),MINGW32_NT)  # 32-bit Windows
 	OS_NAME := Windows
 	LIB_EXTENSION := dll
 	OS_SPECIFIC_CXX_FLAGS := -shared
-	OS_SPECIFIC_LIBRARY_NAME_FLAG := -Wl,--out-implib,$(APP_DIR)/$(BASE_NAME_PREFIX).dll.a
+	OS_SPECIFIC_LIBRARY_NAME_FLAG = -Wl,--out-implib,$(APP_DIR)/$(BASE_NAME_PREFIX).dll.a
 	TARGET := $(BASE_NAME_PREFIX).dll
 	EXE_EXTENSION := .exe
 	# Additional Windows-specific variables
@@ -61,7 +61,7 @@ else ifeq ($(findstring MINGW64_NT,$(UNAME_S)),MINGW64_NT)  # 64-bit Windows
 	OS_NAME := Windows
 	LIB_EXTENSION := dll
 	OS_SPECIFIC_CXX_FLAGS := -shared
-	OS_SPECIFIC_LIBRARY_NAME_FLAG := -Wl,--out-implib,$(APP_DIR)/$(BASE_NAME_PREFIX).dll.a
+	OS_SPECIFIC_LIBRARY_NAME_FLAG = -Wl,--out-implib,$(APP_DIR)/$(BASE_NAME_PREFIX).dll.a
 	TARGET := $(BASE_NAME_PREFIX).dll
 	EXE_EXTENSION := .exe
 	# Additional Windows-specific variables

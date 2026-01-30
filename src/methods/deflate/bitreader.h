@@ -14,6 +14,7 @@
 #define GCOMP_DEFLATE_BITREADER_H
 
 #include <ghoti.io/compress/errors.h>
+#include <ghoti.io/compress/macros.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -41,7 +42,7 @@ typedef struct gcomp_deflate_bitreader_s {
  * @param data   Input buffer (can be NULL if @p size is 0).
  * @param size   Size of @p data in bytes.
  */
-gcomp_status_t gcomp_deflate_bitreader_init(
+GCOMP_INTERNAL_API gcomp_status_t gcomp_deflate_bitreader_init(
     gcomp_deflate_bitreader_t * reader, const uint8_t * data, size_t size);
 
 /**
@@ -56,7 +57,7 @@ gcomp_status_t gcomp_deflate_bitreader_init(
  * @return ::GCOMP_OK on success, ::GCOMP_ERR_INVALID_ARG on bad parameters,
  *         ::GCOMP_ERR_CORRUPT if there are not enough bits remaining.
  */
-gcomp_status_t gcomp_deflate_bitreader_read_bits(
+GCOMP_INTERNAL_API gcomp_status_t gcomp_deflate_bitreader_read_bits(
     gcomp_deflate_bitreader_t * reader, uint32_t num_bits, uint32_t * out);
 
 /**
@@ -69,7 +70,7 @@ gcomp_status_t gcomp_deflate_bitreader_read_bits(
  * @param reader Bit reader (must not be NULL).
  * @return ::GCOMP_OK on success, ::GCOMP_ERR_INVALID_ARG if @p reader is NULL.
  */
-gcomp_status_t gcomp_deflate_bitreader_align_to_byte(
+GCOMP_INTERNAL_API gcomp_status_t gcomp_deflate_bitreader_align_to_byte(
     gcomp_deflate_bitreader_t * reader);
 
 /**
@@ -81,7 +82,8 @@ gcomp_status_t gcomp_deflate_bitreader_align_to_byte(
  * @param reader Bit reader (must not be NULL).
  * @return 1 if at end of stream, 0 otherwise.
  */
-int gcomp_deflate_bitreader_is_eof(const gcomp_deflate_bitreader_t * reader);
+GCOMP_INTERNAL_API int gcomp_deflate_bitreader_is_eof(
+    const gcomp_deflate_bitreader_t * reader);
 
 #ifdef __cplusplus
 }
