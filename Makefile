@@ -331,6 +331,8 @@ $(APP_DIR)/fuzz/%$(EXE_EXTENSION): fuzz/%.c $(APP_DIR)/$(AFL_STATIC_TARGET)
 .PHONY: all-debug install-debug test-debug test-valgrind-debug test-watch-debug uninstall-debug watch-debug
 # Fuzz commands
 .PHONY: fuzz-build fuzz-corpus fuzz-decoder fuzz-encoder fuzz-roundtrip fuzz-help
+# Sanitizer commands
+.PHONY: test-asan test-ubsan sanitizer-help
 
 
 watch: ## Watch the file directory for changes and compile the target
@@ -560,6 +562,147 @@ else
 	@printf "\033[0m\n"
 	@exit 1
 endif
+
+####################################################################
+# Sanitizer Builds (ASan, UBSan)
+####################################################################
+
+# Sanitizer flags
+ASAN_FLAGS := -fsanitize=address -fno-omit-frame-pointer -g
+UBSAN_FLAGS := -fsanitize=undefined -fno-omit-frame-pointer -g
+# Combined sanitizer flags (ASan + UBSan work well together)
+ASAN_UBSAN_FLAGS := $(ASAN_FLAGS) -fsanitize=undefined
+
+# Sanitizer-specific build directories
+ASAN_BUILD_DIR := ./build/$(BUILD)-asan
+ASAN_OBJ_DIR := $(ASAN_BUILD_DIR)/objects
+ASAN_APP_DIR := $(ASAN_BUILD_DIR)/apps
+
+# ASan-instrumented object files
+ASAN_LIBOBJECTS := $(patsubst src/%.c,$(ASAN_OBJ_DIR)/%.o,$(SOURCES))
+ASAN_TARGET := $(BASE_NAME_PREFIX)-asan.so
+ASAN_STATIC_TARGET := $(BASE_NAME_PREFIX)-asan.a
+
+# ASan test helper and executables
+ASAN_TEST_HELPER_OBJ := $(ASAN_OBJ_DIR)/tests/test_helpers.o
+ASAN_TEST_EXECUTABLES := $(foreach test,$(TEST_SOURCES),$(ASAN_APP_DIR)/$(call test-name,$(test))$(EXE_EXTENSION))
+
+# Compile flags for ASan builds (include UBSan for comprehensive checking)
+ASAN_CFLAGS := $(CFLAGS) $(ASAN_UBSAN_FLAGS) -DGCOMP_BUILD -DGCOMP_TEST_BUILD
+ASAN_CXXFLAGS := $(CXXFLAGS) $(ASAN_UBSAN_FLAGS)
+ASAN_LDFLAGS := $(LDFLAGS) $(ASAN_UBSAN_FLAGS)
+ASAN_COMPRESSLIBRARY := -L $(ASAN_APP_DIR) -l$(SUITE)-$(PROJECT)$(BRANCH)-asan
+
+# Add PIC on Linux
+ifeq ($(UNAME_S), Linux)
+	ASAN_CFLAGS += -fPIC
+endif
+
+# Pattern rule for ASan-instrumented C object files
+$(ASAN_OBJ_DIR)/%.o: src/%.c
+	@printf "\n### Compiling (ASan+UBSan instrumented): $< ###\n"
+	@mkdir -p $(@D)
+	$(CC) $(ASAN_CFLAGS) $(INCLUDE) -c $< -o $@
+
+# ASan-instrumented static library
+$(ASAN_APP_DIR)/$(ASAN_STATIC_TARGET): $(ASAN_LIBOBJECTS)
+	@printf "\n### Archiving ASan+UBSan-instrumented Static Library ###\n"
+	@mkdir -p $(@D)
+	ar rcs $@ $^
+
+# ASan-instrumented shared library
+$(ASAN_APP_DIR)/$(ASAN_TARGET): $(ASAN_LIBOBJECTS)
+	@printf "\n### Compiling ASan+UBSan-instrumented Shared Library ###\n"
+	@mkdir -p $(@D)
+	$(CXX) $(ASAN_CXXFLAGS) -shared -o $@ $^ $(ASAN_LDFLAGS)
+
+# ASan test helper object
+$(ASAN_OBJ_DIR)/tests/test_helpers.o: tests/test_helpers.cpp
+	@mkdir -p $(@D)
+	$(CXX) $(ASAN_CXXFLAGS) $(INCLUDE) -c $< -o $@
+
+# Pattern rule for ASan test object files
+$(ASAN_OBJ_DIR)/tests/%.o: tests/%.cpp
+	@printf "\n### Compiling ASan+UBSan Test Object: $* ###\n"
+	@mkdir -p $(@D)
+	$(CXX) $(ASAN_CXXFLAGS) $(INCLUDE) -c $< -o $@
+
+# Pattern rule for ASan test executables
+define asan-test-executable-rule
+ASAN_TEST_OBJ_$1 := $(ASAN_OBJ_DIR)/tests/$(basename $(notdir $1)).o
+
+$(ASAN_APP_DIR)/$(call test-name,$1)$(EXE_EXTENSION): \
+		$$(ASAN_TEST_OBJ_$1) \
+		$(ASAN_TEST_HELPER_OBJ) \
+		| $(ASAN_APP_DIR)/$(ASAN_TARGET)
+	@printf "\n### Linking ASan+UBSan %s Test ###\n" "$(call test-name,$1)"
+	@mkdir -p $$(@D)
+	$$(CXX) $$(ASAN_CXXFLAGS) -o $$@ $$(ASAN_TEST_OBJ_$1) $$(ASAN_TEST_HELPER_OBJ) $$(ASAN_LDFLAGS) $$(TESTFLAGS) $$(ASAN_COMPRESSLIBRARY)
+endef
+
+# Generate ASan build rules for all test sources
+$(foreach test,$(TEST_SOURCES),$(eval $(call asan-test-executable-rule,$(test))))
+
+test-asan: ## Run all tests with AddressSanitizer + UndefinedBehaviorSanitizer (Linux only)
+test-asan: $(ASAN_APP_DIR)/$(ASAN_TARGET) $(ASAN_TEST_EXECUTABLES)
+ifeq ($(OS_NAME), Linux)
+	@printf "\033[0;36m\n"
+	@printf "###########################################\n"
+	@printf "### Running tests with ASan + UBSan    ###\n"
+	@printf "###########################################\n"
+	@printf "\033[0m\n"
+	@for test_exe in $(ASAN_TEST_EXECUTABLES); do \
+		test_name=$$(basename $$test_exe $(EXE_EXTENSION) | sed 's/test/\u&/'); \
+		printf "\033[0;30;43m\n"; \
+		printf "############################\n"; \
+		printf "### Running %s tests (ASan+UBSan) ###\n" "$$test_name"; \
+		printf "############################"; \
+		printf "\033[0m\n\n"; \
+		LD_LIBRARY_PATH="$(ASAN_APP_DIR)" ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 $$test_exe --gtest_brief=1 || exit 1; \
+	done
+	@printf "\033[0;32m\n"
+	@printf "###########################################\n"
+	@printf "### All tests passed with ASan + UBSan ###\n"
+	@printf "###########################################\n"
+	@printf "\033[0m\n"
+else
+	@printf "\033[0;31m\n"
+	@printf "Sanitizer builds are currently only supported on Linux\n"
+	@printf "\033[0m\n"
+	@exit 1
+endif
+
+test-ubsan: ## Alias for test-asan (ASan+UBSan are run together)
+test-ubsan: test-asan
+
+sanitizer-help: ## Show sanitizer build help
+	@printf "\033[0;36m"
+	@printf "###########################################\n"
+	@printf "### Sanitizer Builds                   ###\n"
+	@printf "###########################################\n"
+	@printf "\033[0m\n"
+	@printf "Available targets:\n"
+	@printf "  make test-asan   - Run tests with AddressSanitizer + UndefinedBehaviorSanitizer\n"
+	@printf "  make test-ubsan  - Alias for test-asan (both run together)\n"
+	@printf "\n"
+	@printf "What these sanitizers detect:\n"
+	@printf "  ASan (AddressSanitizer):\n"
+	@printf "    - Buffer overflows (heap, stack, global)\n"
+	@printf "    - Use-after-free\n"
+	@printf "    - Use-after-return (with ASAN_OPTIONS=detect_stack_use_after_return=1)\n"
+	@printf "    - Double-free\n"
+	@printf "    - Memory leaks\n"
+	@printf "  UBSan (UndefinedBehaviorSanitizer):\n"
+	@printf "    - Signed integer overflow\n"
+	@printf "    - Divide by zero\n"
+	@printf "    - Null pointer dereference\n"
+	@printf "    - Invalid shift operations\n"
+	@printf "    - Out-of-bounds array access\n"
+	@printf "    - Misaligned memory access\n"
+	@printf "\n"
+	@printf "Note: Sanitizer builds are slower than regular builds but catch\n"
+	@printf "bugs that may not cause immediate crashes in release builds.\n"
+	@printf "\n"
 
 clean: ## Remove all contents of the build directories.
 	-@rm -rvf $(BUILD_DIR)
