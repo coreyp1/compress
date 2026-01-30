@@ -205,7 +205,77 @@ gcomp_status_t gcomp_decode_stream_cb(
 );
 ```
 
-**Example: File-based compression**
+### Callback Semantics
+
+#### Read Callback
+
+The read callback is called when the library needs more input data.
+
+**Contract:**
+- `ctx`: Your user-provided context pointer (e.g., file handle, socket, buffer position)
+- `dst`: Buffer to read data into (library-owned, valid for the duration of the call)
+- `cap`: Maximum bytes to read (always > 0)
+- `out_n`: Must be set to the number of bytes actually read
+
+**Return values:**
+- `GCOMP_OK`: Read succeeded. Check `*out_n` for bytes read.
+- `GCOMP_ERR_IO`: I/O error occurred (e.g., file read error, network error)
+- Other error codes: Treated as fatal errors
+
+**EOF handling:**
+- Return `GCOMP_OK` with `*out_n = 0` to indicate end-of-file
+- Once EOF is signaled, the callback will not be called again
+
+**Partial reads:**
+- Returning fewer bytes than `cap` is always valid (the library will call again if needed)
+- This allows for non-blocking I/O or reading from slow sources
+
+#### Write Callback
+
+The write callback is called when the library has output data to write.
+
+**Contract:**
+- `ctx`: Your user-provided context pointer
+- `src`: Data to write (library-owned, valid for the duration of the call)
+- `n`: Number of bytes to write (always > 0)
+- `out_n`: Must be set to the number of bytes actually written
+
+**Return values:**
+- `GCOMP_OK`: Write succeeded. Check `*out_n` for bytes written.
+- `GCOMP_ERR_IO`: I/O error occurred
+- Other error codes: Treated as fatal errors
+
+**Partial writes:**
+- Returning fewer bytes than `n` is valid (the library retries with remaining data)
+- Returning `*out_n = 0` with `GCOMP_OK` is treated as `GCOMP_ERR_IO` (no progress)
+
+**Backpressure:**
+- The library automatically handles partial writes by retrying
+- All output is eventually written before returning to the caller
+
+### Error Propagation
+
+Errors from callbacks are propagated directly to the caller:
+
+```c
+gcomp_status_t my_read(void *ctx, uint8_t *dst, size_t cap, size_t *out_n) {
+    // Return GCOMP_ERR_IO on failure
+    if (read_failed) {
+        return GCOMP_ERR_IO;
+    }
+    // ...
+}
+
+// This error propagates to the caller
+gcomp_status_t status = gcomp_encode_stream_cb(..., my_read, ...);
+// status == GCOMP_ERR_IO if my_read returned GCOMP_ERR_IO
+```
+
+**Cleanup on error:**
+- The library always cleans up internal resources (encoder/decoder, buffers) on error
+- You are responsible for cleaning up your callback context
+
+### Example: File-Based Compression
 
 ```c
 typedef struct {
@@ -221,19 +291,61 @@ gcomp_status_t read_file(void *ctx, uint8_t *dst, size_t cap, size_t *out_n) {
 gcomp_status_t write_file(void *ctx, const uint8_t *src, size_t n, size_t *out_n) {
     file_ctx_t *fc = (file_ctx_t *)ctx;
     *out_n = fwrite(src, 1, n, fc->file);
-    return (*out_n < n) ? GCOMP_ERR_IO : GCOMP_OK;
+    return (*out_n < n && ferror(fc->file)) ? GCOMP_ERR_IO : GCOMP_OK;
 }
 
 // Usage
 file_ctx_t in_ctx = { fopen("input.txt", "rb") };
 file_ctx_t out_ctx = { fopen("output.deflate", "wb") };
 
-gcomp_encode_stream_cb(NULL, "deflate", NULL,
+gcomp_status_t status = gcomp_encode_stream_cb(NULL, "deflate", NULL,
     read_file, &in_ctx, write_file, &out_ctx);
 
 fclose(in_ctx.file);
 fclose(out_ctx.file);
+
+if (status != GCOMP_OK) {
+    fprintf(stderr, "Compression failed: %s\n", gcomp_status_to_string(status));
+}
 ```
+
+### Example: Memory Buffer with Partial Reads
+
+```c
+typedef struct {
+    const uint8_t *data;
+    size_t size;
+    size_t pos;
+    size_t chunk_size;  // Simulate slow reads
+} chunked_reader_t;
+
+gcomp_status_t read_chunked(void *ctx, uint8_t *dst, size_t cap, size_t *out_n) {
+    chunked_reader_t *r = (chunked_reader_t *)ctx;
+    
+    if (r->pos >= r->size) {
+        *out_n = 0;  // EOF
+        return GCOMP_OK;
+    }
+    
+    // Read at most chunk_size bytes at a time
+    size_t remaining = r->size - r->pos;
+    size_t to_read = (remaining < r->chunk_size) ? remaining : r->chunk_size;
+    if (to_read > cap) to_read = cap;
+    
+    memcpy(dst, r->data + r->pos, to_read);
+    r->pos += to_read;
+    *out_n = to_read;
+    return GCOMP_OK;
+}
+```
+
+### Internal Buffer Size
+
+The callback API uses internal 64 KiB buffers for reading and writing. This means:
+- Your read callback will be asked to read up to 64 KiB at a time
+- Your write callback will receive up to 64 KiB at a time
+
+This is an implementation detail and may change in future versions.
 
 ## Buffer Convenience Functions
 
