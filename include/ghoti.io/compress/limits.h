@@ -40,6 +40,17 @@ typedef struct {
 #define GCOMP_DEFAULT_MAX_MEMORY_BYTES (256ULL * 1024 * 1024)
 
 /**
+ * @brief Default maximum expansion ratio (1000x)
+ *
+ * This means 1 KB of compressed data can expand to at most 1 MB of output.
+ * This protects against "decompression bombs" - maliciously crafted inputs
+ * that decompress to massive outputs (e.g., 1 MB → 1 TB).
+ *
+ * Set to 0 for unlimited (not recommended for untrusted input).
+ */
+#define GCOMP_DEFAULT_MAX_EXPANSION_RATIO 1000ULL
+
+/**
  * @brief Read the maximum output bytes limit from options
  *
  * Reads the `limits.max_output_bytes` option from the options object.
@@ -79,6 +90,22 @@ GCOMP_API uint64_t gcomp_limits_read_window_max(
     const gcomp_options_t * opts, uint64_t default_val);
 
 /**
+ * @brief Read the maximum expansion ratio from options
+ *
+ * Reads the `limits.max_expansion_ratio` option from the options object.
+ * If not set, returns the default value.
+ *
+ * The expansion ratio is output_bytes / input_bytes. A ratio of 1000 means
+ * 1 KB of compressed input can expand to at most 1 MB of output.
+ *
+ * @param opts Options object (can be NULL for default)
+ * @param default_val Default value to use if not set in options
+ * @return The limit value (0 means unlimited)
+ */
+GCOMP_API uint64_t gcomp_limits_read_expansion_ratio_max(
+    const gcomp_options_t * opts, uint64_t default_val);
+
+/**
  * @brief Check if output size exceeds limit
  *
  * Checks if the current output size exceeds the limit. If it does,
@@ -103,6 +130,24 @@ GCOMP_API gcomp_status_t gcomp_limits_check_output(
  */
 GCOMP_API gcomp_status_t gcomp_limits_check_memory(
     size_t current, uint64_t limit);
+
+/**
+ * @brief Check if expansion ratio exceeds limit
+ *
+ * Checks if the output/input ratio exceeds the maximum allowed expansion.
+ * This protects against decompression bombs where a small compressed input
+ * expands to a massive output.
+ *
+ * The ratio is calculated as output_bytes / input_bytes. If input_bytes is 0,
+ * the function returns GCOMP_OK (no ratio can be computed yet).
+ *
+ * @param input_bytes Total compressed input bytes consumed
+ * @param output_bytes Total decompressed output bytes produced
+ * @param ratio_limit Maximum allowed ratio (0 means unlimited)
+ * @return GCOMP_OK if within limit, GCOMP_ERR_LIMIT if exceeded
+ */
+GCOMP_API gcomp_status_t gcomp_limits_check_expansion_ratio(
+    uint64_t input_bytes, uint64_t output_bytes, uint64_t ratio_limit);
 
 /**
  * @brief Track a memory allocation

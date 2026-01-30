@@ -8,6 +8,41 @@
  * update/finish streaming semantics: partial input and partial output buffers
  * are supported by retaining internal state across calls.
  *
+ * ## Safety Limits
+ *
+ * The decoder enforces several safety limits to protect against malicious input:
+ *
+ * - **max_output_bytes**: Caps total decompressed output. Checked before each
+ *   byte is emitted via `deflate_check_output_limit()`.
+ *
+ * - **max_memory_bytes**: Caps working memory (state, window, Huffman tables).
+ *   Checked at initialization and when building dynamic Huffman tables.
+ *
+ * - **max_expansion_ratio**: Caps the output/input ratio to protect against
+ *   decompression bombs. Both `total_input_bytes` and `total_output_bytes` are
+ *   tracked throughout decoding. The ratio check is integrated into
+ *   `deflate_check_output_limit()` so it runs on every output operation.
+ *
+ * ## Input Tracking for Expansion Ratio
+ *
+ * Input bytes are tracked in two places:
+ *
+ * 1. `deflate_try_fill_bits()`: Increments `total_input_bytes` for each byte
+ *    read into the bit buffer (used for Huffman-compressed blocks).
+ *
+ * 2. `deflate_copy_stored()`: Increments `total_input_bytes` for bytes copied
+ *    directly from input in stored blocks (no bit-level processing).
+ *
+ * This ensures accurate tracking regardless of block type.
+ *
+ * ## Output Limit Check
+ *
+ * The `deflate_check_output_limit()` function performs both checks:
+ * 1. Absolute output limit: `total_output_bytes + add <= max_output_bytes`
+ * 2. Expansion ratio: `total_output_bytes + add <= max_expansion_ratio * total_input_bytes`
+ *
+ * If either check fails, `GCOMP_ERR_LIMIT` is returned with error details set.
+ *
  * Copyright 2026 by Corey Pennycuff
  */
 
@@ -54,12 +89,17 @@ typedef struct gcomp_deflate_decoder_state_s {
   uint32_t bit_count;
 
   //
-  // Limits
+  // Limits and counters for safety checks
   //
-  uint64_t max_output_bytes;
-  uint64_t max_window_bytes;
-  uint64_t max_memory_bytes;
-  uint64_t total_output_bytes;
+  // These limits are read from options at creation time and remain constant.
+  // The counters are updated throughout decoding and reset by reset().
+  //
+  uint64_t max_output_bytes;     ///< Max decompressed output (0 = unlimited)
+  uint64_t max_window_bytes;     ///< Max LZ77 window size
+  uint64_t max_memory_bytes;     ///< Max working memory (0 = unlimited)
+  uint64_t max_expansion_ratio;  ///< Max output/input ratio (0 = unlimited)
+  uint64_t total_output_bytes;   ///< Decompressed bytes produced so far
+  uint64_t total_input_bytes;    ///< Compressed bytes consumed so far
 
   //
   // Memory tracking
@@ -206,6 +246,7 @@ static int deflate_try_fill_bits(gcomp_deflate_decoder_state_t * st,
     st->bit_buffer |= ((uint32_t)byte) << st->bit_count;
     st->bit_count += 8u;
     input->used += 1u;
+    st->total_input_bytes += 1u;
   }
 
   return 1;
@@ -277,18 +318,48 @@ static uint32_t reverse_bits(uint32_t v, uint32_t nbits) {
 // Output helpers (window + limits)
 //
 
+/**
+ * @brief Check if emitting `add` more output bytes would exceed any limit.
+ *
+ * This function performs two checks before allowing output:
+ *
+ * 1. **Absolute output limit**: Ensures `total_output_bytes + add` does not
+ *    exceed `max_output_bytes`. This caps the total decompressed size.
+ *
+ * 2. **Expansion ratio limit**: Ensures `(total_output_bytes + add) / total_input_bytes`
+ *    does not exceed `max_expansion_ratio`. This catches decompression bombs
+ *    where a tiny input expands to massive output.
+ *
+ * The expansion ratio check is performed via `gcomp_limits_check_expansion_ratio()`
+ * which handles edge cases like zero input and arithmetic overflow.
+ *
+ * @param st Decoder state (contains limits and counters)
+ * @param add Number of bytes about to be emitted
+ * @return GCOMP_OK if within limits, GCOMP_ERR_LIMIT if either limit exceeded
+ */
 static gcomp_status_t deflate_check_output_limit(
     gcomp_deflate_decoder_state_t * st, size_t add) {
   if (!st) {
     return GCOMP_ERR_INTERNAL;
   }
 
+  // Check for counter overflow (extremely unlikely but defensive)
   if (add > 0 && st->total_output_bytes > UINT64_MAX - (uint64_t)add) {
     return GCOMP_ERR_LIMIT;
   }
 
   uint64_t next = st->total_output_bytes + (uint64_t)add;
-  return gcomp_limits_check_output((size_t)next, st->max_output_bytes);
+
+  // Check absolute output limit
+  gcomp_status_t status =
+      gcomp_limits_check_output((size_t)next, st->max_output_bytes);
+  if (status != GCOMP_OK) {
+    return status;
+  }
+
+  // Check expansion ratio limit (decompression bomb protection)
+  return gcomp_limits_check_expansion_ratio(
+      st->total_input_bytes, next, st->max_expansion_ratio);
 }
 
 static void deflate_window_put(gcomp_deflate_decoder_state_t * st, uint8_t b) {
@@ -362,8 +433,13 @@ static gcomp_status_t deflate_copy_stored(gcomp_deflate_decoder_state_t * st,
     return GCOMP_OK;
   }
 
+  // Track input consumption before the output limit check (for accurate ratio)
+  st->total_input_bytes += (uint64_t)to_copy;
+
   gcomp_status_t lim = deflate_check_output_limit(st, to_copy);
   if (lim != GCOMP_OK) {
+    // Rollback input tracking since we're not actually consuming it
+    st->total_input_bytes -= (uint64_t)to_copy;
     return lim;
   }
 
@@ -932,7 +1008,10 @@ gcomp_status_t gcomp_deflate_decoder_init(gcomp_registry_t * registry,
 
   st->max_output_bytes =
       gcomp_limits_read_output_max(options, GCOMP_DEFAULT_MAX_OUTPUT_BYTES);
+  st->max_expansion_ratio = gcomp_limits_read_expansion_ratio_max(
+      options, GCOMP_DEFAULT_MAX_EXPANSION_RATIO);
   st->total_output_bytes = 0;
+  st->total_input_bytes = 0;
 
   st->fixed_ready = 0;
   st->dyn_ready = 0;
@@ -1030,6 +1109,7 @@ gcomp_status_t gcomp_deflate_decoder_reset(gcomp_decoder_t * decoder) {
   st->window_pos = 0;
   st->window_filled = 0;
   st->total_output_bytes = 0;
+  st->total_input_bytes = 0;
 
   // Reset pending match/literal state
   st->match_remaining = 0;

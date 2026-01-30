@@ -32,10 +32,12 @@ See [Auto-Registration](../auto-registration.md) for details on disabling auto-r
 | `deflate.level` | int64 | 6 | 0..9 | Compression level (0 = none, 9 = best). Encoder only. |
 | `deflate.strategy` | string | "default" | see below | Compression strategy. Encoder only. |
 | `deflate.window_bits` | uint64 | 15 | 8..15 | LZ77 window size in bits (max 32 KiB). |
-| `limits.max_output_bytes` | uint64 | core default | 0 = unlimited | Max decompressed size (decoder). |
+| `limits.max_output_bytes` | uint64 | 512 MiB | 0 = unlimited | Max decompressed size (decoder). |
+| `limits.max_memory_bytes` | uint64 | 256 MiB | 0 = unlimited | Max working memory (decoder). |
 | `limits.max_window_bytes` | uint64 | window size | — | Max window (format-constrained). |
+| `limits.max_expansion_ratio` | uint64 | 1000 | 0 = unlimited | Max output/input ratio (decoder). |
 
-Limits are enforced by the core; the decoder returns `GCOMP_ERR_LIMIT` when `max_output_bytes` is exceeded.
+Limits are enforced by the core; the decoder returns `GCOMP_ERR_LIMIT` when any limit is exceeded.
 
 ### Strategy option values
 
@@ -124,10 +126,45 @@ The error detail includes the decoder stage where the error occurred:
 
 ## Limits and security notes
 
-- **Max output:** Set `limits.max_output_bytes` to avoid unbounded decompression (e.g. from untrusted input).
+### Decompression bomb protection
+
+The deflate decoder implements multiple layers of protection against malicious inputs:
+
+- **Max output:** Set `limits.max_output_bytes` to cap absolute decompressed size. Default: 512 MiB.
+- **Expansion ratio:** Set `limits.max_expansion_ratio` to limit the ratio of output to input bytes. Default: 1000x (meaning 1 KB compressed → max 1 MB decompressed). This catches "zip bombs" where tiny inputs decompress to massive outputs.
+- **Memory limits:** Set `limits.max_memory_bytes` to bound decoder working memory. Default: 256 MiB.
+
+**Example: Strict limits for untrusted input**
+
+```c
+gcomp_options_t *opts = NULL;
+gcomp_options_create(&opts);
+
+// Max 10 MB output
+gcomp_options_set_uint64(opts, "limits.max_output_bytes", 10 * 1024 * 1024);
+
+// Max 100x expansion ratio (stricter than default 1000x)
+gcomp_options_set_uint64(opts, "limits.max_expansion_ratio", 100);
+
+// Max 1 MB working memory
+gcomp_options_set_uint64(opts, "limits.max_memory_bytes", 1024 * 1024);
+
+gcomp_decoder_t *dec = NULL;
+gcomp_decoder_create(registry, "deflate", opts, &dec);
+```
+
+**Example: Disable expansion ratio limit for known-good data**
+
+```c
+// For trusted data with extreme compression (e.g., all-zeros test data)
+gcomp_options_set_uint64(opts, "limits.max_expansion_ratio", 0);  // 0 = unlimited
+```
+
+### Other security considerations
+
 - **Window:** DEFLATE allows up to 32 KiB back-reference distance; `deflate.window_bits` and `limits.max_window_bytes` constrain the decoder.
 - **Malformed input:** Invalid block type, stored-block NLEN mismatch, or invalid distance/length can produce `GCOMP_ERR_CORRUPT`.
-- **Memory limits:** Set `limits.max_memory_bytes` to bound decoder memory usage (state struct, window buffer, Huffman tables).
+- **Error details:** Call `gcomp_decoder_get_error_detail()` for diagnostic information when errors occur.
 
 ## Huffman tables
 

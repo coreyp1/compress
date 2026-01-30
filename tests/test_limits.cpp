@@ -339,6 +339,179 @@ TEST_F(LimitsTest, EdgeCaseLargeCurrent) {
   EXPECT_EQ(status, GCOMP_OK);
 }
 
+//
+// Tests for expansion ratio limit (decompression bomb protection)
+//
+
+// Test gcomp_limits_read_expansion_ratio_max()
+TEST_F(LimitsTest, ReadExpansionRatioMaxWithDefault) {
+  uint64_t default_val = 1000;
+  uint64_t result =
+      gcomp_limits_read_expansion_ratio_max(options_, default_val);
+  EXPECT_EQ(result, default_val);
+}
+
+TEST_F(LimitsTest, ReadExpansionRatioMaxWithNullOptions) {
+  uint64_t default_val = 1000;
+  uint64_t result = gcomp_limits_read_expansion_ratio_max(nullptr, default_val);
+  EXPECT_EQ(result, default_val);
+}
+
+TEST_F(LimitsTest, ReadExpansionRatioMaxFromOptions) {
+  uint64_t set_value = 500;
+  ASSERT_EQ(gcomp_options_set_uint64(
+                options_, "limits.max_expansion_ratio", set_value),
+      GCOMP_OK);
+
+  uint64_t default_val = 1000;
+  uint64_t result =
+      gcomp_limits_read_expansion_ratio_max(options_, default_val);
+  EXPECT_EQ(result, set_value);
+}
+
+TEST_F(LimitsTest, ReadExpansionRatioMaxZeroUnlimited) {
+  uint64_t set_value = 0; // 0 means unlimited
+  ASSERT_EQ(gcomp_options_set_uint64(
+                options_, "limits.max_expansion_ratio", set_value),
+      GCOMP_OK);
+
+  uint64_t default_val = 1000;
+  uint64_t result =
+      gcomp_limits_read_expansion_ratio_max(options_, default_val);
+  EXPECT_EQ(result, 0);
+}
+
+// Test gcomp_limits_check_expansion_ratio()
+TEST_F(LimitsTest, CheckExpansionRatioWithinLimit) {
+  // 100 input, 1000 output, ratio = 10x, limit = 100x
+  uint64_t input_bytes = 100;
+  uint64_t output_bytes = 1000;
+  uint64_t ratio_limit = 100;
+  gcomp_status_t status =
+      gcomp_limits_check_expansion_ratio(input_bytes, output_bytes, ratio_limit);
+  EXPECT_EQ(status, GCOMP_OK);
+}
+
+TEST_F(LimitsTest, CheckExpansionRatioAtLimit) {
+  // 100 input, 10000 output, ratio = 100x, limit = 100x
+  uint64_t input_bytes = 100;
+  uint64_t output_bytes = 10000;
+  uint64_t ratio_limit = 100;
+  gcomp_status_t status =
+      gcomp_limits_check_expansion_ratio(input_bytes, output_bytes, ratio_limit);
+  EXPECT_EQ(status, GCOMP_OK);
+}
+
+TEST_F(LimitsTest, CheckExpansionRatioOverLimit) {
+  // 100 input, 10001 output, ratio > 100x, limit = 100x
+  uint64_t input_bytes = 100;
+  uint64_t output_bytes = 10001;
+  uint64_t ratio_limit = 100;
+  gcomp_status_t status =
+      gcomp_limits_check_expansion_ratio(input_bytes, output_bytes, ratio_limit);
+  EXPECT_EQ(status, GCOMP_ERR_LIMIT);
+}
+
+TEST_F(LimitsTest, CheckExpansionRatioUnlimited) {
+  // With ratio_limit = 0, any expansion should be allowed
+  uint64_t input_bytes = 1;
+  uint64_t output_bytes = UINT64_MAX;
+  uint64_t ratio_limit = 0; // unlimited
+  gcomp_status_t status =
+      gcomp_limits_check_expansion_ratio(input_bytes, output_bytes, ratio_limit);
+  EXPECT_EQ(status, GCOMP_OK);
+}
+
+TEST_F(LimitsTest, CheckExpansionRatioZeroInput) {
+  // With 0 input bytes, ratio cannot be computed, should allow
+  uint64_t input_bytes = 0;
+  uint64_t output_bytes = 1000;
+  uint64_t ratio_limit = 100;
+  gcomp_status_t status =
+      gcomp_limits_check_expansion_ratio(input_bytes, output_bytes, ratio_limit);
+  EXPECT_EQ(status, GCOMP_OK);
+}
+
+TEST_F(LimitsTest, CheckExpansionRatioZeroOutput) {
+  // With 0 output bytes, ratio is 0, always within limit
+  uint64_t input_bytes = 100;
+  uint64_t output_bytes = 0;
+  uint64_t ratio_limit = 100;
+  gcomp_status_t status =
+      gcomp_limits_check_expansion_ratio(input_bytes, output_bytes, ratio_limit);
+  EXPECT_EQ(status, GCOMP_OK);
+}
+
+TEST_F(LimitsTest, CheckExpansionRatioDefaultValue) {
+  // Test with default ratio (1000x)
+  // 1 KB input, 1000 KB output = 1000x ratio, should be exactly at limit
+  uint64_t input_bytes = 1024;
+  uint64_t output_bytes = 1024 * 1000; // Exactly 1000x
+  uint64_t ratio_limit = GCOMP_DEFAULT_MAX_EXPANSION_RATIO;
+  gcomp_status_t status =
+      gcomp_limits_check_expansion_ratio(input_bytes, output_bytes, ratio_limit);
+  EXPECT_EQ(status, GCOMP_OK);
+
+  // 1 KB input, slightly more than 1000 KB output, should exceed
+  output_bytes = 1024 * 1000 + 1;
+  status =
+      gcomp_limits_check_expansion_ratio(input_bytes, output_bytes, ratio_limit);
+  EXPECT_EQ(status, GCOMP_ERR_LIMIT);
+}
+
+TEST_F(LimitsTest, CheckExpansionRatioOverflowProtection) {
+  // Test that the multiplication doesn't overflow
+  // With very large ratio_limit * input_bytes that would overflow
+  uint64_t input_bytes = UINT64_MAX / 100;
+  uint64_t output_bytes = UINT64_MAX / 2;
+  uint64_t ratio_limit = 200; // ratio_limit * input_bytes would overflow
+  gcomp_status_t status =
+      gcomp_limits_check_expansion_ratio(input_bytes, output_bytes, ratio_limit);
+  // Since overflow would occur, the effective limit is infinite, so allow
+  EXPECT_EQ(status, GCOMP_OK);
+}
+
+TEST_F(LimitsTest, CheckExpansionRatioTypicalBombScenario) {
+  // Typical decompression bomb: 1 KB compressed -> 1 GB decompressed
+  // Ratio = 1,000,000x, should exceed default limit of 1000x
+  uint64_t input_bytes = 1024;               // 1 KB
+  uint64_t output_bytes = 1024ULL * 1024 * 1024; // 1 GB
+  uint64_t ratio_limit = GCOMP_DEFAULT_MAX_EXPANSION_RATIO;
+  gcomp_status_t status =
+      gcomp_limits_check_expansion_ratio(input_bytes, output_bytes, ratio_limit);
+  EXPECT_EQ(status, GCOMP_ERR_LIMIT);
+}
+
+TEST_F(LimitsTest, CheckExpansionRatioLegitimateHighRatio) {
+  // Legitimate high-ratio data like all zeros
+  // 1 KB compressed -> 900 KB decompressed (ratio ~900x)
+  // Should be allowed with default 1000x limit
+  uint64_t input_bytes = 1024;
+  uint64_t output_bytes = 900 * 1024;
+  uint64_t ratio_limit = GCOMP_DEFAULT_MAX_EXPANSION_RATIO;
+  gcomp_status_t status =
+      gcomp_limits_check_expansion_ratio(input_bytes, output_bytes, ratio_limit);
+  EXPECT_EQ(status, GCOMP_OK);
+}
+
+// Test round-trip: set expansion ratio limit, read it, check it
+TEST_F(LimitsTest, RoundTripExpansionRatioLimit) {
+  uint64_t set_value = 50;
+  ASSERT_EQ(gcomp_options_set_uint64(
+                options_, "limits.max_expansion_ratio", set_value),
+      GCOMP_OK);
+
+  uint64_t read_value = gcomp_limits_read_expansion_ratio_max(
+      options_, GCOMP_DEFAULT_MAX_EXPANSION_RATIO);
+  EXPECT_EQ(read_value, set_value);
+
+  // 100 input, 5000 output = 50x ratio, exactly at limit
+  EXPECT_EQ(gcomp_limits_check_expansion_ratio(100, 5000, read_value), GCOMP_OK);
+  // 100 input, 5001 output > 50x ratio, over limit
+  EXPECT_EQ(
+      gcomp_limits_check_expansion_ratio(100, 5001, read_value), GCOMP_ERR_LIMIT);
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

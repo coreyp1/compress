@@ -285,11 +285,48 @@ if (status == GCOMP_ERR_LIMIT) {
 - **Registries**: The default registry is thread-safe for lookups after initialization. Custom registries should not be modified while in use.
 - **Options**: Once frozen with `gcomp_options_freeze()`, options objects are safe to share across threads.
 
+## Resource Limits
+
+The library provides several safety limits to protect against resource exhaustion from malicious or malformed inputs:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `limits.max_output_bytes` | 512 MiB | Maximum decompressed output size |
+| `limits.max_memory_bytes` | 256 MiB | Maximum working memory for decoder |
+| `limits.max_expansion_ratio` | 1000 | Maximum output/input byte ratio |
+
+### Expansion ratio protection
+
+The `limits.max_expansion_ratio` option protects against "decompression bombs" - maliciously crafted archives that decompress to massive outputs from tiny inputs (e.g., a 42 KB file that expands to 4.5 PB).
+
+The ratio is calculated as `output_bytes / input_bytes`. With the default limit of 1000:
+- 1 KB input → max 1 MB output
+- 1 MB input → max 1 GB output
+
+**Example: Setting limits for untrusted input**
+
+```c
+gcomp_options_t *opts = NULL;
+gcomp_options_create(&opts);
+
+// Strict limits for untrusted data
+gcomp_options_set_uint64(opts, "limits.max_output_bytes", 10 * 1024 * 1024);  // 10 MB
+gcomp_options_set_uint64(opts, "limits.max_expansion_ratio", 100);            // 100x max
+
+gcomp_decoder_t *dec = NULL;
+gcomp_decoder_create(registry, "deflate", opts, &dec);
+// ... use decoder ...
+gcomp_decoder_destroy(dec);
+gcomp_options_destroy(opts);
+```
+
+When a limit is exceeded, the decoder returns `GCOMP_ERR_LIMIT`. Call `gcomp_decoder_get_error_detail()` to get diagnostic information about which limit was hit.
+
 ## Best Practices
 
 1. **Check all return values** - Every API call can fail
 2. **Use error details for debugging** - Call `gcomp_*_get_error_detail()` after failures
 3. **Pre-allocate output buffers** - For encoding, output is typically slightly larger than input; for decoding, you need to know or estimate the decompressed size
-4. **Set limits for untrusted input** - Use `limits.max_output_bytes` to prevent decompression bombs
+4. **Set limits for untrusted input** - Use `limits.max_output_bytes` and `limits.max_expansion_ratio` to prevent decompression bombs
 5. **Reuse encoders/decoders** - Call `gcomp_*_reset()` between streams instead of destroy/create for better performance
 6. **Destroy after use** - Always call `gcomp_*_destroy()` to free resources
