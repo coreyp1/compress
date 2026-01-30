@@ -106,6 +106,13 @@ typedef struct gcomp_deflate_decoder_state_s {
   uint32_t match_distance;
 
   //
+  // Pending literal byte
+  // When we decode a literal but the output buffer is full, save it here.
+  //
+  int pending_literal_valid;
+  uint8_t pending_literal_value;
+
+  //
   // Pending length/distance decode state
   // When we've decoded a length code but need more bits for the distance,
   // we save the state here so we can resume on the next update() call.
@@ -309,6 +316,9 @@ static gcomp_status_t deflate_emit_byte(
   }
 
   if (!deflate_out_available(output)) {
+    // Output buffer full - save the literal for the next call
+    st->pending_literal_valid = 1;
+    st->pending_literal_value = b;
     return GCOMP_OK;
   }
 
@@ -1099,7 +1109,27 @@ static gcomp_status_t deflate_process_huffman_data(
     return GCOMP_ERR_INTERNAL;
   }
 
-  // Drain any pending match first.
+  // Emit any pending literal byte first.
+  if (st->pending_literal_valid) {
+    if (!deflate_out_available(output)) {
+      return GCOMP_OK; // Still no room, wait for more output space
+    }
+    gcomp_status_t lim = deflate_check_output_limit(st, 1u);
+    if (lim != GCOMP_OK) {
+      return lim;
+    }
+    uint8_t * dst = (uint8_t *)output->data;
+    if (dst) {
+      dst[output->used] = st->pending_literal_value;
+    }
+    output->used += 1u;
+    st->total_output_bytes += 1u;
+    deflate_window_put(st, st->pending_literal_value);
+    st->pending_literal_valid = 0;
+    // Continue to process more data
+  }
+
+  // Drain any pending match.
   if (st->match_remaining > 0) {
     return deflate_copy_match(st, output);
   }
@@ -1187,6 +1217,7 @@ gcomp_status_t gcomp_deflate_decoder_update(gcomp_decoder_t * decoder,
     uint32_t prev_stored = st->stored_remaining;
     uint32_t prev_match = st->match_remaining;
     uint32_t prev_bits = st->bit_count;
+    int prev_literal_valid = st->pending_literal_valid;
 
     gcomp_status_t s = GCOMP_OK;
     switch (st->stage) {
@@ -1240,7 +1271,8 @@ gcomp_status_t gcomp_deflate_decoder_update(gcomp_decoder_t * decoder,
      * relevant state, stop to avoid spinning with no progress. */
     if (input->used == prev_in_used && output->used == prev_out_used &&
         st->stage == prev_stage && st->stored_remaining == prev_stored &&
-        st->match_remaining == prev_match && st->bit_count == prev_bits) {
+        st->match_remaining == prev_match && st->bit_count == prev_bits &&
+        st->pending_literal_valid == prev_literal_valid) {
       return GCOMP_OK;
     }
   }
