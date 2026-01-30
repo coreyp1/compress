@@ -455,6 +455,541 @@ TEST_F(DeflateEncoderTest, Error_NullBuffers) {
   EXPECT_EQ(gcomp_encoder_finish(encoder_, nullptr), GCOMP_ERR_INVALID_ARG);
 }
 
+//
+// Strategy tests
+//
+
+TEST_F(DeflateEncoderTest, Strategy_Default_RoundTrip) {
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  ASSERT_EQ(
+      gcomp_options_set_string(opts, "deflate.strategy", "default"), GCOMP_OK);
+  ASSERT_EQ(gcomp_options_set_int64(opts, "deflate.level", 6), GCOMP_OK);
+
+  const char * input_str = "Hello, World! This is a test with repeated words. "
+                           "Hello again! World, here we go.";
+  const uint8_t * input = (const uint8_t *)input_str;
+  size_t input_len = strlen(input_str);
+
+  std::vector<uint8_t> compressed;
+  ASSERT_EQ(encode_data(input, input_len, compressed, opts), GCOMP_OK);
+
+  gcomp_options_destroy(opts);
+  gcomp_encoder_destroy(encoder_);
+  encoder_ = nullptr;
+
+  std::vector<uint8_t> decompressed;
+  ASSERT_EQ(decode_data(
+                compressed.data(), compressed.size(), decompressed, input_len),
+      GCOMP_OK);
+
+  ASSERT_EQ(decompressed.size(), input_len);
+  EXPECT_EQ(memcmp(decompressed.data(), input, input_len), 0);
+}
+
+TEST_F(DeflateEncoderTest, Strategy_Fixed_RoundTrip) {
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  ASSERT_EQ(
+      gcomp_options_set_string(opts, "deflate.strategy", "fixed"), GCOMP_OK);
+  // Use level 6 (which would normally use dynamic Huffman)
+  ASSERT_EQ(gcomp_options_set_int64(opts, "deflate.level", 6), GCOMP_OK);
+
+  const char * input_str = "The quick brown fox jumps over the lazy dog. "
+                           "Pack my box with five dozen liquor jugs.";
+  const uint8_t * input = (const uint8_t *)input_str;
+  size_t input_len = strlen(input_str);
+
+  std::vector<uint8_t> compressed;
+  ASSERT_EQ(encode_data(input, input_len, compressed, opts), GCOMP_OK);
+
+  gcomp_options_destroy(opts);
+  gcomp_encoder_destroy(encoder_);
+  encoder_ = nullptr;
+
+  std::vector<uint8_t> decompressed;
+  ASSERT_EQ(decode_data(
+                compressed.data(), compressed.size(), decompressed, input_len),
+      GCOMP_OK);
+
+  ASSERT_EQ(decompressed.size(), input_len);
+  EXPECT_EQ(memcmp(decompressed.data(), input, input_len), 0);
+}
+
+TEST_F(DeflateEncoderTest, Strategy_HuffmanOnly_RoundTrip) {
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  ASSERT_EQ(gcomp_options_set_string(opts, "deflate.strategy", "huffman_only"),
+      GCOMP_OK);
+  ASSERT_EQ(gcomp_options_set_int64(opts, "deflate.level", 6), GCOMP_OK);
+
+  const char * input_str = "Hello, World! This is a test.";
+  const uint8_t * input = (const uint8_t *)input_str;
+  size_t input_len = strlen(input_str);
+
+  std::vector<uint8_t> compressed;
+  ASSERT_EQ(encode_data(input, input_len, compressed, opts), GCOMP_OK);
+
+  gcomp_options_destroy(opts);
+  gcomp_encoder_destroy(encoder_);
+  encoder_ = nullptr;
+
+  std::vector<uint8_t> decompressed;
+  ASSERT_EQ(decode_data(
+                compressed.data(), compressed.size(), decompressed, input_len),
+      GCOMP_OK);
+
+  ASSERT_EQ(decompressed.size(), input_len);
+  EXPECT_EQ(memcmp(decompressed.data(), input, input_len), 0);
+}
+
+TEST_F(DeflateEncoderTest, Strategy_HuffmanOnly_NoCompression) {
+  // Huffman-only should produce larger output for repetitive data
+  // because it doesn't use LZ77 back-references
+  gcomp_options_t * opts_huffman = nullptr;
+  gcomp_options_t * opts_default = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts_huffman), GCOMP_OK);
+  ASSERT_EQ(gcomp_options_create(&opts_default), GCOMP_OK);
+  ASSERT_EQ(gcomp_options_set_string(
+                opts_huffman, "deflate.strategy", "huffman_only"),
+      GCOMP_OK);
+  ASSERT_EQ(
+      gcomp_options_set_string(opts_default, "deflate.strategy", "default"),
+      GCOMP_OK);
+  ASSERT_EQ(
+      gcomp_options_set_int64(opts_huffman, "deflate.level", 6), GCOMP_OK);
+  ASSERT_EQ(
+      gcomp_options_set_int64(opts_default, "deflate.level", 6), GCOMP_OK);
+
+  // Repetitive data that compresses well with LZ77
+  std::vector<uint8_t> input(1000);
+  for (size_t i = 0; i < input.size(); i++) {
+    input[i] = (uint8_t)(i % 10);
+  }
+
+  // Compress with huffman_only
+  std::vector<uint8_t> compressed_huffman;
+  ASSERT_EQ(
+      encode_data(input.data(), input.size(), compressed_huffman, opts_huffman),
+      GCOMP_OK);
+  gcomp_encoder_destroy(encoder_);
+  encoder_ = nullptr;
+
+  // Compress with default strategy
+  std::vector<uint8_t> compressed_default;
+  ASSERT_EQ(
+      encode_data(input.data(), input.size(), compressed_default, opts_default),
+      GCOMP_OK);
+
+  gcomp_options_destroy(opts_huffman);
+  gcomp_options_destroy(opts_default);
+  gcomp_encoder_destroy(encoder_);
+  encoder_ = nullptr;
+
+  // Huffman-only should produce larger output for repetitive data
+  EXPECT_GT(compressed_huffman.size(), compressed_default.size());
+
+  // Verify both decompress correctly
+  std::vector<uint8_t> decompressed;
+  ASSERT_EQ(decode_data(compressed_huffman.data(), compressed_huffman.size(),
+                decompressed, input.size()),
+      GCOMP_OK);
+  ASSERT_EQ(decompressed.size(), input.size());
+  EXPECT_EQ(memcmp(decompressed.data(), input.data(), input.size()), 0);
+}
+
+TEST_F(DeflateEncoderTest, Strategy_RLE_RoundTrip) {
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  ASSERT_EQ(
+      gcomp_options_set_string(opts, "deflate.strategy", "rle"), GCOMP_OK);
+  ASSERT_EQ(gcomp_options_set_int64(opts, "deflate.level", 6), GCOMP_OK);
+
+  // Data with runs of repeated bytes (good for RLE)
+  std::vector<uint8_t> input;
+  for (int i = 0; i < 100; i++) {
+    for (int j = 0; j < 10; j++) {
+      input.push_back((uint8_t)i);
+    }
+  }
+
+  std::vector<uint8_t> compressed;
+  ASSERT_EQ(
+      encode_data(input.data(), input.size(), compressed, opts), GCOMP_OK);
+
+  gcomp_options_destroy(opts);
+  gcomp_encoder_destroy(encoder_);
+  encoder_ = nullptr;
+
+  std::vector<uint8_t> decompressed;
+  ASSERT_EQ(decode_data(compressed.data(), compressed.size(), decompressed,
+                input.size()),
+      GCOMP_OK);
+
+  ASSERT_EQ(decompressed.size(), input.size());
+  EXPECT_EQ(memcmp(decompressed.data(), input.data(), input.size()), 0);
+}
+
+TEST_F(DeflateEncoderTest, Strategy_RLE_CompressesRuns) {
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  ASSERT_EQ(
+      gcomp_options_set_string(opts, "deflate.strategy", "rle"), GCOMP_OK);
+  ASSERT_EQ(gcomp_options_set_int64(opts, "deflate.level", 6), GCOMP_OK);
+
+  // Data with long runs of the same byte
+  std::vector<uint8_t> input(1000, 'A'); // 1000 'A' characters
+
+  std::vector<uint8_t> compressed;
+  ASSERT_EQ(
+      encode_data(input.data(), input.size(), compressed, opts), GCOMP_OK);
+
+  gcomp_options_destroy(opts);
+  gcomp_encoder_destroy(encoder_);
+  encoder_ = nullptr;
+
+  // RLE should compress this very well
+  EXPECT_LT(compressed.size(), input.size());
+
+  std::vector<uint8_t> decompressed;
+  ASSERT_EQ(decode_data(compressed.data(), compressed.size(), decompressed,
+                input.size()),
+      GCOMP_OK);
+
+  ASSERT_EQ(decompressed.size(), input.size());
+  EXPECT_EQ(memcmp(decompressed.data(), input.data(), input.size()), 0);
+}
+
+TEST_F(DeflateEncoderTest, Strategy_Filtered_RoundTrip) {
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  ASSERT_EQ(
+      gcomp_options_set_string(opts, "deflate.strategy", "filtered"), GCOMP_OK);
+  ASSERT_EQ(gcomp_options_set_int64(opts, "deflate.level", 6), GCOMP_OK);
+
+  // Simulate PNG-like filtered data (small differences)
+  std::vector<uint8_t> input(1000);
+  uint8_t prev = 0;
+  for (size_t i = 0; i < input.size(); i++) {
+    // Small differences like PNG filter output
+    int diff = (int)(i % 7) - 3; // -3 to +3
+    input[i] = (uint8_t)(prev + diff);
+    prev = input[i];
+  }
+
+  std::vector<uint8_t> compressed;
+  ASSERT_EQ(
+      encode_data(input.data(), input.size(), compressed, opts), GCOMP_OK);
+
+  gcomp_options_destroy(opts);
+  gcomp_encoder_destroy(encoder_);
+  encoder_ = nullptr;
+
+  std::vector<uint8_t> decompressed;
+  ASSERT_EQ(decode_data(compressed.data(), compressed.size(), decompressed,
+                input.size()),
+      GCOMP_OK);
+
+  ASSERT_EQ(decompressed.size(), input.size());
+  EXPECT_EQ(memcmp(decompressed.data(), input.data(), input.size()), 0);
+}
+
+TEST_F(DeflateEncoderTest, Strategy_InvalidFallsBackToDefault) {
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  // Invalid strategy should silently fall back to default
+  ASSERT_EQ(gcomp_options_set_string(opts, "deflate.strategy", "invalid_xyz"),
+      GCOMP_OK);
+  ASSERT_EQ(gcomp_options_set_int64(opts, "deflate.level", 6), GCOMP_OK);
+
+  const char * input_str = "Hello, World!";
+  const uint8_t * input = (const uint8_t *)input_str;
+  size_t input_len = strlen(input_str);
+
+  std::vector<uint8_t> compressed;
+  ASSERT_EQ(encode_data(input, input_len, compressed, opts), GCOMP_OK);
+
+  gcomp_options_destroy(opts);
+  gcomp_encoder_destroy(encoder_);
+  encoder_ = nullptr;
+
+  std::vector<uint8_t> decompressed;
+  ASSERT_EQ(decode_data(
+                compressed.data(), compressed.size(), decompressed, input_len),
+      GCOMP_OK);
+
+  ASSERT_EQ(decompressed.size(), input_len);
+  EXPECT_EQ(memcmp(decompressed.data(), input, input_len), 0);
+}
+
+TEST_F(DeflateEncoderTest, Strategy_Default_LargeInput) {
+  // Test default strategy with larger input - same data as RoundTrip_LargeInput
+  // to verify strategy option doesn't break basic functionality
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  ASSERT_EQ(
+      gcomp_options_set_string(opts, "deflate.strategy", "default"), GCOMP_OK);
+  ASSERT_EQ(gcomp_options_set_int64(opts, "deflate.level", 6), GCOMP_OK);
+
+  // 64KB of random-ish data (same pattern as RoundTrip_LargeInput)
+  std::vector<uint8_t> input(65536);
+  unsigned seed = 12345;
+  for (size_t i = 0; i < input.size(); i++) {
+    seed = seed * 1103515245u + 12345u;
+    input[i] = (uint8_t)(seed >> 16);
+  }
+
+  std::vector<uint8_t> compressed;
+  ASSERT_EQ(
+      encode_data(input.data(), input.size(), compressed, opts), GCOMP_OK);
+
+  gcomp_options_destroy(opts);
+  gcomp_encoder_destroy(encoder_);
+  encoder_ = nullptr;
+
+  std::vector<uint8_t> decompressed;
+  ASSERT_EQ(decode_data(compressed.data(), compressed.size(), decompressed,
+                input.size()),
+      GCOMP_OK);
+
+  ASSERT_EQ(decompressed.size(), input.size());
+  EXPECT_EQ(memcmp(decompressed.data(), input.data(), input.size()), 0);
+}
+
+TEST_F(DeflateEncoderTest, Strategy_HuffmanOnly_SizeProgression) {
+  // Test huffman_only with progressively larger sizes to find the breakpoint
+  const size_t test_sizes[] = {100, 500, 1000, 2000, 4000, 8000};
+
+  for (size_t test_size : test_sizes) {
+    gcomp_options_t * opts = nullptr;
+    ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+    ASSERT_EQ(
+        gcomp_options_set_string(opts, "deflate.strategy", "huffman_only"),
+        GCOMP_OK);
+    ASSERT_EQ(gcomp_options_set_int64(opts, "deflate.level", 6), GCOMP_OK);
+
+    // Simple incrementing pattern
+    std::vector<uint8_t> input(test_size);
+    for (size_t i = 0; i < input.size(); i++) {
+      input[i] = (uint8_t)(i & 0xFF);
+    }
+
+    std::vector<uint8_t> compressed;
+    ASSERT_EQ(
+        encode_data(input.data(), input.size(), compressed, opts), GCOMP_OK)
+        << "Failed to encode with size: " << test_size;
+
+    gcomp_options_destroy(opts);
+    gcomp_encoder_destroy(encoder_);
+    encoder_ = nullptr;
+
+    std::vector<uint8_t> decompressed;
+    ASSERT_EQ(decode_data(compressed.data(), compressed.size(), decompressed,
+                  input.size()),
+        GCOMP_OK)
+        << "Failed to decode with size: " << test_size;
+
+    ASSERT_EQ(decompressed.size(), input.size())
+        << "Size mismatch for size: " << test_size;
+    EXPECT_EQ(memcmp(decompressed.data(), input.data(), input.size()), 0)
+        << "Data mismatch for size: " << test_size;
+
+    gcomp_decoder_destroy(decoder_);
+    decoder_ = nullptr;
+  }
+}
+
+TEST_F(DeflateEncoderTest, Strategy_AllStrategies_SmallInput) {
+  // Test all strategies with small input (256 bytes)
+  const char * strategies[] = {
+      "default", "filtered", "huffman_only", "rle", "fixed"};
+
+  // Simple incrementing pattern
+  std::vector<uint8_t> input(256);
+  for (size_t i = 0; i < input.size(); i++) {
+    input[i] = (uint8_t)i;
+  }
+
+  for (const char * strategy : strategies) {
+    gcomp_options_t * opts = nullptr;
+    ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+    ASSERT_EQ(
+        gcomp_options_set_string(opts, "deflate.strategy", strategy), GCOMP_OK);
+    ASSERT_EQ(gcomp_options_set_int64(opts, "deflate.level", 6), GCOMP_OK);
+
+    std::vector<uint8_t> compressed;
+    ASSERT_EQ(
+        encode_data(input.data(), input.size(), compressed, opts), GCOMP_OK)
+        << "Failed to encode with strategy: " << strategy;
+
+    gcomp_options_destroy(opts);
+    gcomp_encoder_destroy(encoder_);
+    encoder_ = nullptr;
+
+    std::vector<uint8_t> decompressed;
+    ASSERT_EQ(decode_data(compressed.data(), compressed.size(), decompressed,
+                  input.size()),
+        GCOMP_OK)
+        << "Failed to decode with strategy: " << strategy;
+
+    ASSERT_EQ(decompressed.size(), input.size())
+        << "Size mismatch for strategy: " << strategy;
+    EXPECT_EQ(memcmp(decompressed.data(), input.data(), input.size()), 0)
+        << "Data mismatch for strategy: " << strategy;
+
+    gcomp_decoder_destroy(decoder_);
+    decoder_ = nullptr;
+  }
+}
+
+TEST_F(DeflateEncoderTest, Strategy_HuffmanOnly_LargerSimple) {
+  // Test with larger simple pattern to check if size matters
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  ASSERT_EQ(gcomp_options_set_string(opts, "deflate.strategy", "huffman_only"),
+      GCOMP_OK);
+  ASSERT_EQ(gcomp_options_set_int64(opts, "deflate.level", 6), GCOMP_OK);
+
+  // 32KB of simple incrementing pattern
+  std::vector<uint8_t> input(32 * 1024);
+  for (size_t i = 0; i < input.size(); i++) {
+    input[i] = (uint8_t)(i & 0xFF);
+  }
+
+  std::vector<uint8_t> compressed;
+  ASSERT_EQ(
+      encode_data(input.data(), input.size(), compressed, opts), GCOMP_OK);
+
+  gcomp_options_destroy(opts);
+  gcomp_encoder_destroy(encoder_);
+  encoder_ = nullptr;
+
+  std::vector<uint8_t> decompressed;
+  ASSERT_EQ(decode_data(compressed.data(), compressed.size(), decompressed,
+                input.size()),
+      GCOMP_OK);
+
+  ASSERT_EQ(decompressed.size(), input.size());
+  EXPECT_EQ(memcmp(decompressed.data(), input.data(), input.size()), 0);
+}
+
+TEST_F(DeflateEncoderTest, Strategy_HuffmanOnly_MixedPattern_Fixed) {
+  // Test with mixed pattern using fixed Huffman (level 3) to isolate
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  ASSERT_EQ(gcomp_options_set_string(opts, "deflate.strategy", "huffman_only"),
+      GCOMP_OK);
+  // Level 3 uses fixed Huffman codes
+  ASSERT_EQ(gcomp_options_set_int64(opts, "deflate.level", 3), GCOMP_OK);
+
+  // 4KB of mixed data
+  std::vector<uint8_t> input(4 * 1024);
+  unsigned seed = 54321;
+  for (size_t i = 0; i < input.size(); i++) {
+    seed = seed * 1103515245u + 12345u;
+    if ((i / 100) % 2 == 0) {
+      input[i] = (uint8_t)(seed >> 16);
+    }
+    else {
+      input[i] = (uint8_t)(i % 10);
+    }
+  }
+
+  std::vector<uint8_t> compressed;
+  ASSERT_EQ(
+      encode_data(input.data(), input.size(), compressed, opts), GCOMP_OK);
+
+  gcomp_options_destroy(opts);
+  gcomp_encoder_destroy(encoder_);
+  encoder_ = nullptr;
+
+  std::vector<uint8_t> decompressed;
+  ASSERT_EQ(decode_data(compressed.data(), compressed.size(), decompressed,
+                input.size()),
+      GCOMP_OK);
+
+  ASSERT_EQ(decompressed.size(), input.size());
+  EXPECT_EQ(memcmp(decompressed.data(), input.data(), input.size()), 0);
+}
+
+TEST_F(DeflateEncoderTest, Strategy_HuffmanOnly_MixedPattern_Dynamic) {
+  // Test with mixed pattern using dynamic Huffman (level 6)
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  ASSERT_EQ(gcomp_options_set_string(opts, "deflate.strategy", "huffman_only"),
+      GCOMP_OK);
+  // Level 6 uses dynamic Huffman codes
+  ASSERT_EQ(gcomp_options_set_int64(opts, "deflate.level", 6), GCOMP_OK);
+
+  // 4KB of mixed data
+  std::vector<uint8_t> input(4 * 1024);
+  unsigned seed = 54321;
+  for (size_t i = 0; i < input.size(); i++) {
+    seed = seed * 1103515245u + 12345u;
+    if ((i / 100) % 2 == 0) {
+      input[i] = (uint8_t)(seed >> 16);
+    }
+    else {
+      input[i] = (uint8_t)(i % 10);
+    }
+  }
+
+  std::vector<uint8_t> compressed;
+  ASSERT_EQ(
+      encode_data(input.data(), input.size(), compressed, opts), GCOMP_OK);
+
+  gcomp_options_destroy(opts);
+  gcomp_encoder_destroy(encoder_);
+  encoder_ = nullptr;
+
+  std::vector<uint8_t> decompressed;
+  ASSERT_EQ(decode_data(compressed.data(), compressed.size(), decompressed,
+                input.size()),
+      GCOMP_OK);
+
+  ASSERT_EQ(decompressed.size(), input.size());
+  EXPECT_EQ(memcmp(decompressed.data(), input.data(), input.size()), 0);
+}
+
+TEST_F(DeflateEncoderTest, Strategy_Default_MixedPattern_Dynamic) {
+  // Test default strategy with same mixed pattern
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  ASSERT_EQ(
+      gcomp_options_set_string(opts, "deflate.strategy", "default"), GCOMP_OK);
+  ASSERT_EQ(gcomp_options_set_int64(opts, "deflate.level", 6), GCOMP_OK);
+
+  // Same 4KB of mixed data
+  std::vector<uint8_t> input(4 * 1024);
+  unsigned seed = 54321;
+  for (size_t i = 0; i < input.size(); i++) {
+    seed = seed * 1103515245u + 12345u;
+    if ((i / 100) % 2 == 0) {
+      input[i] = (uint8_t)(seed >> 16);
+    }
+    else {
+      input[i] = (uint8_t)(i % 10);
+    }
+  }
+
+
+  std::vector<uint8_t> compressed;
+  ASSERT_EQ(
+      encode_data(input.data(), input.size(), compressed, opts), GCOMP_OK);
+
+  gcomp_options_destroy(opts);
+  gcomp_encoder_destroy(encoder_);
+  encoder_ = nullptr;
+
+  std::vector<uint8_t> decompressed;
+  ASSERT_EQ(decode_data(compressed.data(), compressed.size(), decompressed,
+                input.size()),
+      GCOMP_OK);
+
+  ASSERT_EQ(decompressed.size(), input.size());
+  EXPECT_EQ(memcmp(decompressed.data(), input.data(), input.size()), 0);
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

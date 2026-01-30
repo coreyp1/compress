@@ -429,7 +429,7 @@ GCOMP_API gcomp_status_t gcomp_options_validate(
     return GCOMP_ERR_INVALID_ARG;
   }
 
-  /* No options means nothing to validate. */
+  // No options means nothing to validate.
   if (!options) {
     return GCOMP_OK;
   }
@@ -446,11 +446,11 @@ GCOMP_API gcomp_status_t gcomp_options_validate(
 
   gcomp_unknown_key_policy_t policy = schema->unknown_key_policy;
   if (policy != GCOMP_UNKNOWN_KEY_ERROR && policy != GCOMP_UNKNOWN_KEY_IGNORE) {
-    /* Defensive default if schema provides an unknown policy. */
+    // Defensive default if schema provides an unknown policy.
     policy = GCOMP_UNKNOWN_KEY_ERROR;
   }
 
-  /* Iterate through all stored options and validate them. */
+  // Iterate through all stored options and validate them.
   for (size_t i = 0; i < GCOMP_OPTIONS_HASH_SIZE; ++i) {
     gcomp_option_entry_t * entry = options->buckets[i];
     while (entry) {
@@ -459,7 +459,7 @@ GCOMP_API gcomp_status_t gcomp_options_validate(
           gcomp_method_get_option_schema(typed_method, entry->key, &opt_schema);
 
       if (status != GCOMP_OK) {
-        /* If the key is unknown and the policy is IGNORE, skip it. */
+        // If the key is unknown and the policy is IGNORE, skip it.
         if (status == GCOMP_ERR_INVALID_ARG &&
             policy == GCOMP_UNKNOWN_KEY_IGNORE) {
           entry = entry->next;
@@ -472,12 +472,12 @@ GCOMP_API gcomp_status_t gcomp_options_validate(
         return GCOMP_ERR_INTERNAL;
       }
 
-      /* Type must match the schema. */
+      // Type must match the schema.
       if (opt_schema->type != entry->type) {
         return GCOMP_ERR_INVALID_ARG;
       }
 
-      /* Range checks for integer and unsigned integer options. */
+      // Range checks for integer and unsigned integer options.
       if (entry->type == GCOMP_OPT_INT64) {
         if (opt_schema->has_min && entry->value.i64 < opt_schema->min_int) {
           return GCOMP_ERR_INVALID_ARG;

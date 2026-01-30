@@ -28,11 +28,11 @@ extern "C" {
  * Initialize with ::gcomp_deflate_bitreader_init() before use.
  */
 typedef struct gcomp_deflate_bitreader_s {
-  const uint8_t * data; /**< Pointer to input bytes (not owned). */
-  size_t size;          /**< Total size of @ref data in bytes. */
-  size_t byte_pos;      /**< Current byte position in @ref data. */
-  uint32_t bit_buffer;  /**< Buffered bits (LSB-first). */
-  uint32_t bit_count;   /**< Number of valid bits in @ref bit_buffer. */
+  const uint8_t * data; ///< Pointer to input bytes (not owned).
+  size_t size;          ///< Total size of @ref data in bytes.
+  size_t byte_pos;      ///< Current byte position in @ref data.
+  uint32_t bit_buffer;  ///< Buffered bits (LSB-first).
+  uint32_t bit_count;   ///< Number of valid bits in @ref bit_buffer.
 } gcomp_deflate_bitreader_t;
 
 /**

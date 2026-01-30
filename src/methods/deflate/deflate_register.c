@@ -61,7 +61,7 @@
 //
 // Option Schema
 //
-// The deflate method exposes two options:
+// The deflate method exposes these options:
 //
 // - `deflate.level` (int64, 0-9): Controls compression effort.
 //   Level 0 produces stored blocks (no compression).
@@ -71,6 +71,13 @@
 // - `deflate.window_bits` (uint64, 8-15): LZ77 window size as log2(bytes).
 //   Default 15 gives 32 KiB, the maximum allowed by RFC 1951.
 //   Smaller windows reduce memory usage but may hurt compression.
+//
+// - `deflate.strategy` (string): Compression strategy.
+//   - "default": Standard LZ77 + Huffman (recommended for most data)
+//   - "filtered": Optimized for pre-processed/filtered data (e.g., PNG)
+//   - "huffman_only": Skip LZ77, emit literals only (fast, poor compression)
+//   - "rle": Run-length encoding only (distance 1 matches)
+//   - "fixed": Always use fixed Huffman codes (simpler, slightly faster)
 //
 // Core limit options (`limits.max_output_bytes`, `limits.max_memory_bytes`)
 // are handled by the core infrastructure, not the method schema.
@@ -82,39 +89,54 @@
 #define DEFLATE_WINDOW_BITS_DEFAULT 15
 #define DEFLATE_WINDOW_BITS_MIN 8
 #define DEFLATE_WINDOW_BITS_MAX 15
+#define DEFLATE_STRATEGY_DEFAULT "default"
 
 static const gcomp_option_schema_t g_deflate_option_schemas[] = {
     {
-        "deflate.level",                          /* key */
-        GCOMP_OPT_INT64,                          /* type */
-        1,                                        /* has_default */
-        {.i64 = DEFLATE_LEVEL_DEFAULT},           /* default_value */
-        1,                                        /* has_min */
-        1,                                        /* has_max */
-        DEFLATE_LEVEL_MIN,                        /* min_int */
-        DEFLATE_LEVEL_MAX,                        /* max_int */
-        0,                                        /* min_uint */
-        0,                                        /* max_uint */
-        "Compression level 0 (none) to 9 (best)", /* help */
+        "deflate.level",                          // key
+        GCOMP_OPT_INT64,                          // type
+        1,                                        // has_default
+        {.i64 = DEFLATE_LEVEL_DEFAULT},           // default_value
+        1,                                        // has_min
+        1,                                        // has_max
+        DEFLATE_LEVEL_MIN,                        // min_int
+        DEFLATE_LEVEL_MAX,                        // max_int
+        0,                                        // min_uint
+        0,                                        // max_uint
+        "Compression level 0 (none) to 9 (best)", // help
     },
     {
-        "deflate.window_bits",                         /* key */
-        GCOMP_OPT_UINT64,                              /* type */
-        1,                                             /* has_default */
-        {.ui64 = DEFLATE_WINDOW_BITS_DEFAULT},         /* default_value */
-        1,                                             /* has_min */
-        1,                                             /* has_max */
-        0,                                             /* min_int */
-        0,                                             /* max_int */
-        DEFLATE_WINDOW_BITS_MIN,                       /* min_uint */
-        DEFLATE_WINDOW_BITS_MAX,                       /* max_uint */
-        "LZ77 window size in bits (8..15, 32KiB max)", /* help */
+        "deflate.window_bits",                         // key
+        GCOMP_OPT_UINT64,                              // type
+        1,                                             // has_default
+        {.ui64 = DEFLATE_WINDOW_BITS_DEFAULT},         // default_value
+        1,                                             // has_min
+        1,                                             // has_max
+        0,                                             // min_int
+        0,                                             // max_int
+        DEFLATE_WINDOW_BITS_MIN,                       // min_uint
+        DEFLATE_WINDOW_BITS_MAX,                       // max_uint
+        "LZ77 window size in bits (8..15, 32KiB max)", // help
+    },
+    {
+        "deflate.strategy",                // key
+        GCOMP_OPT_STRING,                  // type
+        1,                                 // has_default
+        {.str = DEFLATE_STRATEGY_DEFAULT}, // default_value
+        0,                                 // has_min
+        0,                                 // has_max
+        0,                                 // min_int
+        0,                                 // max_int
+        0,                                 // min_uint
+        0,                                 // max_uint
+        "Strategy: default, filtered, huffman_only, rle, fixed", // help
     },
 };
 
 static const char * const g_deflate_option_keys[] = {
     "deflate.level",
     "deflate.window_bits",
+    "deflate.strategy",
 };
 
 static const gcomp_method_schema_t g_deflate_schema = {

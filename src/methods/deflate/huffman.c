@@ -138,8 +138,8 @@ gcomp_status_t gcomp_deflate_huffman_build_codes(const uint8_t * lengths,
       }
     }
     else {
-      /* Ensure zero-length symbols have zero codes/code_lens to avoid using
-       * uninitialized stack values. */
+      // Ensure zero-length symbols have zero codes/code_lens to avoid using
+      // uninitialized stack values.
       codes[i] = 0;
       if (code_lens) {
         code_lens[i] = 0;
@@ -170,9 +170,39 @@ gcomp_status_t gcomp_deflate_huffman_build_codes(const uint8_t * lengths,
 //   long_base[high] + low. So we need 2^(L - FAST_BITS) entries per distinct
 //   "high" that has long codes.
 //
-// Two passes: first pass counts long_table size and sets
-// long_base/long_extra_bits; then we allocate long_table and fill it in a
-// second pass.
+// IMPORTANT: Mixed-length codes sharing the same prefix
+// -----------------------------------------------------
+// Multiple codes with DIFFERENT lengths can share the same FAST_BITS prefix.
+// For example, with FAST_BITS=9, codes at lengths 11, 12, and 13 might all
+// share prefix 511:
+//   - 11-bit code 0x7FC: high = 0x7FC >> 2 = 511, extra = 2
+//   - 12-bit code 0xFFE: high = 0xFFE >> 3 = 511, extra = 3
+//   - 13-bit code 0x1FFF: high = 0x1FFF >> 4 = 511, extra = 4
+//
+// The long_table must accommodate ALL these codes. We allocate based on the
+// MAXIMUM extra bits for each prefix (4 in this example = 16 entries).
+//
+// Shorter codes must be REPLICATED to fill all matching bit patterns. When
+// the decoder reads max_extra bits from the stream, shorter codes have their
+// actual low bits in the HIGH part of the extended value, with trailing bits
+// (from the next symbol's code) in the LOW part.
+//
+// Example: An 11-bit code with extra=2 (actual low bits = 2 bits) in a table
+// using max_extra=4. The decoder reads 4 bits as "low":
+//   extended_low = (actual_low << 2) | trailing_bits
+// where trailing_bits can be 0-3. So we fill indices:
+//   base + (actual_low << 2) + 0
+//   base + (actual_low << 2) + 1
+//   base + (actual_low << 2) + 2
+//   base + (actual_low << 2) + 3
+// All with the same (symbol, actual_length=11).
+//
+// Algorithm (two passes):
+//   Pass 1: For each long code, track maximum extra bits per prefix.
+//           Then compute long_base[] and total long_table size.
+//   Pass 2: Allocate long_table. For each long code:
+//           - If extra == max_extra: fill single entry
+//           - If extra < max_extra: replicate to 2^(max_extra - extra) entries
 //
 
 gcomp_status_t gcomp_deflate_huffman_build_decode_table(const uint8_t * lengths,
@@ -217,8 +247,8 @@ gcomp_status_t gcomp_deflate_huffman_build_decode_table(const uint8_t * lengths,
 
   long_offset = 0;
 
-  /* First pass: fill fast table for short codes; for long codes, compute
-   * long_base/long_extra_bits and total long_table size. */
+  // First pass: fill fast table for short codes; for long codes, compute
+  // long_base/long_extra_bits and total long_table size.
   for (i = 0; i < num_symbols; i++) {
     unsigned len = code_lens[i];
     uint16_t code = codes[i];
@@ -229,8 +259,8 @@ gcomp_status_t gcomp_deflate_huffman_build_decode_table(const uint8_t * lengths,
     }
 
     if (len <= GCOMP_DEFLATE_HUFFMAN_FAST_BITS) {
-      /* Short code: index = (code << (FAST_BITS - len)) + low; fill step
-       * consecutive entries with (symbol i, nbits len). */
+      // Short code: index = (code << (FAST_BITS - len)) + low; fill step
+      // consecutive entries with (symbol i, nbits len).
       unsigned step = 1u << (GCOMP_DEFLATE_HUFFMAN_FAST_BITS - len);
       unsigned start = code << (GCOMP_DEFLATE_HUFFMAN_FAST_BITS - len);
       if (start + step > GCOMP_DEFLATE_HUFFMAN_FAST_SIZE) {
@@ -242,16 +272,27 @@ gcomp_status_t gcomp_deflate_huffman_build_decode_table(const uint8_t * lengths,
       }
     }
     else {
-      /* Long code: high = first FAST_BITS bits; we need 2^(len - FAST_BITS)
-       * entries in long_table for this high. */
+      // Long code: high = first FAST_BITS bits; we need 2^(len - FAST_BITS)
+      // entries in long_table for this high.
+      //
+      // IMPORTANT: Multiple codes can share the same high prefix but have
+      // different lengths. We must track the MAXIMUM extra bits needed for
+      // each prefix to allocate enough space for all codes.
       unsigned extra = len - GCOMP_DEFLATE_HUFFMAN_FAST_BITS;
       unsigned high = code >> extra;
 
-      if (table->long_extra_bits[high] == 0) {
+      // Update to maximum extra bits for this prefix
+      if (table->long_extra_bits[high] < extra) {
         table->long_extra_bits[high] = (uint8_t)extra;
-        table->long_base[high] = (uint16_t)long_offset;
-        long_offset += (1u << extra);
       }
+    }
+  }
+
+  // Calculate long_offset based on maximum extra bits for each prefix
+  for (i = 0; i < GCOMP_DEFLATE_HUFFMAN_FAST_SIZE; i++) {
+    if (table->long_extra_bits[i] > 0) {
+      table->long_base[i] = (uint16_t)long_offset;
+      long_offset += (1u << table->long_extra_bits[i]);
     }
   }
 
@@ -265,34 +306,44 @@ gcomp_status_t gcomp_deflate_huffman_build_decode_table(const uint8_t * lengths,
     }
     table->long_table_count = (size_t)long_offset;
 
-    /* Second pass: re-establish long_base/long_extra_bits and fill
-     * long_table. Entry for (high, low) is at long_base[high] + low. */
-    memset(table->long_base, 0, sizeof(table->long_base));
-    memset(table->long_extra_bits, 0, sizeof(table->long_extra_bits));
-    long_offset = 0;
-
+    // Second pass: fill long_table. Entry for (high, low) is at
+    // long_base[high] + low, where low uses the maximum extra bits for that
+    // prefix. Shorter codes must be replicated to fill all matching patterns.
     for (i = 0; i < num_symbols; i++) {
       unsigned len = code_lens[i];
       uint16_t code = codes[i];
 
-      if (len == 0) {
+      if (len == 0 || len <= GCOMP_DEFLATE_HUFFMAN_FAST_BITS) {
         continue;
       }
 
-      if (len > GCOMP_DEFLATE_HUFFMAN_FAST_BITS) {
-        unsigned extra = len - GCOMP_DEFLATE_HUFFMAN_FAST_BITS;
-        unsigned high = code >> extra;
-        unsigned low_mask = (1u << extra) - 1;
-        unsigned low = code & low_mask;
-        size_t idx;
+      unsigned extra = len - GCOMP_DEFLATE_HUFFMAN_FAST_BITS;
+      unsigned high = code >> extra;
+      unsigned max_extra = table->long_extra_bits[high];
+      unsigned low_bits = code & ((1u << extra) - 1);
 
-        if (table->long_extra_bits[high] == 0) {
-          table->long_extra_bits[high] = (uint8_t)extra;
-          table->long_base[high] = (uint16_t)long_offset;
-          long_offset += (1u << extra);
+      // If this code has fewer extra bits than the max for this prefix,
+      // we need to replicate it to all matching patterns in the larger table.
+      //
+      // When the decoder reads max_extra bits and reverses them, shorter codes
+      // have their actual low bits in the HIGH part of the extended low value,
+      // with trailing bits (from the next code) in the LOW part.
+      //
+      // So extended_low = (actual_low << diff) | trailing_bits
+      // We need to fill all combinations of trailing_bits (0 to 2^diff - 1).
+      if (extra < max_extra) {
+        unsigned diff = max_extra - extra;
+        unsigned step = 1u << diff;
+        for (unsigned j = 0; j < step; j++) {
+          unsigned low = (low_bits << diff) | j;
+          size_t idx = (size_t)table->long_base[high] + (size_t)low;
+          table->long_table[idx].symbol = (uint16_t)i;
+          table->long_table[idx].nbits = (uint8_t)len;
         }
-
-        idx = (size_t)table->long_base[high] + (size_t)low;
+      }
+      else {
+        // Code uses maximum extra bits, single entry
+        size_t idx = (size_t)table->long_base[high] + (size_t)low_bits;
         table->long_table[idx].symbol = (uint16_t)i;
         table->long_table[idx].nbits = (uint8_t)len;
       }

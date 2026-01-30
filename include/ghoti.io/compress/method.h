@@ -32,8 +32,8 @@ typedef struct gcomp_decoder_s gcomp_decoder_t;
  */
 typedef enum {
   GCOMP_CAP_NONE = 0,
-  GCOMP_CAP_ENCODE = 1 << 0, /**< Method supports encoding */
-  GCOMP_CAP_DECODE = 1 << 1, /**< Method supports decoding */
+  GCOMP_CAP_ENCODE = 1 << 0, ///< Method supports encoding
+  GCOMP_CAP_DECODE = 1 << 1, ///< Method supports decoding
 } gcomp_capabilities_t;
 
 /**

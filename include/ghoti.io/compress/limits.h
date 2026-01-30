@@ -26,7 +26,7 @@ extern "C" {
  * limits. Initialize with zeros before use.
  */
 typedef struct {
-  size_t current_bytes; /**< Current memory usage in bytes */
+  size_t current_bytes; ///< Current memory usage in bytes
 } gcomp_memory_tracker_t;
 
 /**

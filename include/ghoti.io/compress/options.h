@@ -36,12 +36,12 @@ struct gcomp_method_s;
  * @brief Option value types
  */
 typedef enum {
-  GCOMP_OPT_INT64,  /**< 64-bit signed integer */
-  GCOMP_OPT_UINT64, /**< 64-bit unsigned integer */
-  GCOMP_OPT_BOOL,   /**< Boolean */
-  GCOMP_OPT_STRING, /**< String (null-terminated) */
-  GCOMP_OPT_BYTES,  /**< Byte array */
-  GCOMP_OPT_FLOAT,  /**< Floating point (optional) */
+  GCOMP_OPT_INT64,  ///< 64-bit signed integer
+  GCOMP_OPT_UINT64, ///< 64-bit unsigned integer
+  GCOMP_OPT_BOOL,   ///< Boolean
+  GCOMP_OPT_STRING, ///< String (null-terminated)
+  GCOMP_OPT_BYTES,  ///< Byte array
+  GCOMP_OPT_FLOAT,  ///< Floating point (optional)
 } gcomp_option_type_t;
 
 /**

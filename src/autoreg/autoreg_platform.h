@@ -147,7 +147,7 @@ extern "C" {
 
 #else // GCOMP_NO_AUTOREG is defined
 
-#define GCOMP_AUTOREG_METHOD(method_name, register_fn) /* no-op */
+#define GCOMP_AUTOREG_METHOD(method_name, register_fn) // no-op
 
 #endif // GCOMP_NO_AUTOREG
 

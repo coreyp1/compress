@@ -30,11 +30,50 @@ See [Auto-Registration](../auto-registration.md) for details on disabling auto-r
 | Key | Type | Default | Range | Description |
 |-----|------|---------|-------|-------------|
 | `deflate.level` | int64 | 6 | 0..9 | Compression level (0 = none, 9 = best). Encoder only. |
+| `deflate.strategy` | string | "default" | see below | Compression strategy. Encoder only. |
 | `deflate.window_bits` | uint64 | 15 | 8..15 | LZ77 window size in bits (max 32 KiB). |
 | `limits.max_output_bytes` | uint64 | core default | 0 = unlimited | Max decompressed size (decoder). |
 | `limits.max_window_bytes` | uint64 | window size | — | Max window (format-constrained). |
 
 Limits are enforced by the core; the decoder returns `GCOMP_ERR_LIMIT` when `max_output_bytes` is exceeded.
+
+### Strategy option values
+
+| Strategy | Description |
+|----------|-------------|
+| `"default"` | Standard LZ77 + Huffman compression. Best for most data types. |
+| `"filtered"` | Optimized for pre-filtered data (e.g., PNG filter output). Uses longer hash chains and more aggressive lazy matching to find better matches in data with specific statistical properties. |
+| `"huffman_only"` | Skip LZ77 matching entirely; emit all bytes as literals. Very fast encoding, minimal compression. Useful for already-compressed or high-entropy data where LZ77 would find few matches. |
+| `"rle"` | Run-length encoding mode: only find matches at distance 1. Very fast, limited compression. Best for data with long runs of repeated bytes. |
+| `"fixed"` | Always use fixed Huffman tables (skip dynamic tree building). Faster encoding at the cost of compression ratio. Equivalent to low compression levels but can be combined with any level. |
+
+**Example: Using strategies**
+
+```c
+gcomp_options_t *opts = NULL;
+gcomp_options_create(&opts);
+
+// For PNG image data (pre-filtered)
+gcomp_options_set_string(opts, "deflate.strategy", "filtered");
+gcomp_options_set_int64(opts, "deflate.level", 9);
+
+// For already-compressed data (JPEG inside a container)
+gcomp_options_set_string(opts, "deflate.strategy", "huffman_only");
+
+// For data with many byte runs (simple graphics, sparse data)
+gcomp_options_set_string(opts, "deflate.strategy", "rle");
+
+gcomp_encoder_t *enc = NULL;
+gcomp_encoder_create(registry, "deflate", opts, &enc);
+```
+
+**Strategy selection guidelines:**
+
+- **General data**: Use `"default"` (or omit the option).
+- **PNG images**: Use `"filtered"` with high compression level for best results.
+- **Pre-compressed data**: Use `"huffman_only"` to avoid wasting CPU on futile LZ77 searches.
+- **Simple patterns**: Use `"rle"` for data dominated by repeated byte runs.
+- **Speed-critical**: Use `"fixed"` or `"huffman_only"` to minimize encoding time.
 
 ## Limits and security notes
 
@@ -51,14 +90,22 @@ Limits are enforced by the core; the decoder returns `GCOMP_ERR_LIMIT` when `max
 
 ## Compression levels
 
-| Level | Strategy |
-|-------|----------|
-| 0 | Stored blocks (no compression, data copied verbatim) |
-| 1-3 | Fixed Huffman with LZ77, shorter hash chains |
-| 4-6 | Dynamic Huffman with LZ77, medium hash chains |
-| 7-9 | Dynamic Huffman with LZ77, longer hash chains (best compression) |
+| Level | Huffman Mode | LZ77 Effort | Use Case |
+|-------|--------------|-------------|----------|
+| 0 | Stored blocks | None | No compression (data copied verbatim) |
+| 1-3 | Fixed | Short hash chains | Fast compression, reasonable ratio |
+| 4-6 | Dynamic | Medium hash chains | Balanced speed and compression |
+| 7-9 | Dynamic | Long hash chains | Best compression, slower |
 
 Higher levels spend more effort searching for matches and build optimal Huffman codes from actual symbol frequencies, improving compression ratio at the cost of speed.
+
+**Level and strategy interaction:** The `deflate.strategy` option modifies how matching works at each level:
+
+- `"default"`: Uses the standard LZ77 algorithm with hash chain length determined by level.
+- `"filtered"`: Uses longer hash chains than default at each level (16/128/256 vs 8/32/64).
+- `"huffman_only"`: Ignores level for matching (no LZ77), but level still affects Huffman mode.
+- `"rle"`: Ignores hash chains entirely; only checks distance-1 matches.
+- `"fixed"`: Forces fixed Huffman codes regardless of level (skips dynamic tree building).
 
 ### Dynamic Huffman encoding (levels 4-9)
 

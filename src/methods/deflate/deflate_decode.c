@@ -418,11 +418,36 @@ static gcomp_status_t deflate_copy_match(
 //
 
 /**
- * @brief Decode a Huffman symbol from the bit stream.
+ * @brief Decode a Huffman symbol from the bit stream using two-level lookup.
  *
- * @param decoded_out  Output flag: set to 1 if a symbol was decoded, 0 if more
- *                     input is needed. Caller must check this before using
- *                     sym_out.
+ * This function implements the fast Huffman decoding algorithm described in
+ * huffman.h. The algorithm works as follows:
+ *
+ * 1. **Peek FAST_BITS** (9) bits from the bit buffer (LSB-first).
+ * 2. **Reverse** the bits to convert from stream order to canonical code order.
+ * 3. **Fast table lookup**: If fast_table[idx].nbits > 0, we found a short
+ * code; emit the symbol and consume nbits bits. Done.
+ * 4. **Long code path**: If nbits == 0, read long_extra_bits[idx] more bits,
+ *    reverse all (FAST_BITS + extra) bits to get the full canonical code,
+ *    extract the low bits, and look up in long_table[long_base[idx] + low].
+ *    Emit the symbol and consume long_table entry's nbits bits.
+ *
+ * **Bit reversal rationale**: DEFLATE writes codes LSB-first, but canonical
+ * Huffman codes are defined MSB-first. The fast table is indexed by the
+ * canonical code (left-aligned in FAST_BITS). Reversing the peeked bits
+ * converts the stream's LSB-first representation back to canonical form.
+ *
+ * **Partial input handling**: If we don't have enough bits for the code, we
+ * return GCOMP_OK with *decoded_out = 0. The caller should provide more input
+ * and retry.
+ *
+ * @param st          Decoder state (contains bit buffer).
+ * @param input       Input buffer to refill bits from.
+ * @param table       Huffman decode table (from huffman.c).
+ * @param sym_out     Output: decoded symbol (valid only if *decoded_out == 1).
+ * @param decoded_out Output: 1 if symbol was decoded, 0 if more input needed.
+ * @return GCOMP_OK on success or need-more-input, GCOMP_ERR_CORRUPT if the
+ *         bit pattern doesn't match any valid code.
  */
 static gcomp_status_t deflate_huff_decode_symbol(
     gcomp_deflate_decoder_state_t * st, gcomp_buffer_t * input,
@@ -434,9 +459,8 @@ static gcomp_status_t deflate_huff_decode_symbol(
 
   *decoded_out = 0;
 
-  /* Try to fill the bit buffer with FAST_BITS bits. This may not succeed if
-   * input is exhausted, but we might still have enough bits for a short code.
-   */
+  // Try to fill the bit buffer with FAST_BITS bits. This may not succeed if
+  // input is exhausted, but we might still have enough bits for a short code.
   (void)deflate_try_fill_bits(st, input, GCOMP_DEFLATE_HUFFMAN_FAST_BITS);
 
   // If we have no bits at all, we need more input.
@@ -444,9 +468,9 @@ static gcomp_status_t deflate_huff_decode_symbol(
     return GCOMP_OK;
   }
 
-  /* Peek whatever bits we have, padding with zeros if needed. The fast table
-   * is designed so that short codes at index (code << (FAST_BITS - len)) work
-   * correctly even with partial bits. */
+  // Peek whatever bits we have, padding with zeros if needed. The fast table
+  // is designed so that short codes at index (code << (FAST_BITS - len)) work
+  // correctly even with partial bits.
   uint32_t avail_bits = (st->bit_count > GCOMP_DEFLATE_HUFFMAN_FAST_BITS)
       ? GCOMP_DEFLATE_HUFFMAN_FAST_BITS
       : st->bit_count;
@@ -1147,7 +1171,7 @@ static gcomp_status_t deflate_process_huffman_data(
     return ds;
   }
 
-  /* Not enough input to decode a symbol. */
+  // Not enough input to decode a symbol.
   if (!decoded) {
     return GCOMP_OK;
   }
@@ -1267,8 +1291,8 @@ gcomp_status_t gcomp_deflate_decoder_update(gcomp_decoder_t * decoder,
       return s;
     }
 
-    /* If this iteration did not consume input, produce output, or change any
-     * relevant state, stop to avoid spinning with no progress. */
+    // If this iteration did not consume input, produce output, or change any
+    // relevant state, stop to avoid spinning with no progress.
     if (input->used == prev_in_used && output->used == prev_out_used &&
         st->stage == prev_stage && st->stored_remaining == prev_stored &&
         st->match_remaining == prev_match && st->bit_count == prev_bits &&

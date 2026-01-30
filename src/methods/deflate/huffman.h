@@ -98,8 +98,8 @@ extern "C" {
  * long-code path (see ::gcomp_deflate_huffman_decode_table_t).
  */
 typedef struct gcomp_deflate_huffman_fast_entry_s {
-  uint16_t symbol; /**< Decoded symbol (meaningful when nbits > 0). */
-  uint8_t nbits;   /**< Number of bits consumed (0 in fast table = use long). */
+  uint16_t symbol; ///< Decoded symbol (meaningful when nbits > 0).
+  uint8_t nbits;   ///< Number of bits consumed (0 in fast table = use long).
 } gcomp_deflate_huffman_fast_entry_t;
 
 /**

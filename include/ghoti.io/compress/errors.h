@@ -19,14 +19,14 @@ extern "C" {
  * @brief Status codes for compression operations
  */
 typedef enum {
-  GCOMP_OK = 0,              /**< Operation succeeded */
-  GCOMP_ERR_INVALID_ARG,     /**< Invalid argument */
-  GCOMP_ERR_MEMORY,          /**< Memory allocation failed */
-  GCOMP_ERR_LIMIT,           /**< Resource limit exceeded */
-  GCOMP_ERR_CORRUPT,         /**< Corrupted input data */
-  GCOMP_ERR_UNSUPPORTED,      /**< Unsupported operation or format */
-  GCOMP_ERR_INTERNAL,        /**< Internal library error */
-  GCOMP_ERR_IO,              /**< I/O error */
+  GCOMP_OK = 0,          ///< Operation succeeded
+  GCOMP_ERR_INVALID_ARG, ///< Invalid argument
+  GCOMP_ERR_MEMORY,      ///< Memory allocation failed
+  GCOMP_ERR_LIMIT,       ///< Resource limit exceeded
+  GCOMP_ERR_CORRUPT,     ///< Corrupted input data
+  GCOMP_ERR_UNSUPPORTED, ///< Unsupported operation or format
+  GCOMP_ERR_INTERNAL,    ///< Internal library error
+  GCOMP_ERR_IO,          ///< I/O error
 } gcomp_status_t;
 
 /**

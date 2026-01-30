@@ -30,9 +30,9 @@ typedef struct gcomp_decoder_s gcomp_decoder_t;
  * @brief Buffer structure for input/output operations
  */
 typedef struct {
-  const void * data; /**< Pointer to data */
-  size_t size;       /**< Size of data in bytes */
-  size_t used;       /**< Number of bytes consumed/produced */
+  const void * data; ///< Pointer to data
+  size_t size;       ///< Size of data in bytes
+  size_t used;       ///< Number of bytes consumed/produced
 } gcomp_buffer_t;
 
 /**

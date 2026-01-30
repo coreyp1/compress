@@ -61,10 +61,9 @@ GCOMP_API gcomp_status_t gcomp_method_get_option_keys(
     return GCOMP_OK;
   }
 
-  /* If no explicit keys array is provided, we cannot safely synthesise one
-   * without dynamic allocation and ownership rules. For now, treat this as
-   * unsupported and let callers fall back to iterating @ref options directly.
-   */
+  // If no explicit keys array is provided, we cannot safely synthesise one
+  // without dynamic allocation and ownership rules. For now, treat this as
+  // unsupported and let callers fall back to iterating @ref options directly.
   return GCOMP_ERR_UNSUPPORTED;
 }
 
@@ -93,6 +92,6 @@ GCOMP_API gcomp_status_t gcomp_method_get_option_schema(
     }
   }
 
-  /* Key not found in schema. */
+  // Key not found in schema.
   return GCOMP_ERR_INVALID_ARG;
 }

@@ -61,12 +61,97 @@ typedef enum {
   DEFLATE_ENC_STAGE_DONE,
 } gcomp_deflate_encoder_stage_t;
 
+//
+// Compression strategies
+// ======================
+//
+// The `deflate.strategy` option controls how the encoder finds and encodes
+// matches. Each strategy optimizes for different data characteristics:
+//
+// DEFLATE_STRATEGY_DEFAULT (strategy="default")
+// ---------------------------------------------
+// Standard LZ77 with hash-chain match finding, suitable for most data.
+// - Uses hash chains to find repeated byte sequences in the sliding window
+// - Chain length varies by compression level (8/32/64 at L1-3/L4-6/L7-9)
+// - Chooses fixed or dynamic Huffman based on compression level
+// - Good balance of speed and compression for general-purpose data
+//
+// DEFLATE_STRATEGY_FILTERED (strategy="filtered")
+// -----------------------------------------------
+// Optimized for pre-filtered data like PNG filter output.
+// PNG filters (Sub, Up, Average, Paeth) produce data where:
+// - Values cluster around zero (differences between adjacent pixels)
+// - Patterns may be longer but harder to find with short hash chains
+// - Longer matches tend to provide more benefit
+//
+// Implementation differences from DEFAULT:
+// - Uses 2x longer hash chains (16/128/256 vs 8/32/64)
+// - Applies lazy matching heuristic: if a short match (<32 bytes) is found,
+//   checks if the next position has a longer match before committing
+// - This extra effort helps find the longer patterns typical in filtered data
+//
+// DEFLATE_STRATEGY_HUFFMAN_ONLY (strategy="huffman_only")
+// -------------------------------------------------------
+// Skip LZ77 entirely; emit all input bytes as literals.
+// - No hash table lookups or match searching
+// - Only entropy encoding via Huffman codes
+// - Extremely fast encoding, minimal compression
+//
+// Use cases:
+// - Pre-compressed data (JPEG, PNG, ZIP contents) where LZ77 finds few matches
+// - High-entropy data (random, encrypted) where searching is wasted effort
+// - When encoding speed is more important than compression ratio
+//
+// Note: Even with huffman_only, the encoder builds optimal dynamic Huffman
+// codes from literal byte frequencies (at levels 4+), providing some
+// compression for non-uniform byte distributions.
+//
+// DEFLATE_STRATEGY_RLE (strategy="rle")
+// ------------------------------------
+// Run-length encoding: only find matches at distance 1.
+// - No hash chains needed; just check if current byte equals previous byte
+// - Very fast O(n) matching with no memory overhead
+// - Good compression for data with long runs of repeated bytes
+//
+// Use cases:
+// - Simple graphics (icons, diagrams) with solid color regions
+// - Sparse data (arrays with many zeros)
+// - Any data dominated by repeated byte patterns
+//
+// Implementation: At each position, scans forward while bytes match the
+// immediately preceding byte, up to DEFLATE_MAX_MATCH_LENGTH (258).
+//
+// DEFLATE_STRATEGY_FIXED (strategy="fixed")
+// ----------------------------------------
+// Always use fixed Huffman tables, skip dynamic tree building.
+// - Avoids the overhead of computing optimal Huffman codes
+// - Avoids transmitting custom Huffman tree in block header
+// - Faster encoding, slightly worse compression ratio
+//
+// Combines with any compression level:
+// - Level 0 + fixed: stored blocks (fixed has no effect)
+// - Level 1-9 + fixed: LZ77 matching at that level, but fixed Huffman output
+//
+// Useful when:
+// - Encoding many small blocks where tree overhead dominates
+// - Very speed-sensitive applications
+// - Data that compresses similarly with fixed vs dynamic codes
+//
+
+typedef enum {
+  DEFLATE_STRATEGY_DEFAULT = 0,
+  DEFLATE_STRATEGY_FILTERED,
+  DEFLATE_STRATEGY_HUFFMAN_ONLY,
+  DEFLATE_STRATEGY_RLE,
+  DEFLATE_STRATEGY_FIXED,
+} gcomp_deflate_strategy_t;
+
 /**
  * @brief LZ77 match result.
  */
 typedef struct {
-  uint32_t length;   /**< Match length (0 if no match found). */
-  uint32_t distance; /**< Match distance (1-based). */
+  uint32_t length;   ///< Match length (0 if no match found).
+  uint32_t distance; ///< Match distance (1-based).
 } deflate_match_t;
 
 typedef struct gcomp_deflate_encoder_state_s {
@@ -76,6 +161,7 @@ typedef struct gcomp_deflate_encoder_state_s {
   int level;
   size_t window_bits;
   size_t window_size;
+  gcomp_deflate_strategy_t strategy;
 
   //
   // State machine
@@ -87,18 +173,18 @@ typedef struct gcomp_deflate_encoder_state_s {
   // Sliding window buffer for LZ77
   //
   uint8_t * window;
-  size_t window_pos;  /**< Next write position (circular index). */
-  size_t window_fill; /**< Total bytes written (capped at window_size). */
-  size_t lookahead;   /**< Bytes available for matching. */
-  size_t total_in;    /**< Total bytes written to window (for hash validity). */
+  size_t window_pos;  ///< Next write position (circular index).
+  size_t window_fill; ///< Total bytes written (capped at window_size).
+  size_t lookahead;   ///< Bytes available for matching.
+  size_t total_in;    ///< Total bytes written to window (for hash validity).
 
   //
   // Hash chain for LZ77 match finding
   //
-  uint16_t * hash_head; /**< Head of each hash chain. */
-  uint16_t * hash_prev; /**< Previous link in hash chain. */
-  size_t * hash_pos;    /**< Stream position when hash entry was inserted. */
-  uint32_t hash_value;  /**< Running hash value. */
+  uint16_t * hash_head; ///< Head of each hash chain.
+  uint16_t * hash_prev; ///< Previous link in hash chain.
+  size_t * hash_pos;    ///< Stream position when hash entry was inserted.
+  uint32_t hash_value;  ///< Running hash value.
 
   //
   // Output bitstream
@@ -115,16 +201,16 @@ typedef struct gcomp_deflate_encoder_state_s {
   //
   // Symbol buffer for Huffman encoding
   //
-  uint16_t * lit_buf;  /**< Literal/length symbols. */
-  uint16_t * dist_buf; /**< Distance values (0 for literals). */
-  size_t sym_buf_size; /**< Capacity of symbol buffers. */
-  size_t sym_buf_used; /**< Number of symbols buffered. */
+  uint16_t * lit_buf;  ///< Literal/length symbols.
+  uint16_t * dist_buf; ///< Distance values (0 for literals).
+  size_t sym_buf_size; ///< Capacity of symbol buffers.
+  size_t sym_buf_used; ///< Number of symbols buffered.
 
   //
   // Histograms for dynamic Huffman
   //
-  uint32_t * lit_freq;  /**< Literal/length frequencies. */
-  uint32_t * dist_freq; /**< Distance frequencies. */
+  uint32_t * lit_freq;  ///< Literal/length frequencies.
+  uint32_t * dist_freq; ///< Distance frequencies.
 
   //
   // Fixed Huffman codes (precomputed)
@@ -720,10 +806,10 @@ static gcomp_status_t deflate_flush_fixed_block(
  * indices array). This avoids copying node data during heap operations.
  */
 typedef struct {
-  uint32_t freq;  /**< Symbol frequency (leaves) or combined freq (internal) */
-  int16_t symbol; /**< Symbol value (0-285) or -1 for internal nodes */
-  int16_t left;   /**< Index of left child in nodes array, or -1 */
-  int16_t right;  /**< Index of right child in nodes array, or -1 */
+  uint32_t freq;  ///< Symbol frequency (leaves) or combined freq (internal)
+  int16_t symbol; ///< Symbol value (0-285) or -1 for internal nodes
+  int16_t left;   ///< Index of left child in nodes array, or -1
+  int16_t right;  ///< Index of right child in nodes array, or -1
 } huffman_node_t;
 
 /**
@@ -1017,9 +1103,11 @@ static gcomp_status_t deflate_flush_dynamic_block(
     hdist--;
   }
 
-  // Ensure at least one distance code (DEFLATE requires it)
-  if (hdist < 0) {
-    hdist = 0;
+  // Ensure at least one distance code (DEFLATE requires it).
+  // When no distance codes are used (e.g., huffman_only strategy), all
+  // dist_lengths are 0. The while loop stops at hdist == 0, but we still
+  // need to ensure dist_lengths[0] has a valid code length.
+  if (dist_lengths[0] == 0) {
     dist_lengths[0] = 1;
   }
 
@@ -1114,6 +1202,75 @@ static gcomp_status_t deflate_flush_dynamic_block(
 
   uint8_t cl_lengths[19];
   build_code_lengths(cl_freq, 19, cl_lengths, 7);
+
+  // =========================================================================
+  // Code-length alphabet completeness (zlib compatibility)
+  // =========================================================================
+  // RFC 1951 allows incomplete Huffman trees (Kraft sum < 2^max_bits), but
+  // zlib's inflate_table() function rejects incomplete trees for the CODES
+  // type (code-length alphabet). This is stricter than the RFC requires.
+  //
+  // Background: The Kraft inequality states that for a valid prefix code,
+  // sum(2^(-length_i)) <= 1. An "under-subscribed" or "incomplete" tree has
+  // sum < 1, meaning some bit patterns don't decode to any symbol. RFC 1951
+  // permits this (unused patterns simply never appear in the stream).
+  //
+  // However, zlib's decoder checks: if (left > 0) return -1; // incomplete
+  // This occurs specifically for the code-length alphabet (symbols 0-18 that
+  // encode the lit/len and distance code lengths).
+  //
+  // Solution: If our code-length alphabet is under-subscribed, add unused
+  // symbols with appropriate code lengths to make the Kraft sum exactly 2^7.
+  // We prefer symbols late in k_cl_order[] to minimize HCLEN (the count of
+  // code-length codes transmitted in the block header).
+  // =========================================================================
+  {
+    // Calculate current Kraft sum (scaled by 2^7 = 128)
+    uint32_t kraft = 0;
+    for (int i = 0; i < 19; i++) {
+      if (cl_lengths[i] > 0) {
+        kraft += 1u << (7 - cl_lengths[i]);
+      }
+    }
+
+    // If under-subscribed (kraft < 128), fill remaining space
+    if (kraft < 128) {
+      uint32_t remaining = 128 - kraft;
+
+      // Find unused symbols to fill the space
+      // Prefer symbols that come late in k_cl_order (to minimize HCLEN)
+      // Symbols at positions 15-18 in k_cl_order are: 2, 14, 1, 15
+      while (remaining > 0) {
+        int best_ord = -1;
+        int best_len = 0;
+        uint32_t best_contrib = 0;
+
+        // Find the best unused symbol and length that fits
+        for (int ord = 18; ord >= 0; ord--) {
+          uint8_t sym = k_cl_order[ord];
+          if (cl_lengths[sym] == 0) {
+            for (int len = 7; len >= 1; len--) {
+              uint32_t contribution = 1u << (7 - len);
+              if (contribution <= remaining && contribution > best_contrib) {
+                best_ord = ord;
+                best_len = len;
+                best_contrib = contribution;
+              }
+            }
+          }
+        }
+
+        if (best_ord < 0) {
+          // No suitable unused symbol found - should not happen in practice
+          break;
+        }
+
+        uint8_t sym = k_cl_order[best_ord];
+        cl_lengths[sym] = (uint8_t)best_len;
+        remaining -= best_contrib;
+      }
+    }
+  }
 
   // Determine HCLEN (number of code length codes - 4)
   int hclen = 19 - 4;
@@ -1344,6 +1501,32 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
     }
   }
 
+  // Read compression strategy
+  st->strategy = DEFLATE_STRATEGY_DEFAULT;
+  if (options) {
+    const char * strategy_str = NULL;
+    if (gcomp_options_get_string(options, "deflate.strategy", &strategy_str) ==
+            GCOMP_OK &&
+        strategy_str != NULL) {
+      if (strcmp(strategy_str, "default") == 0) {
+        st->strategy = DEFLATE_STRATEGY_DEFAULT;
+      }
+      else if (strcmp(strategy_str, "filtered") == 0) {
+        st->strategy = DEFLATE_STRATEGY_FILTERED;
+      }
+      else if (strcmp(strategy_str, "huffman_only") == 0) {
+        st->strategy = DEFLATE_STRATEGY_HUFFMAN_ONLY;
+      }
+      else if (strcmp(strategy_str, "rle") == 0) {
+        st->strategy = DEFLATE_STRATEGY_RLE;
+      }
+      else if (strcmp(strategy_str, "fixed") == 0) {
+        st->strategy = DEFLATE_STRATEGY_FIXED;
+      }
+      // Invalid strategy values silently fall back to default
+    }
+  }
+
   st->window_size = (size_t)1u << st->window_bits;
   st->stage = DEFLATE_ENC_STAGE_INIT;
   st->final_block_written = 0;
@@ -1543,7 +1726,36 @@ gcomp_status_t gcomp_deflate_encoder_update(gcomp_encoder_t * encoder,
   }
   else {
     // Levels 1-9: LZ77 + Huffman compression
-    int max_chain = (st->level <= 3) ? 4 : (st->level <= 6) ? 32 : 128;
+    //
+    // Strategy affects match finding and Huffman mode:
+    // - DEFAULT: Standard LZ77 with chain length based on level
+    // - FILTERED: Longer chains, favors longer matches (PNG-optimized)
+    // - HUFFMAN_ONLY: No LZ77, emit all bytes as literals
+    // - RLE: Only find matches at distance 1
+    // - FIXED: Standard LZ77 but always use fixed Huffman codes
+    //
+    int max_chain;
+    int use_fixed_huffman;
+    int skip_lz77 = (st->strategy == DEFLATE_STRATEGY_HUFFMAN_ONLY);
+
+    // Determine hash chain length based on level and strategy
+    if (st->strategy == DEFLATE_STRATEGY_FILTERED) {
+      // Filtered strategy uses longer chains for better matching
+      max_chain = (st->level <= 3) ? 16 : (st->level <= 6) ? 128 : 256;
+    }
+    else if (st->strategy == DEFLATE_STRATEGY_RLE) {
+      // RLE doesn't use hash chains (only checks distance 1)
+      max_chain = 0;
+    }
+    else {
+      // Default/Fixed: standard chain lengths
+      max_chain = (st->level <= 3) ? 4 : (st->level <= 6) ? 32 : 128;
+    }
+
+    // Determine whether to use fixed or dynamic Huffman
+    // FIXED strategy always uses fixed codes; otherwise depends on level
+    use_fixed_huffman =
+        (st->strategy == DEFLATE_STRATEGY_FIXED) || (st->level <= 3);
 
     while (input->used < input->size) {
       // Fill window with input data
@@ -1568,10 +1780,11 @@ gcomp_status_t gcomp_deflate_encoder_update(gcomp_encoder_t * encoder,
       }
 
       // Process lookahead data
-      while (st->lookahead >= DEFLATE_MIN_MATCH_LENGTH) {
+      while (st->lookahead >= DEFLATE_MIN_MATCH_LENGTH ||
+          (skip_lz77 && st->lookahead > 0)) {
         // Check if symbol buffer needs flushing
         if (st->sym_buf_used >= st->sym_buf_size - 2) {
-          if (st->level <= 3) {
+          if (use_fixed_huffman) {
             s = deflate_flush_fixed_block(st, 0);
           }
           else {
@@ -1588,9 +1801,56 @@ gcomp_status_t gcomp_deflate_encoder_update(gcomp_encoder_t * encoder,
             st->window_size;
         size_t stream_pos = st->total_in - st->lookahead;
 
-        // Try to find a match
-        deflate_match_t match =
-            deflate_find_match(st, pos, stream_pos, max_chain);
+        // Strategy-specific match finding
+        deflate_match_t match = {0, 0};
+
+        if (skip_lz77) {
+          // HUFFMAN_ONLY: No match finding at all
+          // match stays {0, 0} - will emit literal
+        }
+        else if (st->strategy == DEFLATE_STRATEGY_RLE) {
+          // RLE: Only look for matches at distance 1
+          if (st->lookahead >= DEFLATE_MIN_MATCH_LENGTH && stream_pos > 0) {
+            // Check for run at distance 1
+            size_t prev_pos = (pos + st->window_size - 1) % st->window_size;
+            uint8_t run_byte = st->window[prev_pos];
+            size_t run_len = 0;
+            size_t max_len = st->lookahead;
+            if (max_len > DEFLATE_MAX_MATCH_LENGTH) {
+              max_len = DEFLATE_MAX_MATCH_LENGTH;
+            }
+
+            // Count how many bytes match the previous byte
+            while (run_len < max_len &&
+                st->window[(pos + run_len) % st->window_size] == run_byte) {
+              run_len++;
+            }
+
+            if (run_len >= DEFLATE_MIN_MATCH_LENGTH) {
+              match.length = (uint32_t)run_len;
+              match.distance = 1;
+            }
+          }
+        }
+        else if (st->lookahead >= DEFLATE_MIN_MATCH_LENGTH) {
+          // DEFAULT/FILTERED/FIXED: Standard LZ77 match finding
+          match = deflate_find_match(st, pos, stream_pos, max_chain);
+
+          // FILTERED strategy: apply lazy matching heuristic
+          // If we found a short match, look ahead for a better one
+          if (st->strategy == DEFLATE_STRATEGY_FILTERED &&
+              match.length >= DEFLATE_MIN_MATCH_LENGTH && match.length < 32 &&
+              st->lookahead > match.length) {
+            // Check if the next position has a longer match
+            size_t next_pos = (pos + 1) % st->window_size;
+            deflate_match_t next_match =
+                deflate_find_match(st, next_pos, stream_pos + 1, max_chain);
+            // If next match is significantly better, emit current as literal
+            if (next_match.length > match.length + 1) {
+              match.length = 0; // Force literal emission
+            }
+          }
+        }
 
         if (match.length >= DEFLATE_MIN_MATCH_LENGTH) {
           // Record length/distance pair
@@ -1628,8 +1888,8 @@ gcomp_status_t gcomp_deflate_encoder_update(gcomp_encoder_t * encoder,
             st->lit_freq[lit]++;
           }
 
-          // Insert byte into hash table
-          if (st->lookahead >= 3) {
+          // Insert byte into hash table (unless HUFFMAN_ONLY)
+          if (!skip_lz77 && st->lookahead >= 3) {
             deflate_insert_hash(st, pos, stream_pos);
           }
           st->lookahead--;
@@ -1637,7 +1897,8 @@ gcomp_status_t gcomp_deflate_encoder_update(gcomp_encoder_t * encoder,
       }
 
       // If we can't make progress, break
-      if (copy == 0 && st->lookahead < DEFLATE_MIN_MATCH_LENGTH) {
+      if (copy == 0 && st->lookahead < DEFLATE_MIN_MATCH_LENGTH &&
+          !(skip_lz77 && st->lookahead > 0)) {
         break;
       }
     }
@@ -1676,10 +1937,15 @@ gcomp_status_t gcomp_deflate_encoder_finish(
     s = deflate_flush_stored_block(st, 1);
   }
   else {
+    // Determine whether to use fixed or dynamic Huffman
+    // FIXED strategy always uses fixed codes; otherwise depends on level
+    int use_fixed_huffman =
+        (st->strategy == DEFLATE_STRATEGY_FIXED) || (st->level <= 3);
+
     // Flush any remaining lookahead as literals
     while (st->lookahead > 0) {
       if (st->sym_buf_used >= st->sym_buf_size) {
-        if (st->level <= 3) {
+        if (use_fixed_huffman) {
           s = deflate_flush_fixed_block(st, 0);
         }
         else {
@@ -1707,7 +1973,7 @@ gcomp_status_t gcomp_deflate_encoder_finish(
     }
 
     // Flush final block
-    if (st->level <= 3) {
+    if (use_fixed_huffman) {
       s = deflate_flush_fixed_block(st, 1);
     }
     else {

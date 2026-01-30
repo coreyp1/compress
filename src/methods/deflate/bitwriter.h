@@ -28,11 +28,11 @@ extern "C" {
  * Initialize with ::gcomp_deflate_bitwriter_init() before use.
  */
 typedef struct gcomp_deflate_bitwriter_s {
-  uint8_t * data;      /**< Output buffer (not owned). */
-  size_t size;         /**< Capacity of @ref data in bytes. */
-  size_t byte_pos;     /**< Current byte position in @ref data. */
-  uint32_t bit_buffer; /**< Buffered bits (LSB-first). */
-  uint32_t bit_count;  /**< Number of valid bits in @ref bit_buffer. */
+  uint8_t * data;      ///< Output buffer (not owned).
+  size_t size;         ///< Capacity of @ref data in bytes.
+  size_t byte_pos;     ///< Current byte position in @ref data.
+  uint32_t bit_buffer; ///< Buffered bits (LSB-first).
+  uint32_t bit_count;  ///< Number of valid bits in @ref bit_buffer.
 } gcomp_deflate_bitwriter_t;
 
 /**
