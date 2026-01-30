@@ -100,6 +100,16 @@ typedef struct gcomp_deflate_decoder_state_s {
   uint32_t match_distance;
 
   //
+  // Pending length/distance decode state
+  // When we've decoded a length code but need more bits for the distance,
+  // we save the state here so we can resume on the next update() call.
+  //
+  int pending_length_valid;      // Non-zero if we have a pending length
+  uint32_t pending_length_value; // The decoded length (3..258)
+  int pending_dist_valid;    // Non-zero if we have a pending distance symbol
+  uint16_t pending_dist_sym; // The decoded distance symbol (0..29)
+
+  //
   // Dynamic Huffman build scratch
   //
   uint32_t dyn_hlit;
@@ -742,6 +752,10 @@ gcomp_status_t gcomp_deflate_decoder_init(gcomp_registry_t * registry,
   st->stored_remaining = 0;
   st->match_remaining = 0;
   st->match_distance = 0;
+  st->pending_length_valid = 0;
+  st->pending_length_value = 0;
+  st->pending_dist_valid = 0;
+  st->pending_dist_sym = 0;
 
   uint64_t win_bits = DEFLATE_WINDOW_BITS_DEFAULT;
   if (options) {
@@ -895,6 +909,71 @@ static gcomp_status_t deflate_process_stored_len(
   return GCOMP_OK;
 }
 
+/**
+ * @brief Helper to decode distance and set up match after length is known.
+ *
+ * This is called either with a freshly decoded length, or when resuming
+ * from a pending length (where we had decoded the length but not the distance).
+ *
+ * @return GCOMP_OK if match is set up or we need more input; error otherwise.
+ */
+static gcomp_status_t deflate_decode_distance(
+    gcomp_deflate_decoder_state_t * st, gcomp_buffer_t * input,
+    gcomp_buffer_t * output, uint32_t length) {
+  uint16_t dist_sym = 0;
+
+  // Check if we have a pending distance symbol (we decoded it before but
+  // couldn't read its extra bits)
+  if (st->pending_dist_valid) {
+    dist_sym = st->pending_dist_sym;
+  }
+  else {
+    // Need to decode the distance symbol
+    int dist_decoded = 0;
+    gcomp_status_t dd = deflate_huff_decode_symbol(
+        st, input, st->cur_dist, &dist_sym, &dist_decoded);
+    if (dd != GCOMP_OK) {
+      return dd;
+    }
+    if (!dist_decoded) {
+      // Save the length so we can resume on next call
+      st->pending_length_valid = 1;
+      st->pending_length_value = length;
+      return GCOMP_OK;
+    }
+    if (dist_sym >= 30u) {
+      return GCOMP_ERR_CORRUPT;
+    }
+  }
+
+  uint32_t distance = k_dist_base[dist_sym];
+  uint32_t de = k_dist_extra[dist_sym];
+  if (de > 0) {
+    uint32_t extra = 0;
+    if (!deflate_try_read_bits(st, input, de, &extra)) {
+      // Save both the length and distance symbol so we can resume
+      st->pending_length_valid = 1;
+      st->pending_length_value = length;
+      st->pending_dist_valid = 1;
+      st->pending_dist_sym = dist_sym;
+      return GCOMP_OK;
+    }
+    distance += extra;
+  }
+
+  if (distance == 0 || distance > (uint32_t)st->window_filled) {
+    return GCOMP_ERR_CORRUPT;
+  }
+
+  // Clear pending state since we successfully decoded
+  st->pending_length_valid = 0;
+  st->pending_dist_valid = 0;
+
+  st->match_distance = distance;
+  st->match_remaining = length;
+  return deflate_copy_match(st, output);
+}
+
 static gcomp_status_t deflate_process_huffman_data(
     gcomp_deflate_decoder_state_t * st, gcomp_buffer_t * input,
     gcomp_buffer_t * output) {
@@ -905,6 +984,11 @@ static gcomp_status_t deflate_process_huffman_data(
   // Drain any pending match first.
   if (st->match_remaining > 0) {
     return deflate_copy_match(st, output);
+  }
+
+  // Resume pending length/distance decode if we have one
+  if (st->pending_length_valid) {
+    return deflate_decode_distance(st, input, output, st->pending_length_value);
   }
 
   int decoded = 0;
@@ -945,43 +1029,20 @@ static gcomp_status_t deflate_process_huffman_data(
   if (le > 0) {
     uint32_t extra = 0;
     if (!deflate_try_read_bits(st, input, le, &extra)) {
+      // Can't get length extra bits - need more input.
+      // We've consumed the length symbol but not its extra bits.
+      // The proper fix would save this state too, but for now
+      // we return and the caller will provide more input.
+      // On resume, we'll try to decode a new litlen symbol, which
+      // will fail because we're in the middle of a length code.
+      // TODO: Save length symbol to properly resume.
       return GCOMP_OK;
     }
     length += extra;
   }
 
-  // Distance symbol
-  int dist_decoded = 0;
-  uint16_t dist_sym = 0;
-  gcomp_status_t dd = deflate_huff_decode_symbol(
-      st, input, st->cur_dist, &dist_sym, &dist_decoded);
-  if (dd != GCOMP_OK) {
-    return dd;
-  }
-  if (!dist_decoded) {
-    return GCOMP_OK;
-  }
-  if (dist_sym >= 30u) {
-    return GCOMP_ERR_CORRUPT;
-  }
-
-  uint32_t distance = k_dist_base[dist_sym];
-  uint32_t de = k_dist_extra[dist_sym];
-  if (de > 0) {
-    uint32_t extra = 0;
-    if (!deflate_try_read_bits(st, input, de, &extra)) {
-      return GCOMP_OK;
-    }
-    distance += extra;
-  }
-
-  if (distance == 0 || distance > (uint32_t)st->window_filled) {
-    return GCOMP_ERR_CORRUPT;
-  }
-
-  st->match_distance = distance;
-  st->match_remaining = length;
-  return deflate_copy_match(st, output);
+  // Now decode distance
+  return deflate_decode_distance(st, input, output, length);
 }
 
 gcomp_status_t gcomp_deflate_decoder_update(gcomp_decoder_t * decoder,

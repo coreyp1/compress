@@ -7,6 +7,7 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
+#include "data/deflate/golden_vectors.h"
 #include "test_helpers.h"
 #include <cstring>
 #include <ghoti.io/compress/deflate.h>
@@ -476,6 +477,183 @@ TEST_F(DeflateDecoderTest, Memory_CreateDestroyNoLeak) {
         gcomp_decoder_create(registry_, "deflate", nullptr, &dec), GCOMP_OK);
     ASSERT_NE(dec, nullptr);
     gcomp_decoder_destroy(dec);
+  }
+}
+
+//
+// Golden Vector Tests (T3.9)
+//
+
+class GoldenVectorTest
+    : public ::testing::TestWithParam<gcomp_golden_vector_t> {
+protected:
+  void SetUp() override {
+    ASSERT_EQ(gcomp_registry_create(nullptr, &registry_), GCOMP_OK);
+    ASSERT_NE(registry_, nullptr);
+    ASSERT_EQ(gcomp_method_deflate_register(registry_), GCOMP_OK);
+  }
+
+  void TearDown() override {
+    if (decoder_) {
+      gcomp_decoder_destroy(decoder_);
+      decoder_ = nullptr;
+    }
+    if (registry_) {
+      gcomp_registry_destroy(registry_);
+      registry_ = nullptr;
+    }
+  }
+
+  gcomp_registry_t * registry_ = nullptr;
+  gcomp_decoder_t * decoder_ = nullptr;
+};
+
+TEST_P(GoldenVectorTest, DecodeMatchesExpected) {
+  const gcomp_golden_vector_t & vec = GetParam();
+
+  ASSERT_EQ(
+      gcomp_decoder_create(registry_, "deflate", nullptr, &decoder_), GCOMP_OK);
+
+  std::vector<uint8_t> output(vec.expected_len + 256);
+  gcomp_buffer_t in_buf = {vec.compressed, vec.compressed_len, 0};
+  gcomp_buffer_t out_buf = {output.data(), output.size(), 0};
+
+  ASSERT_EQ(gcomp_decoder_update(decoder_, &in_buf, &out_buf), GCOMP_OK)
+      << "Failed to decode vector: " << vec.name;
+  ASSERT_EQ(in_buf.used, vec.compressed_len)
+      << "Did not consume all input for: " << vec.name;
+
+  gcomp_buffer_t finish_out = {
+      output.data() + out_buf.used, output.size() - out_buf.used, 0};
+  ASSERT_EQ(gcomp_decoder_finish(decoder_, &finish_out), GCOMP_OK)
+      << "Finish failed for: " << vec.name;
+
+  size_t total_out = out_buf.used + finish_out.used;
+  ASSERT_EQ(total_out, vec.expected_len)
+      << "Output length mismatch for: " << vec.name;
+
+  if (vec.expected_len > 0 && vec.expected != nullptr) {
+    EXPECT_EQ(std::memcmp(output.data(), vec.expected, vec.expected_len), 0)
+        << "Output data mismatch for: " << vec.name;
+  }
+}
+
+TEST_P(GoldenVectorTest, DecodeChunkedMatchesExpected) {
+  const gcomp_golden_vector_t & vec = GetParam();
+
+  ASSERT_EQ(
+      gcomp_decoder_create(registry_, "deflate", nullptr, &decoder_), GCOMP_OK);
+
+  std::vector<uint8_t> output;
+  output.reserve(vec.expected_len + 256);
+
+  size_t in_off = 0;
+  size_t iterations = 0;
+  const size_t max_iterations =
+      vec.compressed_len * 16u + vec.expected_len + 1000u;
+
+  // Feed input one byte at a time to test streaming edge cases
+  while (in_off < vec.compressed_len && iterations < max_iterations) {
+    gcomp_buffer_t in_buf = {vec.compressed + in_off, 1u, 0};
+    uint8_t tmp[64] = {};
+    gcomp_buffer_t out_buf = {tmp, sizeof(tmp), 0};
+
+    gcomp_status_t s = gcomp_decoder_update(decoder_, &in_buf, &out_buf);
+    ASSERT_EQ(s, GCOMP_OK) << "Update failed at offset " << in_off
+                           << " for: " << vec.name;
+
+    in_off += in_buf.used;
+    for (size_t j = 0; j < out_buf.used; j++) {
+      output.push_back(tmp[j]);
+    }
+    iterations++;
+  }
+
+  ASSERT_EQ(in_off, vec.compressed_len)
+      << "Did not consume all input (chunked) for: " << vec.name;
+
+  uint8_t finish_buf[256] = {};
+  gcomp_buffer_t finish_out = {finish_buf, sizeof(finish_buf), 0};
+  ASSERT_EQ(gcomp_decoder_finish(decoder_, &finish_out), GCOMP_OK)
+      << "Finish failed (chunked) for: " << vec.name;
+
+  for (size_t j = 0; j < finish_out.used; j++) {
+    output.push_back(finish_buf[j]);
+  }
+
+  ASSERT_EQ(output.size(), vec.expected_len)
+      << "Output length mismatch (chunked) for: " << vec.name;
+
+  if (vec.expected_len > 0 && vec.expected != nullptr) {
+    EXPECT_EQ(std::memcmp(output.data(), vec.expected, vec.expected_len), 0)
+        << "Output data mismatch (chunked) for: " << vec.name;
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(GoldenVectors, GoldenVectorTest,
+    ::testing::ValuesIn(
+        g_golden_vectors, g_golden_vectors + g_golden_vectors_count),
+    [](const ::testing::TestParamInfo<gcomp_golden_vector_t> & info) {
+      return std::string(info.param.name);
+    });
+
+//
+// Additional golden vector tests for runtime-generated expected data
+//
+
+TEST_F(DeflateDecoderTest, GoldenVector_BinarySequence256) {
+  // Vector 7: 0x00-0xFF (256 bytes)
+  ASSERT_EQ(
+      gcomp_decoder_create(registry_, "deflate", nullptr, &decoder_), GCOMP_OK);
+
+  std::vector<uint8_t> output(golden_v7_expected_len + 64);
+  gcomp_buffer_t in_buf = {
+      golden_v7_compressed_ptr, golden_v7_compressed_len, 0};
+  gcomp_buffer_t out_buf = {output.data(), output.size(), 0};
+
+  ASSERT_EQ(gcomp_decoder_update(decoder_, &in_buf, &out_buf), GCOMP_OK);
+  ASSERT_EQ(in_buf.used, golden_v7_compressed_len);
+
+  gcomp_buffer_t finish_out = {
+      output.data() + out_buf.used, output.size() - out_buf.used, 0};
+  ASSERT_EQ(gcomp_decoder_finish(decoder_, &finish_out), GCOMP_OK);
+
+  size_t total_out = out_buf.used + finish_out.used;
+  ASSERT_EQ(total_out, golden_v7_expected_len);
+
+  // Verify expected: 0x00, 0x01, ..., 0xFF
+  for (size_t i = 0; i < golden_v7_expected_len; i++) {
+    EXPECT_EQ(output[i], (uint8_t)i)
+        << "Mismatch at position " << i << " for binary sequence vector";
+  }
+}
+
+TEST_F(DeflateDecoderTest, GoldenVector_RepeatedHelloWorld260) {
+  // Vector 8: "Hello world! Hello world! " repeated 10x (260 bytes)
+  ASSERT_EQ(
+      gcomp_decoder_create(registry_, "deflate", nullptr, &decoder_), GCOMP_OK);
+
+  std::vector<uint8_t> output(golden_v8_expected_len + 64);
+  gcomp_buffer_t in_buf = {
+      golden_v8_compressed_ptr, golden_v8_compressed_len, 0};
+  gcomp_buffer_t out_buf = {output.data(), output.size(), 0};
+
+  ASSERT_EQ(gcomp_decoder_update(decoder_, &in_buf, &out_buf), GCOMP_OK);
+  ASSERT_EQ(in_buf.used, golden_v8_compressed_len);
+
+  gcomp_buffer_t finish_out = {
+      output.data() + out_buf.used, output.size() - out_buf.used, 0};
+  ASSERT_EQ(gcomp_decoder_finish(decoder_, &finish_out), GCOMP_OK);
+
+  size_t total_out = out_buf.used + finish_out.used;
+  ASSERT_EQ(total_out, golden_v8_expected_len);
+
+  // Verify expected: "Hello world! Hello world! " repeated
+  const char * phrase = "Hello world! Hello world! ";
+  const size_t phrase_len = 26u;
+  for (size_t i = 0; i < golden_v8_expected_len; i++) {
+    EXPECT_EQ(output[i], (uint8_t)phrase[i % phrase_len])
+        << "Mismatch at position " << i << " for repeated hello world vector";
   }
 }
 
