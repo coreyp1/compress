@@ -23,9 +23,23 @@ Limits are enforced by the core; the decoder returns `GCOMP_ERR_LIMIT` when `max
 
 - **Decode (fixed):** Block type 1 uses the fixed literal/length and distance code lengths defined in RFC 1951 §3.2.6.
 - **Decode (dynamic):** Block type 2 sends HLIT, HDIST, HCLEN, then code-length alphabet and literal/length and distance lengths; the decoder builds canonical decode tables from these.
-- **Encode:** Not yet implemented; encoder will derive code lengths from histograms (fixed or dynamic blocks).
+- **Encode (fixed):** The encoder uses the same fixed code tables as the decoder for levels 1-9.
+- **Encode (dynamic):** Not yet implemented; encoder currently falls back to fixed Huffman for all levels > 0.
+
+## Compression levels
+
+| Level | Strategy |
+|-------|----------|
+| 0 | Stored blocks (no compression, data copied verbatim) |
+| 1-3 | Fixed Huffman with LZ77, shorter hash chains |
+| 4-6 | Fixed Huffman with LZ77, medium hash chains |
+| 7-9 | Fixed Huffman with LZ77, longer hash chains (best compression) |
+
+Higher levels spend more effort searching for matches, improving compression ratio at the cost of speed.
 
 ## Streaming usage
+
+### Decoding
 
 ```c
 gcomp_decoder_t * dec = NULL;
@@ -46,4 +60,30 @@ if (s != GCOMP_OK) { /* stream incomplete or corrupt */ }
 gcomp_decoder_destroy(dec);
 ```
 
-Encoder API is the same (`gcomp_encoder_create`, `gcomp_encoder_update`, `gcomp_encoder_finish`, `gcomp_encoder_destroy`); encoder implementation is stubbed and returns `GCOMP_ERR_UNSUPPORTED`.
+### Encoding
+
+```c
+gcomp_encoder_t * enc = NULL;
+gcomp_options_t * opts = NULL;
+gcomp_options_create(&opts);
+gcomp_options_set_int64(opts, "deflate.level", 6);  // 0-9
+gcomp_encoder_create(registry, "deflate", opts, &enc);
+
+gcomp_buffer_t in_buf = { input_data, input_len, 0 };
+gcomp_buffer_t out_buf = { output_array, output_capacity, 0 };
+
+// Feed input (can be called multiple times for streaming)
+gcomp_status_t s = gcomp_encoder_update(enc, &in_buf, &out_buf);
+if (s != GCOMP_OK) { /* handle error */ }
+
+// Finalize (writes final block, flushes to byte boundary)
+gcomp_buffer_t finish_buf = { output_array + out_buf.used,
+                              output_capacity - out_buf.used, 0 };
+s = gcomp_encoder_finish(enc, &finish_buf);
+if (s != GCOMP_OK) { /* handle error */ }
+
+size_t total_compressed = out_buf.used + finish_buf.used;
+
+gcomp_encoder_destroy(enc);
+gcomp_options_destroy(opts);
+```

@@ -84,6 +84,20 @@ gcomp_status_t gcomp_deflate_bitwriter_flush_to_byte(
 size_t gcomp_deflate_bitwriter_bytes_written(
     const gcomp_deflate_bitwriter_t * writer);
 
+/**
+ * @brief Update the output buffer pointer without resetting bit state.
+ *
+ * Call this to continue writing to a new buffer segment while preserving
+ * any partial bits from the previous segment. The byte_pos is reset to 0.
+ *
+ * @param writer Bit writer (must not be NULL).
+ * @param data   New output buffer (can be NULL if @p size is 0).
+ * @param size   Capacity of @p data in bytes.
+ * @return ::GCOMP_OK on success, ::GCOMP_ERR_INVALID_ARG if writer is NULL.
+ */
+gcomp_status_t gcomp_deflate_bitwriter_set_buffer(
+    gcomp_deflate_bitwriter_t * writer, uint8_t * data, size_t size);
+
 #ifdef __cplusplus
 }
 #endif

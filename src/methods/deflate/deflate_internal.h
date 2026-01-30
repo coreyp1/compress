@@ -48,6 +48,32 @@ gcomp_status_t gcomp_deflate_decoder_update(
 gcomp_status_t gcomp_deflate_decoder_finish(
     gcomp_decoder_t * decoder, gcomp_buffer_t * output);
 
+/**
+ * @brief Create and attach deflate encoder state to an encoder.
+ *
+ * On success, sets @c encoder->method_state and @c encoder->update_fn /
+ * @c encoder->finish_fn.
+ */
+gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
+    gcomp_options_t * options, gcomp_encoder_t * encoder);
+
+/**
+ * @brief Destroy and detach deflate encoder state.
+ */
+void gcomp_deflate_encoder_destroy(gcomp_encoder_t * encoder);
+
+/**
+ * @brief Deflate encoder update implementation.
+ */
+gcomp_status_t gcomp_deflate_encoder_update(
+    gcomp_encoder_t * encoder, gcomp_buffer_t * input, gcomp_buffer_t * output);
+
+/**
+ * @brief Deflate encoder finish implementation.
+ */
+gcomp_status_t gcomp_deflate_encoder_finish(
+    gcomp_encoder_t * encoder, gcomp_buffer_t * output);
+
 #ifdef __cplusplus
 }
 #endif

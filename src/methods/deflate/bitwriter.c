@@ -109,3 +109,17 @@ size_t gcomp_deflate_bitwriter_bytes_written(
 
   return writer->byte_pos;
 }
+
+gcomp_status_t gcomp_deflate_bitwriter_set_buffer(
+    gcomp_deflate_bitwriter_t * writer, uint8_t * data, size_t size) {
+  if (!writer) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  writer->data = data;
+  writer->size = size;
+  writer->byte_pos = 0;
+  // Preserve bit_buffer and bit_count - this is the key difference from init()
+
+  return GCOMP_OK;
+}

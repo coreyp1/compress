@@ -299,7 +299,7 @@ TEST_F(StreamTest, DeflateEncoderCreateSuccess) {
   gcomp_registry_destroy(reg);
 }
 
-TEST_F(StreamTest, DeflateEncoderUpdateReturnsUnsupported) {
+TEST_F(StreamTest, DeflateEncoderUpdateSucceeds) {
   gcomp_registry_t * reg = nullptr;
   ASSERT_EQ(gcomp_registry_create(nullptr, &reg), GCOMP_OK);
   ASSERT_EQ(gcomp_method_deflate_register(reg), GCOMP_OK);
@@ -312,8 +312,18 @@ TEST_F(StreamTest, DeflateEncoderUpdateReturnsUnsupported) {
   gcomp_buffer_t input = {input_buf, sizeof(input_buf), 0};
   gcomp_buffer_t output = {output_buf, sizeof(output_buf), 0};
 
+  // Update should succeed
   gcomp_status_t status = gcomp_encoder_update(encoder, &input, &output);
-  EXPECT_EQ(status, GCOMP_ERR_UNSUPPORTED);
+  EXPECT_EQ(status, GCOMP_OK);
+  EXPECT_EQ(input.used, sizeof(input_buf)); // Input should be consumed
+
+  // Finish should succeed
+  gcomp_buffer_t finish_output = {
+      output_buf + output.used, sizeof(output_buf) - output.used, 0};
+  status = gcomp_encoder_finish(encoder, &finish_output);
+  EXPECT_EQ(status, GCOMP_OK);
+  EXPECT_GT(
+      output.used + finish_output.used, 0u); // Should have produced output
 
   gcomp_encoder_destroy(encoder);
   gcomp_registry_destroy(reg);

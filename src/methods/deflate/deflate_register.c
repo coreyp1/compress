@@ -75,22 +75,17 @@ static const gcomp_method_schema_t * deflate_get_schema(void) {
 }
 
 //
-// Stub encoder/decoder: return GCOMP_ERR_UNSUPPORTED until T3.5/T3.6.
+// Encoder/decoder update/finish wrappers
 //
 
 static gcomp_status_t deflate_encoder_update(gcomp_encoder_t * encoder,
     gcomp_buffer_t * input, gcomp_buffer_t * output) {
-  (void)encoder;
-  (void)input;
-  (void)output;
-  return GCOMP_ERR_UNSUPPORTED;
+  return gcomp_deflate_encoder_update(encoder, input, output);
 }
 
 static gcomp_status_t deflate_encoder_finish(
     gcomp_encoder_t * encoder, gcomp_buffer_t * output) {
-  (void)encoder;
-  (void)output;
-  return GCOMP_ERR_UNSUPPORTED;
+  return gcomp_deflate_encoder_finish(encoder, output);
 }
 
 static gcomp_status_t deflate_decoder_update(gcomp_decoder_t * decoder,
@@ -105,11 +100,16 @@ static gcomp_status_t deflate_decoder_finish(
 
 static gcomp_status_t deflate_create_encoder(gcomp_registry_t * registry,
     gcomp_options_t * options, gcomp_encoder_t ** encoder_out) {
-  (void)registry;
-  (void)options;
   if (!encoder_out || !*encoder_out) {
     return GCOMP_ERR_INVALID_ARG;
   }
+
+  gcomp_status_t status =
+      gcomp_deflate_encoder_init(registry, options, *encoder_out);
+  if (status != GCOMP_OK) {
+    return status;
+  }
+
   (*encoder_out)->update_fn = deflate_encoder_update;
   (*encoder_out)->finish_fn = deflate_encoder_finish;
   return GCOMP_OK;
@@ -133,7 +133,7 @@ static gcomp_status_t deflate_create_decoder(gcomp_registry_t * registry,
 }
 
 static void deflate_destroy_encoder(gcomp_encoder_t * encoder) {
-  (void)encoder;
+  gcomp_deflate_encoder_destroy(encoder);
 }
 
 static void deflate_destroy_decoder(gcomp_decoder_t * decoder) {
