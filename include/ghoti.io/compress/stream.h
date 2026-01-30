@@ -118,7 +118,7 @@ GCOMP_API gcomp_status_t gcomp_encoder_update(
  *
  * Finalizes the compression stream, flushes any pending output, and
  * emits trailers (if applicable). After calling this, the encoder
- * should not be used for further updates.
+ * should not be used for further updates unless reset is called.
  *
  * @param encoder The encoder
  * @param output Output buffer
@@ -126,6 +126,23 @@ GCOMP_API gcomp_status_t gcomp_encoder_update(
  */
 GCOMP_API gcomp_status_t gcomp_encoder_finish(
     gcomp_encoder_t * encoder, gcomp_buffer_t * output);
+
+/**
+ * @brief Reset encoder to initial state
+ *
+ * Resets the encoder to its initial state, allowing it to be reused for a
+ * new compression stream without destroying and recreating it. This is more
+ * efficient than destroying and recreating the encoder when compressing
+ * multiple independent streams with the same options.
+ *
+ * After reset, the encoder behaves as if it was just created with the same
+ * options. Any error state is cleared.
+ *
+ * @param encoder The encoder to reset
+ * @return GCOMP_OK on success, GCOMP_ERR_UNSUPPORTED if the method does not
+ *         support reset, or another error code on failure
+ */
+GCOMP_API gcomp_status_t gcomp_encoder_reset(gcomp_encoder_t * encoder);
 
 /**
  * @brief Update decoder with input data
@@ -145,7 +162,8 @@ GCOMP_API gcomp_status_t gcomp_decoder_update(
  * @brief Finish decoding
  *
  * Finalizes the decompression stream and validates trailers (if applicable).
- * After calling this, the decoder should not be used for further updates.
+ * After calling this, the decoder should not be used for further updates
+ * unless reset is called.
  *
  * @param decoder The decoder
  * @param output Output buffer
@@ -153,6 +171,23 @@ GCOMP_API gcomp_status_t gcomp_decoder_update(
  */
 GCOMP_API gcomp_status_t gcomp_decoder_finish(
     gcomp_decoder_t * decoder, gcomp_buffer_t * output);
+
+/**
+ * @brief Reset decoder to initial state
+ *
+ * Resets the decoder to its initial state, allowing it to be reused for a
+ * new decompression stream without destroying and recreating it. This is more
+ * efficient than destroying and recreating the decoder when decompressing
+ * multiple independent streams with the same options.
+ *
+ * After reset, the decoder behaves as if it was just created with the same
+ * options. Any error state is cleared.
+ *
+ * @param decoder The decoder to reset
+ * @return GCOMP_OK on success, GCOMP_ERR_UNSUPPORTED if the method does not
+ *         support reset, or another error code on failure
+ */
+GCOMP_API gcomp_status_t gcomp_decoder_reset(gcomp_decoder_t * decoder);
 
 /**
  * @brief Get the last error status from an encoder

@@ -748,6 +748,197 @@ TEST_F(StreamTest, ErrorDetailNullDecoderReturnsEmpty) {
   EXPECT_STREQ(gcomp_decoder_get_error_detail(nullptr), "");
 }
 
+// Reset API tests
+
+TEST_F(StreamTest, EncoderResetNullPointer) {
+  EXPECT_EQ(gcomp_encoder_reset(nullptr), GCOMP_ERR_INVALID_ARG);
+}
+
+TEST_F(StreamTest, DecoderResetNullPointer) {
+  EXPECT_EQ(gcomp_decoder_reset(nullptr), GCOMP_ERR_INVALID_ARG);
+}
+
+TEST_F(StreamTest, EncoderResetUnsupportedMethod) {
+  // Mock method doesn't implement reset_fn
+  gcomp_encoder_t * encoder = nullptr;
+  ASSERT_EQ(gcomp_encoder_create(registry_, "test_method", nullptr, &encoder),
+      GCOMP_OK);
+  ASSERT_NE(encoder, nullptr);
+
+  // Reset should return UNSUPPORTED since mock method doesn't implement reset
+  EXPECT_EQ(gcomp_encoder_reset(encoder), GCOMP_ERR_UNSUPPORTED);
+
+  gcomp_encoder_destroy(encoder);
+}
+
+TEST_F(StreamTest, DeflateEncoderResetSuccess) {
+  // Create isolated registry
+  gcomp_registry_t * reg = nullptr;
+  ASSERT_EQ(gcomp_registry_create(nullptr, &reg), GCOMP_OK);
+  ASSERT_EQ(gcomp_method_deflate_register(reg), GCOMP_OK);
+
+  gcomp_encoder_t * encoder = nullptr;
+  ASSERT_EQ(gcomp_encoder_create(reg, "deflate", nullptr, &encoder), GCOMP_OK);
+  ASSERT_NE(encoder, nullptr);
+
+  // First compression
+  uint8_t input1[] = "Hello, World!";
+  uint8_t output1[64] = {};
+  gcomp_buffer_t in1 = {input1, sizeof(input1) - 1, 0};
+  gcomp_buffer_t out1 = {output1, sizeof(output1), 0};
+
+  ASSERT_EQ(gcomp_encoder_update(encoder, &in1, &out1), GCOMP_OK);
+
+  gcomp_buffer_t finish1 = {
+      output1 + out1.used, sizeof(output1) - out1.used, 0};
+  ASSERT_EQ(gcomp_encoder_finish(encoder, &finish1), GCOMP_OK);
+  size_t compressed_size1 = out1.used + finish1.used;
+  EXPECT_GT(compressed_size1, 0u);
+
+  // Reset encoder
+  ASSERT_EQ(gcomp_encoder_reset(encoder), GCOMP_OK);
+
+  // Second compression (should produce valid output again)
+  uint8_t input2[] = "Goodbye!";
+  uint8_t output2[64] = {};
+  gcomp_buffer_t in2 = {input2, sizeof(input2) - 1, 0};
+  gcomp_buffer_t out2 = {output2, sizeof(output2), 0};
+
+  ASSERT_EQ(gcomp_encoder_update(encoder, &in2, &out2), GCOMP_OK);
+
+  gcomp_buffer_t finish2 = {
+      output2 + out2.used, sizeof(output2) - out2.used, 0};
+  ASSERT_EQ(gcomp_encoder_finish(encoder, &finish2), GCOMP_OK);
+  size_t compressed_size2 = out2.used + finish2.used;
+  EXPECT_GT(compressed_size2, 0u);
+
+  // Verify second output is valid by decoding
+  gcomp_decoder_t * decoder = nullptr;
+  ASSERT_EQ(gcomp_decoder_create(reg, "deflate", nullptr, &decoder), GCOMP_OK);
+
+  uint8_t decompressed[64] = {};
+  gcomp_buffer_t dec_in = {output2, compressed_size2, 0};
+  gcomp_buffer_t dec_out = {decompressed, sizeof(decompressed), 0};
+
+  ASSERT_EQ(gcomp_decoder_update(decoder, &dec_in, &dec_out), GCOMP_OK);
+  ASSERT_EQ(gcomp_decoder_finish(decoder, &dec_out), GCOMP_OK);
+
+  EXPECT_EQ(dec_out.used, sizeof(input2) - 1);
+  EXPECT_EQ(memcmp(decompressed, input2, sizeof(input2) - 1), 0);
+
+  gcomp_decoder_destroy(decoder);
+  gcomp_encoder_destroy(encoder);
+  gcomp_registry_destroy(reg);
+}
+
+TEST_F(StreamTest, DeflateDecoderResetSuccess) {
+  // Create isolated registry
+  gcomp_registry_t * reg = nullptr;
+  ASSERT_EQ(gcomp_registry_create(nullptr, &reg), GCOMP_OK);
+  ASSERT_EQ(gcomp_method_deflate_register(reg), GCOMP_OK);
+
+  // Create encoder to produce compressed data
+  gcomp_encoder_t * encoder = nullptr;
+  ASSERT_EQ(gcomp_encoder_create(reg, "deflate", nullptr, &encoder), GCOMP_OK);
+
+  // Compress first message
+  uint8_t input1[] = "First message";
+  uint8_t compressed1[64] = {};
+  gcomp_buffer_t in1 = {input1, sizeof(input1) - 1, 0};
+  gcomp_buffer_t out1 = {compressed1, sizeof(compressed1), 0};
+  ASSERT_EQ(gcomp_encoder_update(encoder, &in1, &out1), GCOMP_OK);
+  gcomp_buffer_t finish1 = {
+      compressed1 + out1.used, sizeof(compressed1) - out1.used, 0};
+  ASSERT_EQ(gcomp_encoder_finish(encoder, &finish1), GCOMP_OK);
+  size_t compressed_size1 = out1.used + finish1.used;
+
+  // Reset and compress second message
+  ASSERT_EQ(gcomp_encoder_reset(encoder), GCOMP_OK);
+  uint8_t input2[] = "Second message";
+  uint8_t compressed2[64] = {};
+  gcomp_buffer_t in2 = {input2, sizeof(input2) - 1, 0};
+  gcomp_buffer_t out2 = {compressed2, sizeof(compressed2), 0};
+  ASSERT_EQ(gcomp_encoder_update(encoder, &in2, &out2), GCOMP_OK);
+  gcomp_buffer_t finish2 = {
+      compressed2 + out2.used, sizeof(compressed2) - out2.used, 0};
+  ASSERT_EQ(gcomp_encoder_finish(encoder, &finish2), GCOMP_OK);
+  size_t compressed_size2 = out2.used + finish2.used;
+
+  gcomp_encoder_destroy(encoder);
+
+  // Create decoder and decode first message
+  gcomp_decoder_t * decoder = nullptr;
+  ASSERT_EQ(gcomp_decoder_create(reg, "deflate", nullptr, &decoder), GCOMP_OK);
+
+  uint8_t decompressed1[64] = {};
+  gcomp_buffer_t dec_in1 = {compressed1, compressed_size1, 0};
+  gcomp_buffer_t dec_out1 = {decompressed1, sizeof(decompressed1), 0};
+  ASSERT_EQ(gcomp_decoder_update(decoder, &dec_in1, &dec_out1), GCOMP_OK);
+  ASSERT_EQ(gcomp_decoder_finish(decoder, &dec_out1), GCOMP_OK);
+  EXPECT_EQ(dec_out1.used, sizeof(input1) - 1);
+  EXPECT_EQ(memcmp(decompressed1, input1, sizeof(input1) - 1), 0);
+
+  // Reset decoder and decode second message
+  ASSERT_EQ(gcomp_decoder_reset(decoder), GCOMP_OK);
+
+  uint8_t decompressed2[64] = {};
+  gcomp_buffer_t dec_in2 = {compressed2, compressed_size2, 0};
+  gcomp_buffer_t dec_out2 = {decompressed2, sizeof(decompressed2), 0};
+  ASSERT_EQ(gcomp_decoder_update(decoder, &dec_in2, &dec_out2), GCOMP_OK);
+  ASSERT_EQ(gcomp_decoder_finish(decoder, &dec_out2), GCOMP_OK);
+  EXPECT_EQ(dec_out2.used, sizeof(input2) - 1);
+  EXPECT_EQ(memcmp(decompressed2, input2, sizeof(input2) - 1), 0);
+
+  gcomp_decoder_destroy(decoder);
+  gcomp_registry_destroy(reg);
+}
+
+TEST_F(StreamTest, EncoderResetClearsError) {
+  // Create isolated registry
+  gcomp_registry_t * reg = nullptr;
+  ASSERT_EQ(gcomp_registry_create(nullptr, &reg), GCOMP_OK);
+  ASSERT_EQ(gcomp_method_deflate_register(reg), GCOMP_OK);
+
+  gcomp_encoder_t * encoder = nullptr;
+  ASSERT_EQ(gcomp_encoder_create(reg, "deflate", nullptr, &encoder), GCOMP_OK);
+
+  // Set an error manually
+  gcomp_encoder_set_error(encoder, GCOMP_ERR_CORRUPT, "test error");
+  EXPECT_EQ(gcomp_encoder_get_error(encoder), GCOMP_ERR_CORRUPT);
+  EXPECT_STRNE(gcomp_encoder_get_error_detail(encoder), "");
+
+  // Reset should clear the error
+  ASSERT_EQ(gcomp_encoder_reset(encoder), GCOMP_OK);
+  EXPECT_EQ(gcomp_encoder_get_error(encoder), GCOMP_OK);
+  EXPECT_STREQ(gcomp_encoder_get_error_detail(encoder), "");
+
+  gcomp_encoder_destroy(encoder);
+  gcomp_registry_destroy(reg);
+}
+
+TEST_F(StreamTest, DecoderResetClearsError) {
+  // Create isolated registry
+  gcomp_registry_t * reg = nullptr;
+  ASSERT_EQ(gcomp_registry_create(nullptr, &reg), GCOMP_OK);
+  ASSERT_EQ(gcomp_method_deflate_register(reg), GCOMP_OK);
+
+  gcomp_decoder_t * decoder = nullptr;
+  ASSERT_EQ(gcomp_decoder_create(reg, "deflate", nullptr, &decoder), GCOMP_OK);
+
+  // Set an error manually
+  gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT, "test error");
+  EXPECT_EQ(gcomp_decoder_get_error(decoder), GCOMP_ERR_CORRUPT);
+  EXPECT_STRNE(gcomp_decoder_get_error_detail(decoder), "");
+
+  // Reset should clear the error
+  ASSERT_EQ(gcomp_decoder_reset(decoder), GCOMP_OK);
+  EXPECT_EQ(gcomp_decoder_get_error(decoder), GCOMP_OK);
+  EXPECT_STREQ(gcomp_decoder_get_error_detail(decoder), "");
+
+  gcomp_decoder_destroy(decoder);
+  gcomp_registry_destroy(reg);
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

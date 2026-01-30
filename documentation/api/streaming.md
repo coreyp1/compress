@@ -56,6 +56,23 @@ status = gcomp_encoder_finish(encoder, &final_output);
 // Writes final block, flushes to byte boundary
 ```
 
+### Reset (Optional)
+
+For compressing multiple independent streams with the same options, reuse the encoder instead of destroying and recreating:
+
+```c
+// First compression...
+gcomp_encoder_finish(encoder, &output);
+
+// Reset for next stream (more efficient than destroy/create)
+status = gcomp_encoder_reset(encoder);
+if (status == GCOMP_ERR_UNSUPPORTED) {
+    // Method doesn't support reset - must destroy and recreate
+}
+
+// Second compression with same options...
+```
+
 ### Cleanup
 
 ```c
@@ -80,6 +97,10 @@ while (/* more data */) {
 }
 
 status = gcomp_decoder_finish(decoder, &output);
+
+// Optional: reset for another stream
+status = gcomp_decoder_reset(decoder);
+
 gcomp_decoder_destroy(decoder);
 ```
 
@@ -270,4 +291,5 @@ if (status == GCOMP_ERR_LIMIT) {
 2. **Use error details for debugging** - Call `gcomp_*_get_error_detail()` after failures
 3. **Pre-allocate output buffers** - For encoding, output is typically slightly larger than input; for decoding, you need to know or estimate the decompressed size
 4. **Set limits for untrusted input** - Use `limits.max_output_bytes` to prevent decompression bombs
-5. **Destroy after use** - Always call `gcomp_*_destroy()` to free resources
+5. **Reuse encoders/decoders** - Call `gcomp_*_reset()` between streams instead of destroy/create for better performance
+6. **Destroy after use** - Always call `gcomp_*_destroy()` to free resources

@@ -37,6 +37,14 @@ gcomp_status_t gcomp_deflate_decoder_init(gcomp_registry_t * registry,
 void gcomp_deflate_decoder_destroy(gcomp_decoder_t * decoder);
 
 /**
+ * @brief Reset deflate decoder to initial state.
+ *
+ * Resets all internal state so the decoder can be reused for a new stream.
+ * Allocated buffers (window, Huffman tables) are retained but cleared.
+ */
+gcomp_status_t gcomp_deflate_decoder_reset(gcomp_decoder_t * decoder);
+
+/**
  * @brief Deflate decoder update implementation.
  */
 gcomp_status_t gcomp_deflate_decoder_update(
@@ -61,6 +69,14 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
  * @brief Destroy and detach deflate encoder state.
  */
 void gcomp_deflate_encoder_destroy(gcomp_encoder_t * encoder);
+
+/**
+ * @brief Reset deflate encoder to initial state.
+ *
+ * Resets all internal state so the encoder can be reused for a new stream.
+ * Allocated buffers are retained (not freed and reallocated).
+ */
+gcomp_status_t gcomp_deflate_encoder_reset(gcomp_encoder_t * encoder);
 
 /**
  * @brief Deflate encoder update implementation.

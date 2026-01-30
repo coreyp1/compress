@@ -181,6 +181,40 @@ gcomp_status_t gcomp_decoder_finish(
   return decoder->finish_fn(decoder, output);
 }
 
+gcomp_status_t gcomp_encoder_reset(gcomp_encoder_t * encoder) {
+  if (!encoder) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  // Clear error state
+  encoder->last_error = GCOMP_OK;
+  encoder->error_detail[0] = '\0';
+
+  // If method doesn't support reset, return unsupported
+  if (!encoder->reset_fn) {
+    return GCOMP_ERR_UNSUPPORTED;
+  }
+
+  return encoder->reset_fn(encoder);
+}
+
+gcomp_status_t gcomp_decoder_reset(gcomp_decoder_t * decoder) {
+  if (!decoder) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  // Clear error state
+  decoder->last_error = GCOMP_OK;
+  decoder->error_detail[0] = '\0';
+
+  // If method doesn't support reset, return unsupported
+  if (!decoder->reset_fn) {
+    return GCOMP_ERR_UNSUPPORTED;
+  }
+
+  return decoder->reset_fn(decoder);
+}
+
 void gcomp_encoder_destroy(gcomp_encoder_t * encoder) {
   if (!encoder) {
     return;

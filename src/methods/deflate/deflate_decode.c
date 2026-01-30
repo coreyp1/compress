@@ -959,6 +959,7 @@ gcomp_status_t gcomp_deflate_decoder_init(gcomp_registry_t * registry,
   decoder->method_state = st;
   decoder->update_fn = gcomp_deflate_decoder_update;
   decoder->finish_fn = gcomp_deflate_decoder_finish;
+  decoder->reset_fn = gcomp_deflate_decoder_reset;
   return GCOMP_OK;
 }
 
@@ -1002,6 +1003,76 @@ void gcomp_deflate_decoder_destroy(gcomp_decoder_t * decoder) {
       &st->mem_tracker, sizeof(gcomp_deflate_decoder_state_t));
   gcomp_free(alloc, st);
   decoder->method_state = NULL;
+}
+
+gcomp_status_t gcomp_deflate_decoder_reset(gcomp_decoder_t * decoder) {
+  if (!decoder) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  gcomp_deflate_decoder_state_t * st =
+      (gcomp_deflate_decoder_state_t *)decoder->method_state;
+  if (!st) {
+    return GCOMP_ERR_INTERNAL;
+  }
+
+  // Reset bit buffer state
+  st->bit_buffer = 0;
+  st->bit_count = 0;
+
+  // Reset state machine
+  st->stage = DEFLATE_STAGE_BLOCK_HEADER;
+  st->last_block = 0;
+  st->block_type = 0;
+  st->stored_remaining = 0;
+
+  // Reset window state (keep buffer allocated)
+  st->window_pos = 0;
+  st->window_filled = 0;
+  st->total_output_bytes = 0;
+
+  // Reset pending match/literal state
+  st->match_remaining = 0;
+  st->match_distance = 0;
+  st->pending_literal_valid = 0;
+  st->pending_literal_value = 0;
+  st->pending_length_valid = 0;
+  st->pending_length_value = 0;
+  st->pending_dist_valid = 0;
+  st->pending_dist_sym = 0;
+
+  // Clean up dynamic Huffman tables (keep fixed tables - they can be reused)
+  if (st->dyn_ready) {
+    track_huffman_table_free(st, &st->dyn_litlen);
+    track_huffman_table_free(st, &st->dyn_dist);
+    gcomp_deflate_huffman_decode_table_cleanup(&st->dyn_litlen);
+    gcomp_deflate_huffman_decode_table_cleanup(&st->dyn_dist);
+    memset(&st->dyn_litlen, 0, sizeof(st->dyn_litlen));
+    memset(&st->dyn_dist, 0, sizeof(st->dyn_dist));
+    st->dyn_ready = 0;
+  }
+
+  if (st->dyn_clen_ready) {
+    track_huffman_table_free(st, &st->dyn_clen_table);
+    gcomp_deflate_huffman_decode_table_cleanup(&st->dyn_clen_table);
+    memset(&st->dyn_clen_table, 0, sizeof(st->dyn_clen_table));
+    st->dyn_clen_ready = 0;
+  }
+
+  // Reset dynamic Huffman build scratch
+  st->dyn_hlit = 0;
+  st->dyn_hdist = 0;
+  st->dyn_hclen = 0;
+  st->dyn_clen_index = 0;
+  st->dyn_lengths_index = 0;
+  st->dyn_lengths_total = 0;
+  st->dyn_prev_len = 0;
+
+  // Clear current table pointers
+  st->cur_litlen = NULL;
+  st->cur_dist = NULL;
+
+  return GCOMP_OK;
 }
 
 static gcomp_status_t deflate_process_block_header(

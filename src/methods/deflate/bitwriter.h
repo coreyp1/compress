@@ -99,6 +99,25 @@ GCOMP_INTERNAL_API size_t gcomp_deflate_bitwriter_bytes_written(
 GCOMP_INTERNAL_API gcomp_status_t gcomp_deflate_bitwriter_set_buffer(
     gcomp_deflate_bitwriter_t * writer, uint8_t * data, size_t size);
 
+/**
+ * @brief Reset the bit writer to its initial state.
+ *
+ * Clears the bit buffer and resets byte_pos to 0. The output buffer pointer
+ * and size are also cleared - caller must call set_buffer before writing.
+ *
+ * @param writer Bit writer (must not be NULL).
+ */
+static inline void gcomp_deflate_bitwriter_reset(
+    gcomp_deflate_bitwriter_t * writer) {
+  if (writer) {
+    writer->data = NULL;
+    writer->size = 0;
+    writer->byte_pos = 0;
+    writer->bit_buffer = 0;
+    writer->bit_count = 0;
+  }
+}
+
 #ifdef __cplusplus
 }
 #endif

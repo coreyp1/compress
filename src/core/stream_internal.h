@@ -74,6 +74,14 @@ typedef gcomp_status_t (*gcomp_encoder_finish_fn_t)(
     gcomp_encoder_t * encoder, gcomp_buffer_t * output);
 
 /**
+ * @brief Encoder reset function type
+ *
+ * Resets the encoder to its initial state, allowing it to be reused for a new
+ * compression stream without destroying and recreating it.
+ */
+typedef gcomp_status_t (*gcomp_encoder_reset_fn_t)(gcomp_encoder_t * encoder);
+
+/**
  * @brief Decoder update function type
  */
 typedef gcomp_status_t (*gcomp_decoder_update_fn_t)(
@@ -84,6 +92,14 @@ typedef gcomp_status_t (*gcomp_decoder_update_fn_t)(
  */
 typedef gcomp_status_t (*gcomp_decoder_finish_fn_t)(
     gcomp_decoder_t * decoder, gcomp_buffer_t * output);
+
+/**
+ * @brief Decoder reset function type
+ *
+ * Resets the decoder to its initial state, allowing it to be reused for a new
+ * decompression stream without destroying and recreating it.
+ */
+typedef gcomp_status_t (*gcomp_decoder_reset_fn_t)(gcomp_decoder_t * decoder);
 
 /**
  * @brief Maximum length for error detail strings
@@ -119,7 +135,9 @@ struct gcomp_encoder_s {
   void * method_state;                 ///< Method-specific encoder state
   gcomp_encoder_update_fn_t update_fn; ///< Method's update implementation
   gcomp_encoder_finish_fn_t finish_fn; ///< Method's finish implementation
-  gcomp_status_t last_error;           ///< Last error status (GCOMP_OK if none)
+  gcomp_encoder_reset_fn_t
+      reset_fn;              ///< Method's reset implementation (optional)
+  gcomp_status_t last_error; ///< Last error status (GCOMP_OK if none)
   char error_detail[GCOMP_ERROR_DETAIL_MAX]; ///< Human-readable error context
 };
 
@@ -149,7 +167,9 @@ struct gcomp_decoder_s {
   void * method_state;                 ///< Method-specific decoder state
   gcomp_decoder_update_fn_t update_fn; ///< Method's update implementation
   gcomp_decoder_finish_fn_t finish_fn; ///< Method's finish implementation
-  gcomp_status_t last_error;           ///< Last error status (GCOMP_OK if none)
+  gcomp_decoder_reset_fn_t
+      reset_fn;              ///< Method's reset implementation (optional)
+  gcomp_status_t last_error; ///< Last error status (GCOMP_OK if none)
   char error_detail[GCOMP_ERROR_DETAIL_MAX]; ///< Human-readable error context
 };
 

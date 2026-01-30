@@ -164,6 +164,16 @@ typedef struct gcomp_deflate_encoder_state_s {
   gcomp_deflate_strategy_t strategy;
 
   //
+  // Limits
+  //
+  uint64_t max_memory_bytes;
+
+  //
+  // Memory tracking
+  //
+  gcomp_memory_tracker_t mem_tracker;
+
+  //
   // State machine
   //
   gcomp_deflate_encoder_stage_t stage;
@@ -1471,12 +1481,22 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
 
   const gcomp_allocator_t * alloc = gcomp_registry_get_allocator(registry);
 
+  // Read max memory limit early so we can check it during allocation
+  uint64_t max_mem =
+      gcomp_limits_read_memory_max(options, GCOMP_DEFAULT_MAX_MEMORY_BYTES);
+
   gcomp_deflate_encoder_state_t * st =
       (gcomp_deflate_encoder_state_t *)gcomp_calloc(
           alloc, 1, sizeof(gcomp_deflate_encoder_state_t));
   if (!st) {
     return GCOMP_ERR_MEMORY;
   }
+
+  // Initialize memory tracker and track state struct allocation
+  st->mem_tracker.current_bytes = 0;
+  gcomp_memory_track_alloc(
+      &st->mem_tracker, sizeof(gcomp_deflate_encoder_state_t));
+  st->max_memory_bytes = max_mem;
 
   // Read compression level
   st->level = 6; // Default
@@ -1537,11 +1557,17 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
     gcomp_free(alloc, st);
     return GCOMP_ERR_MEMORY;
   }
+  gcomp_memory_track_alloc(&st->mem_tracker, st->window_size);
+
   st->window_pos = 0;
   st->window_fill = 0;
   st->lookahead = 0;
 
   // Allocate hash tables for LZ77
+  size_t hash_head_size = DEFLATE_HASH_SIZE * sizeof(uint16_t);
+  size_t hash_prev_size = st->window_size * sizeof(uint16_t);
+  size_t hash_pos_size = st->window_size * sizeof(size_t);
+
   st->hash_head =
       (uint16_t *)gcomp_calloc(alloc, DEFLATE_HASH_SIZE, sizeof(uint16_t));
   st->hash_prev =
@@ -1555,6 +1581,10 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
     gcomp_free(alloc, st);
     return GCOMP_ERR_MEMORY;
   }
+  gcomp_memory_track_alloc(&st->mem_tracker, hash_head_size);
+  gcomp_memory_track_alloc(&st->mem_tracker, hash_prev_size);
+  gcomp_memory_track_alloc(&st->mem_tracker, hash_pos_size);
+
   st->total_in = 0;
 
   // For level 0, allocate block buffer
@@ -1569,6 +1599,7 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
       gcomp_free(alloc, st);
       return GCOMP_ERR_MEMORY;
     }
+    gcomp_memory_track_alloc(&st->mem_tracker, st->block_buffer_size);
     st->block_buffer_used = 0;
   }
 
@@ -1576,10 +1607,10 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
   if (st->level > 0) {
     // Allocate enough for a full window worth of literals
     st->sym_buf_size = st->window_size;
-    st->lit_buf =
-        (uint16_t *)gcomp_malloc(alloc, st->sym_buf_size * sizeof(uint16_t));
-    st->dist_buf =
-        (uint16_t *)gcomp_malloc(alloc, st->sym_buf_size * sizeof(uint16_t));
+    size_t sym_buf_bytes = st->sym_buf_size * sizeof(uint16_t);
+
+    st->lit_buf = (uint16_t *)gcomp_malloc(alloc, sym_buf_bytes);
+    st->dist_buf = (uint16_t *)gcomp_malloc(alloc, sym_buf_bytes);
     if (!st->lit_buf || !st->dist_buf) {
       gcomp_free(alloc, st->dist_buf);
       gcomp_free(alloc, st->lit_buf);
@@ -1590,10 +1621,15 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
       gcomp_free(alloc, st);
       return GCOMP_ERR_MEMORY;
     }
+    gcomp_memory_track_alloc(&st->mem_tracker, sym_buf_bytes); // lit_buf
+    gcomp_memory_track_alloc(&st->mem_tracker, sym_buf_bytes); // dist_buf
     st->sym_buf_used = 0;
 
     // For levels > 3, allocate frequency histograms for dynamic Huffman
     if (st->level > 3) {
+      size_t lit_freq_size = DEFLATE_MAX_LITLEN_SYMBOLS * sizeof(uint32_t);
+      size_t dist_freq_size = DEFLATE_MAX_DIST_SYMBOLS * sizeof(uint32_t);
+
       st->lit_freq = (uint32_t *)gcomp_calloc(
           alloc, DEFLATE_MAX_LITLEN_SYMBOLS, sizeof(uint32_t));
       st->dist_freq = (uint32_t *)gcomp_calloc(
@@ -1610,6 +1646,8 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
         gcomp_free(alloc, st);
         return GCOMP_ERR_MEMORY;
       }
+      gcomp_memory_track_alloc(&st->mem_tracker, lit_freq_size);
+      gcomp_memory_track_alloc(&st->mem_tracker, dist_freq_size);
     }
 
     // Build fixed Huffman codes
@@ -1628,11 +1666,29 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
     }
   }
 
+  // Check memory limit after all allocations
+  gcomp_status_t mem_check =
+      gcomp_memory_check_limit(&st->mem_tracker, st->max_memory_bytes);
+  if (mem_check != GCOMP_OK) {
+    gcomp_free(alloc, st->dist_freq);
+    gcomp_free(alloc, st->lit_freq);
+    gcomp_free(alloc, st->dist_buf);
+    gcomp_free(alloc, st->lit_buf);
+    gcomp_free(alloc, st->block_buffer);
+    gcomp_free(alloc, st->hash_pos);
+    gcomp_free(alloc, st->hash_prev);
+    gcomp_free(alloc, st->hash_head);
+    gcomp_free(alloc, st->window);
+    gcomp_free(alloc, st);
+    return mem_check;
+  }
+
   st->stage = DEFLATE_ENC_STAGE_ACCEPTING;
 
   encoder->method_state = st;
   encoder->update_fn = gcomp_deflate_encoder_update;
   encoder->finish_fn = gcomp_deflate_encoder_finish;
+  encoder->reset_fn = gcomp_deflate_encoder_reset;
   return GCOMP_OK;
 }
 
@@ -1661,6 +1717,60 @@ void gcomp_deflate_encoder_destroy(gcomp_encoder_t * encoder) {
   gcomp_free(alloc, st->window);
   gcomp_free(alloc, st);
   encoder->method_state = NULL;
+}
+
+gcomp_status_t gcomp_deflate_encoder_reset(gcomp_encoder_t * encoder) {
+  if (!encoder) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  gcomp_deflate_encoder_state_t * st =
+      (gcomp_deflate_encoder_state_t *)encoder->method_state;
+  if (!st) {
+    return GCOMP_ERR_INTERNAL;
+  }
+
+  // Reset state machine
+  st->stage = DEFLATE_ENC_STAGE_ACCEPTING;
+  st->final_block_written = 0;
+
+  // Reset sliding window state (keep buffer allocated)
+  st->window_pos = 0;
+  st->window_fill = 0;
+  st->lookahead = 0;
+  st->total_in = 0;
+
+  // Reset hash tables (clear to zeros)
+  memset(st->hash_head, 0, DEFLATE_HASH_SIZE * sizeof(uint16_t));
+  memset(st->hash_prev, 0, st->window_size * sizeof(uint16_t));
+  memset(st->hash_pos, 0, st->window_size * sizeof(size_t));
+  st->hash_value = 0;
+
+  // Reset bitwriter state
+  gcomp_deflate_bitwriter_reset(&st->bitwriter);
+
+  // Reset block buffer (level 0)
+  if (st->block_buffer) {
+    st->block_buffer_used = 0;
+  }
+
+  // Reset symbol buffers (levels > 0)
+  if (st->lit_buf) {
+    st->sym_buf_used = 0;
+  }
+
+  // Reset frequency histograms (levels > 3)
+  if (st->lit_freq) {
+    memset(st->lit_freq, 0, DEFLATE_MAX_LITLEN_SYMBOLS * sizeof(uint32_t));
+  }
+  if (st->dist_freq) {
+    memset(st->dist_freq, 0, DEFLATE_MAX_DIST_SYMBOLS * sizeof(uint32_t));
+  }
+
+  // Note: We don't reset fixed_ready because the fixed Huffman tables don't
+  // need to be rebuilt - they're static and can be reused.
+
+  return GCOMP_OK;
 }
 
 gcomp_status_t gcomp_deflate_encoder_update(gcomp_encoder_t * encoder,
