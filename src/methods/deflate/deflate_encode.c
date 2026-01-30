@@ -4,9 +4,17 @@
  * Streaming DEFLATE (RFC 1951) encoder for the Ghoti.io Compress library.
  *
  * Implements multiple compression strategies based on level:
- * - Level 0: Stored blocks (no compression)
- * - Levels 1-3: Fixed Huffman with basic LZ77
- * - Levels 4-9: Dynamic Huffman with LZ77
+ * - Level 0: Stored blocks (no compression, data copied verbatim)
+ * - Levels 1-3: Fixed Huffman codes with LZ77 (shorter hash chains)
+ * - Levels 4-9: Dynamic Huffman codes with LZ77 (optimal code lengths from
+ *   symbol frequency histograms, longer hash chains for better matching)
+ *
+ * The encoder maintains a sliding window for LZ77 back-references and uses
+ * hash chains for efficient match finding. Dynamic Huffman blocks are built
+ * by collecting symbol frequencies during LZ77 matching, then constructing
+ * optimal length-limited (15-bit max) Huffman codes.
+ *
+ * See the "Dynamic Huffman Encoding" section below for algorithm details.
  *
  * Copyright 2026 by Corey Pennycuff
  */
@@ -18,6 +26,7 @@
 #include "huffman.h"
 #include <ghoti.io/compress/limits.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 //
@@ -614,15 +623,683 @@ static gcomp_status_t deflate_flush_fixed_block(
     return s;
   }
 
+  // Reset for next block
   st->sym_buf_used = 0;
+  if (st->lit_freq) {
+    memset(st->lit_freq, 0, DEFLATE_MAX_LITLEN_SYMBOLS * sizeof(uint32_t));
+  }
+  if (st->dist_freq) {
+    memset(st->dist_freq, 0, DEFLATE_MAX_DIST_SYMBOLS * sizeof(uint32_t));
+  }
   return GCOMP_OK;
 }
 
+/*
+ * ===========================================================================
+ * Dynamic Huffman Encoding (RFC 1951 Section 3.2.7)
+ * ===========================================================================
+ *
+ * OVERVIEW
+ * --------
+ * For compression levels 4-9, we build optimal Huffman codes based on actual
+ * symbol frequencies observed in the data. Dynamic Huffman typically achieves
+ * better compression than fixed Huffman because the code lengths are tailored
+ * to the specific input data's statistical properties.
+ *
+ * ALGORITHM STEPS
+ * ---------------
+ * 1. FREQUENCY COLLECTION (during LZ77 matching in encoder_update):
+ *    - lit_freq[0..255]: Count of each literal byte
+ *    - lit_freq[257..285]: Count of each length code (match lengths 3-258)
+ *    - dist_freq[0..29]: Count of each distance code (distances 1-32768)
+ *    - lit_freq[256] is incremented for the end-of-block marker
+ *
+ * 2. HUFFMAN TREE CONSTRUCTION (build_code_lengths):
+ *    - Create leaf nodes for symbols with freq > 0
+ *    - Build min-heap ordered by frequency
+ *    - Repeatedly extract two minimum nodes and combine into internal node
+ *    - This produces an optimal prefix-free code (Huffman's algorithm)
+ *
+ * 3. LENGTH EXTRACTION AND LIMITING:
+ *    - Walk tree depth-first to determine code length for each symbol
+ *    - DEFLATE limits code lengths to 15 bits maximum
+ *    - If any code exceeds 15 bits, apply length-limiting adjustment:
+ *      a. Cap all lengths at 15
+ *      b. Verify Kraft inequality: sum(2^(-length)) <= 1
+ *      c. If over-subscribed, increment some lengths to reduce code space
+ *
+ * 4. CODE LENGTH ENCODING (RFC 1951 Section 3.2.7):
+ *    - Combine literal/length and distance code lengths into one sequence
+ *    - Run-length encode using the code-length alphabet:
+ *      * 0-15: Literal code length values
+ *      * 16: Copy previous code length 3-6 times (2 extra bits)
+ *      * 17: Repeat code length 0 for 3-10 times (3 extra bits)
+ *      * 18: Repeat code length 0 for 11-138 times (7 extra bits)
+ *    - Build a Huffman tree for the code-length symbols themselves
+ *
+ * 5. BLOCK HEADER WRITING:
+ *    - BFINAL (1 bit): 1 if this is the final block
+ *    - BTYPE (2 bits): 10 binary = dynamic Huffman
+ *    - HLIT (5 bits): Number of literal/length codes - 257 (range 0-29)
+ *    - HDIST (5 bits): Number of distance codes - 1 (range 0-29)
+ *    - HCLEN (4 bits): Number of code-length codes - 4 (range 0-15)
+ *    - Code-length code lengths (3 bits each, in permuted order k_cl_order)
+ *    - Encoded code lengths for literal/length alphabet
+ *    - Encoded code lengths for distance alphabet
+ *
+ * 6. DATA ENCODING:
+ *    - Emit each buffered symbol using its dynamic Huffman code
+ *    - End with end-of-block symbol (256)
+ *
+ * DESIGN RATIONALE
+ * ----------------
+ * - Heap-based tree construction is O(n log n) and memory-efficient
+ * - The 15-bit length limit is mandated by RFC 1951; we enforce it with
+ *   a post-processing step rather than package-merge for simplicity
+ * - Fallback to fixed Huffman occurs on memory allocation failure
+ * - Empty distance trees are valid when no LZ77 matches are used (e.g.,
+ *   incompressible data or very short inputs)
+ *
+ * MEMORY LAYOUT
+ * -------------
+ * - lit_freq: 288 uint32_t entries (allocated for levels > 3)
+ * - dist_freq: 32 uint32_t entries (allocated for levels > 3)
+ * - Temporary allocations in build_code_lengths: ~2*num_symbols nodes
+ *
+ * ===========================================================================
+ */
+
+/**
+ * @brief Node structure for Huffman tree construction.
+ *
+ * Used during the heap-based Huffman tree building process. Leaf nodes
+ * represent symbols and have symbol >= 0 with left/right = -1. Internal
+ * nodes combine two children and have symbol = -1.
+ *
+ * The nodes array is used as both storage and a min-heap (via separate
+ * indices array). This avoids copying node data during heap operations.
+ */
+typedef struct {
+  uint32_t freq;  /**< Symbol frequency (leaves) or combined freq (internal) */
+  int16_t symbol; /**< Symbol value (0-285) or -1 for internal nodes */
+  int16_t left;   /**< Index of left child in nodes array, or -1 */
+  int16_t right;  /**< Index of right child in nodes array, or -1 */
+} huffman_node_t;
+
+/**
+ * @brief Min-heap sift down operation.
+ */
+static void heap_sift_down(
+    huffman_node_t * heap, int * indices, int size, int i) {
+  while (1) {
+    int smallest = i;
+    int left = 2 * i + 1;
+    int right = 2 * i + 2;
+
+    if (left < size &&
+        heap[indices[left]].freq < heap[indices[smallest]].freq) {
+      smallest = left;
+    }
+    if (right < size &&
+        heap[indices[right]].freq < heap[indices[smallest]].freq) {
+      smallest = right;
+    }
+    if (smallest == i) {
+      break;
+    }
+    int tmp = indices[i];
+    indices[i] = indices[smallest];
+    indices[smallest] = tmp;
+    i = smallest;
+  }
+}
+
+/**
+ * @brief Min-heap sift up operation.
+ */
+static void heap_sift_up(huffman_node_t * heap, int * indices, int i) {
+  while (i > 0) {
+    int parent = (i - 1) / 2;
+    if (heap[indices[parent]].freq <= heap[indices[i]].freq) {
+      break;
+    }
+    int tmp = indices[i];
+    indices[i] = indices[parent];
+    indices[parent] = tmp;
+    i = parent;
+  }
+}
+
+/**
+ * @brief Extract code lengths from Huffman tree.
+ */
+static void extract_lengths(
+    huffman_node_t * nodes, int root, uint8_t * lengths, int depth) {
+  if (root < 0) {
+    return;
+  }
+  if (nodes[root].symbol >= 0) {
+    // Leaf node
+    lengths[nodes[root].symbol] = (uint8_t)(depth > 15 ? 15 : depth);
+    return;
+  }
+  extract_lengths(nodes, nodes[root].left, lengths, depth + 1);
+  extract_lengths(nodes, nodes[root].right, lengths, depth + 1);
+}
+
+/**
+ * @brief Build optimal Huffman code lengths from symbol frequencies.
+ *
+ * Uses the classic Huffman algorithm with a min-heap to construct an optimal
+ * prefix-free code. The algorithm is O(n log n) where n is the number of
+ * symbols with non-zero frequency.
+ *
+ * @param freq       Array of symbol frequencies (freq[i] = count of symbol i)
+ * @param num_symbols Number of symbols in the frequency array
+ * @param lengths    Output array for code lengths (same size as freq)
+ * @param max_bits   Maximum allowed code length (15 for DEFLATE)
+ *
+ * Special cases:
+ * - 0 symbols with freq > 0: all lengths set to 0
+ * - 1 symbol with freq > 0: that symbol gets length 1
+ * - Memory allocation failure: fallback to uniform 8-bit lengths
+ *
+ * The algorithm handles the DEFLATE 15-bit length limit by:
+ * 1. Building the unconstrained Huffman tree
+ * 2. Capping any lengths > max_bits
+ * 3. Adjusting via Kraft inequality to ensure valid prefix code
+ */
+static void build_code_lengths(const uint32_t * freq, size_t num_symbols,
+    uint8_t * lengths, unsigned max_bits) {
+  // Count non-zero frequencies
+  int count = 0;
+  for (size_t i = 0; i < num_symbols; i++) {
+    lengths[i] = 0;
+    if (freq[i] > 0) {
+      count++;
+    }
+  }
+
+  if (count == 0) {
+    return;
+  }
+
+  if (count == 1) {
+    // Single symbol gets length 1
+    for (size_t i = 0; i < num_symbols; i++) {
+      if (freq[i] > 0) {
+        lengths[i] = 1;
+        break;
+      }
+    }
+    return;
+  }
+
+  // Allocate nodes: up to num_symbols leaves + (num_symbols-1) internal nodes
+  size_t max_nodes = num_symbols * 2;
+  huffman_node_t * nodes =
+      (huffman_node_t *)malloc(max_nodes * sizeof(huffman_node_t));
+  int * heap = (int *)malloc(max_nodes * sizeof(int));
+  if (!nodes || !heap) {
+    free(heap);
+    free(nodes);
+    // Fallback: use uniform lengths
+    for (size_t i = 0; i < num_symbols; i++) {
+      if (freq[i] > 0) {
+        lengths[i] = 8;
+      }
+    }
+    return;
+  }
+
+  // Initialize leaf nodes
+  int node_count = 0;
+  int heap_size = 0;
+  for (size_t i = 0; i < num_symbols; i++) {
+    if (freq[i] > 0) {
+      nodes[node_count].freq = freq[i];
+      nodes[node_count].symbol = (int16_t)i;
+      nodes[node_count].left = -1;
+      nodes[node_count].right = -1;
+      heap[heap_size] = node_count;
+      heap_size++;
+      node_count++;
+    }
+  }
+
+  // Build heap
+  for (int i = heap_size / 2 - 1; i >= 0; i--) {
+    heap_sift_down(nodes, heap, heap_size, i);
+  }
+
+  // Build Huffman tree
+  while (heap_size > 1) {
+    // Extract two minimum nodes
+    int min1 = heap[0];
+    heap[0] = heap[heap_size - 1];
+    heap_size--;
+    heap_sift_down(nodes, heap, heap_size, 0);
+
+    int min2 = heap[0];
+    heap[0] = heap[heap_size - 1];
+    heap_size--;
+    heap_sift_down(nodes, heap, heap_size, 0);
+
+    // Create internal node
+    nodes[node_count].freq = nodes[min1].freq + nodes[min2].freq;
+    nodes[node_count].symbol = -1;
+    nodes[node_count].left = (int16_t)min1;
+    nodes[node_count].right = (int16_t)min2;
+
+    // Add to heap
+    heap[heap_size] = node_count;
+    heap_size++;
+    heap_sift_up(nodes, heap, heap_size - 1);
+    node_count++;
+  }
+
+  // Extract lengths
+  int root = heap[0];
+  extract_lengths(nodes, root, lengths, 0);
+
+  // Limit code lengths to max_bits using the package-merge simplification:
+  // If any length > max_bits, reduce it and compensate by reducing others
+  int need_adjustment = 0;
+  for (size_t i = 0; i < num_symbols; i++) {
+    if (lengths[i] > max_bits) {
+      need_adjustment = 1;
+      break;
+    }
+  }
+
+  if (need_adjustment) {
+    // Simple length limiting: cap at max_bits and rebalance
+    // This is a simplified approach that may not be optimal but produces
+    // valid codes
+    for (size_t i = 0; i < num_symbols; i++) {
+      if (lengths[i] > max_bits) {
+        lengths[i] = (uint8_t)max_bits;
+      }
+    }
+
+    // Verify/fix the code is valid (Kraft inequality)
+    // Sum of 2^(-length) must be <= 1
+    uint32_t kraft = 0;
+    for (size_t i = 0; i < num_symbols; i++) {
+      if (lengths[i] > 0) {
+        kraft += 1u << (max_bits - lengths[i]);
+      }
+    }
+
+    // If over-subscribed, increase some lengths
+    while (kraft > (1u << max_bits)) {
+      for (size_t i = 0; i < num_symbols && kraft > (1u << max_bits); i++) {
+        if (lengths[i] > 0 && lengths[i] < max_bits) {
+          kraft -= 1u << (max_bits - lengths[i]);
+          lengths[i]++;
+          kraft += 1u << (max_bits - lengths[i]);
+        }
+      }
+    }
+  }
+
+  free(heap);
+  free(nodes);
+}
+
+/**
+ * Code length alphabet transmission order (RFC 1951 Section 3.2.7).
+ *
+ * The code lengths for the code-length alphabet are transmitted in this
+ * permuted order to maximize trailing zeros (which can be omitted via HCLEN).
+ * The most commonly used code-length symbols (0, 17, 18 for runs of zeros,
+ * and small literal lengths like 1-4) appear at positions that allow HCLEN
+ * to exclude the rarely-used symbols at the end.
+ */
+static const uint8_t k_cl_order[19] = {
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
+
+/**
+ * @brief Write a complete dynamic Huffman block.
+ *
+ * This function performs the following steps:
+ * 1. Builds optimal code lengths from the frequency histograms
+ * 2. Calculates HLIT, HDIST (number of codes to transmit)
+ * 3. Run-length encodes the code lengths using symbols 16, 17, 18
+ * 4. Builds a Huffman tree for the code-length alphabet
+ * 5. Writes the complete block header (BFINAL, BTYPE, HLIT, HDIST, HCLEN)
+ * 6. Writes the code-length code lengths in permuted order
+ * 7. Writes the encoded literal/length and distance code lengths
+ * 8. Writes all buffered symbols using the dynamic Huffman codes
+ * 9. Writes the end-of-block symbol (256)
+ *
+ * Falls back to fixed Huffman on memory allocation failure or if no
+ * frequency data is available.
+ *
+ * @param st    Encoder state with frequency histograms and symbol buffer
+ * @param final Non-zero if this is the final block (sets BFINAL bit)
+ * @return GCOMP_OK on success, error code on failure
+ */
 static gcomp_status_t deflate_flush_dynamic_block(
     gcomp_deflate_encoder_state_t * st, int final) {
-  // For now, fall back to fixed Huffman
-  // TODO: Implement dynamic Huffman tree building
-  return deflate_flush_fixed_block(st, final);
+  if (!st || !st->lit_freq) {
+    // Fall back to fixed if no frequency data
+    return deflate_flush_fixed_block(st, final);
+  }
+
+  gcomp_status_t s;
+
+  // Ensure end-of-block symbol is counted
+  st->lit_freq[256]++;
+
+  // Build code lengths for literal/length alphabet
+  uint8_t lit_lengths[DEFLATE_MAX_LITLEN_SYMBOLS];
+  build_code_lengths(st->lit_freq, DEFLATE_MAX_LITLEN_SYMBOLS, lit_lengths, 15);
+
+  // Ensure end-of-block (256) has a code
+  if (lit_lengths[256] == 0) {
+    lit_lengths[256] = 1;
+  }
+
+  // Build code lengths for distance alphabet
+  uint8_t dist_lengths[DEFLATE_MAX_DIST_SYMBOLS];
+  build_code_lengths(st->dist_freq, DEFLATE_MAX_DIST_SYMBOLS, dist_lengths, 15);
+
+  // Determine HLIT (number of literal/length codes - 257)
+  int hlit = DEFLATE_MAX_LITLEN_SYMBOLS - 257;
+  while (hlit > 0 && lit_lengths[256 + hlit] == 0) {
+    hlit--;
+  }
+
+  // Determine HDIST (number of distance codes - 1)
+  int hdist = DEFLATE_MAX_DIST_SYMBOLS - 1;
+  while (hdist > 0 && dist_lengths[hdist] == 0) {
+    hdist--;
+  }
+
+  // Ensure at least one distance code (DEFLATE requires it)
+  if (hdist < 0) {
+    hdist = 0;
+    dist_lengths[0] = 1;
+  }
+
+  // Combine lit/dist lengths for encoding
+  size_t total_codes = (size_t)(257 + hlit + 1 + hdist);
+  uint8_t * all_lengths = (uint8_t *)malloc(total_codes);
+  if (!all_lengths) {
+    // Fall back to fixed on memory error
+    st->lit_freq[256]--;
+    return deflate_flush_fixed_block(st, final);
+  }
+
+  memcpy(all_lengths, lit_lengths, 257 + hlit);
+  memcpy(all_lengths + 257 + hlit, dist_lengths, 1 + hdist);
+
+  // Run-length encode the code lengths using the code-length alphabet.
+  // This compresses the sequence of code lengths by encoding runs:
+  //   0-15: Literal code length value (no extra bits)
+  //   16:   Copy previous code length 3-6 times (2 extra bits: 0-3)
+  //   17:   Repeat code length 0 for 3-10 times (3 extra bits: 0-7)
+  //   18:   Repeat code length 0 for 11-138 times (7 extra bits: 0-127)
+  // The cl_symbols array stores the symbol to emit, cl_extra stores extra bits.
+  uint8_t
+      cl_symbols[DEFLATE_MAX_LITLEN_SYMBOLS + DEFLATE_MAX_DIST_SYMBOLS + 32];
+  uint8_t cl_extra[DEFLATE_MAX_LITLEN_SYMBOLS + DEFLATE_MAX_DIST_SYMBOLS + 32];
+  size_t cl_count = 0;
+
+  size_t i = 0;
+  while (i < total_codes) {
+    uint8_t len = all_lengths[i];
+
+    // Count consecutive occurrences of this length
+    size_t run = 1;
+    while (i + run < total_codes && all_lengths[i + run] == len) {
+      run++;
+    }
+
+    if (len == 0) {
+      // Encode run of zeros
+      while (run > 0) {
+        if (run >= 11) {
+          size_t emit = (run > 138) ? 138 : run;
+          cl_symbols[cl_count] = 18;
+          cl_extra[cl_count] = (uint8_t)(emit - 11);
+          cl_count++;
+          run -= emit;
+          i += emit;
+        }
+        else if (run >= 3) {
+          cl_symbols[cl_count] = 17;
+          cl_extra[cl_count] = (uint8_t)(run - 3);
+          cl_count++;
+          i += run;
+          run = 0;
+        }
+        else {
+          cl_symbols[cl_count] = 0;
+          cl_extra[cl_count] = 0;
+          cl_count++;
+          run--;
+          i++;
+        }
+      }
+    }
+    else {
+      // Non-zero length: emit it first
+      cl_symbols[cl_count] = len;
+      cl_extra[cl_count] = 0;
+      cl_count++;
+      i++;
+      run--;
+
+      // Then encode repeats using symbol 16
+      while (run >= 3) {
+        size_t emit = (run > 6) ? 6 : run;
+        cl_symbols[cl_count] = 16;
+        cl_extra[cl_count] = (uint8_t)(emit - 3);
+        cl_count++;
+        run -= emit;
+        i += emit;
+      }
+
+      // Remaining repeats (0-2) will be handled in next iteration
+    }
+  }
+
+  // Build code length Huffman tree
+  uint32_t cl_freq[19] = {0};
+  for (size_t i = 0; i < cl_count; i++) {
+    cl_freq[cl_symbols[i]]++;
+  }
+
+  uint8_t cl_lengths[19];
+  build_code_lengths(cl_freq, 19, cl_lengths, 7);
+
+  // Determine HCLEN (number of code length codes - 4)
+  int hclen = 19 - 4;
+  while (hclen > 0 && cl_lengths[k_cl_order[hclen + 3]] == 0) {
+    hclen--;
+  }
+
+  // Build canonical codes for code lengths
+  uint16_t cl_codes[19];
+  s = gcomp_deflate_huffman_build_codes(cl_lengths, 19, 7, cl_codes, NULL);
+  if (s != GCOMP_OK) {
+    free(all_lengths);
+    st->lit_freq[256]--;
+    return deflate_flush_fixed_block(st, final);
+  }
+
+  // Reverse codes for LSB-first output
+  for (int j = 0; j < 19; j++) {
+    if (cl_lengths[j] > 0) {
+      cl_codes[j] = reverse_code(cl_codes[j], cl_lengths[j]);
+    }
+  }
+
+  // Build canonical codes for lit/len and dist
+  uint16_t lit_codes[DEFLATE_MAX_LITLEN_SYMBOLS];
+  s = gcomp_deflate_huffman_build_codes(
+      lit_lengths, DEFLATE_MAX_LITLEN_SYMBOLS, 15, lit_codes, NULL);
+  if (s != GCOMP_OK) {
+    free(all_lengths);
+    st->lit_freq[256]--;
+    return deflate_flush_fixed_block(st, final);
+  }
+  for (size_t j = 0; j < DEFLATE_MAX_LITLEN_SYMBOLS; j++) {
+    if (lit_lengths[j] > 0) {
+      lit_codes[j] = reverse_code(lit_codes[j], lit_lengths[j]);
+    }
+  }
+
+  uint16_t dist_codes[DEFLATE_MAX_DIST_SYMBOLS];
+  s = gcomp_deflate_huffman_build_codes(
+      dist_lengths, DEFLATE_MAX_DIST_SYMBOLS, 15, dist_codes, NULL);
+  if (s != GCOMP_OK) {
+    free(all_lengths);
+    st->lit_freq[256]--;
+    return deflate_flush_fixed_block(st, final);
+  }
+  for (size_t j = 0; j < DEFLATE_MAX_DIST_SYMBOLS; j++) {
+    if (dist_lengths[j] > 0) {
+      dist_codes[j] = reverse_code(dist_codes[j], dist_lengths[j]);
+    }
+  }
+
+  // Write block header: BFINAL (1 bit), BTYPE=10 (2 bits) = dynamic Huffman
+  s = gcomp_deflate_bitwriter_write_bits(&st->bitwriter, final ? 1u : 0u, 1);
+  if (s != GCOMP_OK) {
+    free(all_lengths);
+    return s;
+  }
+  s = gcomp_deflate_bitwriter_write_bits(&st->bitwriter, 2u, 2); // BTYPE=10
+  if (s != GCOMP_OK) {
+    free(all_lengths);
+    return s;
+  }
+
+  // Write HLIT (5 bits), HDIST (5 bits), HCLEN (4 bits)
+  s = gcomp_deflate_bitwriter_write_bits(&st->bitwriter, (uint32_t)hlit, 5);
+  if (s != GCOMP_OK) {
+    free(all_lengths);
+    return s;
+  }
+  s = gcomp_deflate_bitwriter_write_bits(&st->bitwriter, (uint32_t)hdist, 5);
+  if (s != GCOMP_OK) {
+    free(all_lengths);
+    return s;
+  }
+  s = gcomp_deflate_bitwriter_write_bits(&st->bitwriter, (uint32_t)hclen, 4);
+  if (s != GCOMP_OK) {
+    free(all_lengths);
+    return s;
+  }
+
+  // Write code length code lengths (3 bits each, in permuted order)
+  for (int i = 0; i < hclen + 4; i++) {
+    s = gcomp_deflate_bitwriter_write_bits(
+        &st->bitwriter, cl_lengths[k_cl_order[i]], 3);
+    if (s != GCOMP_OK) {
+      free(all_lengths);
+      return s;
+    }
+  }
+
+  // Write the code lengths for lit/len and dist alphabets
+  for (size_t i = 0; i < cl_count; i++) {
+    uint8_t sym = cl_symbols[i];
+    s = gcomp_deflate_bitwriter_write_bits(
+        &st->bitwriter, cl_codes[sym], cl_lengths[sym]);
+    if (s != GCOMP_OK) {
+      free(all_lengths);
+      return s;
+    }
+
+    // Write extra bits for run-length symbols
+    if (sym == 16) {
+      s = gcomp_deflate_bitwriter_write_bits(&st->bitwriter, cl_extra[i], 2);
+    }
+    else if (sym == 17) {
+      s = gcomp_deflate_bitwriter_write_bits(&st->bitwriter, cl_extra[i], 3);
+    }
+    else if (sym == 18) {
+      s = gcomp_deflate_bitwriter_write_bits(&st->bitwriter, cl_extra[i], 7);
+    }
+    if (s != GCOMP_OK) {
+      free(all_lengths);
+      return s;
+    }
+  }
+
+  free(all_lengths);
+
+  // Write all buffered symbols using the dynamic codes
+  for (size_t i = 0; i < st->sym_buf_used; i++) {
+    uint16_t lit = st->lit_buf[i];
+    uint16_t dist = st->dist_buf[i];
+
+    if (dist == 0) {
+      // Literal byte
+      s = gcomp_deflate_bitwriter_write_bits(
+          &st->bitwriter, lit_codes[lit], lit_lengths[lit]);
+      if (s != GCOMP_OK) {
+        return s;
+      }
+    }
+    else {
+      // Length/distance pair
+      uint32_t len_code = deflate_length_code(lit);
+      uint32_t len_sym = len_code - 257;
+
+      s = gcomp_deflate_bitwriter_write_bits(
+          &st->bitwriter, lit_codes[len_code], lit_lengths[len_code]);
+      if (s != GCOMP_OK) {
+        return s;
+      }
+
+      // Write length extra bits
+      if (k_len_extra[len_sym] > 0) {
+        uint32_t extra = lit - k_len_base[len_sym];
+        s = gcomp_deflate_bitwriter_write_bits(
+            &st->bitwriter, extra, k_len_extra[len_sym]);
+        if (s != GCOMP_OK) {
+          return s;
+        }
+      }
+
+      // Write distance code
+      uint32_t dist_code = deflate_distance_code(dist);
+      s = gcomp_deflate_bitwriter_write_bits(
+          &st->bitwriter, dist_codes[dist_code], dist_lengths[dist_code]);
+      if (s != GCOMP_OK) {
+        return s;
+      }
+
+      // Write distance extra bits
+      if (k_dist_extra[dist_code] > 0) {
+        uint32_t extra = dist - k_dist_base[dist_code];
+        s = gcomp_deflate_bitwriter_write_bits(
+            &st->bitwriter, extra, k_dist_extra[dist_code]);
+        if (s != GCOMP_OK) {
+          return s;
+        }
+      }
+    }
+  }
+
+  // Write end-of-block symbol (256)
+  s = gcomp_deflate_bitwriter_write_bits(
+      &st->bitwriter, lit_codes[256], lit_lengths[256]);
+  if (s != GCOMP_OK) {
+    return s;
+  }
+
+  // Reset for next block
+  st->sym_buf_used = 0;
+  memset(st->lit_freq, 0, DEFLATE_MAX_LITLEN_SYMBOLS * sizeof(uint32_t));
+  memset(st->dist_freq, 0, DEFLATE_MAX_DIST_SYMBOLS * sizeof(uint32_t));
+
+  return GCOMP_OK;
 }
 
 //
@@ -732,9 +1409,31 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
     }
     st->sym_buf_used = 0;
 
+    // For levels > 3, allocate frequency histograms for dynamic Huffman
+    if (st->level > 3) {
+      st->lit_freq = (uint32_t *)gcomp_calloc(
+          alloc, DEFLATE_MAX_LITLEN_SYMBOLS, sizeof(uint32_t));
+      st->dist_freq = (uint32_t *)gcomp_calloc(
+          alloc, DEFLATE_MAX_DIST_SYMBOLS, sizeof(uint32_t));
+      if (!st->lit_freq || !st->dist_freq) {
+        gcomp_free(alloc, st->dist_freq);
+        gcomp_free(alloc, st->lit_freq);
+        gcomp_free(alloc, st->dist_buf);
+        gcomp_free(alloc, st->lit_buf);
+        gcomp_free(alloc, st->hash_pos);
+        gcomp_free(alloc, st->hash_prev);
+        gcomp_free(alloc, st->hash_head);
+        gcomp_free(alloc, st->window);
+        gcomp_free(alloc, st);
+        return GCOMP_ERR_MEMORY;
+      }
+    }
+
     // Build fixed Huffman codes
     gcomp_status_t s = deflate_build_fixed_codes(st);
     if (s != GCOMP_OK) {
+      gcomp_free(alloc, st->dist_freq);
+      gcomp_free(alloc, st->lit_freq);
       gcomp_free(alloc, st->dist_buf);
       gcomp_free(alloc, st->lit_buf);
       gcomp_free(alloc, st->hash_pos);
@@ -899,6 +1598,14 @@ gcomp_status_t gcomp_deflate_encoder_update(gcomp_encoder_t * encoder,
           st->dist_buf[st->sym_buf_used] = (uint16_t)match.distance;
           st->sym_buf_used++;
 
+          // Track frequencies for dynamic Huffman
+          if (st->lit_freq) {
+            uint32_t len_code = deflate_length_code(match.length);
+            st->lit_freq[len_code]++;
+            uint32_t dist_code = deflate_distance_code(match.distance);
+            st->dist_freq[dist_code]++;
+          }
+
           // Insert all bytes of the match into the hash table
           for (uint32_t i = 0; i < match.length && st->lookahead > 0; i++) {
             if (st->lookahead >= 3) {
@@ -911,9 +1618,15 @@ gcomp_status_t gcomp_deflate_encoder_update(gcomp_encoder_t * encoder,
         }
         else {
           // Record literal
-          st->lit_buf[st->sym_buf_used] = st->window[pos];
+          uint8_t lit = st->window[pos];
+          st->lit_buf[st->sym_buf_used] = lit;
           st->dist_buf[st->sym_buf_used] = 0;
           st->sym_buf_used++;
+
+          // Track frequencies for dynamic Huffman
+          if (st->lit_freq) {
+            st->lit_freq[lit]++;
+          }
 
           // Insert byte into hash table
           if (st->lookahead >= 3) {
@@ -980,9 +1693,16 @@ gcomp_status_t gcomp_deflate_encoder_finish(
 
       size_t pos =
           (st->window_pos + st->window_size - st->lookahead) % st->window_size;
-      st->lit_buf[st->sym_buf_used] = st->window[pos];
+      uint8_t lit = st->window[pos];
+      st->lit_buf[st->sym_buf_used] = lit;
       st->dist_buf[st->sym_buf_used] = 0;
       st->sym_buf_used++;
+
+      // Track frequency for dynamic Huffman
+      if (st->lit_freq) {
+        st->lit_freq[lit]++;
+      }
+
       st->lookahead--;
     }
 

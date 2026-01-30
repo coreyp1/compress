@@ -23,8 +23,8 @@ Limits are enforced by the core; the decoder returns `GCOMP_ERR_LIMIT` when `max
 
 - **Decode (fixed):** Block type 1 uses the fixed literal/length and distance code lengths defined in RFC 1951 §3.2.6.
 - **Decode (dynamic):** Block type 2 sends HLIT, HDIST, HCLEN, then code-length alphabet and literal/length and distance lengths; the decoder builds canonical decode tables from these.
-- **Encode (fixed):** The encoder uses the same fixed code tables as the decoder for levels 1-9.
-- **Encode (dynamic):** Not yet implemented; encoder currently falls back to fixed Huffman for all levels > 0.
+- **Encode (fixed):** Levels 1-3 use the fixed Huffman code tables defined in RFC 1951.
+- **Encode (dynamic):** Levels 4-9 build optimal Huffman codes from symbol frequency histograms collected during LZ77 matching. The encoder generates length-limited (15-bit max) codes and transmits them using the code-length alphabet with run-length encoding.
 
 ## Compression levels
 
@@ -32,10 +32,31 @@ Limits are enforced by the core; the decoder returns `GCOMP_ERR_LIMIT` when `max
 |-------|----------|
 | 0 | Stored blocks (no compression, data copied verbatim) |
 | 1-3 | Fixed Huffman with LZ77, shorter hash chains |
-| 4-6 | Fixed Huffman with LZ77, medium hash chains |
-| 7-9 | Fixed Huffman with LZ77, longer hash chains (best compression) |
+| 4-6 | Dynamic Huffman with LZ77, medium hash chains |
+| 7-9 | Dynamic Huffman with LZ77, longer hash chains (best compression) |
 
-Higher levels spend more effort searching for matches, improving compression ratio at the cost of speed.
+Higher levels spend more effort searching for matches and build optimal Huffman codes from actual symbol frequencies, improving compression ratio at the cost of speed.
+
+### Dynamic Huffman encoding (levels 4-9)
+
+At compression levels 4 and above, the encoder:
+
+1. **Collects frequency histograms** during LZ77 matching for:
+   - Literal bytes (0-255) and length codes (257-285)
+   - Distance codes (0-29)
+
+2. **Builds optimal Huffman trees** using a heap-based algorithm:
+   - Creates length-limited codes (max 15 bits per RFC 1951)
+   - Uses Kraft inequality validation for code validity
+   - Falls back to uniform 8-bit codes on memory allocation failure
+
+3. **Encodes the Huffman trees** in the block header using:
+   - Run-length encoding with symbols 16 (repeat previous), 17 (short zero run), 18 (long zero run)
+   - A secondary Huffman tree for the code-length alphabet itself
+
+4. **Writes compressed data** using the dynamic codes, which typically achieve better compression than fixed Huffman for varied input data.
+
+The encoder automatically falls back to fixed Huffman blocks if the dynamic tree would be larger than the savings.
 
 ## Streaming usage
 

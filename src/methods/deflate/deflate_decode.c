@@ -674,19 +674,13 @@ static gcomp_status_t deflate_dynamic_decode_lengths(
     return GCOMP_ERR_CORRUPT;
   }
 
-  // Distance tree must not be entirely empty.
-  {
-    int any_dist = 0;
-    for (uint32_t i = 0; i < st->dyn_hdist; i++) {
-      if (st->dyn_dist_lengths[i] != 0) {
-        any_dist = 1;
-        break;
-      }
-    }
-    if (!any_dist) {
-      return GCOMP_ERR_CORRUPT;
-    }
-  }
+  // Note: Distance tree CAN be empty (all zero code lengths) if no distance
+  // codes are used in the block. This occurs when the encoder outputs only
+  // literals and no LZ77 matches (e.g., incompressible data or very short
+  // inputs). RFC 1951 permits this: the distance tree is only accessed when
+  // decoding a length code (257-285), and if no such codes appear in the
+  // compressed data, an empty distance tree is valid. We only reject streams
+  // where the lit/len tree is incomplete (missing end-of-block symbol 256).
 
   gcomp_status_t a = gcomp_deflate_huffman_build_decode_table(
       st->dyn_litlen_lengths, DEFLATE_MAX_LITLEN_SYMBOLS, 15u, &st->dyn_litlen);
