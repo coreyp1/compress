@@ -27,6 +27,40 @@ make
 make test
 ```
 
+### Running Tests with Valgrind
+
+```bash
+make test-valgrind
+```
+
+### Fuzz Testing
+
+The library includes fuzz testing infrastructure using [AFL++](https://github.com/AFLplusplus/AFLplusplus) to find edge cases and security issues.
+
+**Prerequisites:**
+```bash
+sudo apt install afl++
+```
+
+**Running fuzz tests:**
+```bash
+# Generate seed corpus from test vectors
+make fuzz-corpus
+
+# Build fuzz harnesses with AFL instrumentation
+make fuzz-build
+
+# Run a fuzzer (Ctrl+C to stop)
+make fuzz-decoder    # Test decoder with random compressed data
+make fuzz-encoder    # Test encoder with random input
+make fuzz-roundtrip  # Encode then decode, verify match
+
+# Show help and available targets
+make fuzz-help
+```
+
+Findings are saved to `fuzz/findings/<target>/crashes/`. See `documentation/testing/fuzzing.md` for detailed documentation.
+
 ## Installation
 
 ```bash

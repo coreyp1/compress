@@ -9,3 +9,7 @@ example.output.*
 
 # Task documents
 tasks
+
+# Fuzz testing (generated files)
+fuzz/corpus
+fuzz/findings

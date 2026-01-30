@@ -272,6 +272,54 @@ $(APP_DIR)/bench/%$(EXE_EXTENSION): bench/%.c $(APP_DIR)/$(TARGET)
 	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(COMPRESSLIBRARY)
 
 ####################################################################
+# Fuzz Testing (AFL++)
+####################################################################
+
+# Fuzz harness source files
+FUZZ_SOURCES := $(shell find fuzz -maxdepth 1 -type f -name 'fuzz_*.c' 2>/dev/null)
+
+# Fuzz executables (built with afl-gcc)
+FUZZ_EXECUTABLES := $(patsubst fuzz/%.c,$(APP_DIR)/fuzz/%$(EXE_EXTENSION),$(FUZZ_SOURCES))
+
+# AFL compiler (can be overridden: make fuzz-build AFL_CC=afl-clang-fast)
+AFL_CC ?= afl-gcc
+AFL_CFLAGS := -O2 -g $(INCLUDE)
+
+# AFL environment variables for running fuzzer
+# Set AFL_SKIP_CRASHES=1 to skip core_pattern check (for WSL2/testing)
+# For proper crash detection: echo core | sudo tee /proc/sys/kernel/core_pattern
+AFL_ENV ?=
+
+# AFL-instrumented object files and library (separate from regular build)
+AFL_OBJ_DIR := $(BUILD_DIR)/afl-objects
+AFL_LIBOBJECTS := $(patsubst src/%.c,$(AFL_OBJ_DIR)/%.o,$(SOURCES))
+AFL_STATIC_TARGET := $(BASE_NAME_PREFIX)-afl.a
+
+# Pattern rule for AFL-instrumented object files
+$(AFL_OBJ_DIR)/%.o: src/%.c
+	@printf "\n### Compiling (AFL instrumented): $< ###\n"
+	@mkdir -p $(@D)
+	$(AFL_CC) $(AFL_CFLAGS) -c $< -o $@
+
+# AFL-instrumented static library
+$(APP_DIR)/$(AFL_STATIC_TARGET): $(AFL_LIBOBJECTS)
+	@printf "\n### Archiving AFL-instrumented Static Library ###\n"
+	@mkdir -p $(@D)
+	ar rcs $@ $^
+
+# Corpus generator (built with regular gcc, no AFL instrumentation)
+$(APP_DIR)/fuzz/generate_corpus$(EXE_EXTENSION): fuzz/generate_corpus.c
+	@printf "\n### Compiling Corpus Generator ###\n"
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $<
+
+# Pattern rule for fuzz executables (linked against AFL-instrumented library)
+$(APP_DIR)/fuzz/%$(EXE_EXTENSION): fuzz/%.c $(APP_DIR)/$(AFL_STATIC_TARGET)
+	@printf "\n### Compiling Fuzz Harness: $* ###\n"
+	@mkdir -p $(@D)
+	$(AFL_CC) $(AFL_CFLAGS) -o $@ $< $(APP_DIR)/$(AFL_STATIC_TARGET) -lm
+
+####################################################################
 # Commands
 ####################################################################
 
@@ -281,6 +329,8 @@ $(APP_DIR)/bench/%$(EXE_EXTENSION): bench/%.c $(APP_DIR)/$(TARGET)
 .PHONY: all install test test-valgrind test-watch uninstall watch
 # Debug build commands
 .PHONY: all-debug install-debug test-debug test-valgrind-debug test-watch-debug uninstall-debug watch-debug
+# Fuzz commands
+.PHONY: fuzz-build fuzz-corpus fuzz-decoder fuzz-encoder fuzz-roundtrip fuzz-help
 
 
 watch: ## Watch the file directory for changes and compile the target
@@ -368,6 +418,117 @@ bench-deflate: $(APP_DIR)/$(TARGET) $(APP_DIR)/bench/bench_deflate$(EXE_EXTENSIO
 	@printf "############################\n"
 	@printf "\033[0m\n"
 	@LD_LIBRARY_PATH="$(APP_DIR)" $(APP_DIR)/bench/bench_deflate$(EXE_EXTENSION)
+
+fuzz-help: ## Show fuzzing help and instructions
+	@printf "\033[0;36m"
+	@printf "####################################\n"
+	@printf "### Fuzz Testing with AFL++      ###\n"
+	@printf "####################################\n"
+	@printf "\033[0m\n"
+	@printf "Prerequisites:\n"
+	@printf "  sudo apt install afl++\n"
+	@printf "\n"
+	@printf "Available targets:\n"
+	@printf "  make fuzz-build     - Build library and harnesses with AFL instrumentation\n"
+	@printf "  make fuzz-corpus    - Generate seed corpus from test vectors\n"
+	@printf "  make fuzz-decoder   - Run decoder fuzzer\n"
+	@printf "  make fuzz-encoder   - Run encoder fuzzer\n"
+	@printf "  make fuzz-roundtrip - Run roundtrip fuzzer\n"
+	@printf "\n"
+	@printf "Workflow:\n"
+	@printf "  1. make fuzz-corpus    # Generate seed inputs\n"
+	@printf "  2. make fuzz-build     # Build library + harnesses with AFL\n"
+	@printf "  3. make fuzz-decoder   # Start fuzzing (Ctrl+C to stop)\n"
+	@printf "\n"
+	@printf "Core pattern setup (for crash detection):\n"
+	@printf "  echo core | sudo tee /proc/sys/kernel/core_pattern\n"
+	@printf "\n"
+	@printf "Or skip the check (for quick testing on WSL2):\n"
+	@printf "  make fuzz-decoder AFL_ENV='AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1'\n"
+	@printf "\n"
+	@printf "For faster fuzzing (if LLVM is installed):\n"
+	@printf "  make fuzz-build AFL_CC=afl-clang-fast\n"
+	@printf "\n"
+	@printf "Findings are saved to: fuzz/findings/<target>/\n"
+	@printf "  - crashes/  : Inputs that caused crashes\n"
+	@printf "  - hangs/    : Inputs that caused timeouts\n"
+	@printf "  - queue/    : Interesting inputs for coverage\n"
+	@printf "\n"
+	@printf "Documentation: documentation/testing/fuzzing.md\n"
+	@printf "\n"
+
+fuzz-build: ## Build all fuzz harnesses with AFL instrumentation
+fuzz-build: $(FUZZ_EXECUTABLES)
+	@printf "\033[0;32m\n"
+	@printf "###########################################\n"
+	@printf "### Fuzz harnesses built (instrumented) ###\n"
+	@printf "###########################################\n"
+	@printf "\033[0m\n"
+	@printf "AFL-instrumented library: $(APP_DIR)/$(AFL_STATIC_TARGET)\n"
+	@printf "Harnesses are available in: $(APP_DIR)/fuzz/\n"
+	@for exe in $(FUZZ_EXECUTABLES); do \
+		printf "  - %s\n" "$$exe"; \
+	done
+	@printf "\n"
+	@printf "Run 'make fuzz-help' for usage instructions.\n"
+	@printf "\n"
+
+fuzz-corpus: ## Generate seed corpus from test vectors
+fuzz-corpus: $(APP_DIR)/fuzz/generate_corpus$(EXE_EXTENSION)
+	@printf "\033[0;32m\n"
+	@printf "####################################\n"
+	@printf "### Generating Seed Corpus       ###\n"
+	@printf "####################################\n"
+	@printf "\033[0m\n"
+	@$(APP_DIR)/fuzz/generate_corpus$(EXE_EXTENSION)
+
+fuzz-decoder: ## Run decoder fuzzer (Ctrl+C to stop)
+fuzz-decoder: $(APP_DIR)/fuzz/fuzz_deflate_decoder$(EXE_EXTENSION)
+	@printf "\033[0;32m\n"
+	@printf "####################################\n"
+	@printf "### Running Decoder Fuzzer       ###\n"
+	@printf "####################################\n"
+	@printf "\033[0m\n"
+	@mkdir -p fuzz/findings/decoder
+	@if [ ! -d fuzz/corpus/decoder ] || [ -z "$$(ls -A fuzz/corpus/decoder 2>/dev/null)" ]; then \
+		printf "\033[0;33mWarning: No seed corpus found. Run 'make fuzz-corpus' first.\033[0m\n"; \
+		printf "Creating minimal seed...\n"; \
+		mkdir -p fuzz/corpus/decoder; \
+		printf '\x01\x00\x00\xff\xff' > fuzz/corpus/decoder/empty.bin; \
+	fi
+	$(AFL_ENV) afl-fuzz -i fuzz/corpus/decoder -o fuzz/findings/decoder -- $(APP_DIR)/fuzz/fuzz_deflate_decoder$(EXE_EXTENSION)
+
+fuzz-encoder: ## Run encoder fuzzer (Ctrl+C to stop)
+fuzz-encoder: $(APP_DIR)/fuzz/fuzz_deflate_encoder$(EXE_EXTENSION)
+	@printf "\033[0;32m\n"
+	@printf "####################################\n"
+	@printf "### Running Encoder Fuzzer       ###\n"
+	@printf "####################################\n"
+	@printf "\033[0m\n"
+	@mkdir -p fuzz/findings/encoder
+	@if [ ! -d fuzz/corpus/encoder ] || [ -z "$$(ls -A fuzz/corpus/encoder 2>/dev/null)" ]; then \
+		printf "\033[0;33mWarning: No seed corpus found. Run 'make fuzz-corpus' first.\033[0m\n"; \
+		printf "Creating minimal seed...\n"; \
+		mkdir -p fuzz/corpus/encoder; \
+		printf 'Hello' > fuzz/corpus/encoder/hello.bin; \
+	fi
+	$(AFL_ENV) afl-fuzz -i fuzz/corpus/encoder -o fuzz/findings/encoder -- $(APP_DIR)/fuzz/fuzz_deflate_encoder$(EXE_EXTENSION)
+
+fuzz-roundtrip: ## Run roundtrip fuzzer (Ctrl+C to stop)
+fuzz-roundtrip: $(APP_DIR)/fuzz/fuzz_roundtrip$(EXE_EXTENSION)
+	@printf "\033[0;32m\n"
+	@printf "####################################\n"
+	@printf "### Running Roundtrip Fuzzer     ###\n"
+	@printf "####################################\n"
+	@printf "\033[0m\n"
+	@mkdir -p fuzz/findings/roundtrip
+	@if [ ! -d fuzz/corpus/roundtrip ] || [ -z "$$(ls -A fuzz/corpus/roundtrip 2>/dev/null)" ]; then \
+		printf "\033[0;33mWarning: No seed corpus found. Run 'make fuzz-corpus' first.\033[0m\n"; \
+		printf "Creating minimal seed...\n"; \
+		mkdir -p fuzz/corpus/roundtrip; \
+		printf 'Hello' > fuzz/corpus/roundtrip/hello.bin; \
+	fi
+	$(AFL_ENV) afl-fuzz -i fuzz/corpus/roundtrip -o fuzz/findings/roundtrip -- $(APP_DIR)/fuzz/fuzz_roundtrip$(EXE_EXTENSION)
 
 test: ## Make and run the Unit tests
 test: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES)
