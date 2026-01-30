@@ -13,6 +13,7 @@
 
 #include "../../core/alloc_internal.h"
 #include "../../core/registry_internal.h"
+#include "../../core/stream_internal.h"
 #include "deflate_internal.h"
 #include "huffman.h"
 #include <ghoti.io/compress/limits.h>
@@ -1217,6 +1218,30 @@ static gcomp_status_t deflate_process_huffman_data(
   return deflate_decode_distance(st, input, output, length);
 }
 
+// Helper to get stage name for error messages
+static const char * deflate_stage_name(gcomp_deflate_decoder_stage_t stage) {
+  switch (stage) {
+  case DEFLATE_STAGE_BLOCK_HEADER:
+    return "block_header";
+  case DEFLATE_STAGE_STORED_LEN:
+    return "stored_len";
+  case DEFLATE_STAGE_STORED_COPY:
+    return "stored_copy";
+  case DEFLATE_STAGE_DYNAMIC_HEADER:
+    return "dynamic_header";
+  case DEFLATE_STAGE_DYNAMIC_CODELEN:
+    return "dynamic_codelen";
+  case DEFLATE_STAGE_DYNAMIC_LENGTHS:
+    return "dynamic_lengths";
+  case DEFLATE_STAGE_HUFFMAN_DATA:
+    return "huffman_data";
+  case DEFLATE_STAGE_DONE:
+    return "done";
+  default:
+    return "unknown";
+  }
+}
+
 gcomp_status_t gcomp_deflate_decoder_update(gcomp_decoder_t * decoder,
     gcomp_buffer_t * input, gcomp_buffer_t * output) {
   if (!decoder || !input || !output) {
@@ -1226,7 +1251,8 @@ gcomp_status_t gcomp_deflate_decoder_update(gcomp_decoder_t * decoder,
   gcomp_deflate_decoder_state_t * st =
       (gcomp_deflate_decoder_state_t *)decoder->method_state;
   if (!st) {
-    return GCOMP_ERR_INTERNAL;
+    return gcomp_decoder_set_error(
+        decoder, GCOMP_ERR_INTERNAL, "decoder state is NULL");
   }
 
   for (;;) {
@@ -1284,11 +1310,29 @@ gcomp_status_t gcomp_deflate_decoder_update(gcomp_decoder_t * decoder,
     case DEFLATE_STAGE_DONE:
       return GCOMP_OK;
     default:
-      return GCOMP_ERR_INTERNAL;
+      return gcomp_decoder_set_error(
+          decoder, GCOMP_ERR_INTERNAL, "invalid decoder stage %d", st->stage);
     }
 
     if (s != GCOMP_OK) {
-      return s;
+      // Set error details based on error type and stage
+      const char * stage_name = deflate_stage_name(prev_stage);
+      switch (s) {
+      case GCOMP_ERR_CORRUPT:
+        return gcomp_decoder_set_error(decoder, s,
+            "corrupt deflate stream at stage '%s' (output: %zu bytes)",
+            stage_name, st->total_output_bytes);
+      case GCOMP_ERR_LIMIT:
+        return gcomp_decoder_set_error(decoder, s,
+            "limit exceeded at stage '%s' (output: %zu/%zu bytes)", stage_name,
+            st->total_output_bytes, (size_t)st->max_output_bytes);
+      case GCOMP_ERR_MEMORY:
+        return gcomp_decoder_set_error(
+            decoder, s, "memory allocation failed at stage '%s'", stage_name);
+      default:
+        return gcomp_decoder_set_error(
+            decoder, s, "error at stage '%s'", stage_name);
+      }
     }
 
     // If this iteration did not consume input, produce output, or change any
@@ -1311,16 +1355,25 @@ gcomp_status_t gcomp_deflate_decoder_finish(
   gcomp_deflate_decoder_state_t * st =
       (gcomp_deflate_decoder_state_t *)decoder->method_state;
   if (!st) {
-    return GCOMP_ERR_INTERNAL;
+    return gcomp_decoder_set_error(
+        decoder, GCOMP_ERR_INTERNAL, "decoder state is NULL");
   }
 
   // Drain any pending match with the provided output space.
   if (st->match_remaining > 0) {
     gcomp_status_t s = deflate_copy_match(st, output);
     if (s != GCOMP_OK) {
-      return s;
+      return gcomp_decoder_set_error(decoder, s,
+          "error draining pending match (%u bytes remaining)",
+          st->match_remaining);
     }
   }
 
-  return (st->stage == DEFLATE_STAGE_DONE) ? GCOMP_OK : GCOMP_ERR_CORRUPT;
+  if (st->stage != DEFLATE_STAGE_DONE) {
+    return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+        "incomplete deflate stream (stage '%s', expected final block)",
+        deflate_stage_name(st->stage));
+  }
+
+  return GCOMP_OK;
 }

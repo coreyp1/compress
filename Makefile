@@ -144,6 +144,12 @@ EXAMPLE_SOURCES := $(shell find examples -type f -name '*.c' 2>/dev/null)
 # Convert each example source file path to an executable path.
 EXAMPLES := $(patsubst examples/%.c,$(APP_DIR)/examples/%$(EXE_EXTENSION),$(EXAMPLE_SOURCES))
 
+# Automatically collect all benchmark .c files under bench directories.
+BENCH_SOURCES := $(shell find bench -type f -name '*.c' 2>/dev/null)
+
+# Convert each benchmark source file path to an executable path.
+BENCHMARKS := $(patsubst bench/%.c,$(APP_DIR)/bench/%$(EXE_EXTENSION),$(BENCH_SOURCES))
+
 
 all: $(APP_DIR)/$(TARGET) $(APP_DIR)/$(STATIC_TARGET) ## Build shared + static libraries
 
@@ -256,11 +262,21 @@ $(APP_DIR)/examples/%$(EXE_EXTENSION): examples/%.c $(APP_DIR)/$(TARGET)
 	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(COMPRESSLIBRARY)
 
 ####################################################################
+# Benchmarks
+####################################################################
+
+# Pattern rule for benchmark executables
+$(APP_DIR)/bench/%$(EXE_EXTENSION): bench/%.c $(APP_DIR)/$(TARGET)
+	@printf "\n### Compiling Benchmark: $* ###\n"
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(COMPRESSLIBRARY)
+
+####################################################################
 # Commands
 ####################################################################
 
 # General commands
-.PHONY: clean cloc docs docs-pdf examples
+.PHONY: clean cloc docs docs-pdf examples bench bench-deflate
 # Release build commands
 .PHONY: all install test test-valgrind test-watch uninstall watch
 # Debug build commands
@@ -321,6 +337,37 @@ else ifeq ($(OS_NAME), Windows)
 	@printf "    Then run: $(APP_DIR)/examples/<example>$(EXE_EXTENSION)\n"
 endif
 	@printf "\n"
+
+bench: ## Build all benchmarks
+bench: $(APP_DIR)/$(TARGET) $(BENCHMARKS)
+	@printf "\033[0;32m\n"
+	@printf "############################\n"
+	@printf "### Benchmarks built     ###\n"
+	@printf "############################\n"
+	@printf "\033[0m\n"
+	@printf "Benchmarks are available in: $(APP_DIR)/bench/\n"
+	@printf "\n"
+	@printf "\033[0;33mTo run benchmarks:\033[0m\n"
+ifeq ($(OS_NAME), Linux)
+	@printf "  Linux: Set LD_LIBRARY_PATH and run:\n"
+	@printf "    LD_LIBRARY_PATH=\"$(APP_DIR)\" $(APP_DIR)/bench/bench_deflate\n"
+else ifeq ($(OS_NAME), Mac)
+	@printf "  macOS: Set DYLD_LIBRARY_PATH and run:\n"
+	@printf "    DYLD_LIBRARY_PATH=\"$(APP_DIR)\" $(APP_DIR)/bench/bench_deflate\n"
+else ifeq ($(OS_NAME), Windows)
+	@printf "  Windows (MSYS2): Run from library directory:\n"
+	@printf "    cd $(APP_DIR) && ./bench/bench_deflate$(EXE_EXTENSION)\n"
+endif
+	@printf "\n"
+
+bench-deflate: ## Build and run the deflate benchmark
+bench-deflate: $(APP_DIR)/$(TARGET) $(APP_DIR)/bench/bench_deflate$(EXE_EXTENSION)
+	@printf "\033[0;32m\n"
+	@printf "############################\n"
+	@printf "### Running Deflate Benchmark ###\n"
+	@printf "############################\n"
+	@printf "\033[0m\n"
+	@LD_LIBRARY_PATH="$(APP_DIR)" $(APP_DIR)/bench/bench_deflate$(EXE_EXTENSION)
 
 test: ## Make and run the Unit tests
 test: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES)

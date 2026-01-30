@@ -13,6 +13,9 @@
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/stream.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
 
 gcomp_status_t gcomp_encoder_create(gcomp_registry_t * registry,
     const char * method_name, gcomp_options_t * options,
@@ -208,4 +211,102 @@ void gcomp_decoder_destroy(gcomp_decoder_t * decoder) {
   }
 
   gcomp_free(alloc, decoder);
+}
+
+//
+// Error Detail API
+//
+// Design rationale:
+// -----------------
+// Error detail strings provide human-readable context for debugging when
+// compression/decompression fails. This is particularly useful for:
+//
+// 1. Debugging truncated or corrupt streams - the stage name and byte count
+//    help identify where in the stream the problem occurred.
+//
+// 2. Distinguishing between different types of corruption - knowing whether
+//    the error was in a block header vs. Huffman data helps narrow down issues.
+//
+// 3. Diagnosing limit violations - showing current/max values helps users
+//    adjust limits appropriately.
+//
+// Implementation notes:
+// - Error details are stored in a fixed-size buffer (GCOMP_ERROR_DETAIL_MAX)
+//   to avoid dynamic allocation during error paths.
+// - The set_error functions return the status code for convenient chaining:
+//     return gcomp_decoder_set_error(dec, GCOMP_ERR_CORRUPT, "msg...");
+// - Method implementations (e.g., deflate decoder) call set_error when they
+//   detect errors, providing stage-specific context.
+// - The get_error_detail function returns "" (not NULL) when no error has
+//   occurred, making it safe to pass directly to printf/logging functions.
+//
+
+gcomp_status_t gcomp_encoder_get_error(const gcomp_encoder_t * encoder) {
+  if (!encoder) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  return encoder->last_error;
+}
+
+const char * gcomp_encoder_get_error_detail(const gcomp_encoder_t * encoder) {
+  if (!encoder) {
+    return "";
+  }
+  return encoder->error_detail;
+}
+
+gcomp_status_t gcomp_decoder_get_error(const gcomp_decoder_t * decoder) {
+  if (!decoder) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  return decoder->last_error;
+}
+
+const char * gcomp_decoder_get_error_detail(const gcomp_decoder_t * decoder) {
+  if (!decoder) {
+    return "";
+  }
+  return decoder->error_detail;
+}
+
+gcomp_status_t gcomp_encoder_set_error(
+    gcomp_encoder_t * encoder, gcomp_status_t status, const char * fmt, ...) {
+  if (!encoder) {
+    return status;
+  }
+
+  encoder->last_error = status;
+
+  if (fmt) {
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(encoder->error_detail, GCOMP_ERROR_DETAIL_MAX, fmt, args);
+    va_end(args);
+  }
+  else {
+    encoder->error_detail[0] = '\0';
+  }
+
+  return status;
+}
+
+gcomp_status_t gcomp_decoder_set_error(
+    gcomp_decoder_t * decoder, gcomp_status_t status, const char * fmt, ...) {
+  if (!decoder) {
+    return status;
+  }
+
+  decoder->last_error = status;
+
+  if (fmt) {
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(decoder->error_detail, GCOMP_ERROR_DETAIL_MAX, fmt, args);
+    va_end(args);
+  }
+  else {
+    decoder->error_detail[0] = '\0';
+  }
+
+  return status;
 }

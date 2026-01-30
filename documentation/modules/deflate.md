@@ -75,11 +75,59 @@ gcomp_encoder_create(registry, "deflate", opts, &enc);
 - **Simple patterns**: Use `"rle"` for data dominated by repeated byte runs.
 - **Speed-critical**: Use `"fixed"` or `"huffman_only"` to minimize encoding time.
 
+## Error Handling
+
+The deflate decoder provides detailed error information when decoding fails. This is useful for debugging corrupt or truncated streams.
+
+### Error codes
+
+| Code | Meaning |
+|------|---------|
+| `GCOMP_ERR_CORRUPT` | Invalid block type, NLEN mismatch, invalid Huffman tree, distance beyond window, etc. |
+| `GCOMP_ERR_LIMIT` | `limits.max_output_bytes` or `limits.max_memory_bytes` exceeded |
+| `GCOMP_ERR_MEMORY` | Failed to allocate decoder state or Huffman tables |
+
+### Error details
+
+When decoding fails, call `gcomp_decoder_get_error_detail()` to get a human-readable message with context:
+
+```c
+gcomp_status_t status = gcomp_decoder_update(decoder, &input, &output);
+if (status != GCOMP_OK) {
+    printf("Error: %s\n", gcomp_status_to_string(status));
+    printf("Detail: %s\n", gcomp_decoder_get_error_detail(decoder));
+}
+```
+
+**Example error details:**
+
+- `"corrupt deflate stream at stage 'block_header' (output: 0 bytes)"` - Invalid block type
+- `"corrupt deflate stream at stage 'stored_len' (output: 0 bytes)"` - NLEN mismatch in stored block
+- `"corrupt deflate stream at stage 'huffman_data' (output: 1024 bytes)"` - Invalid distance or length code
+- `"limit exceeded at stage 'huffman_data' (output: 1048576/1048576 bytes)"` - Max output limit reached
+- `"incomplete deflate stream (stage 'huffman_data', expected final block)"` - Stream truncated
+
+### Decoder stages
+
+The error detail includes the decoder stage where the error occurred:
+
+| Stage | Description |
+|-------|-------------|
+| `block_header` | Reading BFINAL and BTYPE bits |
+| `stored_len` | Reading LEN/NLEN for stored block |
+| `stored_copy` | Copying stored block data |
+| `dynamic_header` | Reading HLIT/HDIST/HCLEN |
+| `dynamic_codelen` | Reading code-length-lengths |
+| `dynamic_lengths` | Decoding literal/distance code lengths |
+| `huffman_data` | Decoding compressed symbols |
+| `done` | Stream complete |
+
 ## Limits and security notes
 
 - **Max output:** Set `limits.max_output_bytes` to avoid unbounded decompression (e.g. from untrusted input).
 - **Window:** DEFLATE allows up to 32 KiB back-reference distance; `deflate.window_bits` and `limits.max_window_bytes` constrain the decoder.
 - **Malformed input:** Invalid block type, stored-block NLEN mismatch, or invalid distance/length can produce `GCOMP_ERR_CORRUPT`.
+- **Memory limits:** Set `limits.max_memory_bytes` to bound decoder memory usage (state struct, window buffer, Huffman tables).
 
 ## Huffman tables
 

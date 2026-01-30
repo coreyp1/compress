@@ -664,6 +664,90 @@ TEST_F(StreamTest, DecoderFinishCallsFunction) {
   gcomp_decoder_destroy(decoder);
 }
 
+// Error detail API tests
+
+TEST_F(StreamTest, EncoderErrorDetailInitiallyEmpty) {
+  gcomp_encoder_t * encoder = nullptr;
+  ASSERT_EQ(gcomp_encoder_create(registry_, "test_method", nullptr, &encoder),
+      GCOMP_OK);
+  ASSERT_NE(encoder, nullptr);
+
+  // Initially, no error should be set
+  EXPECT_EQ(gcomp_encoder_get_error(encoder), GCOMP_OK);
+  const char * detail = gcomp_encoder_get_error_detail(encoder);
+  EXPECT_NE(detail, nullptr);
+  EXPECT_STREQ(detail, "");
+
+  gcomp_encoder_destroy(encoder);
+}
+
+TEST_F(StreamTest, DecoderErrorDetailInitiallyEmpty) {
+  gcomp_decoder_t * decoder = nullptr;
+  ASSERT_EQ(gcomp_decoder_create(registry_, "test_method", nullptr, &decoder),
+      GCOMP_OK);
+  ASSERT_NE(decoder, nullptr);
+
+  // Initially, no error should be set
+  EXPECT_EQ(gcomp_decoder_get_error(decoder), GCOMP_OK);
+  const char * detail = gcomp_decoder_get_error_detail(decoder);
+  EXPECT_NE(detail, nullptr);
+  EXPECT_STREQ(detail, "");
+
+  gcomp_decoder_destroy(decoder);
+}
+
+TEST_F(StreamTest, EncoderSetErrorStoresDetail) {
+  gcomp_encoder_t * encoder = nullptr;
+  ASSERT_EQ(gcomp_encoder_create(registry_, "test_method", nullptr, &encoder),
+      GCOMP_OK);
+  ASSERT_NE(encoder, nullptr);
+
+  // Set an error with details
+  gcomp_status_t ret =
+      gcomp_encoder_set_error(encoder, GCOMP_ERR_CORRUPT, "test error %d", 42);
+  EXPECT_EQ(ret, GCOMP_ERR_CORRUPT);
+
+  // Check that the error was stored
+  EXPECT_EQ(gcomp_encoder_get_error(encoder), GCOMP_ERR_CORRUPT);
+  const char * detail = gcomp_encoder_get_error_detail(encoder);
+  EXPECT_NE(detail, nullptr);
+  EXPECT_STREQ(detail, "test error 42");
+
+  gcomp_encoder_destroy(encoder);
+}
+
+TEST_F(StreamTest, DecoderSetErrorStoresDetail) {
+  gcomp_decoder_t * decoder = nullptr;
+  ASSERT_EQ(gcomp_decoder_create(registry_, "test_method", nullptr, &decoder),
+      GCOMP_OK);
+  ASSERT_NE(decoder, nullptr);
+
+  // Set an error with details
+  gcomp_status_t ret = gcomp_decoder_set_error(
+      decoder, GCOMP_ERR_LIMIT, "limit exceeded: %zu", (size_t)1000);
+  EXPECT_EQ(ret, GCOMP_ERR_LIMIT);
+
+  // Check that the error was stored
+  EXPECT_EQ(gcomp_decoder_get_error(decoder), GCOMP_ERR_LIMIT);
+  const char * detail = gcomp_decoder_get_error_detail(decoder);
+  EXPECT_NE(detail, nullptr);
+  EXPECT_STREQ(detail, "limit exceeded: 1000");
+
+  gcomp_decoder_destroy(decoder);
+}
+
+TEST_F(StreamTest, ErrorDetailNullEncoderReturnsEmpty) {
+  // Null pointer handling
+  EXPECT_EQ(gcomp_encoder_get_error(nullptr), GCOMP_ERR_INVALID_ARG);
+  EXPECT_STREQ(gcomp_encoder_get_error_detail(nullptr), "");
+}
+
+TEST_F(StreamTest, ErrorDetailNullDecoderReturnsEmpty) {
+  // Null pointer handling
+  EXPECT_EQ(gcomp_decoder_get_error(nullptr), GCOMP_ERR_INVALID_ARG);
+  EXPECT_STREQ(gcomp_decoder_get_error_detail(nullptr), "");
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

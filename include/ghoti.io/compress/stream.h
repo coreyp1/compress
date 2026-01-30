@@ -155,6 +155,50 @@ GCOMP_API gcomp_status_t gcomp_decoder_finish(
     gcomp_decoder_t * decoder, gcomp_buffer_t * output);
 
 /**
+ * @brief Get the last error status from an encoder
+ *
+ * @param encoder The encoder
+ * @return The last error status, or GCOMP_OK if no error has occurred
+ */
+GCOMP_API gcomp_status_t gcomp_encoder_get_error(
+    const gcomp_encoder_t * encoder);
+
+/**
+ * @brief Get the error detail string from an encoder
+ *
+ * Returns a human-readable string describing the last error. The returned
+ * pointer is valid until the encoder is destroyed or another operation is
+ * performed on it.
+ *
+ * @param encoder The encoder
+ * @return Error detail string, or empty string if no error has occurred
+ */
+GCOMP_API const char * gcomp_encoder_get_error_detail(
+    const gcomp_encoder_t * encoder);
+
+/**
+ * @brief Get the last error status from a decoder
+ *
+ * @param decoder The decoder
+ * @return The last error status, or GCOMP_OK if no error has occurred
+ */
+GCOMP_API gcomp_status_t gcomp_decoder_get_error(
+    const gcomp_decoder_t * decoder);
+
+/**
+ * @brief Get the error detail string from a decoder
+ *
+ * Returns a human-readable string describing the last error. The returned
+ * pointer is valid until the decoder is destroyed or another operation is
+ * performed on it.
+ *
+ * @param decoder The decoder
+ * @return Error detail string, or empty string if no error has occurred
+ */
+GCOMP_API const char * gcomp_decoder_get_error_detail(
+    const gcomp_decoder_t * decoder);
+
+/**
  * @brief Destroy an encoder
  *
  * @param encoder The encoder to destroy
