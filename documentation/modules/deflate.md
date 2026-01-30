@@ -2,6 +2,29 @@
 
 Raw DEFLATE compression and decompression for the Ghoti.io Compress library. The method name is `"deflate"` and supports stream encode and decode.
 
+## Registration
+
+Deflate is **auto-registered** with the default registry when the library loads. No explicit initialization is required:
+
+```c
+#include <ghoti.io/compress/compress.h>
+#include <ghoti.io/compress/deflate.h>
+
+// deflate is already available - just use it
+gcomp_encoder_t *enc = NULL;
+gcomp_encoder_create(gcomp_registry_default(), "deflate", NULL, &enc);
+```
+
+For custom registries or when auto-registration is disabled, register explicitly:
+
+```c
+gcomp_registry_t *custom = NULL;
+gcomp_registry_create(NULL, &custom);
+gcomp_method_deflate_register(custom);  // Now deflate is available
+```
+
+See [Auto-Registration](../auto-registration.md) for details on disabling auto-registration.
+
 ## Options
 
 | Key | Type | Default | Range | Description |

@@ -20,6 +20,9 @@
 class DeflateEncoderTest : public ::testing::Test {
 protected:
   void SetUp() override {
+    // Use a custom registry for test isolation - each test gets a fresh
+    // registry that doesn't share state with other tests or the default
+    // registry. This requires explicit method registration.
     ASSERT_EQ(gcomp_registry_create(nullptr, &registry_), GCOMP_OK);
     ASSERT_NE(registry_, nullptr);
     ASSERT_EQ(gcomp_method_deflate_register(registry_), GCOMP_OK);

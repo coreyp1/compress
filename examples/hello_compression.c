@@ -5,7 +5,6 @@
  * Ghoti.io Compress library using DEFLATE (RFC 1951).
  *
  * This example shows how to:
- * - Register the deflate compression method
  * - Compress a string using gcomp_encode_buffer()
  * - Decompress the data using gcomp_decode_buffer()
  * - Verify the round-trip produces the original data
@@ -16,7 +15,6 @@
  */
 
 #include <ghoti.io/compress/compress.h>
-#include <ghoti.io/compress/deflate.h>
 #include <ghoti.io/compress/stream.h>
 
 #include <stdint.h>
@@ -35,23 +33,16 @@ int main(void) {
   printf("=== Ghoti.io Compress Library - Hello Compression Example ===\n\n");
   printf("Library version: %s\n\n", gcomp_version_string());
 
-  // Step 1: Get the default registry and register the deflate method
+  // Get the default registry (deflate is already registered)
   gcomp_registry_t * registry = gcomp_registry_default();
   if (!registry) {
     fprintf(stderr, "Error: Failed to get default registry\n");
     return 1;
   }
 
-  status = gcomp_method_deflate_register(registry);
-  if (status != GCOMP_OK) {
-    fprintf(stderr, "Error: Failed to register deflate method: %s\n",
-        gcomp_status_to_string(status));
-    return 1;
-  }
-
   printf("Original message (%zu bytes):\n  \"%s\"\n\n", message_len, message);
 
-  // Step 2: Compress the message
+  // Step 1: Compress the message
   // Allocate a buffer for compressed output. For small inputs, compressed
   // data might actually be larger due to overhead, so we allocate generously.
   size_t compressed_capacity = message_len + 256;
@@ -85,7 +76,7 @@ int main(void) {
   }
   printf("\n\n");
 
-  // Step 3: Decompress the message
+  // Step 2: Decompress the message
   // We know the original size, but in practice you might need to allocate
   // more and handle GCOMP_ERR_LIMIT (output buffer too small).
   size_t decompressed_capacity = message_len + 1; // +1 for null terminator
@@ -115,7 +106,7 @@ int main(void) {
   decompressed[decompressed_size] = '\0';
   printf("Decompressed message:\n  \"%s\"\n\n", decompressed);
 
-  // Step 4: Verify the round-trip
+  // Step 3: Verify the round-trip
   if (decompressed_size == message_len &&
       memcmp(message, decompressed, message_len) == 0) {
     printf("SUCCESS: Round-trip compression verified!\n");

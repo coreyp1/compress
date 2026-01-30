@@ -292,10 +292,15 @@ TEST_F(SchemaTest, OptionsValidateKey_TypeMismatch) {
 }
 
 //
-// Deflate method schema tests (T2.8: "query schema for a method (deflate)")
+// Deflate method schema tests
+//
+// These tests use custom registries for test isolation - each test gets a
+// fresh registry that doesn't share state with other tests or the default
+// registry. This requires explicit method registration.
 //
 
 TEST(SchemaDeflateTest, GetAllSchemas_DeflateMethod) {
+  // Custom registry for test isolation
   gcomp_registry_t * reg = nullptr;
   ASSERT_EQ(gcomp_registry_create(nullptr, &reg), GCOMP_OK);
   ASSERT_EQ(gcomp_method_deflate_register(reg), GCOMP_OK);
@@ -314,6 +319,7 @@ TEST(SchemaDeflateTest, GetAllSchemas_DeflateMethod) {
 }
 
 TEST(SchemaDeflateTest, GetOptionSchema_DeflateLevel) {
+  // Custom registry for test isolation
   gcomp_registry_t * reg = nullptr;
   ASSERT_EQ(gcomp_registry_create(nullptr, &reg), GCOMP_OK);
   ASSERT_EQ(gcomp_method_deflate_register(reg), GCOMP_OK);
@@ -334,6 +340,7 @@ TEST(SchemaDeflateTest, GetOptionSchema_DeflateLevel) {
 }
 
 TEST(SchemaDeflateTest, OptionsValidate_DeflateOptions) {
+  // Custom registry for test isolation
   gcomp_registry_t * reg = nullptr;
   ASSERT_EQ(gcomp_registry_create(nullptr, &reg), GCOMP_OK);
   ASSERT_EQ(gcomp_method_deflate_register(reg), GCOMP_OK);
@@ -353,6 +360,7 @@ TEST(SchemaDeflateTest, OptionsValidate_DeflateOptions) {
 }
 
 TEST(SchemaDeflateTest, OptionsValidate_DeflateLevelOutOfRange) {
+  // Custom registry for test isolation
   gcomp_registry_t * reg = nullptr;
   ASSERT_EQ(gcomp_registry_create(nullptr, &reg), GCOMP_OK);
   ASSERT_EQ(gcomp_method_deflate_register(reg), GCOMP_OK);

@@ -21,7 +21,6 @@
  */
 
 #include <ghoti.io/compress/compress.h>
-#include <ghoti.io/compress/deflate.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/stream.h>
 
@@ -343,17 +342,10 @@ int main(void) {
   printf("=== Ghoti.io Compress Library - Chunked Streaming Example ===\n\n");
   printf("Library version: %s\n", gcomp_version_string());
 
-  // Set up registry
+  // Get the default registry (deflate is already registered)
   gcomp_registry_t * registry = gcomp_registry_default();
   if (!registry) {
     fprintf(stderr, "Error: Failed to get default registry\n");
-    return 1;
-  }
-
-  status = gcomp_method_deflate_register(registry);
-  if (status != GCOMP_OK) {
-    fprintf(stderr, "Error: Failed to register deflate method: %s\n",
-        gcomp_status_to_string(status));
     return 1;
   }
 

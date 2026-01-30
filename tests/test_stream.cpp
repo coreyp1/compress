@@ -281,10 +281,15 @@ TEST_F(StreamTest, DecoderCreateMethodWithoutCreateFunction) {
 }
 
 //
-// Deflate method (stub encoder/decoder until T3.5/T3.6)
+// Deflate method tests
+//
+// These tests use custom registries for test isolation - each test gets a
+// fresh registry that doesn't share state with other tests or the default
+// registry. This requires explicit method registration.
 //
 
 TEST_F(StreamTest, DeflateEncoderCreateSuccess) {
+  // Custom registry for test isolation
   gcomp_registry_t * reg = nullptr;
   ASSERT_EQ(gcomp_registry_create(nullptr, &reg), GCOMP_OK);
   ASSERT_EQ(gcomp_method_deflate_register(reg), GCOMP_OK);
@@ -300,6 +305,7 @@ TEST_F(StreamTest, DeflateEncoderCreateSuccess) {
 }
 
 TEST_F(StreamTest, DeflateEncoderUpdateSucceeds) {
+  // Custom registry for test isolation
   gcomp_registry_t * reg = nullptr;
   ASSERT_EQ(gcomp_registry_create(nullptr, &reg), GCOMP_OK);
   ASSERT_EQ(gcomp_method_deflate_register(reg), GCOMP_OK);
@@ -330,6 +336,7 @@ TEST_F(StreamTest, DeflateEncoderUpdateSucceeds) {
 }
 
 TEST_F(StreamTest, DeflateDecoderCreateSuccess) {
+  // Custom registry for test isolation
   gcomp_registry_t * reg = nullptr;
   ASSERT_EQ(gcomp_registry_create(nullptr, &reg), GCOMP_OK);
   ASSERT_EQ(gcomp_method_deflate_register(reg), GCOMP_OK);
@@ -345,6 +352,7 @@ TEST_F(StreamTest, DeflateDecoderCreateSuccess) {
 }
 
 TEST_F(StreamTest, DeflateDecoderUpdateSucceedsWithEmptyInput) {
+  // Custom registry for test isolation
   gcomp_registry_t * reg = nullptr;
   ASSERT_EQ(gcomp_registry_create(nullptr, &reg), GCOMP_OK);
   ASSERT_EQ(gcomp_method_deflate_register(reg), GCOMP_OK);
