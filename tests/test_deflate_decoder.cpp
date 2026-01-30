@@ -187,6 +187,105 @@ TEST_F(DeflateDecoderTest, FixedHuffman_ChunkedInputOneByteAtATime) {
   ASSERT_EQ(std::memcmp(out.data(), "Hello, world!", 13u), 0);
 }
 
+TEST_F(DeflateDecoderTest, FixedHuffman_SmallOutputBuffer) {
+  // Test that the decoder can handle producing output with a small buffer.
+  // This stress-tests the streaming behavior when output buffer space is
+  // limited.
+
+  // First, create a compressed stream from a reasonably sized input
+  const char * original_str =
+      "This is a test of small output buffer decoding. "
+      "The decoder must handle backpressure correctly when output space is "
+      "limited. Each call produces a small amount of output. "
+      "We need enough data to exercise the decoder's internal buffering and "
+      "match copy logic across multiple update calls.";
+  const uint8_t * original = (const uint8_t *)original_str;
+  size_t original_len = strlen(original_str);
+
+  // Compress the data first
+  gcomp_encoder_t * encoder = nullptr;
+  ASSERT_EQ(
+      gcomp_encoder_create(registry_, "deflate", nullptr, &encoder), GCOMP_OK);
+
+  std::vector<uint8_t> compressed(original_len * 2);
+  gcomp_buffer_t enc_in = {original, original_len, 0};
+  gcomp_buffer_t enc_out = {compressed.data(), compressed.size(), 0};
+  ASSERT_EQ(gcomp_encoder_update(encoder, &enc_in, &enc_out), GCOMP_OK);
+  ASSERT_EQ(enc_in.used, original_len);
+
+  gcomp_buffer_t enc_finish = {
+      compressed.data() + enc_out.used, compressed.size() - enc_out.used, 0};
+  ASSERT_EQ(gcomp_encoder_finish(encoder, &enc_finish), GCOMP_OK);
+  size_t compressed_len = enc_out.used + enc_finish.used;
+  gcomp_encoder_destroy(encoder);
+
+  // Now decode with small output buffer (1 byte at a time for decoder)
+  ASSERT_EQ(
+      gcomp_decoder_create(registry_, "deflate", nullptr, &decoder_), GCOMP_OK);
+
+  std::vector<uint8_t> decompressed;
+  decompressed.reserve(original_len);
+
+  gcomp_buffer_t in_buf = {compressed.data(), compressed_len, 0};
+
+  size_t iterations = 0;
+  const size_t max_iterations = original_len * 10; // Safety limit
+
+  // Decode one byte at a time - decoder DOES support 1-byte output
+  while (iterations < max_iterations) {
+    uint8_t one_byte = 0;
+    gcomp_buffer_t out_buf = {&one_byte, 1, 0};
+
+    gcomp_status_t status = gcomp_decoder_update(decoder_, &in_buf, &out_buf);
+    ASSERT_EQ(status, GCOMP_OK) << "Failed at iteration " << iterations;
+
+    if (out_buf.used > 0) {
+      decompressed.push_back(one_byte);
+    }
+
+    // Advance input pointer for consumed bytes
+    in_buf.data = (const uint8_t *)in_buf.data + in_buf.used;
+    in_buf.size -= in_buf.used;
+    in_buf.used = 0;
+
+    // If no input left and no output produced, we might be done
+    if (in_buf.size == 0 && out_buf.used == 0) {
+      break;
+    }
+
+    iterations++;
+  }
+
+  ASSERT_LT(iterations, max_iterations) << "Decoder did not make progress";
+
+  // Finish - also one byte at a time
+  iterations = 0;
+  while (iterations < max_iterations) {
+    uint8_t one_byte = 0;
+    gcomp_buffer_t finish_out = {&one_byte, 1, 0};
+
+    gcomp_status_t status = gcomp_decoder_finish(decoder_, &finish_out);
+    ASSERT_EQ(status, GCOMP_OK) << "Finish failed at iteration " << iterations;
+
+    if (finish_out.used > 0) {
+      decompressed.push_back(one_byte);
+    }
+    else {
+      // No more output from finish
+      break;
+    }
+
+    iterations++;
+  }
+
+  // Verify the result
+  ASSERT_EQ(decompressed.size(), original_len)
+      << "Decompressed size mismatch: expected " << original_len << ", got "
+      << decompressed.size();
+  EXPECT_EQ(memcmp(decompressed.data(), original, original_len), 0)
+      << "Decompressed data doesn't match original";
+}
+
 TEST_F(DeflateDecoderTest, DynamicHuffman_SingleBlockDecode) {
   // Raw DEFLATE stream with dynamic Huffman block (btype=2). Generated via
   // Python zlib.compressobj(6, 8, -15, 8, 2) on "Hello world! Hello world! "

@@ -230,6 +230,20 @@ typedef struct gcomp_deflate_encoder_state_s {
   uint16_t fixed_dist_codes[DEFLATE_MAX_DIST_SYMBOLS];
   uint8_t fixed_dist_lens[DEFLATE_MAX_DIST_SYMBOLS];
   int fixed_ready;
+
+  //
+  // Finish buffer for incremental output during finish()
+  //
+  // When finish() is called, the entire final output is rendered to this
+  // internal buffer first, then copied incrementally to the user's output
+  // buffer. This allows finish() to work with arbitrarily small output
+  // buffers (even 1 byte at a time) without corrupting the output stream.
+  //
+  uint8_t * finish_buf;     ///< Buffer holding rendered finish output.
+  size_t finish_buf_size;   ///< Allocated size of finish_buf.
+  size_t finish_buf_used;   ///< Bytes written to finish_buf.
+  size_t finish_buf_copied; ///< Bytes already copied to user output.
+  int finish_buf_ready;     ///< Non-zero if finish output is fully rendered.
 } gcomp_deflate_encoder_state_t;
 
 //
@@ -1706,6 +1720,7 @@ void gcomp_deflate_encoder_destroy(gcomp_encoder_t * encoder) {
   const gcomp_allocator_t * alloc =
       gcomp_registry_get_allocator(encoder->registry);
 
+  gcomp_free(alloc, st->finish_buf);
   gcomp_free(alloc, st->dist_freq);
   gcomp_free(alloc, st->lit_freq);
   gcomp_free(alloc, st->dist_buf);
@@ -1729,6 +1744,9 @@ gcomp_status_t gcomp_deflate_encoder_reset(gcomp_encoder_t * encoder) {
   if (!st) {
     return GCOMP_ERR_INTERNAL;
   }
+
+  const gcomp_allocator_t * alloc =
+      gcomp_registry_get_allocator(encoder->registry);
 
   // Reset state machine
   st->stage = DEFLATE_ENC_STAGE_ACCEPTING;
@@ -1766,6 +1784,16 @@ gcomp_status_t gcomp_deflate_encoder_reset(gcomp_encoder_t * encoder) {
   if (st->dist_freq) {
     memset(st->dist_freq, 0, DEFLATE_MAX_DIST_SYMBOLS * sizeof(uint32_t));
   }
+
+  // Free and reset finish buffer (if any partial finish was in progress)
+  if (st->finish_buf) {
+    gcomp_free(alloc, st->finish_buf);
+    st->finish_buf = NULL;
+  }
+  st->finish_buf_size = 0;
+  st->finish_buf_used = 0;
+  st->finish_buf_copied = 0;
+  st->finish_buf_ready = 0;
 
   // Note: We don't reset fixed_ready because the fixed Huffman tables don't
   // need to be rebuilt - they're static and can be reused.
@@ -2018,6 +2046,75 @@ gcomp_status_t gcomp_deflate_encoder_update(gcomp_encoder_t * encoder,
   return GCOMP_OK;
 }
 
+/**
+ * @brief Estimate the maximum size needed for finish() output.
+ *
+ * This is a conservative upper bound to ensure we allocate enough buffer
+ * space to render the entire finish output in one pass.
+ *
+ * The estimate accounts for:
+ * - Remaining lookahead bytes (each becomes a literal or part of a match)
+ * - Buffered symbols that need to be flushed
+ * - Dynamic Huffman tree overhead
+ * - Block headers and end-of-block markers
+ * - Byte alignment padding
+ *
+ * @param st Encoder state
+ * @return Conservative upper bound in bytes
+ */
+static size_t deflate_estimate_finish_size(
+    const gcomp_deflate_encoder_state_t * st) {
+  // Each literal/length can be up to 15 bits (dynamic Huffman max)
+  // Each distance can be up to 15 bits + 13 extra bits = 28 bits
+  // Worst case for a length/distance pair: ~43 bits
+  // For a literal: 15 bits
+  //
+  // Conservative: assume 4 bytes per symbol (32 bits) which is more than
+  // enough for any symbol type.
+  size_t sym_overhead = 4;
+
+  // Count symbols: remaining lookahead + already buffered symbols
+  size_t total_symbols = st->lookahead + st->sym_buf_used;
+
+  // For level 0, each byte becomes a stored block byte (1:1 plus header)
+  if (st->level == 0) {
+    // Stored block: 3 bits header, byte-align, 4 bytes LEN/NLEN, then data
+    // Plus we might have multiple blocks if data is large
+    size_t data_bytes = st->block_buffer_used + st->lookahead;
+    size_t num_blocks =
+        (data_bytes + DEFLATE_MAX_STORED_BLOCK - 1) / DEFLATE_MAX_STORED_BLOCK;
+    if (num_blocks == 0) {
+      num_blocks = 1; // At least one final block
+    }
+    // Each block: up to 5 bytes header (3 bits rounded + 4 bytes LEN/NLEN)
+    // plus the data
+    return num_blocks * 5 + data_bytes + 8; // +8 for safety margin
+  }
+
+  // For Huffman blocks, estimate based on symbols
+  size_t symbol_bytes = total_symbols * sym_overhead;
+
+  // Dynamic Huffman tree overhead: up to ~300 bytes for the tree encoding
+  // (HLIT/HDIST/HCLEN headers, code-length codes, encoded code lengths)
+  size_t tree_overhead = 512;
+
+  // Block headers (3 bits each) and end-of-block (up to 15 bits)
+  // Multiple blocks may be needed if sym_buf fills up
+  size_t num_blocks = (total_symbols + st->sym_buf_size - 1) / st->sym_buf_size;
+  if (num_blocks == 0) {
+    num_blocks = 1;
+  }
+  size_t block_overhead = num_blocks * (tree_overhead + 8);
+
+  // Byte alignment (up to 7 bits = 1 byte)
+  size_t alignment = 1;
+
+  // Safety margin
+  size_t margin = 64;
+
+  return symbol_bytes + block_overhead + alignment + margin;
+}
+
 gcomp_status_t gcomp_deflate_encoder_finish(
     gcomp_encoder_t * encoder, gcomp_buffer_t * output) {
   if (!encoder || !output) {
@@ -2034,77 +2131,130 @@ gcomp_status_t gcomp_deflate_encoder_finish(
     return GCOMP_OK;
   }
 
-  // Set bitwriter output buffer, preserving partial bits from update() calls.
-  // See comment in gcomp_deflate_encoder_update() for why this is necessary.
-  gcomp_status_t s = gcomp_deflate_bitwriter_set_buffer(&st->bitwriter,
-      (uint8_t *)output->data + output->used, output->size - output->used);
-  if (s != GCOMP_OK) {
-    return s;
-  }
+  const gcomp_allocator_t * alloc =
+      gcomp_registry_get_allocator(encoder->registry);
 
-  if (st->level == 0) {
-    // Flush remaining stored data as final block
-    s = deflate_flush_stored_block(st, 1);
-  }
-  else {
-    // Determine whether to use fixed or dynamic Huffman
-    // FIXED strategy always uses fixed codes; otherwise depends on level
-    int use_fixed_huffman =
-        (st->strategy == DEFLATE_STRATEGY_FIXED) || (st->level <= 3);
+  // If we haven't rendered the finish output yet, do so now
+  if (!st->finish_buf_ready) {
+    // Estimate how much buffer we need
+    size_t buf_size = deflate_estimate_finish_size(st);
 
-    // Flush any remaining lookahead as literals
-    while (st->lookahead > 0) {
-      if (st->sym_buf_used >= st->sym_buf_size) {
-        if (use_fixed_huffman) {
-          s = deflate_flush_fixed_block(st, 0);
-        }
-        else {
-          s = deflate_flush_dynamic_block(st, 0);
-        }
-        if (s != GCOMP_OK) {
-          output->used += gcomp_deflate_bitwriter_bytes_written(&st->bitwriter);
-          return s;
-        }
-      }
+    // Allocate the finish buffer
+    st->finish_buf = (uint8_t *)gcomp_malloc(alloc, buf_size);
+    if (!st->finish_buf) {
+      return GCOMP_ERR_MEMORY;
+    }
+    st->finish_buf_size = buf_size;
+    st->finish_buf_used = 0;
+    st->finish_buf_copied = 0;
 
-      size_t pos =
-          (st->window_pos + st->window_size - st->lookahead) % st->window_size;
-      uint8_t lit = st->window[pos];
-      st->lit_buf[st->sym_buf_used] = lit;
-      st->dist_buf[st->sym_buf_used] = 0;
-      st->sym_buf_used++;
-
-      // Track frequency for dynamic Huffman
-      if (st->lit_freq) {
-        st->lit_freq[lit]++;
-      }
-
-      st->lookahead--;
+    // Set up bitwriter to write to our internal buffer
+    gcomp_status_t s = gcomp_deflate_bitwriter_set_buffer(
+        &st->bitwriter, st->finish_buf, st->finish_buf_size);
+    if (s != GCOMP_OK) {
+      gcomp_free(alloc, st->finish_buf);
+      st->finish_buf = NULL;
+      st->finish_buf_size = 0;
+      return s;
     }
 
-    // Flush final block
-    if (use_fixed_huffman) {
-      s = deflate_flush_fixed_block(st, 1);
+    if (st->level == 0) {
+      // Flush remaining stored data as final block
+      s = deflate_flush_stored_block(st, 1);
     }
     else {
-      s = deflate_flush_dynamic_block(st, 1);
+      // Determine whether to use fixed or dynamic Huffman
+      int use_fixed_huffman =
+          (st->strategy == DEFLATE_STRATEGY_FIXED) || (st->level <= 3);
+
+      // Flush any remaining lookahead as literals
+      while (st->lookahead > 0) {
+        if (st->sym_buf_used >= st->sym_buf_size) {
+          if (use_fixed_huffman) {
+            s = deflate_flush_fixed_block(st, 0);
+          }
+          else {
+            s = deflate_flush_dynamic_block(st, 0);
+          }
+          if (s != GCOMP_OK) {
+            gcomp_free(alloc, st->finish_buf);
+            st->finish_buf = NULL;
+            st->finish_buf_size = 0;
+            return s;
+          }
+        }
+
+        size_t pos = (st->window_pos + st->window_size - st->lookahead) %
+            st->window_size;
+        uint8_t lit = st->window[pos];
+        st->lit_buf[st->sym_buf_used] = lit;
+        st->dist_buf[st->sym_buf_used] = 0;
+        st->sym_buf_used++;
+
+        // Track frequency for dynamic Huffman
+        if (st->lit_freq) {
+          st->lit_freq[lit]++;
+        }
+
+        st->lookahead--;
+      }
+
+      // Flush final block
+      if (use_fixed_huffman) {
+        s = deflate_flush_fixed_block(st, 1);
+      }
+      else {
+        s = deflate_flush_dynamic_block(st, 1);
+      }
     }
+
+    if (s != GCOMP_OK) {
+      gcomp_free(alloc, st->finish_buf);
+      st->finish_buf = NULL;
+      st->finish_buf_size = 0;
+      return s;
+    }
+
+    // Flush bitwriter to byte boundary
+    s = gcomp_deflate_bitwriter_flush_to_byte(&st->bitwriter);
+    if (s != GCOMP_OK) {
+      gcomp_free(alloc, st->finish_buf);
+      st->finish_buf = NULL;
+      st->finish_buf_size = 0;
+      return s;
+    }
+
+    // Record how many bytes were written
+    st->finish_buf_used = gcomp_deflate_bitwriter_bytes_written(&st->bitwriter);
+    st->finish_buf_ready = 1;
   }
 
-  if (s != GCOMP_OK) {
-    output->used += gcomp_deflate_bitwriter_bytes_written(&st->bitwriter);
-    return s;
+  // Copy from finish buffer to user output
+  size_t remaining = st->finish_buf_used - st->finish_buf_copied;
+  size_t out_space = output->size - output->used;
+  size_t to_copy = (remaining < out_space) ? remaining : out_space;
+
+  if (to_copy > 0) {
+    memcpy((uint8_t *)output->data + output->used,
+        st->finish_buf + st->finish_buf_copied, to_copy);
+    output->used += to_copy;
+    st->finish_buf_copied += to_copy;
   }
 
-  // Flush bitwriter to byte boundary
-  s = gcomp_deflate_bitwriter_flush_to_byte(&st->bitwriter);
-  if (s != GCOMP_OK) {
-    output->used += gcomp_deflate_bitwriter_bytes_written(&st->bitwriter);
-    return s;
+  // Check if we've copied everything
+  if (st->finish_buf_copied >= st->finish_buf_used) {
+    // All done - clean up and mark complete
+    gcomp_free(alloc, st->finish_buf);
+    st->finish_buf = NULL;
+    st->finish_buf_size = 0;
+    st->finish_buf_used = 0;
+    st->finish_buf_copied = 0;
+    st->finish_buf_ready = 0;
+    st->final_block_written = 1;
+    st->stage = DEFLATE_ENC_STAGE_DONE;
+    return GCOMP_OK;
   }
 
-  output->used += gcomp_deflate_bitwriter_bytes_written(&st->bitwriter);
-  st->final_block_written = 1;
-  st->stage = DEFLATE_ENC_STAGE_DONE;
-  return GCOMP_OK;
+  // More data to copy - caller should call finish() again
+  return GCOMP_ERR_LIMIT;
 }

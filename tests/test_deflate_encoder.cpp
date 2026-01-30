@@ -398,6 +398,69 @@ TEST_F(DeflateEncoderTest, ChunkedEncoding_SmallChunks) {
   EXPECT_EQ(memcmp(decompressed.data(), input, input_len), 0);
 }
 
+TEST_F(DeflateEncoderTest, ChunkedEncoding_SmallInputChunks) {
+  // Test that the encoder can handle input fed in very small chunks (1 byte at
+  // a time). This stress-tests the streaming behavior during update().
+  //
+  // Note: The current encoder's finish() doesn't support incremental output
+  // across multiple calls with small buffers - it needs enough space to write
+  // the entire final block. This test focuses on small INPUT chunks instead.
+  const char * input_str =
+      "This is a test of small input chunk encoding. "
+      "The encoder must handle input fed one byte at a time correctly. "
+      "Each update call receives a single byte of input.";
+  const uint8_t * input = (const uint8_t *)input_str;
+  size_t input_len = strlen(input_str);
+
+  ASSERT_EQ(
+      gcomp_encoder_create(registry_, "deflate", nullptr, &encoder_), GCOMP_OK);
+
+  std::vector<uint8_t> compressed;
+  compressed.reserve(input_len * 2);
+
+  // Feed input one byte at a time
+  uint8_t update_out[256] = {};
+  for (size_t i = 0; i < input_len; i++) {
+    gcomp_buffer_t in_buf = {input + i, 1, 0};
+    gcomp_buffer_t out_buf = {update_out, sizeof(update_out), 0};
+
+    gcomp_status_t status = gcomp_encoder_update(encoder_, &in_buf, &out_buf);
+    ASSERT_EQ(status, GCOMP_OK) << "Update failed at byte " << i;
+    ASSERT_EQ(in_buf.used, 1u) << "Encoder did not consume byte " << i;
+
+    // Collect any output
+    for (size_t j = 0; j < out_buf.used; j++) {
+      compressed.push_back(update_out[j]);
+    }
+  }
+
+  // Finish with a buffer large enough to complete in one call
+  uint8_t finish_out[512] = {};
+  gcomp_buffer_t finish_buf = {finish_out, sizeof(finish_out), 0};
+  gcomp_status_t status = gcomp_encoder_finish(encoder_, &finish_buf);
+  ASSERT_EQ(status, GCOMP_OK) << "Finish failed";
+
+  for (size_t i = 0; i < finish_buf.used; i++) {
+    compressed.push_back(finish_out[i]);
+  }
+
+  ASSERT_GT(compressed.size(), 0u) << "No compressed output produced";
+
+  // Clean up encoder before creating decoder
+  gcomp_encoder_destroy(encoder_);
+  encoder_ = nullptr;
+
+  // Decode and verify
+  std::vector<uint8_t> decompressed;
+  ASSERT_EQ(decode_data(
+                compressed.data(), compressed.size(), decompressed, input_len),
+      GCOMP_OK);
+
+  ASSERT_EQ(decompressed.size(), input_len);
+  EXPECT_EQ(memcmp(decompressed.data(), input, input_len), 0)
+      << "Decompressed data doesn't match original";
+}
+
 //
 // Memory tests
 //
@@ -988,6 +1051,413 @@ TEST_F(DeflateEncoderTest, Strategy_Default_MixedPattern_Dynamic) {
 
   ASSERT_EQ(decompressed.size(), input.size());
   EXPECT_EQ(memcmp(decompressed.data(), input.data(), input.size()), 0);
+}
+
+//
+// Incremental finish() output tests (T5.9)
+//
+// These tests verify that encoder finish() correctly supports small output
+// buffers by buffering output internally and copying incrementally.
+//
+
+TEST_F(DeflateEncoderTest, Finish_OneByteOutputBuffer) {
+  // Test finish() with 1-byte output buffer - the encoder should buffer
+  // internally and copy out one byte at a time
+  const char * input_str = "Hello, World! This tests incremental finish.";
+  const uint8_t * input = (const uint8_t *)input_str;
+  size_t input_len = strlen(input_str);
+
+  ASSERT_EQ(
+      gcomp_encoder_create(registry_, "deflate", nullptr, &encoder_), GCOMP_OK);
+
+  // First, feed all input and collect any output during update
+  std::vector<uint8_t> compressed;
+  compressed.reserve(input_len * 2);
+
+  uint8_t update_out[256] = {};
+  gcomp_buffer_t in_buf = {input, input_len, 0};
+  gcomp_buffer_t out_buf = {update_out, sizeof(update_out), 0};
+
+  gcomp_status_t status = gcomp_encoder_update(encoder_, &in_buf, &out_buf);
+  ASSERT_EQ(status, GCOMP_OK);
+  ASSERT_EQ(in_buf.used, input_len);
+
+  for (size_t i = 0; i < out_buf.used; i++) {
+    compressed.push_back(update_out[i]);
+  }
+
+  // Now call finish() with 1-byte output buffer repeatedly until done
+  uint8_t one_byte_buf[1] = {};
+  int iterations = 0;
+  const int max_iterations = 10000; // Safety limit
+
+  while (iterations < max_iterations) {
+    gcomp_buffer_t finish_buf = {one_byte_buf, 1, 0};
+    status = gcomp_encoder_finish(encoder_, &finish_buf);
+
+    if (finish_buf.used > 0) {
+      compressed.push_back(one_byte_buf[0]);
+    }
+
+    if (status == GCOMP_OK) {
+      // Finished successfully
+      break;
+    }
+
+    ASSERT_EQ(status, GCOMP_ERR_LIMIT)
+        << "Unexpected status: " << status << " at iteration " << iterations;
+    iterations++;
+  }
+
+  ASSERT_LT(iterations, max_iterations)
+      << "finish() did not complete in reasonable iterations";
+  ASSERT_GT(compressed.size(), 0u) << "No compressed output produced";
+
+  // Clean up encoder before creating decoder
+  gcomp_encoder_destroy(encoder_);
+  encoder_ = nullptr;
+
+  // Verify the output decompresses correctly
+  std::vector<uint8_t> decompressed;
+  ASSERT_EQ(decode_data(
+                compressed.data(), compressed.size(), decompressed, input_len),
+      GCOMP_OK);
+
+  ASSERT_EQ(decompressed.size(), input_len);
+  EXPECT_EQ(memcmp(decompressed.data(), input, input_len), 0)
+      << "Decompressed data doesn't match original";
+}
+
+TEST_F(DeflateEncoderTest, Finish_SmallOutputBuffer_16Bytes) {
+  // Test finish() with 16-byte output buffer
+  const char * input_str = "The quick brown fox jumps over the lazy dog. "
+                           "Pack my box with five dozen liquor jugs.";
+  const uint8_t * input = (const uint8_t *)input_str;
+  size_t input_len = strlen(input_str);
+
+  ASSERT_EQ(
+      gcomp_encoder_create(registry_, "deflate", nullptr, &encoder_), GCOMP_OK);
+
+  // Feed all input
+  std::vector<uint8_t> compressed;
+  compressed.reserve(input_len * 2);
+
+  uint8_t update_out[512] = {};
+  gcomp_buffer_t in_buf = {input, input_len, 0};
+  gcomp_buffer_t out_buf = {update_out, sizeof(update_out), 0};
+
+  ASSERT_EQ(gcomp_encoder_update(encoder_, &in_buf, &out_buf), GCOMP_OK);
+
+  for (size_t i = 0; i < out_buf.used; i++) {
+    compressed.push_back(update_out[i]);
+  }
+
+  // Call finish() with 16-byte output buffer
+  uint8_t small_buf[16] = {};
+  int iterations = 0;
+  const int max_iterations = 1000;
+
+  while (iterations < max_iterations) {
+    gcomp_buffer_t finish_buf = {small_buf, sizeof(small_buf), 0};
+    gcomp_status_t status = gcomp_encoder_finish(encoder_, &finish_buf);
+
+    for (size_t i = 0; i < finish_buf.used; i++) {
+      compressed.push_back(small_buf[i]);
+    }
+
+    if (status == GCOMP_OK) {
+      break;
+    }
+
+    ASSERT_EQ(status, GCOMP_ERR_LIMIT)
+        << "Unexpected status at iteration " << iterations;
+    iterations++;
+  }
+
+  ASSERT_LT(iterations, max_iterations);
+
+  // Clean up and verify
+  gcomp_encoder_destroy(encoder_);
+  encoder_ = nullptr;
+
+  std::vector<uint8_t> decompressed;
+  ASSERT_EQ(decode_data(
+                compressed.data(), compressed.size(), decompressed, input_len),
+      GCOMP_OK);
+
+  ASSERT_EQ(decompressed.size(), input_len);
+  EXPECT_EQ(memcmp(decompressed.data(), input, input_len), 0);
+}
+
+TEST_F(DeflateEncoderTest, Finish_VaryingBufferSizes) {
+  // Test finish() with varying buffer sizes each call
+  const char * input_str =
+      "This test uses different buffer sizes for each finish call.";
+  const uint8_t * input = (const uint8_t *)input_str;
+  size_t input_len = strlen(input_str);
+
+  ASSERT_EQ(
+      gcomp_encoder_create(registry_, "deflate", nullptr, &encoder_), GCOMP_OK);
+
+  // Feed all input
+  std::vector<uint8_t> compressed;
+  uint8_t update_out[512] = {};
+  gcomp_buffer_t in_buf = {input, input_len, 0};
+  gcomp_buffer_t out_buf = {update_out, sizeof(update_out), 0};
+
+  ASSERT_EQ(gcomp_encoder_update(encoder_, &in_buf, &out_buf), GCOMP_OK);
+
+  for (size_t i = 0; i < out_buf.used; i++) {
+    compressed.push_back(update_out[i]);
+  }
+
+  // Call finish() with varying buffer sizes: 1, 3, 7, 2, 5, 11, 4, 8, ...
+  const size_t buffer_sizes[] = {1, 3, 7, 2, 5, 11, 4, 8, 13, 6, 9, 15, 10};
+  size_t size_index = 0;
+  uint8_t var_buf[16] = {};
+  int iterations = 0;
+  const int max_iterations = 1000;
+
+  while (iterations < max_iterations) {
+    size_t buf_size = buffer_sizes[size_index % 13];
+    gcomp_buffer_t finish_buf = {var_buf, buf_size, 0};
+    gcomp_status_t status = gcomp_encoder_finish(encoder_, &finish_buf);
+
+    for (size_t i = 0; i < finish_buf.used; i++) {
+      compressed.push_back(var_buf[i]);
+    }
+
+    if (status == GCOMP_OK) {
+      break;
+    }
+
+    ASSERT_EQ(status, GCOMP_ERR_LIMIT);
+    size_index++;
+    iterations++;
+  }
+
+  ASSERT_LT(iterations, max_iterations);
+
+  // Clean up and verify
+  gcomp_encoder_destroy(encoder_);
+  encoder_ = nullptr;
+
+  std::vector<uint8_t> decompressed;
+  ASSERT_EQ(decode_data(
+                compressed.data(), compressed.size(), decompressed, input_len),
+      GCOMP_OK);
+
+  ASSERT_EQ(decompressed.size(), input_len);
+  EXPECT_EQ(memcmp(decompressed.data(), input, input_len), 0);
+}
+
+TEST_F(DeflateEncoderTest, Finish_SmallBuffer_MatchesSingleCall) {
+  // Verify that incremental finish produces the same output as single-call
+  const char * input_str = "Test data for comparing incremental vs single call";
+  const uint8_t * input = (const uint8_t *)input_str;
+  size_t input_len = strlen(input_str);
+
+  // First: encode with large buffer (single-call finish)
+  std::vector<uint8_t> compressed_single;
+  {
+    gcomp_encoder_t * enc = nullptr;
+    ASSERT_EQ(
+        gcomp_encoder_create(registry_, "deflate", nullptr, &enc), GCOMP_OK);
+
+    uint8_t out[1024] = {};
+    gcomp_buffer_t in_buf = {input, input_len, 0};
+    gcomp_buffer_t out_buf = {out, sizeof(out), 0};
+    ASSERT_EQ(gcomp_encoder_update(enc, &in_buf, &out_buf), GCOMP_OK);
+
+    for (size_t i = 0; i < out_buf.used; i++) {
+      compressed_single.push_back(out[i]);
+    }
+
+    gcomp_buffer_t finish_buf = {out, sizeof(out), 0};
+    ASSERT_EQ(gcomp_encoder_finish(enc, &finish_buf), GCOMP_OK);
+
+    for (size_t i = 0; i < finish_buf.used; i++) {
+      compressed_single.push_back(out[i]);
+    }
+
+    gcomp_encoder_destroy(enc);
+  }
+
+  // Second: encode with small buffer (incremental finish)
+  std::vector<uint8_t> compressed_incremental;
+  {
+    gcomp_encoder_t * enc = nullptr;
+    ASSERT_EQ(
+        gcomp_encoder_create(registry_, "deflate", nullptr, &enc), GCOMP_OK);
+
+    uint8_t out[1024] = {};
+    gcomp_buffer_t in_buf = {input, input_len, 0};
+    gcomp_buffer_t out_buf = {out, sizeof(out), 0};
+    ASSERT_EQ(gcomp_encoder_update(enc, &in_buf, &out_buf), GCOMP_OK);
+
+    for (size_t i = 0; i < out_buf.used; i++) {
+      compressed_incremental.push_back(out[i]);
+    }
+
+    // Finish with 1-byte buffer
+    uint8_t one_byte[1] = {};
+    int iterations = 0;
+    while (iterations < 10000) {
+      gcomp_buffer_t finish_buf = {one_byte, 1, 0};
+      gcomp_status_t status = gcomp_encoder_finish(enc, &finish_buf);
+
+      if (finish_buf.used > 0) {
+        compressed_incremental.push_back(one_byte[0]);
+      }
+
+      if (status == GCOMP_OK) {
+        break;
+      }
+      iterations++;
+    }
+
+    gcomp_encoder_destroy(enc);
+  }
+
+  // Compare: both should produce identical output
+  ASSERT_EQ(compressed_single.size(), compressed_incremental.size())
+      << "Size mismatch between single-call and incremental finish";
+  EXPECT_EQ(memcmp(compressed_single.data(), compressed_incremental.data(),
+                compressed_single.size()),
+      0)
+      << "Data mismatch between single-call and incremental finish";
+}
+
+TEST_F(DeflateEncoderTest, Finish_SmallBuffer_Level0_Stored) {
+  // Test incremental finish with level 0 (stored blocks)
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  ASSERT_EQ(gcomp_options_set_int64(opts, "deflate.level", 0), GCOMP_OK);
+
+  const char * input_str =
+      "Testing level 0 stored blocks with small finish buffer";
+  const uint8_t * input = (const uint8_t *)input_str;
+  size_t input_len = strlen(input_str);
+
+  ASSERT_EQ(
+      gcomp_encoder_create(registry_, "deflate", opts, &encoder_), GCOMP_OK);
+  gcomp_options_destroy(opts);
+
+  // Feed all input
+  std::vector<uint8_t> compressed;
+  uint8_t update_out[256] = {};
+  gcomp_buffer_t in_buf = {input, input_len, 0};
+  gcomp_buffer_t out_buf = {update_out, sizeof(update_out), 0};
+
+  ASSERT_EQ(gcomp_encoder_update(encoder_, &in_buf, &out_buf), GCOMP_OK);
+
+  for (size_t i = 0; i < out_buf.used; i++) {
+    compressed.push_back(update_out[i]);
+  }
+
+  // Finish with 1-byte buffer
+  uint8_t one_byte[1] = {};
+  int iterations = 0;
+
+  while (iterations < 10000) {
+    gcomp_buffer_t finish_buf = {one_byte, 1, 0};
+    gcomp_status_t status = gcomp_encoder_finish(encoder_, &finish_buf);
+
+    if (finish_buf.used > 0) {
+      compressed.push_back(one_byte[0]);
+    }
+
+    if (status == GCOMP_OK) {
+      break;
+    }
+
+    ASSERT_EQ(status, GCOMP_ERR_LIMIT);
+    iterations++;
+  }
+
+  ASSERT_LT(iterations, 10000);
+
+  // Clean up and verify
+  gcomp_encoder_destroy(encoder_);
+  encoder_ = nullptr;
+
+  std::vector<uint8_t> decompressed;
+  ASSERT_EQ(decode_data(
+                compressed.data(), compressed.size(), decompressed, input_len),
+      GCOMP_OK);
+
+  ASSERT_EQ(decompressed.size(), input_len);
+  EXPECT_EQ(memcmp(decompressed.data(), input, input_len), 0);
+}
+
+TEST_F(DeflateEncoderTest, Finish_SmallBuffer_AllLevels) {
+  // Test incremental finish across all compression levels
+  const char * input_str = "Test data for all levels with incremental finish";
+  const uint8_t * input = (const uint8_t *)input_str;
+  size_t input_len = strlen(input_str);
+
+  for (int level = 0; level <= 9; level++) {
+    gcomp_options_t * opts = nullptr;
+    ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+    ASSERT_EQ(gcomp_options_set_int64(opts, "deflate.level", level), GCOMP_OK);
+
+    gcomp_encoder_t * enc = nullptr;
+    ASSERT_EQ(gcomp_encoder_create(registry_, "deflate", opts, &enc), GCOMP_OK);
+    gcomp_options_destroy(opts);
+
+    // Feed input
+    std::vector<uint8_t> compressed;
+    uint8_t out[256] = {};
+    gcomp_buffer_t in_buf = {input, input_len, 0};
+    gcomp_buffer_t out_buf = {out, sizeof(out), 0};
+
+    ASSERT_EQ(gcomp_encoder_update(enc, &in_buf, &out_buf), GCOMP_OK)
+        << "Update failed at level " << level;
+
+    for (size_t i = 0; i < out_buf.used; i++) {
+      compressed.push_back(out[i]);
+    }
+
+    // Incremental finish with 8-byte buffer
+    uint8_t small_buf[8] = {};
+    int iterations = 0;
+
+    while (iterations < 1000) {
+      gcomp_buffer_t finish_buf = {small_buf, sizeof(small_buf), 0};
+      gcomp_status_t status = gcomp_encoder_finish(enc, &finish_buf);
+
+      for (size_t i = 0; i < finish_buf.used; i++) {
+        compressed.push_back(small_buf[i]);
+      }
+
+      if (status == GCOMP_OK) {
+        break;
+      }
+
+      ASSERT_EQ(status, GCOMP_ERR_LIMIT)
+          << "Unexpected status at level " << level;
+      iterations++;
+    }
+
+    ASSERT_LT(iterations, 1000) << "Too many iterations at level " << level;
+
+    gcomp_encoder_destroy(enc);
+
+    // Verify
+    std::vector<uint8_t> decompressed;
+    ASSERT_EQ(decode_data(compressed.data(), compressed.size(), decompressed,
+                  input_len),
+        GCOMP_OK)
+        << "Decode failed at level " << level;
+
+    ASSERT_EQ(decompressed.size(), input_len)
+        << "Size mismatch at level " << level;
+    EXPECT_EQ(memcmp(decompressed.data(), input, input_len), 0)
+        << "Data mismatch at level " << level;
+
+    gcomp_decoder_destroy(decoder_);
+    decoder_ = nullptr;
+  }
 }
 
 int main(int argc, char ** argv) {
