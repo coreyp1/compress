@@ -52,6 +52,7 @@
 // - `gzip.extra` (bytes, optional): FEXTRA field data
 // - `gzip.header_crc` (bool, default false): Include FHCRC
 // - `gzip.xfl` (uint64, optional): Extra flags (auto-calculated if not set)
+// - `gzip.header_flags` (uint64, optional): Header flags byte (auto-calculated)
 // - `gzip.concat` (bool, default false): Decoder: support concatenated members
 //
 // Header field size limits (decoder safety):
@@ -164,6 +165,19 @@ static const gcomp_option_schema_t g_gzip_option_schemas[] = {
         "Extra flags (auto-calculated if not set)", // help
     },
     {
+        "gzip.header_flags", // key
+        GCOMP_OPT_UINT64,    // type
+        0,                   // has_default (auto-calculated)
+        {.ui64 = 0},         // default_value
+        1,                   // has_min
+        1,                   // has_max
+        0,                   // min_int
+        0,                   // max_int
+        0,                   // min_uint
+        255,                 // max_uint
+        "Header flags byte (auto-calculated if not set)", // help
+    },
+    {
         "gzip.concat",                           // key
         GCOMP_OPT_BOOL,                          // type
         1,                                       // has_default
@@ -225,6 +239,7 @@ static const char * const g_gzip_option_keys[] = {
     "gzip.extra",
     "gzip.header_crc",
     "gzip.xfl",
+    "gzip.header_flags",
     "gzip.concat",
     "gzip.max_name_bytes",
     "gzip.max_comment_bytes",

@@ -41,6 +41,7 @@ See [Auto-Registration](../auto-registration.md) for details on disabling auto-r
 | `gzip.extra` | bytes | (none) | Extra field data (written to FEXTRA header field) |
 | `gzip.header_crc` | bool | false | Include CRC16 of header (FHCRC field) |
 | `gzip.xfl` | uint64 | (auto) | Extra flags byte; auto-calculated from compression level if not set |
+| `gzip.header_flags` | uint64 | (auto) | Header FLG byte; OR'd with auto-calculated flags (0-255) |
 | `gzip.concat` | bool | false | Decoder: support concatenated gzip members |
 
 ### Header field size limits (decoder safety)
@@ -85,12 +86,29 @@ The FLG byte is auto-calculated based on which optional fields are provided:
 
 | Bit | Flag | Set when |
 |-----|------|----------|
-| 0 | FTEXT | Never (not used) |
+| 0 | FTEXT | Never (not used by default) |
 | 1 | FHCRC | `gzip.header_crc` is true |
 | 2 | FEXTRA | `gzip.extra` is provided |
 | 3 | FNAME | `gzip.name` is provided |
 | 4 | FCOMMENT | `gzip.comment` is provided |
 | 5-7 | Reserved | Always 0 |
+
+### Explicit header flags
+
+The `gzip.header_flags` option allows explicit control over the FLG byte. When set, the value is **OR'd** with the auto-calculated flags, ensuring consistency between the header byte and the actual optional fields present:
+
+```c
+gcomp_options_t *opts = NULL;
+gcomp_options_create(&opts);
+
+// Set FTEXT flag (bit 0) to indicate text content
+gcomp_options_set_uint64(opts, "gzip.header_flags", 0x01);
+
+// The encoder will compute: FLG = auto_flags | 0x01
+// If gzip.name is also set, FLG will have both FNAME (0x08) and FTEXT (0x01)
+```
+
+**Note:** Setting explicit flags does not disable auto-calculation. If you set `gzip.header_flags` to a value that conflicts with provided fields (e.g., clearing FNAME when `gzip.name` is provided), the auto-calculated flags will still be OR'd in, ensuring the header correctly reflects the data that follows.
 
 ## Concatenated members
 

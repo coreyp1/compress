@@ -3,8 +3,45 @@
  *
  * Implementation of CRC32 computation for the Ghoti.io Compress library.
  *
- * This implementation is compatible with RFC 1952 (gzip format) and uses
- * the IEEE 802.3 polynomial (0xEDB88320).
+ * ## Algorithm
+ *
+ * This implementation uses the IEEE 802.3 CRC32 algorithm, which is the
+ * standard CRC used by gzip (RFC 1952), PNG, zlib, and Ethernet. The
+ * polynomial is 0x04C11DB7 (normal) / 0xEDB88320 (bit-reversed).
+ *
+ * ## API Design
+ *
+ * The CRC32 API uses an incremental computation model:
+ *
+ * 1. **Initialize** with GCOMP_CRC32_INIT (0xFFFFFFFF)
+ * 2. **Update** with one or more calls to gcomp_crc32_update()
+ * 3. **Finalize** with gcomp_crc32_finalize() to get the actual CRC32
+ *
+ * Example (incremental):
+ * ```c
+ * uint32_t crc = GCOMP_CRC32_INIT;
+ * crc = gcomp_crc32_update(crc, data1, len1);
+ * crc = gcomp_crc32_update(crc, data2, len2);
+ * uint32_t final_crc = gcomp_crc32_finalize(crc);  // → e.g., 0xCBF43926
+ * ```
+ *
+ * The one-shot gcomp_crc32() function returns the **unfinalized** running
+ * CRC, not the final value. This design allows combining one-shot and
+ * incremental modes:
+ *
+ * ```c
+ * uint32_t crc = gcomp_crc32(data, len);          // Unfinalized
+ * uint32_t final = gcomp_crc32_finalize(crc);     // Finalized
+ * ```
+ *
+ * ## Why Unfinalized One-Shot?
+ *
+ * The one-shot function returns the unfinalized value to match the behavior
+ * of gcomp_crc32_update(), allowing:
+ * - Combining one-shot with incremental: start with gcomp_crc32(), continue
+ *   with gcomp_crc32_update() using the same running value
+ * - Consistent mental model: all intermediate values are "running CRC"
+ * - Explicit finalization makes the XOR operation visible to callers
  *
  * Copyright 2026 by Corey Pennycuff
  */
@@ -15,7 +52,34 @@
 #include <stddef.h>
 #include <stdint.h>
 
-// CRC32 lookup table for byte-by-byte computation
+/**
+ * CRC32 lookup table for byte-by-byte computation.
+ *
+ * This table implements the IEEE 802.3 CRC32 (also known as ISO 3309, ITU-T
+ * V.42, ANSI X3.66, or simply "CRC-32"). It is the standard CRC used by:
+ *   - gzip (RFC 1952)
+ *   - PNG (RFC 2083)
+ *   - zlib
+ *   - Ethernet frame check sequence
+ *   - PKZIP, InfoZIP, and many other formats
+ *
+ * Polynomial: 0x04C11DB7 (normal form) / 0xEDB88320 (bit-reversed form)
+ *   Normal:   x^32 + x^26 + x^23 + x^22 + x^16 + x^12 + x^11 + x^10 +
+ *             x^8 + x^7 + x^5 + x^4 + x^2 + x + 1
+ *
+ * The table is indexed by byte value (0-255). Each entry crc32_table[i] is
+ * the CRC32 contribution of processing byte i, computed as:
+ *
+ *   for (int i = 0; i < 256; i++) {
+ *       uint32_t crc = i;
+ *       for (int j = 0; j < 8; j++) {
+ *           crc = (crc >> 1) ^ ((crc & 1) ? 0xEDB88320 : 0);
+ *       }
+ *       crc32_table[i] = crc;
+ *   }
+ *
+ * Reference: RFC 1952, Section 8 ("Appendix: CRC32 algorithm")
+ */
 static const uint32_t crc32_table[256] = {0x00000000, 0x77073096, 0xee0e612c,
     0x990951ba, 0x076dc419, 0x706af48f, 0xe963a535, 0x9e6495a3, 0x0edb8832,
     0x79dcb8a4, 0xe0d5e91e, 0x97d2d988, 0x09b64c2b, 0x7eb17cbd, 0xe7b82d07,
@@ -61,42 +125,81 @@ static const uint32_t crc32_table[256] = {0x00000000, 0x77073096, 0xee0e612c,
     0xc4614ab8, 0x5d681b02, 0x2a6f2b94, 0xb40bbe37, 0xc30c8ea1, 0x5a05df1b,
     0x2d02ef8d};
 
+/**
+ * Update CRC32 with additional data bytes.
+ *
+ * Process data bytes through the CRC32 algorithm and return the updated
+ * running CRC value. This function can be called multiple times to
+ * compute the CRC incrementally.
+ *
+ * @param crc   Current running CRC (initialize with GCOMP_CRC32_INIT)
+ * @param data  Pointer to data bytes (may be NULL, which returns crc unchanged)
+ * @param len   Number of bytes to process
+ * @return Updated running CRC value (not finalized)
+ *
+ * @note The returned value is NOT the final CRC32. Call gcomp_crc32_finalize()
+ *       on the final result to get the actual CRC32 value.
+ */
 uint32_t gcomp_crc32_update(uint32_t crc, const uint8_t * data, size_t len) {
   if (!data) {
     return crc;
   }
 
-  // Standard CRC32 algorithm with pre/post conditioning
-  // Pre-condition: invert the CRC value (for init 0xFFFFFFFF, this gives 0)
-  uint32_t result = crc ^ 0xFFFFFFFFU;
-
+  // Process each byte through the lookup table.
+  // The expression (crc ^ byte) & 0xFF gives the table index.
+  // The table value is XOR'd with the shifted CRC to produce the new value.
   for (size_t i = 0; i < len; i++) {
     uint8_t byte = data[i];
-    uint8_t index = (uint8_t)(result ^ byte);
-    result = (result >> 8) ^ crc32_table[index];
+    crc = crc32_table[(crc ^ byte) & 0xFF] ^ (crc >> 8);
   }
 
-  // Post-condition: invert the result back
-  return result ^ 0xFFFFFFFFU;
+  return crc;
 }
 
+/**
+ * Finalize a running CRC32 value.
+ *
+ * The IEEE 802.3 CRC32 algorithm requires a final XOR with 0xFFFFFFFF
+ * to produce the actual checksum value. This function performs that step.
+ *
+ * @param crc  Running CRC value from gcomp_crc32_update()
+ * @return Finalized CRC32 value suitable for storage/comparison
+ *
+ * @note For "123456789", the finalized CRC32 is 0xCBF43926 (the standard
+ *       "check value" used to verify CRC32 implementations).
+ */
 uint32_t gcomp_crc32_finalize(uint32_t crc) {
   return crc ^ 0xFFFFFFFFU;
 }
 
+/**
+ * Compute CRC32 of a data buffer (one-shot, returns unfinalized value).
+ *
+ * This is a convenience function that initializes the CRC, processes all
+ * data, and returns the running CRC value. Note that this returns the
+ * UNFINALIZED value to maintain consistency with gcomp_crc32_update().
+ *
+ * @param data  Pointer to data bytes (NULL or len=0 returns 0)
+ * @param len   Number of bytes to process
+ * @return Running CRC value (not finalized)
+ *
+ * @note Call gcomp_crc32_finalize() on the result to get the actual CRC32.
+ *
+ * Example:
+ * ```c
+ * uint32_t crc = gcomp_crc32(data, len);
+ * uint32_t final = gcomp_crc32_finalize(crc);  // Actual CRC32
+ * ```
+ */
 uint32_t gcomp_crc32(const uint8_t * data, size_t len) {
   if (!data || len == 0) {
-    // For empty input with init 0xFFFFFFFF, result is 0xFFFFFFFF
-    // But return 0 for empty input to match common behavior
+    // For empty input, return 0 (the unfinalized CRC of no data).
+    // Note: finalize(0) would give 0xFFFFFFFF, but typically empty
+    // data is compared against finalized CRC32 of 0x00000000.
     return 0;
   }
 
-  // Standard CRC32 (RFC 1952): init 0xFFFFFFFF, no final XOR for one-shot
   uint32_t crc = GCOMP_CRC32_INIT;
   crc = gcomp_crc32_update(crc, data, len);
-
-  // Note: We don't finalize here (no XOR with 0xFFFFFFFF) to match common
-  // usage patterns. Call gcomp_crc32_finalize() if you need the finalized
-  // value for file formats (e.g., gzip format requires finalized CRC32)
   return crc;
 }

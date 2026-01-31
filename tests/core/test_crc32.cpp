@@ -21,25 +21,26 @@
 // For empty input, gcomp_crc32() returns 0
 static const uint32_t CRC32_EMPTY = 0x00000000U;
 
-// "123456789" CRC32: 0xD202D277 (unfinalized), 0x2DFD2D88 (finalized)
+// "123456789" CRC32: 0x340BC6D9 (unfinalized), 0xCBF43926 (finalized)
+// Standard check value for CRC32 (IEEE 802.3)
 static const uint8_t TEST_STRING_123456789[] = {
     '1', '2', '3', '4', '5', '6', '7', '8', '9'};
-static const uint32_t CRC32_123456789_UNFINALIZED = 0xD202D277U;
-static const uint32_t CRC32_123456789_FINALIZED = 0x2DFD2D88U;
+static const uint32_t CRC32_123456789_UNFINALIZED = 0x340BC6D9U;
+static const uint32_t CRC32_123456789_FINALIZED = 0xCBF43926U;
 
 // "The quick brown fox jumps over the lazy dog" CRC32
 static const uint8_t TEST_STRING_QUICK_BROWN[] = {'T', 'h', 'e', ' ', 'q', 'u',
     'i', 'c', 'k', ' ', 'b', 'r', 'o', 'w', 'n', ' ', 'f', 'o', 'x', ' ', 'j',
     'u', 'm', 'p', 's', ' ', 'o', 'v', 'e', 'r', ' ', 't', 'h', 'e', ' ', 'l',
     'a', 'z', 'y', ' ', 'd', 'o', 'g'};
-static const uint32_t CRC32_QUICK_BROWN_UNFINALIZED = 0x4639F7F7U;
-static const uint32_t CRC32_QUICK_BROWN_FINALIZED = 0xB9C60808U;
+static const uint32_t CRC32_QUICK_BROWN_UNFINALIZED = 0xBEB05CC6U;
+static const uint32_t CRC32_QUICK_BROWN_FINALIZED = 0x414FA339U;
 
-// Single byte 'A' (0x41) CRC32: 0xFE248EF9 (unfinalized), 0x01DB7106
+// Single byte 'A' (0x41) CRC32: 0x2C266174 (unfinalized), 0xD3D99E8B
 // (finalized)
 static const uint8_t TEST_SINGLE_BYTE = 0x41;
-static const uint32_t CRC32_SINGLE_BYTE_UNFINALIZED = 0xFE248EF9U;
-static const uint32_t CRC32_SINGLE_BYTE_FINALIZED = 0x01DB7106U;
+static const uint32_t CRC32_SINGLE_BYTE_UNFINALIZED = 0x2C266174U;
+static const uint32_t CRC32_SINGLE_BYTE_FINALIZED = 0xD3D99E8BU;
 
 class Crc32Test : public ::testing::Test {
 protected:

@@ -3,10 +3,64 @@
  *
  * RFC 1952 format helpers for the gzip method.
  *
- * This file provides helper functions for:
- * - Building gzip headers
- * - Building gzip trailers
- * - Cleanup of header info structures
+ * This file provides helper functions for constructing and managing gzip
+ * headers and trailers according to RFC 1952 ("GZIP file format specification
+ * version 4.3").
+ *
+ * ## Gzip Header Structure (RFC 1952 Section 2.3)
+ *
+ * ```
+ * Offset  Size  Field       Description
+ * ------  ----  -----       -----------
+ *    0      1   ID1         Magic byte 1 (0x1F)
+ *    1      1   ID2         Magic byte 2 (0x8B)
+ *    2      1   CM          Compression method (8 = deflate)
+ *    3      1   FLG         Flags (see below)
+ *    4      4   MTIME       Modification time (Unix timestamp, little-endian)
+ *    8      1   XFL         Extra flags (2=max compression, 4=fastest)
+ *    9      1   OS          Operating system (see RFC 1952 §2.3.1)
+ *
+ * Optional fields follow based on FLG bits:
+ *
+ *   If FEXTRA (bit 2) set:
+ *   10+     2   XLEN        Extra field length (little-endian)
+ *   12+  XLEN   extra       Extra field data
+ *
+ *   If FNAME (bit 3) set:
+ *   ...     ?   name        Original filename (Latin-1, NUL-terminated)
+ *
+ *   If FCOMMENT (bit 4) set:
+ *   ...     ?   comment     File comment (Latin-1, NUL-terminated)
+ *
+ *   If FHCRC (bit 1) set:
+ *   ...     2   CRC16       CRC16 of header bytes (lower 16 bits of CRC32)
+ * ```
+ *
+ * ## FLG Byte Bits
+ *
+ *   Bit 0: FTEXT    - File is probably ASCII text (informational)
+ *   Bit 1: FHCRC    - Header CRC16 present
+ *   Bit 2: FEXTRA   - Extra field present
+ *   Bit 3: FNAME    - Original filename present
+ *   Bit 4: FCOMMENT - File comment present
+ *   Bits 5-7: Reserved (must be zero)
+ *
+ * ## Gzip Trailer Structure (RFC 1952 Section 2.3.1)
+ *
+ * ```
+ * Offset  Size  Field       Description
+ * ------  ----  -----       -----------
+ *    0      4   CRC32       CRC32 of uncompressed data (little-endian)
+ *    4      4   ISIZE       Original uncompressed size mod 2^32 (little-endian)
+ * ```
+ *
+ * ## String Encoding Note (RFC 1952 Section 2.3)
+ *
+ * FNAME and FCOMMENT fields must be encoded in ISO 8859-1 (Latin-1) and
+ * cannot contain embedded NUL bytes (only the terminating NUL). Since this
+ * implementation uses C strings via the options API, embedded NULs would
+ * naturally truncate the string at that point. The use of strlen() to
+ * determine field lengths ensures RFC compliance.
  *
  * Copyright 2026 by Corey Pennycuff
  */
@@ -17,10 +71,24 @@
 #include <stdlib.h>
 #include <string.h>
 
-//
-// Header Writer
-//
-
+/**
+ * Write a complete gzip header to a buffer.
+ *
+ * Constructs the RFC 1952 header based on the provided header_info structure.
+ * The FLG byte in info determines which optional fields are written. The
+ * caller is responsible for ensuring the FLG byte is consistent with the
+ * populated fields (e.g., if FNAME is set in FLG, info->name should be valid).
+ *
+ * If FHCRC is set in FLG, this function computes the header CRC16 by taking
+ * the lower 16 bits of the CRC32 of all header bytes up to (but not including)
+ * the CRC16 field itself.
+ *
+ * @param info        Header information structure
+ * @param buf         Output buffer (must be at least GZIP_HEADER_MAX_SIZE)
+ * @param buf_size    Size of output buffer
+ * @param header_len_out  Receives the actual header length written
+ * @return GCOMP_OK on success, GCOMP_ERR_INVALID_ARG if buffer too small
+ */
 gcomp_status_t gzip_write_header(const gzip_header_info_t * info, uint8_t * buf,
     size_t buf_size, size_t * header_len_out) {
   if (!info || !buf || !header_len_out) {
@@ -138,10 +206,20 @@ gcomp_status_t gzip_write_header(const gzip_header_info_t * info, uint8_t * buf,
   return GCOMP_OK;
 }
 
-//
-// Trailer Writer
-//
-
+/**
+ * Write the 8-byte gzip trailer to a buffer.
+ *
+ * The trailer consists of:
+ * - CRC32: 32-bit CRC of the uncompressed data (already finalized)
+ * - ISIZE: Original uncompressed size modulo 2^32
+ *
+ * Both values are stored in little-endian byte order.
+ *
+ * @param crc32  Finalized CRC32 of uncompressed data (call gcomp_crc32_finalize
+ * first)
+ * @param isize  Uncompressed size mod 2^32
+ * @param buf    Output buffer (must be at least GZIP_TRAILER_SIZE = 8 bytes)
+ */
 void gzip_write_trailer(uint32_t crc32, uint32_t isize, uint8_t * buf) {
   if (!buf) {
     return;
@@ -160,10 +238,17 @@ void gzip_write_trailer(uint32_t crc32, uint32_t isize, uint8_t * buf) {
   buf[7] = (uint8_t)(isize >> 24);
 }
 
-//
-// Header Info Cleanup
-//
-
+/**
+ * Free dynamically allocated members of a gzip_header_info_t structure.
+ *
+ * This function frees the extra, name, and comment fields if they are
+ * non-NULL, and resets the pointers to NULL. The structure itself is not
+ * freed (it may be stack-allocated or embedded in another structure).
+ *
+ * Safe to call with NULL or with already-freed members.
+ *
+ * @param info  Header info structure to clean up (may be NULL)
+ */
 void gzip_header_info_free(gzip_header_info_t * info) {
   if (!info) {
     return;

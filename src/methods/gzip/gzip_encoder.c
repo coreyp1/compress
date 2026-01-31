@@ -3,15 +3,55 @@
  *
  * Streaming gzip (RFC 1952) wrapper encoder for the Ghoti.io Compress library.
  *
- * The gzip encoder wraps the deflate encoder, adding:
- * - RFC 1952 header (magic, CM, FLG, MTIME, XFL, OS, optional fields)
- * - CRC32 tracking of uncompressed input
- * - RFC 1952 trailer (CRC32, ISIZE)
+ * ## Overview
  *
- * The encoder operates in three stages:
- * 1. HEADER: Write gzip header to output
- * 2. BODY: Pass input through deflate encoder, tracking CRC32/ISIZE
- * 3. TRAILER: Write CRC32 and ISIZE to output
+ * The gzip format wraps DEFLATE-compressed data with a header and trailer,
+ * as specified in RFC 1952. This encoder delegates all actual compression
+ * to the inner deflate encoder while handling the gzip-specific framing.
+ *
+ * ## Gzip Stream Structure (RFC 1952)
+ *
+ * ```
+ * +---+---+---+---+--+--+--+--+---+---+=============+--+--+--+--+--+--+--+--+
+ * |ID1|ID2|CM |FLG|   MTIME   |XFL|OS | ...BODY...  |   CRC32   |   ISIZE   |
+ * +---+---+---+---+--+--+--+--+---+---+=============+--+--+--+--+--+--+--+--+
+ * | 1 | 1 | 1 | 1 |     4     | 1 | 1 | compressed  |     4     |     4     |
+ * |           10-byte header          | DEFLATE data|     8-byte trailer    |
+ * ```
+ *
+ * Optional header fields follow the fixed header if corresponding FLG bits
+ * are set: FEXTRA (extra field), FNAME (filename), FCOMMENT (comment),
+ * FHCRC (header CRC16).
+ *
+ * ## State Machine
+ *
+ * ```
+ *   HEADER ──> BODY ──> TRAILER ──> DONE
+ *     │          │         │
+ *     v          v         v
+ *   (pause if output buffer full, resume on next call)
+ * ```
+ *
+ * Transitions:
+ *   - HEADER → BODY: when all header bytes written
+ *   - BODY → TRAILER: when deflate finish() completes
+ *   - TRAILER → DONE: when all 8 trailer bytes written
+ *
+ * The encoder can pause at any stage if the output buffer becomes full.
+ * Call update/finish repeatedly until the stage reaches DONE.
+ *
+ * ## Data Flow
+ *
+ * 1. **Input** flows through the deflate encoder, producing compressed output
+ * 2. **CRC32** is computed incrementally on the uncompressed input data
+ * 3. **ISIZE** tracks the total uncompressed byte count (mod 2^32)
+ * 4. On finish, the trailer contains the finalized CRC32 and ISIZE
+ *
+ * ## Options Processing
+ *
+ * Gzip-specific options (gzip.*) are processed here. All other options
+ * (deflate.*, limits.*) are passed through to the inner deflate encoder.
+ * See gzip_register.c for the complete option schema.
  *
  * Copyright 2026 by Corey Pennycuff
  */
@@ -41,22 +81,26 @@ static gcomp_status_t extract_passthrough_options(
   return gcomp_options_clone(src, dst_out);
 }
 
-//
-// Helper: Compute XFL based on compression level
-//
-
+/**
+ * Compute XFL (extra flags) byte based on deflate compression level.
+ *
+ * RFC 1952 Section 2.3.1 defines XFL values for gzip compressors:
+ * - XFL = 2: compressor used maximum compression, slowest algorithm
+ * - XFL = 4: compressor used fastest algorithm
+ * - XFL = 0: other/unspecified
+ *
+ * This heuristic maps deflate compression levels (0-9) to XFL values
+ * that help decompressors understand the expected compression characteristics.
+ */
 static uint8_t compute_xfl(int64_t level) {
-  // Per RFC 1952:
-  // XFL = 2 for maximum compression (slowest algorithm)
-  // XFL = 4 for fastest algorithm
   if (level <= 2) {
-    return 4; // Fastest
+    return 4; // Fastest compression (levels 0-2)
   }
   else if (level >= 6) {
-    return 2; // Maximum compression
+    return 2; // Maximum compression (levels 6-9)
   }
   else {
-    return 0; // Default
+    return 0; // Default/balanced (levels 3-5)
   }
 }
 
@@ -73,7 +117,8 @@ static uint8_t compute_xfl(int64_t level) {
 //
 
 static gcomp_status_t read_encoder_options(const gcomp_options_t * options,
-    gzip_header_info_t * info, uint8_t * xfl_out, int * has_explicit_xfl) {
+    gzip_header_info_t * info, uint8_t * xfl_out, int * has_explicit_xfl,
+    uint8_t * header_flags_out, int * has_explicit_header_flags) {
   gcomp_status_t status;
   uint64_t u64_val;
   int bool_val;
@@ -93,6 +138,8 @@ static gcomp_status_t read_encoder_options(const gcomp_options_t * options,
   info->header_crc = 0;
   *xfl_out = 0;
   *has_explicit_xfl = 0;
+  *header_flags_out = 0;
+  *has_explicit_header_flags = 0;
 
   if (!options) {
     return GCOMP_OK;
@@ -115,6 +162,13 @@ static gcomp_status_t read_encoder_options(const gcomp_options_t * options,
   if (status == GCOMP_OK) {
     *xfl_out = (uint8_t)u64_val;
     *has_explicit_xfl = 1;
+  }
+
+  // gzip.header_flags (explicit)
+  status = gcomp_options_get_uint64(options, "gzip.header_flags", &u64_val);
+  if (status == GCOMP_OK) {
+    *header_flags_out = (uint8_t)u64_val;
+    *has_explicit_header_flags = 1;
   }
 
   // gzip.name
@@ -194,11 +248,22 @@ gcomp_status_t gzip_encoder_init(gcomp_registry_t * registry,
   // Read options and prepare header info
   uint8_t explicit_xfl;
   int has_explicit_xfl;
-  gcomp_status_t status = read_encoder_options(
-      options, &state->header_info, &explicit_xfl, &has_explicit_xfl);
+  uint8_t explicit_header_flags;
+  int has_explicit_header_flags;
+  gcomp_status_t status = read_encoder_options(options, &state->header_info,
+      &explicit_xfl, &has_explicit_xfl, &explicit_header_flags,
+      &has_explicit_header_flags);
   if (status != GCOMP_OK) {
     free(state);
     return status;
+  }
+
+  // Apply explicit header_flags if provided
+  // Note: Explicit header_flags is OR'd with flags required for provided
+  // optional fields (name, comment, extra, header_crc) to ensure consistency.
+  // If user wants complete control, they should not provide optional fields.
+  if (has_explicit_header_flags) {
+    state->header_info.flg |= explicit_header_flags;
   }
 
   // Extract pass-through options for deflate
