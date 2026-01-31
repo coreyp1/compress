@@ -102,6 +102,9 @@ typedef struct gcomp_deflate_huffman_fast_entry_s {
   uint8_t nbits;   ///< Number of bits consumed (0 in fast table = use long).
 } gcomp_deflate_huffman_fast_entry_t;
 
+// Forward declare allocator for storage in decode table
+struct gcomp_allocator_s;
+
 /**
  * @brief Two-level Huffman decode table for fast decoding.
  *
@@ -127,6 +130,8 @@ typedef struct gcomp_deflate_huffman_decode_table_s {
   gcomp_deflate_huffman_fast_entry_t * long_table;
   /** Number of entries in long_table. */
   size_t long_table_count;
+  /** Allocator used for long_table (stored for cleanup). */
+  const struct gcomp_allocator_s * allocator;
 } gcomp_deflate_huffman_decode_table_t;
 
 /**
@@ -177,6 +182,7 @@ GCOMP_INTERNAL_API gcomp_status_t gcomp_deflate_huffman_build_codes(
  * structure itself, but @p table->long_table may be allocated by this
  * function (caller must call ::gcomp_deflate_huffman_decode_table_cleanup()).
  *
+ * @param allocator   Allocator for long_table memory. If NULL, uses default.
  * @param lengths     Code length per symbol (0 = unused). Must not be NULL.
  * @param num_symbols Number of symbols.
  * @param max_bits    Maximum code length (e.g. 15).
@@ -187,7 +193,8 @@ GCOMP_INTERNAL_API gcomp_status_t gcomp_deflate_huffman_build_codes(
  *         on failure. On failure, table state is undefined.
  */
 GCOMP_INTERNAL_API gcomp_status_t gcomp_deflate_huffman_build_decode_table(
-    const uint8_t * lengths, size_t num_symbols, unsigned max_bits,
+    const struct gcomp_allocator_s * allocator, const uint8_t * lengths,
+    size_t num_symbols, unsigned max_bits,
     gcomp_deflate_huffman_decode_table_t * table);
 
 /**

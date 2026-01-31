@@ -83,6 +83,11 @@ typedef enum {
 
 typedef struct gcomp_deflate_decoder_state_s {
   //
+  // Allocator (for internal memory operations)
+  //
+  const gcomp_allocator_t * allocator;
+
+  //
   // Bitstream state (LSB-first)
   //
   uint32_t bit_buffer;
@@ -162,6 +167,14 @@ typedef struct gcomp_deflate_decoder_state_s {
   uint32_t pending_length_value; // The decoded length (3..258)
   int pending_dist_valid;    // Non-zero if we have a pending distance symbol
   uint16_t pending_dist_sym; // The decoded distance symbol (0..29)
+
+  //
+  // Pending length extra bits state
+  // When we've decoded a length symbol (257-285) but couldn't read the extra
+  // bits, we save the symbol index here to resume on the next update() call.
+  //
+  int pending_length_sym_valid;  // Non-zero if we have a pending length symbol
+  uint8_t pending_length_sym;    // The length symbol index (0..28)
 
   //
   // Dynamic Huffman build scratch
@@ -637,13 +650,13 @@ static gcomp_status_t deflate_build_fixed_tables(
     dist_lengths[i] = 5u;
   }
 
-  gcomp_status_t a = gcomp_deflate_huffman_build_decode_table(
+  gcomp_status_t a = gcomp_deflate_huffman_build_decode_table(st->allocator,
       litlen_lengths, DEFLATE_MAX_LITLEN_SYMBOLS, 15u, &st->fixed_litlen);
   if (a != GCOMP_OK) {
     return a;
   }
 
-  gcomp_status_t b = gcomp_deflate_huffman_build_decode_table(
+  gcomp_status_t b = gcomp_deflate_huffman_build_decode_table(st->allocator,
       dist_lengths, DEFLATE_MAX_DIST_SYMBOLS, 15u, &st->fixed_dist);
   if (b != GCOMP_OK) {
     gcomp_deflate_huffman_decode_table_cleanup(&st->fixed_litlen);
@@ -741,7 +754,7 @@ static gcomp_status_t deflate_dynamic_read_codelen_lengths(
   }
 
   gcomp_status_t st_build = gcomp_deflate_huffman_build_decode_table(
-      st->dyn_clen_lengths, 19u, 7u, &st->dyn_clen_table);
+      st->allocator, st->dyn_clen_lengths, 19u, 7u, &st->dyn_clen_table);
   if (st_build != GCOMP_OK) {
     return st_build == GCOMP_ERR_CORRUPT ? GCOMP_ERR_CORRUPT : st_build;
   }
@@ -869,7 +882,7 @@ static gcomp_status_t deflate_dynamic_decode_lengths(
   // compressed data, an empty distance tree is valid. We only reject streams
   // where the lit/len tree is incomplete (missing end-of-block symbol 256).
 
-  gcomp_status_t a = gcomp_deflate_huffman_build_decode_table(
+  gcomp_status_t a = gcomp_deflate_huffman_build_decode_table(st->allocator,
       st->dyn_litlen_lengths, DEFLATE_MAX_LITLEN_SYMBOLS, 15u, &st->dyn_litlen);
   if (a != GCOMP_OK) {
     return a;
@@ -877,7 +890,7 @@ static gcomp_status_t deflate_dynamic_decode_lengths(
   // Track litlen table memory allocation
   track_huffman_table_alloc(st, &st->dyn_litlen);
 
-  gcomp_status_t b = gcomp_deflate_huffman_build_decode_table(
+  gcomp_status_t b = gcomp_deflate_huffman_build_decode_table(st->allocator,
       st->dyn_dist_lengths, DEFLATE_MAX_DIST_SYMBOLS, 15u, &st->dyn_dist);
   if (b != GCOMP_OK) {
     track_huffman_table_free(st, &st->dyn_litlen);
@@ -967,6 +980,9 @@ gcomp_status_t gcomp_deflate_decoder_init(gcomp_registry_t * registry,
     return GCOMP_ERR_MEMORY;
   }
 
+  // Store allocator for internal use
+  st->allocator = alloc;
+
   // Initialize memory tracker and track state struct allocation
   st->mem_tracker.current_bytes = 0;
   gcomp_memory_track_alloc(
@@ -985,6 +1001,8 @@ gcomp_status_t gcomp_deflate_decoder_init(gcomp_registry_t * registry,
   st->pending_length_value = 0;
   st->pending_dist_valid = 0;
   st->pending_dist_sym = 0;
+  st->pending_length_sym_valid = 0;
+  st->pending_length_sym = 0;
 
   st->window_size = window_size;
   st->max_window_bytes =
@@ -1120,6 +1138,8 @@ gcomp_status_t gcomp_deflate_decoder_reset(gcomp_decoder_t * decoder) {
   st->pending_length_value = 0;
   st->pending_dist_valid = 0;
   st->pending_dist_sym = 0;
+  st->pending_length_sym_valid = 0;
+  st->pending_length_sym = 0;
 
   // Clean up dynamic Huffman tables (keep fixed tables - they can be reused)
   if (st->dyn_ready) {
@@ -1315,6 +1335,22 @@ static gcomp_status_t deflate_process_huffman_data(
     return deflate_decode_distance(st, input, output, st->pending_length_value);
   }
 
+  // Resume pending length symbol decode (waiting for extra bits)
+  if (st->pending_length_sym_valid) {
+    uint32_t len_sym = st->pending_length_sym;
+    uint32_t length = k_len_base[len_sym];
+    uint32_t le = k_len_extra[len_sym];
+    // le must be > 0 since we only save state when extra bits are needed
+    uint32_t extra = 0;
+    if (!deflate_try_read_bits(st, input, le, &extra)) {
+      // Still can't get extra bits - need more input
+      return GCOMP_OK;
+    }
+    length += extra;
+    st->pending_length_sym_valid = 0;
+    return deflate_decode_distance(st, input, output, length);
+  }
+
   int decoded = 0;
   uint16_t sym = 0;
   gcomp_status_t ds =
@@ -1354,12 +1390,9 @@ static gcomp_status_t deflate_process_huffman_data(
     uint32_t extra = 0;
     if (!deflate_try_read_bits(st, input, le, &extra)) {
       // Can't get length extra bits - need more input.
-      // We've consumed the length symbol but not its extra bits.
-      // The proper fix would save this state too, but for now
-      // we return and the caller will provide more input.
-      // On resume, we'll try to decode a new litlen symbol, which
-      // will fail because we're in the middle of a length code.
-      // TODO: Save length symbol to properly resume.
+      // Save the length symbol so we can resume on the next update() call.
+      st->pending_length_sym_valid = 1;
+      st->pending_length_sym = (uint8_t)len_sym;
       return GCOMP_OK;
     }
     length += extra;

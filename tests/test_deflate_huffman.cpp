@@ -148,7 +148,8 @@ TEST(DeflateHuffmanDecodeTable, BuildFromRfcExample) {
   const uint8_t lengths[] = {3, 3, 3, 3, 3, 2, 4, 4};
   gcomp_deflate_huffman_decode_table_t table;
 
-  ASSERT_EQ(gcomp_deflate_huffman_build_decode_table(lengths, 8u, 15u, &table),
+  ASSERT_EQ(
+      gcomp_deflate_huffman_build_decode_table(nullptr, lengths, 8u, 15u, &table),
       GCOMP_OK);
 
   // F has code 0, length 2. Fast table index for 2-bit code 0: indices 0 and 1
@@ -178,7 +179,8 @@ TEST(DeflateHuffmanDecodeTable, LongCodesUseLongTable) {
   const uint8_t lengths[] = {10};
   gcomp_deflate_huffman_decode_table_t table;
 
-  ASSERT_EQ(gcomp_deflate_huffman_build_decode_table(lengths, 1u, 15u, &table),
+  ASSERT_EQ(
+      gcomp_deflate_huffman_build_decode_table(nullptr, lengths, 1u, 15u, &table),
       GCOMP_OK);
 
   // Code 0, length 10. High 9 bits = 0, extra = 1. So fast_table[0].nbits = 0,
@@ -197,9 +199,11 @@ TEST(DeflateHuffmanDecodeTable, NullPointers) {
   const uint8_t lengths[] = {1};
   gcomp_deflate_huffman_decode_table_t table;
 
-  EXPECT_EQ(gcomp_deflate_huffman_build_decode_table(nullptr, 1u, 15u, &table),
+  EXPECT_EQ(
+      gcomp_deflate_huffman_build_decode_table(nullptr, nullptr, 1u, 15u, &table),
       GCOMP_ERR_INVALID_ARG);
-  EXPECT_EQ(gcomp_deflate_huffman_build_decode_table(lengths, 1u, 15u, nullptr),
+  EXPECT_EQ(
+      gcomp_deflate_huffman_build_decode_table(nullptr, lengths, 1u, 15u, nullptr),
       GCOMP_ERR_INVALID_ARG);
 }
 
@@ -211,7 +215,8 @@ TEST(DeflateHuffmanDecodeTable, CleanupIdempotent) {
   const uint8_t lengths[] = {10};
   gcomp_deflate_huffman_decode_table_t table;
 
-  ASSERT_EQ(gcomp_deflate_huffman_build_decode_table(lengths, 1u, 15u, &table),
+  ASSERT_EQ(
+      gcomp_deflate_huffman_build_decode_table(nullptr, lengths, 1u, 15u, &table),
       GCOMP_OK);
   gcomp_deflate_huffman_decode_table_cleanup(&table);
   gcomp_deflate_huffman_decode_table_cleanup(&table);
@@ -224,7 +229,7 @@ TEST(DeflateHuffmanDecodeTable, TooManySymbols) {
 
   // 289 symbols exceeds internal limit (288).
   EXPECT_EQ(
-      gcomp_deflate_huffman_build_decode_table(lengths, 289u, 15u, &table),
+      gcomp_deflate_huffman_build_decode_table(nullptr, lengths, 289u, 15u, &table),
       GCOMP_ERR_INVALID_ARG);
 }
 

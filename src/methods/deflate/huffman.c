@@ -205,7 +205,8 @@ gcomp_status_t gcomp_deflate_huffman_build_codes(const uint8_t * lengths,
 //           - If extra < max_extra: replicate to 2^(max_extra - extra) entries
 //
 
-gcomp_status_t gcomp_deflate_huffman_build_decode_table(const uint8_t * lengths,
+gcomp_status_t gcomp_deflate_huffman_build_decode_table(
+    const gcomp_allocator_t * allocator, const uint8_t * lengths,
     size_t num_symbols, unsigned max_bits,
     gcomp_deflate_huffman_decode_table_t * table) {
   uint16_t codes[288]; // DEFLATE literal/length max 286 + slack
@@ -226,8 +227,12 @@ gcomp_status_t gcomp_deflate_huffman_build_decode_table(const uint8_t * lengths,
     return GCOMP_ERR_INVALID_ARG;
   }
 
+  // Use provided allocator or default
+  alloc = gcomp_alloc_or_default(allocator);
+
   table->long_table = NULL;
   table->long_table_count = 0;
+  table->allocator = alloc;
   memset(table->long_base, 0, sizeof(table->long_base));
   memset(table->long_extra_bits, 0, sizeof(table->long_extra_bits));
 
@@ -298,7 +303,6 @@ gcomp_status_t gcomp_deflate_huffman_build_decode_table(const uint8_t * lengths,
 
   // Allocate long_table and fill it in second pass.
   if (long_offset > 0) {
-    alloc = gcomp_allocator_default();
     table->long_table = (gcomp_deflate_huffman_fast_entry_t *)gcomp_calloc(
         alloc, (size_t)long_offset, sizeof(gcomp_deflate_huffman_fast_entry_t));
     if (!table->long_table) {
@@ -359,14 +363,14 @@ gcomp_status_t gcomp_deflate_huffman_build_decode_table(const uint8_t * lengths,
 
 void gcomp_deflate_huffman_decode_table_cleanup(
     gcomp_deflate_huffman_decode_table_t * table) {
-  const gcomp_allocator_t * alloc;
-
   if (!table) {
     return;
   }
 
   if (table->long_table) {
-    alloc = gcomp_allocator_default();
+    // Use the allocator stored during build, or default if not set
+    const gcomp_allocator_t * alloc =
+        gcomp_alloc_or_default(table->allocator);
     gcomp_free(alloc, table->long_table);
     table->long_table = NULL;
     table->long_table_count = 0;

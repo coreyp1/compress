@@ -26,7 +26,6 @@
 #include "huffman.h"
 #include <ghoti.io/compress/limits.h>
 #include <stdint.h>
-#include <stdlib.h>
 #include <string.h>
 
 //
@@ -155,6 +154,11 @@ typedef struct {
 } deflate_match_t;
 
 typedef struct gcomp_deflate_encoder_state_s {
+  //
+  // Allocator (for internal memory operations)
+  //
+  const gcomp_allocator_t * allocator;
+
   //
   // Configuration
   //
@@ -904,6 +908,7 @@ static void extract_lengths(
  * prefix-free code. The algorithm is O(n log n) where n is the number of
  * symbols with non-zero frequency.
  *
+ * @param alloc      Allocator for temporary memory
  * @param freq       Array of symbol frequencies (freq[i] = count of symbol i)
  * @param num_symbols Number of symbols in the frequency array
  * @param lengths    Output array for code lengths (same size as freq)
@@ -919,8 +924,9 @@ static void extract_lengths(
  * 2. Capping any lengths > max_bits
  * 3. Adjusting via Kraft inequality to ensure valid prefix code
  */
-static void build_code_lengths(const uint32_t * freq, size_t num_symbols,
-    uint8_t * lengths, unsigned max_bits) {
+static void build_code_lengths(const gcomp_allocator_t * alloc,
+    const uint32_t * freq, size_t num_symbols, uint8_t * lengths,
+    unsigned max_bits) {
   // Count non-zero frequencies
   int count = 0;
   for (size_t i = 0; i < num_symbols; i++) {
@@ -948,11 +954,11 @@ static void build_code_lengths(const uint32_t * freq, size_t num_symbols,
   // Allocate nodes: up to num_symbols leaves + (num_symbols-1) internal nodes
   size_t max_nodes = num_symbols * 2;
   huffman_node_t * nodes =
-      (huffman_node_t *)malloc(max_nodes * sizeof(huffman_node_t));
-  int * heap = (int *)malloc(max_nodes * sizeof(int));
+      (huffman_node_t *)gcomp_malloc(alloc, max_nodes * sizeof(huffman_node_t));
+  int * heap = (int *)gcomp_malloc(alloc, max_nodes * sizeof(int));
   if (!nodes || !heap) {
-    free(heap);
-    free(nodes);
+    gcomp_free(alloc, heap);
+    gcomp_free(alloc, nodes);
     // Fallback: use uniform lengths
     for (size_t i = 0; i < num_symbols; i++) {
       if (freq[i] > 0) {
@@ -1053,8 +1059,8 @@ static void build_code_lengths(const uint32_t * freq, size_t num_symbols,
     }
   }
 
-  free(heap);
-  free(nodes);
+  gcomp_free(alloc, heap);
+  gcomp_free(alloc, nodes);
 }
 
 /**
@@ -1104,7 +1110,8 @@ static gcomp_status_t deflate_flush_dynamic_block(
 
   // Build code lengths for literal/length alphabet
   uint8_t lit_lengths[DEFLATE_MAX_LITLEN_SYMBOLS];
-  build_code_lengths(st->lit_freq, DEFLATE_MAX_LITLEN_SYMBOLS, lit_lengths, 15);
+  build_code_lengths(
+      st->allocator, st->lit_freq, DEFLATE_MAX_LITLEN_SYMBOLS, lit_lengths, 15);
 
   // Ensure end-of-block (256) has a code
   if (lit_lengths[256] == 0) {
@@ -1113,7 +1120,8 @@ static gcomp_status_t deflate_flush_dynamic_block(
 
   // Build code lengths for distance alphabet
   uint8_t dist_lengths[DEFLATE_MAX_DIST_SYMBOLS];
-  build_code_lengths(st->dist_freq, DEFLATE_MAX_DIST_SYMBOLS, dist_lengths, 15);
+  build_code_lengths(
+      st->allocator, st->dist_freq, DEFLATE_MAX_DIST_SYMBOLS, dist_lengths, 15);
 
   // Determine HLIT (number of literal/length codes - 257)
   int hlit = DEFLATE_MAX_LITLEN_SYMBOLS - 257;
@@ -1137,7 +1145,7 @@ static gcomp_status_t deflate_flush_dynamic_block(
 
   // Combine lit/dist lengths for encoding
   size_t total_codes = (size_t)(257 + hlit + 1 + hdist);
-  uint8_t * all_lengths = (uint8_t *)malloc(total_codes);
+  uint8_t * all_lengths = (uint8_t *)gcomp_malloc(st->allocator, total_codes);
   if (!all_lengths) {
     // Fall back to fixed on memory error
     st->lit_freq[256]--;
@@ -1225,7 +1233,7 @@ static gcomp_status_t deflate_flush_dynamic_block(
   }
 
   uint8_t cl_lengths[19];
-  build_code_lengths(cl_freq, 19, cl_lengths, 7);
+  build_code_lengths(st->allocator, cl_freq, 19, cl_lengths, 7);
 
   // =========================================================================
   // Code-length alphabet completeness (zlib compatibility)
@@ -1306,7 +1314,7 @@ static gcomp_status_t deflate_flush_dynamic_block(
   uint16_t cl_codes[19];
   s = gcomp_deflate_huffman_build_codes(cl_lengths, 19, 7, cl_codes, NULL);
   if (s != GCOMP_OK) {
-    free(all_lengths);
+    gcomp_free(st->allocator, all_lengths);
     st->lit_freq[256]--;
     return deflate_flush_fixed_block(st, final);
   }
@@ -1323,7 +1331,7 @@ static gcomp_status_t deflate_flush_dynamic_block(
   s = gcomp_deflate_huffman_build_codes(
       lit_lengths, DEFLATE_MAX_LITLEN_SYMBOLS, 15, lit_codes, NULL);
   if (s != GCOMP_OK) {
-    free(all_lengths);
+    gcomp_free(st->allocator, all_lengths);
     st->lit_freq[256]--;
     return deflate_flush_fixed_block(st, final);
   }
@@ -1337,7 +1345,7 @@ static gcomp_status_t deflate_flush_dynamic_block(
   s = gcomp_deflate_huffman_build_codes(
       dist_lengths, DEFLATE_MAX_DIST_SYMBOLS, 15, dist_codes, NULL);
   if (s != GCOMP_OK) {
-    free(all_lengths);
+    gcomp_free(st->allocator, all_lengths);
     st->lit_freq[256]--;
     return deflate_flush_fixed_block(st, final);
   }
@@ -1350,29 +1358,29 @@ static gcomp_status_t deflate_flush_dynamic_block(
   // Write block header: BFINAL (1 bit), BTYPE=10 (2 bits) = dynamic Huffman
   s = gcomp_deflate_bitwriter_write_bits(&st->bitwriter, final ? 1u : 0u, 1);
   if (s != GCOMP_OK) {
-    free(all_lengths);
+    gcomp_free(st->allocator, all_lengths);
     return s;
   }
   s = gcomp_deflate_bitwriter_write_bits(&st->bitwriter, 2u, 2); // BTYPE=10
   if (s != GCOMP_OK) {
-    free(all_lengths);
+    gcomp_free(st->allocator, all_lengths);
     return s;
   }
 
   // Write HLIT (5 bits), HDIST (5 bits), HCLEN (4 bits)
   s = gcomp_deflate_bitwriter_write_bits(&st->bitwriter, (uint32_t)hlit, 5);
   if (s != GCOMP_OK) {
-    free(all_lengths);
+    gcomp_free(st->allocator, all_lengths);
     return s;
   }
   s = gcomp_deflate_bitwriter_write_bits(&st->bitwriter, (uint32_t)hdist, 5);
   if (s != GCOMP_OK) {
-    free(all_lengths);
+    gcomp_free(st->allocator, all_lengths);
     return s;
   }
   s = gcomp_deflate_bitwriter_write_bits(&st->bitwriter, (uint32_t)hclen, 4);
   if (s != GCOMP_OK) {
-    free(all_lengths);
+    gcomp_free(st->allocator, all_lengths);
     return s;
   }
 
@@ -1381,7 +1389,7 @@ static gcomp_status_t deflate_flush_dynamic_block(
     s = gcomp_deflate_bitwriter_write_bits(
         &st->bitwriter, cl_lengths[k_cl_order[i]], 3);
     if (s != GCOMP_OK) {
-      free(all_lengths);
+      gcomp_free(st->allocator, all_lengths);
       return s;
     }
   }
@@ -1392,7 +1400,7 @@ static gcomp_status_t deflate_flush_dynamic_block(
     s = gcomp_deflate_bitwriter_write_bits(
         &st->bitwriter, cl_codes[sym], cl_lengths[sym]);
     if (s != GCOMP_OK) {
-      free(all_lengths);
+      gcomp_free(st->allocator, all_lengths);
       return s;
     }
 
@@ -1407,12 +1415,12 @@ static gcomp_status_t deflate_flush_dynamic_block(
       s = gcomp_deflate_bitwriter_write_bits(&st->bitwriter, cl_extra[i], 7);
     }
     if (s != GCOMP_OK) {
-      free(all_lengths);
+      gcomp_free(st->allocator, all_lengths);
       return s;
     }
   }
 
-  free(all_lengths);
+  gcomp_free(st->allocator, all_lengths);
 
   // Write all buffered symbols using the dynamic codes
   for (size_t i = 0; i < st->sym_buf_used; i++) {
@@ -1505,6 +1513,9 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
   if (!st) {
     return GCOMP_ERR_MEMORY;
   }
+
+  // Store allocator for internal use
+  st->allocator = alloc;
 
   // Initialize memory tracker and track state struct allocation
   st->mem_tracker.current_bytes = 0;
