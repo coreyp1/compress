@@ -326,13 +326,13 @@ $(APP_DIR)/fuzz/%$(EXE_EXTENSION): fuzz/%.c $(APP_DIR)/$(AFL_STATIC_TARGET)
 # General commands
 .PHONY: clean cloc docs docs-pdf examples bench bench-deflate
 # Release build commands
-.PHONY: all install test test-valgrind test-watch uninstall watch
+.PHONY: all install test test-quiet test-valgrind test-valgrind-quiet test-watch uninstall watch
 # Debug build commands
 .PHONY: all-debug install-debug test-debug test-valgrind-debug test-watch-debug uninstall-debug watch-debug
 # Fuzz commands
 .PHONY: fuzz-build fuzz-corpus fuzz-decoder fuzz-encoder fuzz-roundtrip fuzz-help
 # Sanitizer commands
-.PHONY: test-asan test-ubsan sanitizer-help
+.PHONY: test-asan test-asan-quiet test-ubsan sanitizer-help
 
 
 watch: ## Watch the file directory for changes and compile the target
@@ -544,6 +544,42 @@ test: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES)
 		LD_LIBRARY_PATH="$(APP_DIR)" $$test_exe --gtest_brief=1; \
 	done
 
+test-quiet: ## Run tests with minimal output (one line per test suite)
+test-quiet: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES)
+	@total_tests=0; total_passed=0; total_failed=0; total_time=0; failed_suites=""; \
+	printf "\n\033[1;36m%-30s %8s %10s %s\033[0m\n" "Test Suite" "Tests" "Time" "Status"; \
+	printf "\033[1;36m%-30s %8s %10s %s\033[0m\n" "------------------------------" "--------" "----------" "------"; \
+	for test_exe in $(TEST_EXECUTABLES); do \
+		test_name=$$(basename $$test_exe $(EXE_EXTENSION)); \
+		output=$$(LD_LIBRARY_PATH="$(APP_DIR)" $$test_exe --gtest_brief=1 2>&1); \
+		exit_code=$$?; \
+		num_tests=$$(echo "$$output" | grep -oP '\[\s*=+\s*\]\s*\K\d+(?=\s+tests?)' | head -1); \
+		time_ms=$$(echo "$$output" | grep -oP '\(\K\d+(?=\s*ms\s*total\))' | head -1); \
+		[ -z "$$num_tests" ] && num_tests=0; \
+		[ -z "$$time_ms" ] && time_ms=0; \
+		total_tests=$$((total_tests + num_tests)); \
+		total_time=$$((total_time + time_ms)); \
+		if [ $$exit_code -eq 0 ]; then \
+			total_passed=$$((total_passed + num_tests)); \
+			printf "%-30s %8d %8dms \033[0;32mPASS\033[0m\n" "$$test_name" "$$num_tests" "$$time_ms"; \
+		else \
+			failures=$$(echo "$$output" | grep -oP '\[\s*FAILED\s*\]\s*\K\d+' | head -1); \
+			[ -z "$$failures" ] && failures=$$num_tests; \
+			total_failed=$$((total_failed + failures)); \
+			total_passed=$$((total_passed + num_tests - failures)); \
+			printf "%-30s %8d %8dms \033[0;31mFAIL\033[0m\n" "$$test_name" "$$num_tests" "$$time_ms"; \
+			failed_suites="$$failed_suites\n\033[0;31m=== $$test_name FAILURES ===\033[0m\n$$output\n"; \
+		fi; \
+	done; \
+	printf "\033[1;36m%-30s %8s %10s %s\033[0m\n" "------------------------------" "--------" "----------" "------"; \
+	if [ $$total_failed -eq 0 ]; then \
+		printf "\033[0;32m%-30s %8d %6dms PASS\033[0m\n\n" "TOTAL" "$$total_tests" "$$total_time"; \
+	else \
+		printf "\033[0;31m%-30s %8d %6dms FAIL (%d failed)\033[0m\n" "TOTAL" "$$total_tests" "$$total_time" "$$total_failed"; \
+		printf "$$failed_suites\n"; \
+		exit 1; \
+	fi
+
 test-valgrind: ## Run all tests under valgrind (Linux only)
 test-valgrind: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES)
 ifeq ($(OS_NAME), Linux)
@@ -556,6 +592,55 @@ ifeq ($(OS_NAME), Linux)
 		printf "\033[0m\n\n"; \
 		LD_LIBRARY_PATH="$(APP_DIR)" valgrind $(VALGRIND_FLAGS) $$test_exe --gtest_brief=1; \
 	done
+else
+	@printf "\033[0;31m\n"
+	@printf "Valgrind is only available on Linux\n"
+	@printf "\033[0m\n"
+	@exit 1
+endif
+
+test-valgrind-quiet: ## Run tests under valgrind with minimal output (Linux only)
+test-valgrind-quiet: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES)
+ifeq ($(OS_NAME), Linux)
+	@total_tests=0; total_passed=0; total_failed=0; total_time=0; failed_suites=""; \
+	printf "\n\033[1;35m%-30s %8s %10s %s\033[0m\n" "Test Suite (Valgrind)" "Tests" "Time" "Status"; \
+	printf "\033[1;35m%-30s %8s %10s %s\033[0m\n" "------------------------------" "--------" "----------" "------"; \
+	for test_exe in $(TEST_EXECUTABLES); do \
+		test_name=$$(basename $$test_exe $(EXE_EXTENSION)); \
+		output=$$(LD_LIBRARY_PATH="$(APP_DIR)" valgrind $(VALGRIND_FLAGS) $$test_exe --gtest_brief=1 2>&1); \
+		exit_code=$$?; \
+		num_tests=$$(echo "$$output" | grep -oP '\[\s*=+\s*\]\s*\K\d+(?=\s+tests?)' | head -1); \
+		time_ms=$$(echo "$$output" | grep -oP '\(\K\d+(?=\s*ms\s*total\))' | head -1); \
+		[ -z "$$num_tests" ] && num_tests=0; \
+		[ -z "$$time_ms" ] && time_ms=0; \
+		total_tests=$$((total_tests + num_tests)); \
+		total_time=$$((total_time + time_ms)); \
+		has_leak=$$(echo "$$output" | grep -c "definitely lost\|indirectly lost\|possibly lost" || true); \
+		if [ $$exit_code -eq 0 ] && [ $$has_leak -eq 0 ]; then \
+			total_passed=$$((total_passed + num_tests)); \
+			printf "%-30s %8d %8dms \033[0;32mPASS\033[0m\n" "$$test_name" "$$num_tests" "$$time_ms"; \
+		else \
+			failures=$$(echo "$$output" | grep -oP '\[\s*FAILED\s*\]\s*\K\d+' | head -1); \
+			[ -z "$$failures" ] && failures=0; \
+			if [ $$has_leak -gt 0 ]; then \
+				status_msg="LEAK"; \
+			else \
+				status_msg="FAIL"; \
+			fi; \
+			total_failed=$$((total_failed + 1)); \
+			total_passed=$$((total_passed + num_tests - failures)); \
+			printf "%-30s %8d %8dms \033[0;31m%s\033[0m\n" "$$test_name" "$$num_tests" "$$time_ms" "$$status_msg"; \
+			failed_suites="$$failed_suites\n\033[0;31m=== $$test_name FAILURES ===\033[0m\n$$output\n"; \
+		fi; \
+	done; \
+	printf "\033[1;35m%-30s %8s %10s %s\033[0m\n" "------------------------------" "--------" "----------" "------"; \
+	if [ $$total_failed -eq 0 ]; then \
+		printf "\033[0;32m%-30s %8d %6dms PASS\033[0m\n\n" "TOTAL" "$$total_tests" "$$total_time"; \
+	else \
+		printf "\033[0;31m%-30s %8d %6dms FAIL (%d suites)\033[0m\n" "TOTAL" "$$total_tests" "$$total_time" "$$total_failed"; \
+		printf "$$failed_suites\n"; \
+		exit 1; \
+	fi
 else
 	@printf "\033[0;31m\n"
 	@printf "Valgrind is only available on Linux\n"
@@ -674,6 +759,49 @@ endif
 
 test-ubsan: ## Alias for test-asan (ASan+UBSan are run together)
 test-ubsan: test-asan
+
+test-asan-quiet: ## Run ASan+UBSan tests with minimal output (Linux only)
+test-asan-quiet: $(ASAN_APP_DIR)/$(ASAN_TARGET) $(ASAN_TEST_EXECUTABLES)
+ifeq ($(OS_NAME), Linux)
+	@total_tests=0; total_passed=0; total_failed=0; total_time=0; failed_suites=""; \
+	printf "\n\033[1;33m%-30s %8s %10s %s\033[0m\n" "Test Suite (ASan+UBSan)" "Tests" "Time" "Status"; \
+	printf "\033[1;33m%-30s %8s %10s %s\033[0m\n" "------------------------------" "--------" "----------" "------"; \
+	for test_exe in $(ASAN_TEST_EXECUTABLES); do \
+		test_name=$$(basename $$test_exe $(EXE_EXTENSION)); \
+		output=$$(LD_LIBRARY_PATH="$(ASAN_APP_DIR)" ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 $$test_exe --gtest_brief=1 2>&1); \
+		exit_code=$$?; \
+		num_tests=$$(echo "$$output" | grep -oP '\[\s*=+\s*\]\s*\K\d+(?=\s+tests?)' | head -1); \
+		time_ms=$$(echo "$$output" | grep -oP '\(\K\d+(?=\s*ms\s*total\))' | head -1); \
+		[ -z "$$num_tests" ] && num_tests=0; \
+		[ -z "$$time_ms" ] && time_ms=0; \
+		total_tests=$$((total_tests + num_tests)); \
+		total_time=$$((total_time + time_ms)); \
+		if [ $$exit_code -eq 0 ]; then \
+			total_passed=$$((total_passed + num_tests)); \
+			printf "%-30s %8d %8dms \033[0;32mPASS\033[0m\n" "$$test_name" "$$num_tests" "$$time_ms"; \
+		else \
+			failures=$$(echo "$$output" | grep -oP '\[\s*FAILED\s*\]\s*\K\d+' | head -1); \
+			[ -z "$$failures" ] && failures=$$num_tests; \
+			total_failed=$$((total_failed + failures)); \
+			total_passed=$$((total_passed + num_tests - failures)); \
+			printf "%-30s %8d %8dms \033[0;31mFAIL\033[0m\n" "$$test_name" "$$num_tests" "$$time_ms"; \
+			failed_suites="$$failed_suites\n\033[0;31m=== $$test_name FAILURES ===\033[0m\n$$output\n"; \
+		fi; \
+	done; \
+	printf "\033[1;33m%-30s %8s %10s %s\033[0m\n" "------------------------------" "--------" "----------" "------"; \
+	if [ $$total_failed -eq 0 ]; then \
+		printf "\033[0;32m%-30s %8d %6dms PASS\033[0m\n\n" "TOTAL" "$$total_tests" "$$total_time"; \
+	else \
+		printf "\033[0;31m%-30s %8d %6dms FAIL (%d failed)\033[0m\n" "TOTAL" "$$total_tests" "$$total_time" "$$total_failed"; \
+		printf "$$failed_suites\n"; \
+		exit 1; \
+	fi
+else
+	@printf "\033[0;31m\n"
+	@printf "Sanitizer builds are currently only supported on Linux\n"
+	@printf "\033[0m\n"
+	@exit 1
+endif
 
 sanitizer-help: ## Show sanitizer build help
 	@printf "\033[0;36m"
