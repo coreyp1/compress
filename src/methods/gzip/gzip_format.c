@@ -85,6 +85,9 @@ gcomp_status_t gzip_write_header(const gzip_header_info_t * info, uint8_t * buf,
   }
 
   // FNAME (null-terminated)
+  // Per RFC 1952, FNAME must be Latin-1 encoded and cannot contain
+  // embedded NUL bytes (only the terminator). Since we use C strings,
+  // strlen() naturally handles this constraint.
   if (info->flg & GZIP_FLG_FNAME) {
     if (info->name) {
       size_t len = strlen(info->name) + 1; // Include null terminator
@@ -103,6 +106,9 @@ gcomp_status_t gzip_write_header(const gzip_header_info_t * info, uint8_t * buf,
   }
 
   // FCOMMENT (null-terminated)
+  // Per RFC 1952, FCOMMENT must be Latin-1 encoded and cannot contain
+  // embedded NUL bytes (only the terminator). Since we use C strings,
+  // strlen() naturally handles this constraint.
   if (info->flg & GZIP_FLG_FCOMMENT) {
     if (info->comment) {
       size_t len = strlen(info->comment) + 1; // Include null terminator

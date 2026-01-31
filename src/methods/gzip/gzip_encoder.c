@@ -63,6 +63,14 @@ static uint8_t compute_xfl(int64_t level) {
 //
 // Helper: Read options into header_info
 //
+// Note on string validation (RFC 1952 compliance):
+// - FNAME and FCOMMENT must be Latin-1 encoded (ISO 8859-1)
+// - These fields cannot contain NUL bytes except as the terminator
+// - Since we use C strings (null-terminated) via the options API,
+//   any embedded NUL would naturally truncate the string at that point
+// - The gzip format writer uses strlen() to determine the length,
+//   so embedded NULs are inherently handled correctly
+//
 
 static gcomp_status_t read_encoder_options(const gcomp_options_t * options,
     gzip_header_info_t * info, uint8_t * xfl_out, int * has_explicit_xfl) {

@@ -18,6 +18,7 @@
 #include <ghoti.io/compress/gzip.h>
 #include <ghoti.io/compress/method.h>
 #include <ghoti.io/compress/registry.h>
+#include <ghoti.io/compress/stream.h>
 #include <gtest/gtest.h>
 
 //
@@ -102,6 +103,30 @@ TEST_F(GzipRegisterTest, RegistrationWithNullRegistry) {
   // Registering with NULL registry should return error
   gcomp_status_t status = gcomp_method_gzip_register(nullptr);
   EXPECT_EQ(status, GCOMP_ERR_INVALID_ARG);
+}
+
+TEST_F(GzipRegisterTest, EncoderCreationFailsWithoutDeflate) {
+  // Register gzip WITHOUT registering deflate first
+  gcomp_status_t status = gcomp_method_gzip_register(registry_);
+  EXPECT_EQ(status, GCOMP_OK); // Registration itself succeeds
+
+  // Try to create an encoder - should fail because deflate is not registered
+  gcomp_encoder_t * encoder = nullptr;
+  status = gcomp_encoder_create(registry_, "gzip", nullptr, &encoder);
+  EXPECT_EQ(status, GCOMP_ERR_UNSUPPORTED);
+  EXPECT_EQ(encoder, nullptr);
+}
+
+TEST_F(GzipRegisterTest, DecoderCreationFailsWithoutDeflate) {
+  // Register gzip WITHOUT registering deflate first
+  gcomp_status_t status = gcomp_method_gzip_register(registry_);
+  EXPECT_EQ(status, GCOMP_OK); // Registration itself succeeds
+
+  // Try to create a decoder - should fail because deflate is not registered
+  gcomp_decoder_t * decoder = nullptr;
+  status = gcomp_decoder_create(registry_, "gzip", nullptr, &decoder);
+  EXPECT_EQ(status, GCOMP_ERR_UNSUPPORTED);
+  EXPECT_EQ(decoder, nullptr);
 }
 
 TEST_F(GzipRegisterTest, MethodCapabilities) {

@@ -9,16 +9,53 @@
  * - RFC 1952 trailer validation (CRC32, ISIZE)
  * - Optional support for concatenated gzip members
  *
- * The decoder operates in three stages:
- * 1. HEADER: Parse gzip header from input
- * 2. BODY: Pass input through deflate decoder, tracking CRC32/ISIZE
- * 3. TRAILER: Read and validate CRC32 and ISIZE
+ * ## Decoder State Machine
+ *
+ * The decoder operates in three main stages:
+ *
+ * 1. **HEADER**: Parse gzip header from input
+ *    - Validates magic bytes (0x1F 0x8B), compression method (8 = deflate)
+ *    - Reads MTIME, XFL, OS, and optional fields (FEXTRA, FNAME, FCOMMENT)
+ *    - Optionally validates header CRC (FHCRC)
+ *    - Fully streaming: can pause at any byte boundary
+ *
+ * 2. **BODY**: Decompress via inner deflate decoder
+ *    - Passes input to deflate decoder
+ *    - Tracks CRC32 of decompressed output incrementally
+ *    - Tracks ISIZE (uncompressed size mod 2^32)
+ *    - Handles unconsumed bytes from deflate's bit buffer for trailer
+ *
+ * 3. **TRAILER**: Read and validate CRC32 and ISIZE
+ *    - Compares computed CRC32 against stored value
+ *    - Compares computed ISIZE against stored value
+ *    - Mismatch returns GCOMP_ERR_CORRUPT
+ *
+ * ## Concatenated Members
+ *
+ * RFC 1952 allows multiple gzip members to be concatenated into a single
+ * stream. When `gzip.concat` is enabled:
+ *
+ * - After successful trailer validation, the decoder resets for the next member
+ * - CRC32 and ISIZE tracking restart from initial values
+ * - Inner deflate decoder is reset
+ * - Processing continues in the same update() call via an outer loop
+ * - Output is continuous across members (no separation)
+ * - Limits (max_output_bytes, max_expansion_ratio) apply to total output
+ *
+ * The outer loop in gzip_decoder_update() continues as long as:
+ * - We're not in DONE or ERROR state
+ * - There's input available (input->used < input->size)
+ * - There's output space available (output->used < output->size)
+ *
+ * This ensures concatenated members are processed efficiently without
+ * requiring multiple update() calls when data and space are available.
  *
  * Copyright 2026 by Corey Pennycuff
  */
 
 #include "../../core/alloc_internal.h"
 #include "../../core/registry_internal.h"
+#include "../deflate/deflate_internal.h"
 #include "gzip_internal.h"
 #include <ghoti.io/compress/crc32.h>
 #include <ghoti.io/compress/limits.h>
@@ -176,8 +213,11 @@ gcomp_status_t gzip_decoder_init(gcomp_registry_t * registry,
 
 static gcomp_status_t parse_header_byte(
     gzip_decoder_state_t * state, uint8_t byte, gcomp_decoder_t * decoder) {
-  // Accumulate byte for header CRC if needed
-  if (state->header_info.flg & GZIP_FLG_FHCRC) {
+  // Always accumulate bytes for header CRC.
+  // We don't know if FHCRC is set until we parse byte 3 (FLG), so we must
+  // accumulate all bytes and only check the CRC later if FHCRC is set.
+  // Don't include the FHCRC bytes themselves in the CRC calculation.
+  if (state->header_stage != GZIP_HEADER_FHCRC) {
     state->header_crc_accum =
         gcomp_crc32_update(state->header_crc_accum, &byte, 1);
   }
@@ -421,6 +461,45 @@ static gcomp_status_t parse_header_byte(
 // Decoder Update
 //
 
+/**
+ * @brief Process input and produce decompressed output.
+ *
+ * This function implements the main decoding loop, processing gzip data
+ * through HEADER → BODY → TRAILER stages. It handles streaming semantics
+ * by maintaining internal state across calls.
+ *
+ * ## Concatenated Member Handling
+ *
+ * The outer while loop is critical for correctly handling concatenated gzip
+ * streams (multiple gzip members joined together). Without this loop:
+ *
+ * - After processing member 1's trailer, the decoder would return
+ * - The caller would need to call update() again to process member 2
+ * - But member 2's header might already be in the current input buffer
+ *
+ * With the outer loop:
+ * - After member 1's trailer validates, if concat is enabled, we reset state
+ * - The loop continues, immediately processing member 2's header
+ * - Output is continuous across members
+ * - Single update() call can process multiple complete members
+ *
+ * ## Loop Termination Conditions
+ *
+ * The outer loop continues while ALL of these are true:
+ * 1. state->stage != DONE (not finished decoding)
+ * 2. state->stage != ERROR (no unrecoverable error)
+ * 3. input->used < input->size (input available)
+ * 4. output->used < output->size (output space available)
+ *
+ * The output space check is essential: without it, the loop would spin
+ * indefinitely when the output buffer fills (e.g., 1-byte output tests).
+ * The decoder must return control to the caller to consume output.
+ *
+ * @param decoder Decoder instance
+ * @param input Input buffer (consumed bytes tracked via input->used)
+ * @param output Output buffer (produced bytes tracked via output->used)
+ * @return GCOMP_OK on progress, error code on failure
+ */
 gcomp_status_t gzip_decoder_update(gcomp_decoder_t * decoder,
     gcomp_buffer_t * input, gcomp_buffer_t * output) {
   if (!decoder || !decoder->method_state || !input || !output) {
@@ -429,9 +508,16 @@ gcomp_status_t gzip_decoder_update(gcomp_decoder_t * decoder,
 
   gzip_decoder_state_t * state = (gzip_decoder_state_t *)decoder->method_state;
   gcomp_status_t status;
-
-  // HEADER stage: parse header bytes
   const uint8_t * input_data = (const uint8_t *)input->data;
+
+  // Outer loop for concatenated member handling. This loop continues as long
+  // as we have input, output space, and haven't finished or hit an error.
+  // See function documentation for detailed explanation of why this is needed.
+  while (state->stage != GZIP_DEC_STAGE_DONE &&
+      state->stage != GZIP_DEC_STAGE_ERROR && input->used < input->size &&
+      output->used < output->size) {
+
+    // HEADER stage: parse header bytes
   while (state->stage == GZIP_DEC_STAGE_HEADER && input->used < input->size) {
     uint8_t byte = input_data[input->used++];
     state->total_input_bytes++;
@@ -498,6 +584,19 @@ gcomp_status_t gzip_decoder_update(gcomp_decoder_t * decoder,
 
       state->stage = GZIP_DEC_STAGE_TRAILER;
       state->trailer_pos = 0;
+
+      // Retrieve any unconsumed bytes from deflate's bit buffer.
+      // In streaming mode, deflate may have read trailer bytes into its
+      // bit buffer before detecting end-of-stream. These bytes weren't
+      // returned to input (they were consumed in previous calls), so we
+      // need to retrieve them explicitly for trailer parsing.
+      uint32_t unconsumed = gcomp_deflate_decoder_get_unconsumed_bytes(
+          state->inner_decoder);
+      if (unconsumed > 0 && unconsumed <= GZIP_TRAILER_SIZE) {
+        gcomp_deflate_decoder_get_unconsumed_data(state->inner_decoder,
+            state->trailer_buf, unconsumed);
+        state->trailer_pos = unconsumed;
+      }
     }
   }
 
@@ -563,6 +662,8 @@ gcomp_status_t gzip_decoder_update(gcomp_decoder_t * decoder,
       break;
     }
   }
+
+  } // end outer while loop for concatenated members
 
   return GCOMP_OK;
 }
