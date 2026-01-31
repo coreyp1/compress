@@ -221,13 +221,168 @@ int main(void) {
   snprintf(path, sizeof(path), "fuzz/corpus/roundtrip/alternating_256.bin");
   write_file(path, alternating, sizeof(alternating));
 
+  // Generate edge case sizes for encoder/roundtrip
+  printf("\nGenerating edge case size inputs...\n");
+
+  // Power-of-2 boundaries and off-by-one sizes
+  size_t edge_sizes[] = {0, 1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64,
+      65, 127, 128, 129, 255, 256, 257, 511, 512, 513, 1023, 1024, 1025, 2047,
+      2048, 2049, 4095, 4096, 4097};
+
+  for (size_t i = 0; i < sizeof(edge_sizes) / sizeof(edge_sizes[0]); i++) {
+    size_t sz = edge_sizes[i];
+    if (sz > 4097)
+      continue; // Keep files reasonable
+
+    uint8_t * buf = (uint8_t *)malloc(sz > 0 ? sz : 1);
+    if (!buf)
+      continue;
+
+    // Fill with pattern
+    for (size_t j = 0; j < sz; j++) {
+      buf[j] = (uint8_t)(j & 0xFF);
+    }
+
+    snprintf(path, sizeof(path), "fuzz/corpus/encoder/edge_size_%zu.bin", sz);
+    write_file(path, buf, sz);
+    snprintf(path, sizeof(path), "fuzz/corpus/roundtrip/edge_size_%zu.bin", sz);
+    write_file(path, buf, sz);
+
+    free(buf);
+  }
+
+  // Generate gzip corpus with various header combinations
+  printf("\nGenerating gzip corpus directory...\n");
+  mkdir_p("fuzz/corpus/gzip_decoder");
+  mkdir_p("fuzz/corpus/gzip_encoder");
+  mkdir_p("fuzz/corpus/gzip_roundtrip");
+
+  // Minimal valid gzip (empty content)
+  // ID1=1f, ID2=8b, CM=08, FLG=00, MTIME=0, XFL=0, OS=ff,
+  // deflate empty stored block, CRC32=0, ISIZE=0
+  uint8_t gzip_empty[] = {0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0xff, 0x01, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00};
+  snprintf(path, sizeof(path), "fuzz/corpus/gzip_decoder/empty.gz");
+  write_file(path, gzip_empty, sizeof(gzip_empty));
+
+  // Gzip with FNAME flag set (0x08)
+  uint8_t gzip_fname[] = {0x1f, 0x8b, 0x08, 0x08, // magic + CM + FLG=FNAME
+      0x00, 0x00, 0x00, 0x00, // MTIME
+      0x00, 0xff, // XFL, OS
+      't', 'e', 's', 't', '.', 't', 'x', 't', 0x00, // FNAME
+      0x01, 0x00, 0x00, 0xff, 0xff, // deflate empty
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; // CRC+ISIZE
+  snprintf(path, sizeof(path), "fuzz/corpus/gzip_decoder/with_fname.gz");
+  write_file(path, gzip_fname, sizeof(gzip_fname));
+
+  // Gzip with FCOMMENT flag set (0x10)
+  uint8_t gzip_fcomment[] = {0x1f, 0x8b, 0x08, 0x10, // FLG=FCOMMENT
+      0x00, 0x00, 0x00, 0x00, 0x00, 0xff, // MTIME, XFL, OS
+      'H', 'e', 'l', 'l', 'o', 0x00, // FCOMMENT
+      0x01, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00};
+  snprintf(path, sizeof(path), "fuzz/corpus/gzip_decoder/with_fcomment.gz");
+  write_file(path, gzip_fcomment, sizeof(gzip_fcomment));
+
+  // Gzip with FEXTRA flag set (0x04)
+  uint8_t gzip_fextra[] = {0x1f, 0x8b, 0x08, 0x04, // FLG=FEXTRA
+      0x00, 0x00, 0x00, 0x00, 0x00, 0xff, // MTIME, XFL, OS
+      0x04, 0x00, // XLEN=4
+      'E', 'X', 0x02, 0x00, // Extra data (SI1, SI2, LEN=2, data)
+      0x01, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00};
+  snprintf(path, sizeof(path), "fuzz/corpus/gzip_decoder/with_fextra.gz");
+  write_file(path, gzip_fextra, sizeof(gzip_fextra));
+
+  // Gzip with FHCRC flag set (0x02) - need to compute actual CRC16
+  uint8_t gzip_fhcrc[] = {
+      0x1f, 0x8b, 0x08, 0x02, // FLG=FHCRC
+      0x00, 0x00, 0x00, 0x00, 0x00, 0xff, // MTIME, XFL, OS
+      0x17, 0xc9, // FHCRC (CRC16 of header bytes 0-9)
+      0x01, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00};
+  snprintf(path, sizeof(path), "fuzz/corpus/gzip_decoder/with_fhcrc.gz");
+  write_file(path, gzip_fhcrc, sizeof(gzip_fhcrc));
+
+  // Gzip with FTEXT flag set (0x01)
+  uint8_t gzip_ftext[] = {0x1f, 0x8b, 0x08, 0x01, // FLG=FTEXT
+      0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x01, 0x00, 0x00, 0xff, 0xff, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+  snprintf(path, sizeof(path), "fuzz/corpus/gzip_decoder/with_ftext.gz");
+  write_file(path, gzip_ftext, sizeof(gzip_ftext));
+
+  // Gzip with all flags (FTEXT|FHCRC|FEXTRA|FNAME|FCOMMENT = 0x1F)
+  uint8_t gzip_all_flags[] = {0x1f, 0x8b, 0x08, 0x1f, // All flags
+      0x00, 0x00, 0x00, 0x00, 0x00, 0xff, // MTIME, XFL, OS
+      0x04, 0x00, 'E', 'X', 0x02, 0x00, // FEXTRA
+      'f', 'i', 'l', 'e', 0x00, // FNAME
+      'c', 'o', 'm', 'm', 'e', 'n', 't', 0x00, // FCOMMENT
+      0x87, 0x56, // FHCRC (pre-computed)
+      0x01, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00};
+  snprintf(path, sizeof(path), "fuzz/corpus/gzip_decoder/all_flags.gz");
+  write_file(path, gzip_all_flags, sizeof(gzip_all_flags));
+
+  // Truncated gzip streams for decoder testing
+  printf("\nGenerating truncated gzip streams...\n");
+
+  // Truncated in magic
+  snprintf(path, sizeof(path), "fuzz/corpus/gzip_decoder/trunc_magic.gz");
+  write_file(path, gzip_empty, 1);
+
+  // Truncated in header
+  snprintf(path, sizeof(path), "fuzz/corpus/gzip_decoder/trunc_header.gz");
+  write_file(path, gzip_empty, 5);
+
+  // Truncated in body
+  snprintf(path, sizeof(path), "fuzz/corpus/gzip_decoder/trunc_body.gz");
+  write_file(path, gzip_empty, 12);
+
+  // Truncated in trailer
+  snprintf(path, sizeof(path), "fuzz/corpus/gzip_decoder/trunc_trailer.gz");
+  write_file(path, gzip_empty, 18);
+
+  // Long filename (near limit boundary)
+  printf("\nGenerating long header field tests...\n");
+  size_t long_name_len = 1000; // Near boundary
+  uint8_t * long_name_buf =
+      (uint8_t *)malloc(10 + long_name_len + 1 + 5 + 8 + 10);
+  if (long_name_buf) {
+    size_t pos = 0;
+    long_name_buf[pos++] = 0x1f;
+    long_name_buf[pos++] = 0x8b;
+    long_name_buf[pos++] = 0x08;
+    long_name_buf[pos++] = 0x08; // FNAME
+    for (int i = 0; i < 6; i++)
+      long_name_buf[pos++] = 0x00;
+    for (size_t i = 0; i < long_name_len; i++)
+      long_name_buf[pos++] = 'A' + (i % 26);
+    long_name_buf[pos++] = 0x00; // null terminator
+    // deflate empty
+    long_name_buf[pos++] = 0x01;
+    long_name_buf[pos++] = 0x00;
+    long_name_buf[pos++] = 0x00;
+    long_name_buf[pos++] = 0xff;
+    long_name_buf[pos++] = 0xff;
+    // CRC32 + ISIZE
+    for (int i = 0; i < 8; i++)
+      long_name_buf[pos++] = 0x00;
+
+    snprintf(path, sizeof(path), "fuzz/corpus/gzip_decoder/long_fname.gz");
+    write_file(path, long_name_buf, pos);
+    free(long_name_buf);
+  }
+
   printf("\n");
   printf("Seed corpus generation complete!\n");
   printf("\n");
   printf("Corpus locations:\n");
-  printf("  Decoder:   fuzz/corpus/decoder/\n");
-  printf("  Encoder:   fuzz/corpus/encoder/\n");
-  printf("  Roundtrip: fuzz/corpus/roundtrip/\n");
+  printf("  Decoder:      fuzz/corpus/decoder/\n");
+  printf("  Encoder:      fuzz/corpus/encoder/\n");
+  printf("  Roundtrip:    fuzz/corpus/roundtrip/\n");
+  printf("  Gzip Decoder: fuzz/corpus/gzip_decoder/\n");
+  printf("  Gzip Encoder: fuzz/corpus/gzip_encoder/\n");
   printf("\n");
 
   return 0;

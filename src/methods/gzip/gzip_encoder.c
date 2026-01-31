@@ -62,6 +62,7 @@
 #include <ghoti.io/compress/crc32.h>
 #include <ghoti.io/compress/limits.h>
 #include <ghoti.io/compress/stream.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -90,6 +91,29 @@ static uint8_t compute_xfl(int64_t level) {
 }
 
 //
+// Helper: Validate Latin-1 string encoding (RFC 1952 compliance)
+//
+// RFC 1952 requires FNAME and FCOMMENT to be ISO 8859-1 (Latin-1) encoded.
+// Latin-1 allows all byte values 0x00-0xFF, but:
+// - NUL (0x00) is used as a terminator
+// - Control characters (0x00-0x1F except 0x09, 0x0A, 0x0D) are discouraged
+//
+// This function validates that:
+// 1. The string contains no embedded NULs (handled by strlen naturally)
+// 2. All bytes are valid (0x00-0xFF, which is always true for char*)
+//
+// Returns true if valid, false if invalid.
+//
+static bool validate_latin1_string(const char * GCOMP_MAYBE_UNUSED(str)) {
+  // All byte values 0x00-0xFF are valid in Latin-1, so every C string
+  // is valid. The only constraint is no embedded NULs, which strlen()
+  // handles by stopping at the first NUL. We could add stricter validation
+  // here (e.g., rejecting control characters) but RFC 1952 doesn't
+  // strictly require it.
+  return true;
+}
+
+//
 // Helper: Read options into header_info
 //
 // Note on string validation (RFC 1952 compliance):
@@ -99,6 +123,7 @@ static uint8_t compute_xfl(int64_t level) {
 //   any embedded NUL would naturally truncate the string at that point
 // - The gzip format writer uses strlen() to determine the length,
 //   so embedded NULs are inherently handled correctly
+// - We validate strings are proper Latin-1 (currently permissive)
 //
 
 static gcomp_status_t read_encoder_options(const gcomp_options_t * options,
@@ -160,6 +185,10 @@ static gcomp_status_t read_encoder_options(const gcomp_options_t * options,
   // gzip.name
   status = gcomp_options_get_string(options, "gzip.name", &str_val);
   if (status == GCOMP_OK && str_val) {
+    // Validate Latin-1 encoding (RFC 1952 compliance)
+    if (!validate_latin1_string(str_val)) {
+      return GCOMP_ERR_INVALID_ARG; // Invalid character encoding
+    }
     size_t len = strlen(str_val);
     info->name = (char *)malloc(len + 1);
     if (!info->name) {
@@ -173,6 +202,11 @@ static gcomp_status_t read_encoder_options(const gcomp_options_t * options,
   // gzip.comment
   status = gcomp_options_get_string(options, "gzip.comment", &str_val);
   if (status == GCOMP_OK && str_val) {
+    // Validate Latin-1 encoding (RFC 1952 compliance)
+    if (!validate_latin1_string(str_val)) {
+      gzip_header_info_free(info);
+      return GCOMP_ERR_INVALID_ARG; // Invalid character encoding
+    }
     size_t len = strlen(str_val);
     info->comment = (char *)malloc(len + 1);
     if (!info->comment) {
@@ -203,6 +237,54 @@ static gcomp_status_t read_encoder_options(const gcomp_options_t * options,
   status = gcomp_options_get_bool(options, "gzip.header_crc", &bool_val);
   if (status == GCOMP_OK && bool_val) {
     info->flg |= GZIP_FLG_FHCRC;
+  }
+
+  // gzip.text (FTEXT flag)
+  status = gcomp_options_get_bool(options, "gzip.text", &bool_val);
+  if (status == GCOMP_OK && bool_val) {
+    info->flg |= GZIP_FLG_FTEXT;
+  }
+
+  //
+  // Early header size validation
+  //
+  // The gzip header is built into a fixed-size buffer (GZIP_MAX_HEADER_BUFFER).
+  // Rather than allocating strings and then discovering they don't fit when
+  // gzip_write_header() is called, we validate the total size here to:
+  //   1. Fail fast with a clear error before wasting memory
+  //   2. Provide a specific error (GCOMP_ERR_LIMIT) rather than the generic
+  //      GCOMP_ERR_INVALID_ARG from gzip_write_header()
+  //
+  // Header size calculation (mirrors gzip_write_header logic):
+  //   - Fixed header: GZIP_HEADER_MIN_SIZE (10 bytes)
+  //   - FEXTRA:       2 (XLEN field) + extra_len
+  //   - FNAME:        strlen(name) + 1 (NUL terminator)
+  //   - FCOMMENT:     strlen(comment) + 1 (NUL terminator)
+  //   - FHCRC:        2 (CRC16)
+  //
+  {
+    size_t required = GZIP_HEADER_MIN_SIZE;
+
+    if (info->flg & GZIP_FLG_FEXTRA) {
+      required += 2 + info->extra_len;
+    }
+    if (info->flg & GZIP_FLG_FNAME) {
+      required += info->name ? strlen(info->name) + 1 : 1;
+    }
+    if (info->flg & GZIP_FLG_FCOMMENT) {
+      required += info->comment ? strlen(info->comment) + 1 : 1;
+    }
+    if (info->flg & GZIP_FLG_FHCRC) {
+      required += 2;
+    }
+
+    if (required > GZIP_MAX_HEADER_BUFFER) {
+      // Header fields exceed the maximum buffer size. Free any allocated
+      // memory and return a limit error. The caller will receive a clear
+      // indication that the combined size of name/comment/extra is too large.
+      gzip_header_info_free(info);
+      return GCOMP_ERR_LIMIT;
+    }
   }
 
   return GCOMP_OK;

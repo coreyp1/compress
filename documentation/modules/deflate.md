@@ -173,6 +173,18 @@ gcomp_options_set_uint64(opts, "limits.max_expansion_ratio", 0);  // 0 = unlimit
 - **Encode (fixed):** Levels 1-3 use the fixed Huffman code tables defined in RFC 1951.
 - **Encode (dynamic):** Levels 4-9 build optimal Huffman codes from symbol frequency histograms collected during LZ77 matching. The encoder generates length-limited (15-bit max) codes and transmits them using the code-length alphabet with run-length encoding.
 
+### Empty distance tree edge case
+
+RFC 1951 permits dynamic Huffman blocks where the distance tree is empty (all zero code lengths). This occurs when the encoder outputs only literals and no LZ77 matches, which can happen with:
+
+- Very short inputs (not enough data to find matches)
+- Incompressible high-entropy data
+- `"huffman_only"` strategy (no LZ77 matching)
+
+The decoder correctly handles this edge case: the distance tree is only accessed when decoding a length code (symbols 257-285), and if no such codes appear in the compressed data, an empty distance tree is valid.
+
+**Required invariant:** The literal/length tree must always contain the end-of-block symbol (256). A stream missing this symbol is rejected as corrupt.
+
 ## Compression levels
 
 | Level | Huffman Mode | LZ77 Effort | Use Case |

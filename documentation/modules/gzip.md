@@ -88,10 +88,11 @@ Options prefixed with `deflate.*` or `limits.*` are automatically forwarded to t
 |-----|------|---------|-------------|
 | `gzip.mtime` | uint64 | 0 | Modification time as Unix timestamp (seconds since epoch) |
 | `gzip.os` | uint64 | 255 | Operating system code (255 = unknown, per RFC 1952) |
-| `gzip.name` | string | (none) | Original filename (written to FNAME header field) |
-| `gzip.comment` | string | (none) | File comment (written to FCOMMENT header field) |
+| `gzip.name` | string | (none) | Original filename (written to FNAME header field, Latin-1 encoded) |
+| `gzip.comment` | string | (none) | File comment (written to FCOMMENT header field, Latin-1 encoded) |
 | `gzip.extra` | bytes | (none) | Extra field data (written to FEXTRA header field) |
 | `gzip.header_crc` | bool | false | Include CRC16 of header (FHCRC field) |
+| `gzip.text` | bool | false | Set FTEXT flag to indicate ASCII text content |
 | `gzip.xfl` | uint64 | (auto) | Extra flags byte; auto-calculated from compression level if not set |
 | `gzip.header_flags` | uint64 | (auto) | Header FLG byte; OR'd with auto-calculated flags (0-255) |
 | `gzip.concat` | bool | false | Decoder: support concatenated gzip members |
@@ -138,7 +139,7 @@ The FLG byte is auto-calculated based on which optional fields are provided:
 
 | Bit | Flag | Set when |
 |-----|------|----------|
-| 0 | FTEXT | Never (not used by default) |
+| 0 | FTEXT | `gzip.text` is true |
 | 1 | FHCRC | `gzip.header_crc` is true |
 | 2 | FEXTRA | `gzip.extra` is provided |
 | 3 | FNAME | `gzip.name` is provided |
@@ -183,6 +184,19 @@ gcomp_decoder_create(registry, "gzip", opts, &dec);
 - Output is continuous across members (no separation markers)
 - Limits (`max_output_bytes`, `max_expansion_ratio`) apply to total output across all members
 - If any member fails validation, the entire decode fails
+
+### Truncated concatenated streams
+
+When `gzip.concat` is enabled and a subsequent member is truncated or corrupt, the error message indicates the failure point but does not identify which member number failed. Error details include:
+
+- **Truncated in header**: `"gzip stream truncated in header (stage N)"` - Header parsing was incomplete
+- **Truncated in body**: `"gzip stream truncated in deflate data"` - Compressed body was incomplete
+- **Truncated in trailer**: `"gzip stream truncated in trailer (N of 8 bytes)"` - Trailer was incomplete
+- **Corrupt member**: `"gzip CRC32 mismatch..."` or `"gzip ISIZE mismatch..."` - Validation failed
+
+**Note:** When processing untrusted concatenated streams, consider tracking member boundaries in your application if you need to report which member failed. The library processes members continuously without exposing member boundaries.
+
+**Error recovery:** After a failure in a concatenated stream, the decoder enters an error state. Use `gcomp_decoder_reset()` to clear the error and start decoding a new stream. Output produced before the error is valid decompressed data from successfully completed members.
 
 ## Error handling
 

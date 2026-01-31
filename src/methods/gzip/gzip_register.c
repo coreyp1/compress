@@ -152,6 +152,19 @@ static const gcomp_option_schema_t g_gzip_option_schemas[] = {
         "Include header CRC (FHCRC flag)", // help
     },
     {
+        "gzip.text",                                     // key
+        GCOMP_OPT_BOOL,                                  // type
+        1,                                               // has_default
+        {.b = 0},                                        // default_value
+        0,                                               // has_min
+        0,                                               // has_max
+        0,                                               // min_int
+        0,                                               // max_int
+        0,                                               // min_uint
+        0,                                               // max_uint
+        "Set FTEXT flag to indicate ASCII text content", // help
+    },
+    {
         "gzip.xfl",       // key
         GCOMP_OPT_UINT64, // type
         0,                // has_default (auto-calculated)
@@ -238,6 +251,7 @@ static const char * const g_gzip_option_keys[] = {
     "gzip.comment",
     "gzip.extra",
     "gzip.header_crc",
+    "gzip.text",
     "gzip.xfl",
     "gzip.header_flags",
     "gzip.concat",

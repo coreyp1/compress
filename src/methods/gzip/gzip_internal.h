@@ -7,6 +7,30 @@
  * exposes internal helpers used by the method registration vtable and
  * defines structures shared between encoder and decoder.
  *
+ * ## Internal Header Dependencies
+ *
+ * This file includes internal headers from the core library using relative
+ * paths. The include structure is:
+ *
+ * ```
+ * compress/src/methods/gzip/gzip_internal.h
+ *     ├── ../../core/stream_internal.h     (encoder/decoder internal structs)
+ *     └── <ghoti.io/compress/*.h>          (public API headers)
+ *
+ * compress/src/core/stream_internal.h
+ *     └── <ghoti.io/compress/stream.h>     (public stream types)
+ *
+ * compress/src/core/alloc_internal.h
+ *     └── <ghoti.io/compress/allocator.h>  (public allocator types)
+ *
+ * compress/src/core/registry_internal.h
+ *     └── <ghoti.io/compress/registry.h>   (public registry types)
+ * ```
+ *
+ * Build systems must add the `include/` directory to the include path
+ * for public headers, while internal headers use relative paths from
+ * their location in the source tree.
+ *
  * Copyright 2026 by Corey Pennycuff
  */
 
@@ -45,7 +69,7 @@ extern "C" {
 #define GZIP_MAX_EXTRA_BYTES_DEFAULT (64 * 1024)     ///< 64 KiB
 
 // FLG bit masks
-#define GZIP_FLG_FTEXT 0x01    ///< Text file hint (not used)
+#define GZIP_FLG_FTEXT 0x01    ///< Text file hint (set via gzip.text option)
 #define GZIP_FLG_FHCRC 0x02    ///< Header CRC present
 #define GZIP_FLG_FEXTRA 0x04   ///< Extra field present
 #define GZIP_FLG_FNAME 0x08    ///< Original filename present
