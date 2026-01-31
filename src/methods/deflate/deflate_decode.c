@@ -10,7 +10,8 @@
  *
  * ## Safety Limits
  *
- * The decoder enforces several safety limits to protect against malicious input:
+ * The decoder enforces several safety limits to protect against malicious
+ * input:
  *
  * - **max_output_bytes**: Caps total decompressed output. Checked before each
  *   byte is emitted via `deflate_check_output_limit()`.
@@ -39,7 +40,8 @@
  *
  * The `deflate_check_output_limit()` function performs both checks:
  * 1. Absolute output limit: `total_output_bytes + add <= max_output_bytes`
- * 2. Expansion ratio: `total_output_bytes + add <= max_expansion_ratio * total_input_bytes`
+ * 2. Expansion ratio: `total_output_bytes + add <= max_expansion_ratio *
+ * total_input_bytes`
  *
  * If either check fails, `GCOMP_ERR_LIMIT` is returned with error details set.
  *
@@ -94,17 +96,27 @@ typedef struct gcomp_deflate_decoder_state_s {
   uint32_t bit_count;
 
   //
+  // Unconsumed bytes tracking
+  //
+  // When the deflate stream ends, any full bytes remaining in the bit buffer
+  // are saved here. Container formats like gzip can retrieve these bytes
+  // to use them for their own trailer parsing.
+  //
+  uint8_t unconsumed_bytes[4]; ///< Saved unconsumed bytes (max 3 + safety)
+  uint8_t unconsumed_count;    ///< Number of saved unconsumed bytes
+
+  //
   // Limits and counters for safety checks
   //
   // These limits are read from options at creation time and remain constant.
   // The counters are updated throughout decoding and reset by reset().
   //
-  uint64_t max_output_bytes;     ///< Max decompressed output (0 = unlimited)
-  uint64_t max_window_bytes;     ///< Max LZ77 window size
-  uint64_t max_memory_bytes;     ///< Max working memory (0 = unlimited)
-  uint64_t max_expansion_ratio;  ///< Max output/input ratio (0 = unlimited)
-  uint64_t total_output_bytes;   ///< Decompressed bytes produced so far
-  uint64_t total_input_bytes;    ///< Compressed bytes consumed so far
+  uint64_t max_output_bytes;    ///< Max decompressed output (0 = unlimited)
+  uint64_t max_window_bytes;    ///< Max LZ77 window size
+  uint64_t max_memory_bytes;    ///< Max working memory (0 = unlimited)
+  uint64_t max_expansion_ratio; ///< Max output/input ratio (0 = unlimited)
+  uint64_t total_output_bytes;  ///< Decompressed bytes produced so far
+  uint64_t total_input_bytes;   ///< Compressed bytes consumed so far
 
   //
   // Memory tracking
@@ -173,19 +185,35 @@ typedef struct gcomp_deflate_decoder_state_s {
   // When we've decoded a length symbol (257-285) but couldn't read the extra
   // bits, we save the symbol index here to resume on the next update() call.
   //
-  int pending_length_sym_valid;  // Non-zero if we have a pending length symbol
-  uint8_t pending_length_sym;    // The length symbol index (0..28)
+  int pending_length_sym_valid; // Non-zero if we have a pending length symbol
+  uint8_t pending_length_sym;   // The length symbol index (0..28)
 
   //
   // Dynamic Huffman build scratch
   //
-  uint32_t dyn_hlit;
-  uint32_t dyn_hdist;
-  uint32_t dyn_hclen;
-  uint32_t dyn_clen_index;
-  uint32_t dyn_lengths_index;
-  uint32_t dyn_lengths_total;
-  uint32_t dyn_prev_len;
+  // These fields track progress through the multi-step dynamic Huffman table
+  // construction process. Because input may arrive in arbitrary chunks, the
+  // decoder must be able to pause and resume at any point.
+  //
+  uint32_t dyn_hlit;          ///< HLIT: # of literal/length codes - 257
+  uint32_t dyn_hdist;         ///< HDIST: # of distance codes - 1
+  uint32_t dyn_hclen;         ///< HCLEN: # of code length codes - 4
+  uint32_t dyn_clen_index;    ///< Progress through code length code lengths
+  uint32_t dyn_lengths_index; ///< Progress through lit/len + dist lengths
+  uint32_t dyn_lengths_total; ///< Total lengths to decode (dyn_hlit + dyn_hdist)
+  uint32_t dyn_prev_len;      ///< Previous length (for repeat code 16)
+
+  // Streaming state for repeat codes (symbols 16, 17, 18)
+  //
+  // When decoding the code length sequence, symbols 16/17/18 require extra
+  // bits after the symbol. If we decode the symbol but don't have enough
+  // input for the extra bits, we must save the symbol and resume later.
+  //
+  // Without this, the decoder would decode a NEW symbol on resume, causing
+  // silent stream corruption that manifests as invalid Huffman tables.
+  //
+  uint8_t dyn_pending_repeat_sym; ///< Saved repeat code (16, 17, or 18)
+  int dyn_pending_repeat_valid;   ///< 1 if pending repeat needs processing
 
   uint8_t dyn_clen_lengths[19];
   uint8_t dyn_litlen_lengths[DEFLATE_MAX_LITLEN_SYMBOLS];
@@ -339,12 +367,13 @@ static uint32_t reverse_bits(uint32_t v, uint32_t nbits) {
  * 1. **Absolute output limit**: Ensures `total_output_bytes + add` does not
  *    exceed `max_output_bytes`. This caps the total decompressed size.
  *
- * 2. **Expansion ratio limit**: Ensures `(total_output_bytes + add) / total_input_bytes`
- *    does not exceed `max_expansion_ratio`. This catches decompression bombs
- *    where a tiny input expands to massive output.
+ * 2. **Expansion ratio limit**: Ensures `(total_output_bytes + add) /
+ * total_input_bytes` does not exceed `max_expansion_ratio`. This catches
+ * decompression bombs where a tiny input expands to massive output.
  *
- * The expansion ratio check is performed via `gcomp_limits_check_expansion_ratio()`
- * which handles edge cases like zero input and arithmetic overflow.
+ * The expansion ratio check is performed via
+ * `gcomp_limits_check_expansion_ratio()` which handles edge cases like zero
+ * input and arithmetic overflow.
  *
  * @param st Decoder state (contains limits and counters)
  * @param add Number of bytes about to be emitted
@@ -687,6 +716,8 @@ static gcomp_status_t deflate_dynamic_reset(
   st->dyn_lengths_index = 0;
   st->dyn_lengths_total = 0;
   st->dyn_prev_len = 0;
+  st->dyn_pending_repeat_sym = 0;
+  st->dyn_pending_repeat_valid = 0;
 
   memset(st->dyn_clen_lengths, 0, sizeof(st->dyn_clen_lengths));
   memset(st->dyn_litlen_lengths, 0, sizeof(st->dyn_litlen_lengths));
@@ -778,6 +809,47 @@ static gcomp_status_t deflate_dynamic_read_codelen_lengths(
   return GCOMP_OK;
 }
 
+/**
+ * @brief Decode literal/length and distance code lengths for dynamic Huffman.
+ *
+ * This function decodes the code length sequences that define the dynamic
+ * Huffman tables. RFC 1951 uses a compact encoding with repeat codes:
+ *
+ * - Symbols 0-15: Literal code lengths (0 = unused symbol)
+ * - Symbol 16: Repeat previous length 3-6 times (2 extra bits)
+ * - Symbol 17: Repeat zero 3-10 times (3 extra bits)
+ * - Symbol 18: Repeat zero 11-138 times (7 extra bits)
+ *
+ * ## Streaming State Preservation for Repeat Codes
+ *
+ * Repeat codes (16, 17, 18) are two-part symbols: first the symbol itself
+ * is Huffman-decoded, then extra bits are read to determine the repeat count.
+ * In streaming mode, the input buffer may run out between these two steps.
+ *
+ * **The Problem**: If we successfully decode symbol 16 but can't read its
+ * 2 extra bits, we must preserve the symbol for the next update() call.
+ * Simply returning GCOMP_OK would cause us to decode a NEW symbol next time,
+ * corrupting the stream.
+ *
+ * **The Solution**: Use `dyn_pending_repeat_sym` and `dyn_pending_repeat_valid`
+ * to save the repeat symbol when we can't read its extra bits:
+ *
+ * 1. Successfully decode symbol (e.g., sym=16)
+ * 2. Attempt to read extra bits → not enough input
+ * 3. Save: `dyn_pending_repeat_sym = 16`, `dyn_pending_repeat_valid = 1`
+ * 4. Return GCOMP_OK (need more input)
+ * 5. On next call, check `dyn_pending_repeat_valid` first
+ * 6. If set, use saved symbol instead of decoding a new one
+ * 7. Clear flag and attempt to read extra bits again
+ *
+ * This pattern is consistent with other pending state mechanisms in the
+ * decoder (e.g., `pending_literal_valid`, `pending_length_valid`) and
+ * ensures correct resumption across arbitrary input buffer boundaries.
+ *
+ * @param st Decoder state
+ * @param input Input buffer (may be partially consumed)
+ * @return GCOMP_OK if progress made (may need more input), error otherwise
+ */
 static gcomp_status_t deflate_dynamic_decode_lengths(
     gcomp_deflate_decoder_state_t * st, gcomp_buffer_t * input) {
   if (!st || !input) {
@@ -789,17 +861,27 @@ static gcomp_status_t deflate_dynamic_decode_lengths(
   }
 
   while (st->dyn_lengths_index < st->dyn_lengths_total) {
-    int decoded = 0;
     uint16_t sym = 0;
-    gcomp_status_t ds = deflate_huff_decode_symbol(
-        st, input, &st->dyn_clen_table, &sym, &decoded);
-    if (ds != GCOMP_OK) {
-      return ds;
-    }
 
-    // Not enough input to decode a symbol.
-    if (!decoded) {
-      return GCOMP_OK;
+    // Resume from a pending repeat code if we couldn't read its extra bits
+    // on the previous call. See function documentation for details.
+    if (st->dyn_pending_repeat_valid) {
+      sym = st->dyn_pending_repeat_sym;
+      st->dyn_pending_repeat_valid = 0;
+    }
+    else {
+      // Decode a new symbol
+      int decoded = 0;
+      gcomp_status_t ds = deflate_huff_decode_symbol(
+          st, input, &st->dyn_clen_table, &sym, &decoded);
+      if (ds != GCOMP_OK) {
+        return ds;
+      }
+
+      // Not enough input to decode a symbol.
+      if (!decoded) {
+        return GCOMP_OK;
+      }
     }
 
     if (sym <= 15u) {
@@ -822,6 +904,9 @@ static gcomp_status_t deflate_dynamic_decode_lengths(
       }
       uint32_t extra = 0;
       if (!deflate_try_read_bits(st, input, 2u, &extra)) {
+        // Not enough bits for extra data - save symbol and wait for more input
+        st->dyn_pending_repeat_sym = (uint8_t)sym;
+        st->dyn_pending_repeat_valid = 1;
         return GCOMP_OK;
       }
       uint32_t count = 3u + extra;
@@ -845,6 +930,9 @@ static gcomp_status_t deflate_dynamic_decode_lengths(
       uint32_t extra_bits = (sym == 17u) ? 3u : 7u;
       uint32_t extra = 0;
       if (!deflate_try_read_bits(st, input, extra_bits, &extra)) {
+        // Not enough bits for extra data - save symbol and wait for more input
+        st->dyn_pending_repeat_sym = (uint8_t)sym;
+        st->dyn_pending_repeat_valid = 1;
         return GCOMP_OK;
       }
       uint32_t base = (sym == 17u) ? 3u : 11u;
@@ -991,6 +1079,8 @@ gcomp_status_t gcomp_deflate_decoder_init(gcomp_registry_t * registry,
 
   st->bit_buffer = 0;
   st->bit_count = 0;
+  st->unconsumed_count = 0;
+  memset(st->unconsumed_bytes, 0, sizeof(st->unconsumed_bytes));
   st->stage = DEFLATE_STAGE_BLOCK_HEADER;
   st->last_block = 0;
   st->block_type = 0;
@@ -1116,6 +1206,7 @@ gcomp_status_t gcomp_deflate_decoder_reset(gcomp_decoder_t * decoder) {
   // Reset bit buffer state
   st->bit_buffer = 0;
   st->bit_count = 0;
+  st->unconsumed_count = 0;
 
   // Reset state machine
   st->stage = DEFLATE_STAGE_BLOCK_HEADER;
@@ -1167,6 +1258,8 @@ gcomp_status_t gcomp_deflate_decoder_reset(gcomp_decoder_t * decoder) {
   st->dyn_lengths_index = 0;
   st->dyn_lengths_total = 0;
   st->dyn_prev_len = 0;
+  st->dyn_pending_repeat_sym = 0;
+  st->dyn_pending_repeat_valid = 0;
 
   // Clear current table pointers
   st->cur_litlen = NULL;
@@ -1371,6 +1464,49 @@ static gcomp_status_t deflate_process_huffman_data(
   if (sym == 256u) {
     if (st->last_block) {
       st->stage = DEFLATE_STAGE_DONE;
+      // Handle pre-read bytes from the bit buffer for container formats.
+      // This is critical for formats like gzip that need to read data
+      // (e.g., trailer) immediately after the deflate stream.
+      //
+      // We use floor division (bit_count / 8) because:
+      // - Full bytes (8 bits each) in the buffer are pre-read trailer bytes
+      // - Partial byte bits (bit_count % 8) are padding from deflate's last
+      // byte
+      //
+      // Example: if bit_count = 10, we have 1 pre-read byte (8 bits) and
+      // 2 padding bits from the last deflate byte.
+      //
+      // Strategy:
+      // - In bulk mode (when bytes can be returned to input), return them.
+      //   The container format reads from the input buffer.
+      // - In streaming mode (bytes were consumed in previous calls), save
+      //   them for retrieval via gcomp_deflate_decoder_get_unconsumed_data().
+      //   The container format retrieves them explicitly.
+      st->unconsumed_count = 0;
+      if (st->bit_count >= 8) {
+        uint32_t bytes_to_handle = st->bit_count / 8;
+        if (bytes_to_handle > sizeof(st->unconsumed_bytes)) {
+          bytes_to_handle = sizeof(st->unconsumed_bytes);
+        }
+        // Try to return bytes to input buffer (bulk mode)
+        if (bytes_to_handle <= input->used) {
+          // Bulk mode: bytes can be returned to input
+          input->used -= bytes_to_handle;
+          st->total_input_bytes -= bytes_to_handle;
+          // Don't save to unconsumed_bytes - gzip will read from input
+        }
+        else {
+          // Streaming mode: bytes were consumed in previous calls
+          // Save them for explicit retrieval by the container format
+          for (uint32_t i = 0; i < bytes_to_handle; i++) {
+            st->unconsumed_bytes[i] = (uint8_t)(st->bit_buffer >> (i * 8));
+          }
+          st->unconsumed_count = (uint8_t)bytes_to_handle;
+        }
+      }
+      // Clear the bit buffer (padding bits are discarded)
+      st->bit_buffer = 0;
+      st->bit_count = 0;
     }
     else {
       st->stage = DEFLATE_STAGE_BLOCK_HEADER;
@@ -1560,4 +1696,43 @@ gcomp_status_t gcomp_deflate_decoder_finish(
   }
 
   return GCOMP_OK;
+}
+
+int gcomp_deflate_decoder_is_done(gcomp_decoder_t * decoder) {
+  if (!decoder || !decoder->method_state) {
+    return 0;
+  }
+  gcomp_deflate_decoder_state_t * st =
+      (gcomp_deflate_decoder_state_t *)decoder->method_state;
+  return st->stage == DEFLATE_STAGE_DONE;
+}
+
+uint32_t gcomp_deflate_decoder_get_unconsumed_bytes(gcomp_decoder_t * decoder) {
+  if (!decoder || !decoder->method_state) {
+    return 0;
+  }
+  gcomp_deflate_decoder_state_t * st =
+      (gcomp_deflate_decoder_state_t *)decoder->method_state;
+  // Return the count of saved unconsumed bytes
+  return st->unconsumed_count;
+}
+
+uint32_t gcomp_deflate_decoder_get_unconsumed_data(
+    gcomp_decoder_t * decoder, uint8_t * buf, uint32_t buf_size) {
+  if (!decoder || !decoder->method_state || !buf || buf_size == 0) {
+    return 0;
+  }
+  gcomp_deflate_decoder_state_t * st =
+      (gcomp_deflate_decoder_state_t *)decoder->method_state;
+
+  uint32_t to_copy = st->unconsumed_count;
+  if (to_copy > buf_size) {
+    to_copy = buf_size;
+  }
+
+  for (uint32_t i = 0; i < to_copy; i++) {
+    buf[i] = st->unconsumed_bytes[i];
+  }
+
+  return to_copy;
 }

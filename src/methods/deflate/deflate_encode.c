@@ -194,10 +194,53 @@ typedef struct gcomp_deflate_encoder_state_s {
 
   //
   // Hash chain for LZ77 match finding
+  // ==================================
   //
-  uint16_t * hash_head; ///< Head of each hash chain.
-  uint16_t * hash_prev; ///< Previous link in hash chain.
-  size_t * hash_pos;    ///< Stream position when hash entry was inserted.
+  // The encoder uses hash chains to efficiently find repeated byte sequences
+  // in the sliding window. For each 3-byte sequence, a hash value is computed.
+  // Positions with the same hash are linked together in a chain, allowing
+  // quick traversal of potential match candidates.
+  //
+  // Data structures:
+  // - hash_head[hash]: Buffer index of most recent position with this hash
+  // - hash_prev[idx]:  Buffer index of previous position in same chain
+  // - hash_pos[idx]:   Stream position when this entry was inserted (for
+  //                    validity checking - entries older than window_size
+  //                    bytes are stale)
+  // - hash_at[idx]:    Hash value that was used when inserting at this buffer
+  //                    index (for proactive invalidation - see below)
+  //
+  // HASH CHAIN INVALIDATION (Critical for correctness)
+  // ---------------------------------------------------
+  //
+  // Because the sliding window is circular, buffer indices are reused when
+  // the window wraps. This creates a subtle corruption problem:
+  //
+  // Consider buffer index 100:
+  //   1. First use: hash("abc")=500 → hash_head[500]=100, hash_prev[100]=...
+  //   2. Window wraps, index 100 now contains different data
+  //   3. Second use: hash("xyz")=700 → hash_head[700]=100
+  //
+  // Problem: hash_head[500] still points to 100, but 100 is now in chain 700!
+  // If we search chain 500, we'll follow hash_prev[100] into chain 700's
+  // history, causing incorrect matches or infinite loops.
+  //
+  // Solution: Proactive invalidation using hash_at[]:
+  //   - When inserting at buffer index idx with new hash:
+  //     1. Check old_hash = hash_at[idx]
+  //     2. If hash_head[old_hash] == idx (this index is head of old chain)
+  //        AND old_hash != new_hash, set hash_head[old_hash] = NIL
+  //     3. This ensures the old chain doesn't dangle into the wrong chain
+  //
+  // The check "old_hash != new_hash" is important: if we're re-inserting into
+  // the same chain (same data at same position), we don't want to invalidate
+  // the chain head, as that would corrupt hash_prev linkage.
+  //
+  uint16_t * hash_head; ///< Head of each hash chain (hash → buffer index).
+  uint16_t * hash_prev; ///< Previous link in hash chain (buffer index → index).
+  size_t * hash_pos;    ///< Stream position when entry was inserted.
+  uint16_t * hash_at;   ///< Hash value at each buffer position (for proactive
+                        ///< invalidation when buffer indices are reused).
   uint32_t hash_value;  ///< Running hash value.
 
   //
@@ -561,6 +604,27 @@ static deflate_match_t deflate_find_match(gcomp_deflate_encoder_state_t * st,
  * position (in hash_pos) so that stale entries can be detected after the
  * circular buffer wraps.
  *
+ * ## Proactive Hash Chain Invalidation
+ *
+ * This function implements proactive invalidation to prevent hash chain
+ * corruption when buffer indices are reused. The problem and solution:
+ *
+ * **Problem**: When the circular window buffer wraps, a buffer index that
+ * was previously part of hash chain A may be reused for data that hashes
+ * to chain B. If hash_head[A] still points to this index, searches on
+ * chain A will incorrectly follow hash_prev into chain B's history.
+ *
+ * **Solution**: Before inserting at index `idx` with hash `new_hash`:
+ * 1. Look up `old_hash = hash_at[idx]` (the hash from the previous insert)
+ * 2. If `hash_head[old_hash] == idx` AND `old_hash != new_hash`:
+ *    - This index is still the head of the old chain
+ *    - Set `hash_head[old_hash] = NIL` to sever the dangling reference
+ * 3. The condition `old_hash != new_hash` is critical: if we're reinserting
+ *    into the same chain, invalidating would corrupt hash_prev linkage.
+ *
+ * This proactive approach ensures hash chains are always clean, avoiding
+ * the need for expensive validation during match searches.
+ *
  * @param st Encoder state
  * @param pos Position in circular window buffer
  * @param stream_pos Position in the total input stream (for validity checking)
@@ -574,9 +638,19 @@ static void deflate_insert_hash(
   size_t idx = pos % st->window_size;
   uint32_t hash = deflate_hash_3bytes_wrap(st->window, idx, st->window_size);
 
+  // Proactive invalidation: If this buffer index was previously the head of
+  // a different hash chain, clear that chain head to prevent corruption.
+  // See function documentation above for detailed explanation.
+  uint16_t old_hash = st->hash_at[idx];
+  if (old_hash != hash && st->hash_head[old_hash] == idx) {
+    st->hash_head[old_hash] = DEFLATE_NIL;
+  }
+
+  // Standard hash chain insertion: prepend to chain, record metadata
   st->hash_prev[idx] = st->hash_head[hash];
   st->hash_head[hash] = (uint16_t)idx;
-  st->hash_pos[idx] = stream_pos; // Record stream position for validity check
+  st->hash_pos[idx] = stream_pos;
+  st->hash_at[idx] = (uint16_t)hash;
 }
 
 //
@@ -1388,8 +1462,8 @@ static gcomp_status_t deflate_flush_dynamic_block(
   uint8_t
       cl_symbols[DEFLATE_MAX_LITLEN_SYMBOLS + DEFLATE_MAX_DIST_SYMBOLS + 32];
   uint8_t cl_extra[DEFLATE_MAX_LITLEN_SYMBOLS + DEFLATE_MAX_DIST_SYMBOLS + 32];
-  size_t cl_count =
-      deflate_rle_encode_lengths(all_lengths, total_codes, cl_symbols, cl_extra);
+  size_t cl_count = deflate_rle_encode_lengths(
+      all_lengths, total_codes, cl_symbols, cl_extra);
 
   // Build code length Huffman tree
   uint32_t cl_freq[19] = {0};
@@ -1637,13 +1711,17 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
   size_t hash_head_size = DEFLATE_HASH_SIZE * sizeof(uint16_t);
   size_t hash_prev_size = st->window_size * sizeof(uint16_t);
   size_t hash_pos_size = st->window_size * sizeof(size_t);
+  size_t hash_at_size = st->window_size * sizeof(uint16_t);
 
   st->hash_head =
       (uint16_t *)gcomp_calloc(alloc, DEFLATE_HASH_SIZE, sizeof(uint16_t));
   st->hash_prev =
       (uint16_t *)gcomp_calloc(alloc, st->window_size, sizeof(uint16_t));
   st->hash_pos = (size_t *)gcomp_calloc(alloc, st->window_size, sizeof(size_t));
-  if (!st->hash_head || !st->hash_prev || !st->hash_pos) {
+  st->hash_at =
+      (uint16_t *)gcomp_calloc(alloc, st->window_size, sizeof(uint16_t));
+  if (!st->hash_head || !st->hash_prev || !st->hash_pos || !st->hash_at) {
+    gcomp_free(alloc, st->hash_at);
     gcomp_free(alloc, st->hash_pos);
     gcomp_free(alloc, st->hash_prev);
     gcomp_free(alloc, st->hash_head);
@@ -1654,6 +1732,7 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
   gcomp_memory_track_alloc(&st->mem_tracker, hash_head_size);
   gcomp_memory_track_alloc(&st->mem_tracker, hash_prev_size);
   gcomp_memory_track_alloc(&st->mem_tracker, hash_pos_size);
+  gcomp_memory_track_alloc(&st->mem_tracker, hash_at_size);
 
   st->total_in = 0;
 
@@ -1662,6 +1741,7 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
     st->block_buffer_size = DEFLATE_MAX_STORED_BLOCK;
     st->block_buffer = (uint8_t *)gcomp_malloc(alloc, st->block_buffer_size);
     if (!st->block_buffer) {
+      gcomp_free(alloc, st->hash_at);
       gcomp_free(alloc, st->hash_pos);
       gcomp_free(alloc, st->hash_prev);
       gcomp_free(alloc, st->hash_head);
@@ -1684,6 +1764,7 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
     if (!st->lit_buf || !st->dist_buf) {
       gcomp_free(alloc, st->dist_buf);
       gcomp_free(alloc, st->lit_buf);
+      gcomp_free(alloc, st->hash_at);
       gcomp_free(alloc, st->hash_pos);
       gcomp_free(alloc, st->hash_prev);
       gcomp_free(alloc, st->hash_head);
@@ -1709,6 +1790,7 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
         gcomp_free(alloc, st->lit_freq);
         gcomp_free(alloc, st->dist_buf);
         gcomp_free(alloc, st->lit_buf);
+        gcomp_free(alloc, st->hash_at);
         gcomp_free(alloc, st->hash_pos);
         gcomp_free(alloc, st->hash_prev);
         gcomp_free(alloc, st->hash_head);
@@ -1727,6 +1809,7 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
       gcomp_free(alloc, st->lit_freq);
       gcomp_free(alloc, st->dist_buf);
       gcomp_free(alloc, st->lit_buf);
+      gcomp_free(alloc, st->hash_at);
       gcomp_free(alloc, st->hash_pos);
       gcomp_free(alloc, st->hash_prev);
       gcomp_free(alloc, st->hash_head);
@@ -1745,6 +1828,7 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
     gcomp_free(alloc, st->dist_buf);
     gcomp_free(alloc, st->lit_buf);
     gcomp_free(alloc, st->block_buffer);
+    gcomp_free(alloc, st->hash_at);
     gcomp_free(alloc, st->hash_pos);
     gcomp_free(alloc, st->hash_prev);
     gcomp_free(alloc, st->hash_head);
@@ -1782,6 +1866,7 @@ void gcomp_deflate_encoder_destroy(gcomp_encoder_t * encoder) {
   gcomp_free(alloc, st->dist_buf);
   gcomp_free(alloc, st->lit_buf);
   gcomp_free(alloc, st->block_buffer);
+  gcomp_free(alloc, st->hash_at);
   gcomp_free(alloc, st->hash_pos);
   gcomp_free(alloc, st->hash_prev);
   gcomp_free(alloc, st->hash_head);
@@ -1818,6 +1903,7 @@ gcomp_status_t gcomp_deflate_encoder_reset(gcomp_encoder_t * encoder) {
   memset(st->hash_head, 0, DEFLATE_HASH_SIZE * sizeof(uint16_t));
   memset(st->hash_prev, 0, st->window_size * sizeof(uint16_t));
   memset(st->hash_pos, 0, st->window_size * sizeof(size_t));
+  memset(st->hash_at, 0, st->window_size * sizeof(uint16_t));
   st->hash_value = 0;
 
   // Reset bitwriter state

@@ -57,6 +57,47 @@ gcomp_status_t gcomp_deflate_decoder_finish(
     gcomp_decoder_t * decoder, gcomp_buffer_t * output);
 
 /**
+ * @brief Check if deflate decoder stream is complete.
+ *
+ * Returns true if the decoder has seen the end of the deflate stream
+ * (BFINAL=1 block with EOB symbol processed). This is useful for container
+ * formats like gzip that need to detect deflate completion without calling
+ * finish().
+ */
+int gcomp_deflate_decoder_is_done(gcomp_decoder_t * decoder);
+
+/**
+ * @brief Get number of unconsumed bytes in deflate decoder's bit buffer.
+ *
+ * Returns the number of full bytes in the bit buffer that were read from
+ * input but not used for decoding. This is useful for container formats
+ * like gzip that need to know where the deflate stream actually ended
+ * in order to read their trailer.
+ *
+ * Note: In streaming mode, these bytes may have been read in previous update
+ * calls and cannot be "returned" to the input stream. Use
+ * gcomp_deflate_decoder_get_unconsumed_data() to retrieve the actual bytes.
+ */
+uint32_t gcomp_deflate_decoder_get_unconsumed_bytes(gcomp_decoder_t * decoder);
+
+/**
+ * @brief Retrieve unconsumed bytes from deflate decoder's bit buffer.
+ *
+ * Copies up to @c buf_size unconsumed bytes into @c buf. These are bytes
+ * that were read from the input stream into the bit buffer but not used
+ * for decoding (they belong to data after the deflate stream, such as a
+ * gzip trailer).
+ *
+ * @param decoder The decoder to query
+ * @param buf     Buffer to copy unconsumed bytes into
+ * @param buf_size Size of buf in bytes
+ * @return Number of bytes copied (may be less than unconsumed count if buf
+ *         is too small)
+ */
+uint32_t gcomp_deflate_decoder_get_unconsumed_data(
+    gcomp_decoder_t * decoder, uint8_t * buf, uint32_t buf_size);
+
+/**
  * @brief Create and attach deflate encoder state to an encoder.
  *
  * On success, sets @c encoder->method_state and @c encoder->update_fn /
