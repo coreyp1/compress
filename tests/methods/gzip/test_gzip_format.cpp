@@ -648,6 +648,39 @@ TEST_F(GzipFormatTest, ErrorFNAMEExceedsLimit) {
   gcomp_options_destroy(opts);
 }
 
+TEST_F(GzipFormatTest, ErrorFCOMMENTExceedsLimit) {
+  // Create options with very small FCOMMENT limit
+  gcomp_options_t * opts = nullptr;
+  gcomp_status_t status = gcomp_options_create(&opts);
+  ASSERT_EQ(status, GCOMP_OK);
+
+  status = gcomp_options_set_uint64(opts, "gzip.max_comment_bytes", 5);
+  ASSERT_EQ(status, GCOMP_OK);
+
+  gcomp_decoder_t * decoder = nullptr;
+  status = gcomp_decoder_create(registry_, "gzip", opts, &decoder);
+  ASSERT_EQ(status, GCOMP_OK);
+
+  // Header with FCOMMENT that exceeds limit
+  uint8_t bad_data[] = {
+      GZIP_ID1, GZIP_ID2, GZIP_CM_DEFLATE,
+      GZIP_FLG_FCOMMENT,                                // FLG with FCOMMENT
+      0x00, 0x00, 0x00, 0x00,                           // MTIME
+      0x00, 0xFF,                                       // XFL, OS
+      'L', 'o', 'n', 'g', ' ', 'c', 'o', 'm', 'm', 'e', // Long comment
+  };
+
+  gcomp_buffer_t in_buf = {bad_data, sizeof(bad_data), 0};
+  uint8_t output[256];
+  gcomp_buffer_t out_buf = {output, sizeof(output), 0};
+
+  status = gcomp_decoder_update(decoder, &in_buf, &out_buf);
+  EXPECT_EQ(status, GCOMP_ERR_LIMIT);
+
+  gcomp_decoder_destroy(decoder);
+  gcomp_options_destroy(opts);
+}
+
 TEST_F(GzipFormatTest, ErrorTruncatedHeader) {
   // Just the magic bytes - truncated in MTIME
   uint8_t truncated[] = {GZIP_ID1, GZIP_ID2, GZIP_CM_DEFLATE, 0x00, 0x12};

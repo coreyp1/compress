@@ -175,6 +175,10 @@ typedef struct {
   uint64_t max_comment_bytes;
   uint64_t max_extra_bytes;
 
+  // Limit configuration
+  uint64_t max_output_bytes;    ///< Maximum total output bytes (0 = unlimited)
+  uint64_t max_expansion_ratio; ///< Maximum output/input ratio (0 = unlimited)
+
   // Limit tracking
   uint64_t total_input_bytes;
   uint64_t total_output_bytes;

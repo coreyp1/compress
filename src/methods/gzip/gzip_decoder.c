@@ -93,6 +93,12 @@ static gcomp_status_t read_decoder_options(
   state->max_comment_bytes = GZIP_MAX_COMMENT_BYTES_DEFAULT;
   state->max_extra_bytes = GZIP_MAX_EXTRA_BYTES_DEFAULT;
 
+  // Use limit helper functions for default values
+  state->max_output_bytes =
+      gcomp_limits_read_output_max(options, GCOMP_DEFAULT_MAX_OUTPUT_BYTES);
+  state->max_expansion_ratio = gcomp_limits_read_expansion_ratio_max(
+      options, GCOMP_DEFAULT_MAX_EXPANSION_RATIO);
+
   if (!options) {
     return GCOMP_OK;
   }
@@ -542,7 +548,8 @@ gcomp_status_t gzip_decoder_update(gcomp_decoder_t * decoder,
     size_t output_before = output->used;
     size_t input_before = input->used;
 
-    status = gcomp_decoder_update(state->inner_decoder, input, output);
+    gcomp_status_t deflate_status =
+        gcomp_decoder_update(state->inner_decoder, input, output);
 
     // Track input/output bytes
     state->total_input_bytes += (input->used - input_before);
@@ -556,13 +563,39 @@ gcomp_status_t gzip_decoder_update(gcomp_decoder_t * decoder,
       state->isize += (uint32_t)output_produced;
     }
 
-    if (status != GCOMP_OK) {
-      // Check if deflate stream ended (BFINAL=1 complete)
-      // This is signaled by GCOMP_OK from update when stream is complete
-      // For now, propagate the error
-      return gcomp_decoder_set_error(decoder, status,
+    // Check for errors from deflate update
+    if (deflate_status != GCOMP_OK) {
+      state->stage = GZIP_DEC_STAGE_ERROR;
+      return gcomp_decoder_set_error(decoder, deflate_status,
           "deflate decoder update failed: %s",
           gcomp_decoder_get_error_detail(state->inner_decoder));
+    }
+
+    // Check output size limit (gzip-level check, in addition to deflate's)
+    if (state->max_output_bytes > 0 &&
+        state->total_output_bytes > state->max_output_bytes) {
+      state->stage = GZIP_DEC_STAGE_ERROR;
+      return gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
+          "gzip output size %llu exceeds limit %llu",
+          (unsigned long long)state->total_output_bytes,
+          (unsigned long long)state->max_output_bytes);
+    }
+
+    // Check expansion ratio limit (gzip-level check)
+    if (state->max_expansion_ratio > 0 && state->total_input_bytes > 0) {
+      status = gcomp_limits_check_expansion_ratio(state->total_input_bytes,
+          state->total_output_bytes, state->max_expansion_ratio);
+      if (status != GCOMP_OK) {
+        state->stage = GZIP_DEC_STAGE_ERROR;
+        return gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
+            "gzip expansion ratio %llu exceeds limit %llu (input=%llu, "
+            "output=%llu)",
+            (unsigned long long)(state->total_output_bytes /
+                (state->total_input_bytes > 0 ? state->total_input_bytes : 1)),
+            (unsigned long long)state->max_expansion_ratio,
+            (unsigned long long)state->total_input_bytes,
+            (unsigned long long)state->total_output_bytes);
+      }
     }
 
     // Check if deflate is done by trying finish
@@ -580,6 +613,16 @@ gcomp_status_t gzip_decoder_update(gcomp_decoder_t * decoder,
             output_data + output->used - empty_out.used, empty_out.used);
         state->isize += (uint32_t)empty_out.used;
         state->total_output_bytes += empty_out.used;
+
+        // Check output size limit for final output
+        if (state->max_output_bytes > 0 &&
+            state->total_output_bytes > state->max_output_bytes) {
+          state->stage = GZIP_DEC_STAGE_ERROR;
+          return gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
+              "gzip output size %llu exceeds limit %llu",
+              (unsigned long long)state->total_output_bytes,
+              (unsigned long long)state->max_output_bytes);
+        }
       }
 
       state->stage = GZIP_DEC_STAGE_TRAILER;
@@ -657,6 +700,9 @@ gcomp_status_t gzip_decoder_update(gcomp_decoder_t * decoder,
           continue;
         }
       }
+      // If concat is disabled and there's extra data, we just mark as DONE.
+      // The extra input bytes remain unconsumed (input->used < input->size).
+      // This matches standard gzip behavior where trailing data is ignored.
 
       state->stage = GZIP_DEC_STAGE_DONE;
       break;
