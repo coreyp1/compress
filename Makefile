@@ -334,6 +334,7 @@ $(APP_DIR)/fuzz/%$(EXE_EXTENSION): fuzz/%.c $(APP_DIR)/$(AFL_STATIC_TARGET)
 .PHONY: all-debug install-debug test-debug test-valgrind-debug test-watch-debug uninstall-debug watch-debug
 # Fuzz commands
 .PHONY: fuzz-build fuzz-corpus fuzz-decoder fuzz-encoder fuzz-roundtrip fuzz-help
+.PHONY: fuzz-gzip-decoder fuzz-gzip-encoder fuzz-gzip-roundtrip
 # Sanitizer commands
 .PHONY: test-asan test-asan-quiet test-ubsan sanitizer-help
 
@@ -434,16 +435,23 @@ fuzz-help: ## Show fuzzing help and instructions
 	@printf "  sudo apt install afl++\n"
 	@printf "\n"
 	@printf "Available targets:\n"
-	@printf "  make fuzz-build     - Build library and harnesses with AFL instrumentation\n"
-	@printf "  make fuzz-corpus    - Generate seed corpus from test vectors\n"
-	@printf "  make fuzz-decoder   - Run decoder fuzzer\n"
-	@printf "  make fuzz-encoder   - Run encoder fuzzer\n"
-	@printf "  make fuzz-roundtrip - Run roundtrip fuzzer\n"
+	@printf "  make fuzz-build           - Build library and harnesses with AFL instrumentation\n"
+	@printf "  make fuzz-corpus          - Generate seed corpus from test vectors\n"
+	@printf "\n"
+	@printf "  Deflate fuzzers:\n"
+	@printf "    make fuzz-decoder       - Run deflate decoder fuzzer\n"
+	@printf "    make fuzz-encoder       - Run deflate encoder fuzzer\n"
+	@printf "    make fuzz-roundtrip     - Run deflate roundtrip fuzzer\n"
+	@printf "\n"
+	@printf "  Gzip fuzzers:\n"
+	@printf "    make fuzz-gzip-decoder  - Run gzip decoder fuzzer\n"
+	@printf "    make fuzz-gzip-encoder  - Run gzip encoder fuzzer\n"
+	@printf "    make fuzz-gzip-roundtrip- Run gzip roundtrip fuzzer\n"
 	@printf "\n"
 	@printf "Workflow:\n"
-	@printf "  1. make fuzz-corpus    # Generate seed inputs\n"
-	@printf "  2. make fuzz-build     # Build library + harnesses with AFL\n"
-	@printf "  3. make fuzz-decoder   # Start fuzzing (Ctrl+C to stop)\n"
+	@printf "  1. make fuzz-corpus        # Generate seed inputs\n"
+	@printf "  2. make fuzz-build         # Build library + harnesses with AFL\n"
+	@printf "  3. make fuzz-gzip-decoder  # Start fuzzing (Ctrl+C to stop)\n"
 	@printf "\n"
 	@printf "Core pattern setup (for crash detection):\n"
 	@printf "  echo core | sudo tee /proc/sys/kernel/core_pattern\n"
@@ -534,6 +542,51 @@ fuzz-roundtrip: $(APP_DIR)/fuzz/fuzz_roundtrip$(EXE_EXTENSION)
 		printf 'Hello' > fuzz/corpus/roundtrip/hello.bin; \
 	fi
 	$(AFL_ENV) afl-fuzz -i fuzz/corpus/roundtrip -o fuzz/findings/roundtrip -- $(APP_DIR)/fuzz/fuzz_roundtrip$(EXE_EXTENSION)
+
+fuzz-gzip-decoder: ## Run gzip decoder fuzzer (Ctrl+C to stop)
+fuzz-gzip-decoder: $(APP_DIR)/fuzz/fuzz_gzip_decoder$(EXE_EXTENSION)
+	@printf "\033[0;32m\n"
+	@printf "#######################################\n"
+	@printf "### Running Gzip Decoder Fuzzer     ###\n"
+	@printf "#######################################\n"
+	@printf "\033[0m\n"
+	@mkdir -p fuzz/findings/gzip_decoder
+	@if [ ! -d fuzz/corpus/gzip_decoder ] || [ -z "$$(ls -A fuzz/corpus/gzip_decoder 2>/dev/null)" ]; then \
+		printf "\033[0;33mWarning: No seed corpus found. Creating minimal seed...\033[0m\n"; \
+		mkdir -p fuzz/corpus/gzip_decoder; \
+		printf '\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00' > fuzz/corpus/gzip_decoder/empty.gz; \
+	fi
+	$(AFL_ENV) afl-fuzz -i fuzz/corpus/gzip_decoder -o fuzz/findings/gzip_decoder -- $(APP_DIR)/fuzz/fuzz_gzip_decoder$(EXE_EXTENSION)
+
+fuzz-gzip-encoder: ## Run gzip encoder fuzzer (Ctrl+C to stop)
+fuzz-gzip-encoder: $(APP_DIR)/fuzz/fuzz_gzip_encoder$(EXE_EXTENSION)
+	@printf "\033[0;32m\n"
+	@printf "#######################################\n"
+	@printf "### Running Gzip Encoder Fuzzer     ###\n"
+	@printf "#######################################\n"
+	@printf "\033[0m\n"
+	@mkdir -p fuzz/findings/gzip_encoder
+	@if [ ! -d fuzz/corpus/gzip_encoder ] || [ -z "$$(ls -A fuzz/corpus/gzip_encoder 2>/dev/null)" ]; then \
+		printf "\033[0;33mWarning: No seed corpus found. Creating minimal seed...\033[0m\n"; \
+		mkdir -p fuzz/corpus/gzip_encoder; \
+		printf 'Hello' > fuzz/corpus/gzip_encoder/hello.bin; \
+	fi
+	$(AFL_ENV) afl-fuzz -i fuzz/corpus/gzip_encoder -o fuzz/findings/gzip_encoder -- $(APP_DIR)/fuzz/fuzz_gzip_encoder$(EXE_EXTENSION)
+
+fuzz-gzip-roundtrip: ## Run gzip roundtrip fuzzer (Ctrl+C to stop)
+fuzz-gzip-roundtrip: $(APP_DIR)/fuzz/fuzz_gzip_roundtrip$(EXE_EXTENSION)
+	@printf "\033[0;32m\n"
+	@printf "#######################################\n"
+	@printf "### Running Gzip Roundtrip Fuzzer   ###\n"
+	@printf "#######################################\n"
+	@printf "\033[0m\n"
+	@mkdir -p fuzz/findings/gzip_roundtrip
+	@if [ ! -d fuzz/corpus/gzip_roundtrip ] || [ -z "$$(ls -A fuzz/corpus/gzip_roundtrip 2>/dev/null)" ]; then \
+		printf "\033[0;33mWarning: No seed corpus found. Creating minimal seed...\033[0m\n"; \
+		mkdir -p fuzz/corpus/gzip_roundtrip; \
+		printf 'Hello' > fuzz/corpus/gzip_roundtrip/hello.bin; \
+	fi
+	$(AFL_ENV) afl-fuzz -i fuzz/corpus/gzip_roundtrip -o fuzz/findings/gzip_roundtrip -- $(APP_DIR)/fuzz/fuzz_gzip_roundtrip$(EXE_EXTENSION)
 
 test: ## Make and run the Unit tests
 test: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES)
