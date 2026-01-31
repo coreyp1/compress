@@ -15,7 +15,7 @@
  * ```
  * compress/src/methods/gzip/gzip_internal.h
  *     ├── ../../core/stream_internal.h     (encoder/decoder internal structs)
- *     └── <ghoti.io/compress/*.h>          (public API headers)
+ *     └── <ghoti.io/compress/...>          (public API headers)
  *
  * compress/src/core/stream_internal.h
  *     └── <ghoti.io/compress/stream.h>     (public stream types)

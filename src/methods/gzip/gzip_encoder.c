@@ -104,7 +104,7 @@ static uint8_t compute_xfl(int64_t level) {
 //
 // Returns true if valid, false if invalid.
 //
-static bool validate_latin1_string(const char * GCOMP_MAYBE_UNUSED(str)) {
+static bool validate_latin1_string(GCOMP_MAYBE_UNUSED(const char * str)) {
   // All byte values 0x00-0xFF are valid in Latin-1, so every C string
   // is valid. The only constraint is no embedded NULs, which strlen()
   // handles by stopping at the first NUL. We could add stricter validation
