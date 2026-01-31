@@ -442,3 +442,392 @@ When a limit is exceeded, the decoder returns `GCOMP_ERR_LIMIT`. Call `gcomp_dec
 4. **Set limits for untrusted input** - Use `limits.max_output_bytes` and `limits.max_expansion_ratio` to prevent decompression bombs
 5. **Reuse encoders/decoders** - Call `gcomp_*_reset()` between streams instead of destroy/create for better performance
 6. **Destroy after use** - Always call `gcomp_*_destroy()` to free resources
+
+---
+
+## Advanced Streaming Patterns
+
+### Complex Streaming: Multiple Blocks and Interrupts
+
+The streaming API is designed to handle interrupts at any point. When `update()` returns `GCOMP_OK`, it may have consumed only part of the input or produced only part of the output. The caller must track progress and resume:
+
+```c
+// Process data that may arrive in unpredictable chunks (e.g., network)
+gcomp_status_t process_with_interrupts(gcomp_decoder_t *decoder,
+    const uint8_t *compressed, size_t compressed_size,
+    uint8_t *output, size_t output_capacity, size_t *total_out) {
+    
+    size_t input_pos = 0;
+    size_t output_pos = 0;
+    gcomp_status_t status;
+    
+    while (input_pos < compressed_size || output_pos < output_capacity) {
+        // Set up buffers for this iteration
+        gcomp_buffer_t in_buf = {
+            .data = compressed + input_pos,
+            .size = compressed_size - input_pos,
+            .used = 0
+        };
+        gcomp_buffer_t out_buf = {
+            .data = output + output_pos,
+            .size = output_capacity - output_pos,
+            .used = 0
+        };
+        
+        status = gcomp_decoder_update(decoder, &in_buf, &out_buf);
+        if (status != GCOMP_OK) {
+            return status;  // Error or limit exceeded
+        }
+        
+        input_pos += in_buf.used;
+        output_pos += out_buf.used;
+        
+        // Check for completion: all input consumed and no output produced
+        if (in_buf.used == 0 && out_buf.used == 0) {
+            break;  // Decoder has no more buffered data
+        }
+    }
+    
+    *total_out = output_pos;
+    return GCOMP_OK;
+}
+```
+
+**Key points for interrupted streams:**
+
+- Always check both `input.used` and `output.used` after each call
+- The decoder may buffer data internally; drain it by calling `update()` with empty input
+- Deflate blocks can span multiple `update()` calls transparently
+- The encoder may hold data until enough accumulates for efficient compression
+
+### Backpressure Handling
+
+Backpressure occurs when the output consumer (e.g., network, disk) is slower than compression/decompression. The streaming API handles this naturally:
+
+```c
+// Compress with backpressure - writer may accept fewer bytes than offered
+gcomp_status_t compress_with_backpressure(gcomp_encoder_t *encoder,
+    const uint8_t *input, size_t input_size,
+    gcomp_write_cb slow_writer, void *writer_ctx) {
+    
+    size_t input_pos = 0;
+    uint8_t buffer[4096];  // Small buffer for backpressure scenarios
+    gcomp_status_t status;
+    
+    while (input_pos < input_size) {
+        gcomp_buffer_t in_buf = {
+            .data = input + input_pos,
+            .size = input_size - input_pos,
+            .used = 0
+        };
+        gcomp_buffer_t out_buf = {
+            .data = buffer,
+            .size = sizeof(buffer),
+            .used = 0
+        };
+        
+        status = gcomp_encoder_update(encoder, &in_buf, &out_buf);
+        if (status != GCOMP_OK) return status;
+        
+        input_pos += in_buf.used;
+        
+        // Write compressed data, handling partial writes
+        size_t write_pos = 0;
+        while (write_pos < out_buf.used) {
+            size_t written = 0;
+            status = slow_writer(writer_ctx, buffer + write_pos,
+                                 out_buf.used - write_pos, &written);
+            if (status != GCOMP_OK) return status;
+            if (written == 0) return GCOMP_ERR_IO;  // No progress
+            write_pos += written;
+        }
+    }
+    
+    // Finish and flush remaining data
+    gcomp_buffer_t out_buf = { .data = buffer, .size = sizeof(buffer), .used = 0 };
+    status = gcomp_encoder_finish(encoder, &out_buf);
+    if (status != GCOMP_OK) return status;
+    
+    // Write final bytes
+    size_t write_pos = 0;
+    while (write_pos < out_buf.used) {
+        size_t written = 0;
+        status = slow_writer(writer_ctx, buffer + write_pos,
+                             out_buf.used - write_pos, &written);
+        if (status != GCOMP_OK) return status;
+        if (written == 0) return GCOMP_ERR_IO;
+        write_pos += written;
+    }
+    
+    return GCOMP_OK;
+}
+```
+
+### Performance Considerations for Chunk Sizes
+
+Chunk size significantly affects both throughput and memory usage:
+
+| Chunk Size | Throughput | Memory | Latency | Use Case |
+|------------|------------|--------|---------|----------|
+| 4 KiB | Lower | Minimal | Low | Memory-constrained, interactive |
+| 16-64 KiB | Good | Low | Low-Medium | General purpose |
+| 256 KiB - 1 MiB | Optimal | Medium | Medium | Bulk file processing |
+| > 1 MiB | Marginal gain | High | High | Large file archival |
+
+**Recommendations:**
+
+- **Default:** Use 64 KiB chunks for a good balance
+- **Memory-constrained:** Use 4-16 KiB chunks
+- **Maximum throughput:** Use 256 KiB - 1 MiB chunks
+- **Network streaming:** Match chunk size to typical packet/message size
+- **Interactive:** Use small chunks (4-16 KiB) for responsive progress
+
+```c
+// Benchmark different chunk sizes
+#define CHUNK_SMALL   (4 * 1024)      // 4 KiB - memory constrained
+#define CHUNK_DEFAULT (64 * 1024)     // 64 KiB - general purpose
+#define CHUNK_LARGE   (256 * 1024)    // 256 KiB - throughput optimized
+```
+
+### Example: Streaming to/from Network Sockets
+
+```c
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+
+typedef struct {
+    int fd;
+} socket_ctx_t;
+
+// Non-blocking socket read callback
+gcomp_status_t socket_read(void *ctx, uint8_t *dst, size_t cap, size_t *out_n) {
+    socket_ctx_t *sock = (socket_ctx_t *)ctx;
+    
+    ssize_t n = recv(sock->fd, dst, cap, MSG_DONTWAIT);
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            *out_n = 0;  // No data available, but not an error
+            return GCOMP_OK;
+        }
+        return GCOMP_ERR_IO;
+    }
+    if (n == 0) {
+        *out_n = 0;  // EOF - connection closed
+        return GCOMP_OK;
+    }
+    
+    *out_n = (size_t)n;
+    return GCOMP_OK;
+}
+
+// Non-blocking socket write callback
+gcomp_status_t socket_write(void *ctx, const uint8_t *src, size_t n, size_t *out_n) {
+    socket_ctx_t *sock = (socket_ctx_t *)ctx;
+    
+    ssize_t written = send(sock->fd, src, n, MSG_DONTWAIT);
+    if (written < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            *out_n = 0;  // Would block, try again later
+            return GCOMP_OK;
+        }
+        return GCOMP_ERR_IO;
+    }
+    
+    *out_n = (size_t)written;
+    return GCOMP_OK;
+}
+
+// Decompress from one socket to another
+gcomp_status_t decompress_socket_to_socket(int in_fd, int out_fd) {
+    socket_ctx_t in_ctx = { .fd = in_fd };
+    socket_ctx_t out_ctx = { .fd = out_fd };
+    
+    gcomp_options_t *opts = NULL;
+    gcomp_options_create(&opts);
+    
+    // Set strict limits for network data
+    gcomp_options_set_uint64(opts, "limits.max_output_bytes", 100 * 1024 * 1024);
+    gcomp_options_set_uint64(opts, "limits.max_expansion_ratio", 100);
+    
+    gcomp_status_t status = gcomp_decode_stream_cb(
+        NULL, "deflate", opts,
+        socket_read, &in_ctx,
+        socket_write, &out_ctx
+    );
+    
+    gcomp_options_destroy(opts);
+    return status;
+}
+```
+
+### Example: Streaming with Progress Reporting
+
+```c
+typedef struct {
+    const uint8_t *data;
+    size_t size;
+    size_t pos;
+    void (*progress_cb)(size_t current, size_t total, void *user_data);
+    void *user_data;
+    size_t last_report_pos;
+    size_t report_interval;  // Report every N bytes
+} progress_reader_t;
+
+gcomp_status_t progress_read(void *ctx, uint8_t *dst, size_t cap, size_t *out_n) {
+    progress_reader_t *r = (progress_reader_t *)ctx;
+    
+    if (r->pos >= r->size) {
+        *out_n = 0;  // EOF
+        return GCOMP_OK;
+    }
+    
+    size_t remaining = r->size - r->pos;
+    size_t to_read = (remaining < cap) ? remaining : cap;
+    
+    memcpy(dst, r->data + r->pos, to_read);
+    r->pos += to_read;
+    *out_n = to_read;
+    
+    // Report progress at intervals
+    if (r->progress_cb && (r->pos - r->last_report_pos) >= r->report_interval) {
+        r->progress_cb(r->pos, r->size, r->user_data);
+        r->last_report_pos = r->pos;
+    }
+    
+    return GCOMP_OK;
+}
+
+// Usage example
+void my_progress(size_t current, size_t total, void *user_data) {
+    int percent = (int)((current * 100) / total);
+    printf("\rCompressing: %d%% (%zu / %zu bytes)", percent, current, total);
+    fflush(stdout);
+}
+
+gcomp_status_t compress_with_progress(const uint8_t *input, size_t input_size,
+    uint8_t *output, size_t output_capacity, size_t *output_size) {
+    
+    progress_reader_t reader = {
+        .data = input,
+        .size = input_size,
+        .pos = 0,
+        .progress_cb = my_progress,
+        .user_data = NULL,
+        .last_report_pos = 0,
+        .report_interval = 1024 * 1024  // Report every 1 MiB
+    };
+    
+    typedef struct {
+        uint8_t *data;
+        size_t capacity;
+        size_t pos;
+    } buffer_writer_t;
+    
+    buffer_writer_t writer = {
+        .data = output,
+        .capacity = output_capacity,
+        .pos = 0
+    };
+    
+    // Write callback that accumulates into buffer
+    gcomp_status_t buffer_write(void *ctx, const uint8_t *src, size_t n,
+                                 size_t *out_n) {
+        buffer_writer_t *w = (buffer_writer_t *)ctx;
+        size_t remaining = w->capacity - w->pos;
+        size_t to_write = (n < remaining) ? n : remaining;
+        if (to_write == 0) {
+            *out_n = 0;
+            return GCOMP_OK;  // Buffer full
+        }
+        memcpy(w->data + w->pos, src, to_write);
+        w->pos += to_write;
+        *out_n = to_write;
+        return GCOMP_OK;
+    }
+    
+    gcomp_status_t status = gcomp_encode_stream_cb(
+        NULL, "deflate", NULL,
+        progress_read, &reader,
+        buffer_write, &writer
+    );
+    
+    printf("\n");  // Newline after progress
+    *output_size = writer.pos;
+    return status;
+}
+```
+
+### Example: Cancellable Streaming
+
+For long-running operations, you may want to support cancellation:
+
+```c
+typedef struct {
+    const uint8_t *data;
+    size_t size;
+    size_t pos;
+    volatile int *cancel_flag;  // Set by another thread to request cancellation
+} cancellable_reader_t;
+
+gcomp_status_t cancellable_read(void *ctx, uint8_t *dst, size_t cap,
+                                 size_t *out_n) {
+    cancellable_reader_t *r = (cancellable_reader_t *)ctx;
+    
+    // Check cancellation flag
+    if (r->cancel_flag && *r->cancel_flag) {
+        return GCOMP_ERR_IO;  // Use IO error to signal cancellation
+    }
+    
+    if (r->pos >= r->size) {
+        *out_n = 0;
+        return GCOMP_OK;
+    }
+    
+    size_t remaining = r->size - r->pos;
+    size_t to_read = (remaining < cap) ? remaining : cap;
+    
+    memcpy(dst, r->data + r->pos, to_read);
+    r->pos += to_read;
+    *out_n = to_read;
+    
+    return GCOMP_OK;
+}
+```
+
+### Multiple Independent Streams with Reset
+
+For applications that process many independent streams (e.g., HTTP compression, database storage), reuse encoders/decoders with `reset()`:
+
+```c
+// Process multiple independent streams efficiently
+gcomp_status_t process_many_streams(stream_t *streams, size_t count) {
+    gcomp_encoder_t *encoder = NULL;
+    gcomp_status_t status = gcomp_encoder_create(NULL, "deflate", NULL, &encoder);
+    if (status != GCOMP_OK) return status;
+    
+    for (size_t i = 0; i < count; i++) {
+        // Compress stream[i]
+        status = compress_one_stream(encoder, &streams[i]);
+        if (status != GCOMP_OK) {
+            gcomp_encoder_destroy(encoder);
+            return status;
+        }
+        
+        // Reset for next stream (faster than destroy/create)
+        status = gcomp_encoder_reset(encoder);
+        if (status == GCOMP_ERR_UNSUPPORTED) {
+            // Method doesn't support reset; must recreate
+            gcomp_encoder_destroy(encoder);
+            status = gcomp_encoder_create(NULL, "deflate", NULL, &encoder);
+            if (status != GCOMP_OK) return status;
+        } else if (status != GCOMP_OK) {
+            gcomp_encoder_destroy(encoder);
+            return status;
+        }
+    }
+    
+    gcomp_encoder_destroy(encoder);
+    return GCOMP_OK;
+}
+```

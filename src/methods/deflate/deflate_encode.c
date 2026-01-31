@@ -1076,6 +1076,235 @@ static const uint8_t k_cl_order[19] = {
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
 
 /**
+ * @brief Run-length encode code lengths using the code-length alphabet.
+ *
+ * Compresses a sequence of code lengths by encoding runs:
+ *   0-15: Literal code length value (no extra bits)
+ *   16:   Copy previous code length 3-6 times (2 extra bits: 0-3)
+ *   17:   Repeat code length 0 for 3-10 times (3 extra bits: 0-7)
+ *   18:   Repeat code length 0 for 11-138 times (7 extra bits: 0-127)
+ *
+ * @param all_lengths   Array of code lengths to encode
+ * @param total_codes   Number of code lengths in the array
+ * @param cl_symbols    Output: symbols (0-18) to emit
+ * @param cl_extra      Output: extra bits for each symbol
+ * @return Number of symbols written to cl_symbols/cl_extra
+ */
+static size_t deflate_rle_encode_lengths(const uint8_t * all_lengths,
+    size_t total_codes, uint8_t * cl_symbols, uint8_t * cl_extra) {
+  size_t cl_count = 0;
+  size_t i = 0;
+
+  while (i < total_codes) {
+    uint8_t len = all_lengths[i];
+
+    // Count consecutive occurrences of this length
+    size_t run = 1;
+    while (i + run < total_codes && all_lengths[i + run] == len) {
+      run++;
+    }
+
+    if (len == 0) {
+      // Encode run of zeros
+      while (run > 0) {
+        if (run >= 11) {
+          size_t emit = (run > 138) ? 138 : run;
+          cl_symbols[cl_count] = 18;
+          cl_extra[cl_count] = (uint8_t)(emit - 11);
+          cl_count++;
+          run -= emit;
+          i += emit;
+        }
+        else if (run >= 3) {
+          cl_symbols[cl_count] = 17;
+          cl_extra[cl_count] = (uint8_t)(run - 3);
+          cl_count++;
+          i += run;
+          run = 0;
+        }
+        else {
+          cl_symbols[cl_count] = 0;
+          cl_extra[cl_count] = 0;
+          cl_count++;
+          run--;
+          i++;
+        }
+      }
+    }
+    else {
+      // Non-zero length: emit it first
+      cl_symbols[cl_count] = len;
+      cl_extra[cl_count] = 0;
+      cl_count++;
+      i++;
+      run--;
+
+      // Then encode repeats using symbol 16
+      while (run >= 3) {
+        size_t emit = (run > 6) ? 6 : run;
+        cl_symbols[cl_count] = 16;
+        cl_extra[cl_count] = (uint8_t)(emit - 3);
+        cl_count++;
+        run -= emit;
+        i += emit;
+      }
+
+      // Remaining repeats (0-2) will be handled in next iteration
+    }
+  }
+
+  return cl_count;
+}
+
+/**
+ * @brief Ensure code-length alphabet is complete for zlib compatibility.
+ *
+ * RFC 1951 allows incomplete Huffman trees (Kraft sum < 2^max_bits), but
+ * zlib's inflate_table() function rejects incomplete trees for the CODES
+ * type (code-length alphabet). This is stricter than the RFC requires.
+ *
+ * Background: The Kraft inequality states that for a valid prefix code,
+ * sum(2^(-length_i)) <= 1. An "under-subscribed" or "incomplete" tree has
+ * sum < 1, meaning some bit patterns don't decode to any symbol.
+ *
+ * Solution: If the code-length alphabet is under-subscribed, add unused
+ * symbols with appropriate code lengths to make the Kraft sum exactly 2^7.
+ * We prefer symbols late in k_cl_order[] to minimize HCLEN.
+ *
+ * @param cl_lengths  Code lengths array (19 elements), modified in place
+ */
+/**
+ * @brief Write all buffered symbols using dynamic Huffman codes.
+ *
+ * Writes literals and length/distance pairs from the symbol buffer using
+ * the provided Huffman codes. Also writes the end-of-block symbol.
+ *
+ * @param st           Encoder state with symbol buffer and bitwriter
+ * @param lit_codes    Huffman codes for literal/length symbols
+ * @param lit_lengths  Code lengths for literal/length symbols
+ * @param dist_codes   Huffman codes for distance symbols
+ * @param dist_lengths Code lengths for distance symbols
+ * @return GCOMP_OK on success, error code on failure
+ */
+static gcomp_status_t deflate_write_dynamic_block_data(
+    gcomp_deflate_encoder_state_t * st, const uint16_t * lit_codes,
+    const uint8_t * lit_lengths, const uint16_t * dist_codes,
+    const uint8_t * dist_lengths) {
+  gcomp_status_t s;
+
+  // Write all buffered symbols using the dynamic codes
+  for (size_t i = 0; i < st->sym_buf_used; i++) {
+    uint16_t lit = st->lit_buf[i];
+    uint16_t dist = st->dist_buf[i];
+
+    if (dist == 0) {
+      // Literal byte
+      s = gcomp_deflate_bitwriter_write_bits(
+          &st->bitwriter, lit_codes[lit], lit_lengths[lit]);
+      if (s != GCOMP_OK) {
+        return s;
+      }
+    }
+    else {
+      // Length/distance pair
+      uint32_t len_code = deflate_length_code(lit);
+      uint32_t len_sym = len_code - 257;
+
+      s = gcomp_deflate_bitwriter_write_bits(
+          &st->bitwriter, lit_codes[len_code], lit_lengths[len_code]);
+      if (s != GCOMP_OK) {
+        return s;
+      }
+
+      // Write length extra bits
+      if (k_len_extra[len_sym] > 0) {
+        uint32_t extra = lit - k_len_base[len_sym];
+        s = gcomp_deflate_bitwriter_write_bits(
+            &st->bitwriter, extra, k_len_extra[len_sym]);
+        if (s != GCOMP_OK) {
+          return s;
+        }
+      }
+
+      // Write distance code
+      uint32_t dist_code = deflate_distance_code(dist);
+      s = gcomp_deflate_bitwriter_write_bits(
+          &st->bitwriter, dist_codes[dist_code], dist_lengths[dist_code]);
+      if (s != GCOMP_OK) {
+        return s;
+      }
+
+      // Write distance extra bits
+      if (k_dist_extra[dist_code] > 0) {
+        uint32_t extra = dist - k_dist_base[dist_code];
+        s = gcomp_deflate_bitwriter_write_bits(
+            &st->bitwriter, extra, k_dist_extra[dist_code]);
+        if (s != GCOMP_OK) {
+          return s;
+        }
+      }
+    }
+  }
+
+  // Write end-of-block symbol (256)
+  s = gcomp_deflate_bitwriter_write_bits(
+      &st->bitwriter, lit_codes[256], lit_lengths[256]);
+  if (s != GCOMP_OK) {
+    return s;
+  }
+
+  return GCOMP_OK;
+}
+
+static void deflate_ensure_cl_kraft_complete(uint8_t * cl_lengths) {
+  // Calculate current Kraft sum (scaled by 2^7 = 128)
+  uint32_t kraft = 0;
+  for (int i = 0; i < 19; i++) {
+    if (cl_lengths[i] > 0) {
+      kraft += 1u << (7 - cl_lengths[i]);
+    }
+  }
+
+  // If under-subscribed (kraft < 128), fill remaining space
+  if (kraft < 128) {
+    uint32_t remaining = 128 - kraft;
+
+    // Find unused symbols to fill the space
+    // Prefer symbols that come late in k_cl_order (to minimize HCLEN)
+    // Symbols at positions 15-18 in k_cl_order are: 2, 14, 1, 15
+    while (remaining > 0) {
+      int best_ord = -1;
+      int best_len = 0;
+      uint32_t best_contrib = 0;
+
+      // Find the best unused symbol and length that fits
+      for (int ord = 18; ord >= 0; ord--) {
+        uint8_t sym = k_cl_order[ord];
+        if (cl_lengths[sym] == 0) {
+          for (int len = 7; len >= 1; len--) {
+            uint32_t contribution = 1u << (7 - len);
+            if (contribution <= remaining && contribution > best_contrib) {
+              best_ord = ord;
+              best_len = len;
+              best_contrib = contribution;
+            }
+          }
+        }
+      }
+
+      if (best_ord < 0) {
+        // No suitable unused symbol found - should not happen in practice
+        break;
+      }
+
+      uint8_t sym = k_cl_order[best_ord];
+      cl_lengths[sym] = (uint8_t)best_len;
+      remaining -= best_contrib;
+    }
+  }
+}
+
+/**
  * @brief Write a complete dynamic Huffman block.
  *
  * This function performs the following steps:
@@ -1155,76 +1384,12 @@ static gcomp_status_t deflate_flush_dynamic_block(
   memcpy(all_lengths, lit_lengths, 257 + hlit);
   memcpy(all_lengths + 257 + hlit, dist_lengths, 1 + hdist);
 
-  // Run-length encode the code lengths using the code-length alphabet.
-  // This compresses the sequence of code lengths by encoding runs:
-  //   0-15: Literal code length value (no extra bits)
-  //   16:   Copy previous code length 3-6 times (2 extra bits: 0-3)
-  //   17:   Repeat code length 0 for 3-10 times (3 extra bits: 0-7)
-  //   18:   Repeat code length 0 for 11-138 times (7 extra bits: 0-127)
-  // The cl_symbols array stores the symbol to emit, cl_extra stores extra bits.
+  // Run-length encode the code lengths
   uint8_t
       cl_symbols[DEFLATE_MAX_LITLEN_SYMBOLS + DEFLATE_MAX_DIST_SYMBOLS + 32];
   uint8_t cl_extra[DEFLATE_MAX_LITLEN_SYMBOLS + DEFLATE_MAX_DIST_SYMBOLS + 32];
-  size_t cl_count = 0;
-
-  size_t i = 0;
-  while (i < total_codes) {
-    uint8_t len = all_lengths[i];
-
-    // Count consecutive occurrences of this length
-    size_t run = 1;
-    while (i + run < total_codes && all_lengths[i + run] == len) {
-      run++;
-    }
-
-    if (len == 0) {
-      // Encode run of zeros
-      while (run > 0) {
-        if (run >= 11) {
-          size_t emit = (run > 138) ? 138 : run;
-          cl_symbols[cl_count] = 18;
-          cl_extra[cl_count] = (uint8_t)(emit - 11);
-          cl_count++;
-          run -= emit;
-          i += emit;
-        }
-        else if (run >= 3) {
-          cl_symbols[cl_count] = 17;
-          cl_extra[cl_count] = (uint8_t)(run - 3);
-          cl_count++;
-          i += run;
-          run = 0;
-        }
-        else {
-          cl_symbols[cl_count] = 0;
-          cl_extra[cl_count] = 0;
-          cl_count++;
-          run--;
-          i++;
-        }
-      }
-    }
-    else {
-      // Non-zero length: emit it first
-      cl_symbols[cl_count] = len;
-      cl_extra[cl_count] = 0;
-      cl_count++;
-      i++;
-      run--;
-
-      // Then encode repeats using symbol 16
-      while (run >= 3) {
-        size_t emit = (run > 6) ? 6 : run;
-        cl_symbols[cl_count] = 16;
-        cl_extra[cl_count] = (uint8_t)(emit - 3);
-        cl_count++;
-        run -= emit;
-        i += emit;
-      }
-
-      // Remaining repeats (0-2) will be handled in next iteration
-    }
-  }
+  size_t cl_count =
+      deflate_rle_encode_lengths(all_lengths, total_codes, cl_symbols, cl_extra);
 
   // Build code length Huffman tree
   uint32_t cl_freq[19] = {0};
@@ -1235,74 +1400,8 @@ static gcomp_status_t deflate_flush_dynamic_block(
   uint8_t cl_lengths[19];
   build_code_lengths(st->allocator, cl_freq, 19, cl_lengths, 7);
 
-  // =========================================================================
-  // Code-length alphabet completeness (zlib compatibility)
-  // =========================================================================
-  // RFC 1951 allows incomplete Huffman trees (Kraft sum < 2^max_bits), but
-  // zlib's inflate_table() function rejects incomplete trees for the CODES
-  // type (code-length alphabet). This is stricter than the RFC requires.
-  //
-  // Background: The Kraft inequality states that for a valid prefix code,
-  // sum(2^(-length_i)) <= 1. An "under-subscribed" or "incomplete" tree has
-  // sum < 1, meaning some bit patterns don't decode to any symbol. RFC 1951
-  // permits this (unused patterns simply never appear in the stream).
-  //
-  // However, zlib's decoder checks: if (left > 0) return -1; // incomplete
-  // This occurs specifically for the code-length alphabet (symbols 0-18 that
-  // encode the lit/len and distance code lengths).
-  //
-  // Solution: If our code-length alphabet is under-subscribed, add unused
-  // symbols with appropriate code lengths to make the Kraft sum exactly 2^7.
-  // We prefer symbols late in k_cl_order[] to minimize HCLEN (the count of
-  // code-length codes transmitted in the block header).
-  // =========================================================================
-  {
-    // Calculate current Kraft sum (scaled by 2^7 = 128)
-    uint32_t kraft = 0;
-    for (int i = 0; i < 19; i++) {
-      if (cl_lengths[i] > 0) {
-        kraft += 1u << (7 - cl_lengths[i]);
-      }
-    }
-
-    // If under-subscribed (kraft < 128), fill remaining space
-    if (kraft < 128) {
-      uint32_t remaining = 128 - kraft;
-
-      // Find unused symbols to fill the space
-      // Prefer symbols that come late in k_cl_order (to minimize HCLEN)
-      // Symbols at positions 15-18 in k_cl_order are: 2, 14, 1, 15
-      while (remaining > 0) {
-        int best_ord = -1;
-        int best_len = 0;
-        uint32_t best_contrib = 0;
-
-        // Find the best unused symbol and length that fits
-        for (int ord = 18; ord >= 0; ord--) {
-          uint8_t sym = k_cl_order[ord];
-          if (cl_lengths[sym] == 0) {
-            for (int len = 7; len >= 1; len--) {
-              uint32_t contribution = 1u << (7 - len);
-              if (contribution <= remaining && contribution > best_contrib) {
-                best_ord = ord;
-                best_len = len;
-                best_contrib = contribution;
-              }
-            }
-          }
-        }
-
-        if (best_ord < 0) {
-          // No suitable unused symbol found - should not happen in practice
-          break;
-        }
-
-        uint8_t sym = k_cl_order[best_ord];
-        cl_lengths[sym] = (uint8_t)best_len;
-        remaining -= best_contrib;
-      }
-    }
-  }
+  // Ensure code-length alphabet is complete for zlib compatibility
+  deflate_ensure_cl_kraft_complete(cl_lengths);
 
   // Determine HCLEN (number of code length codes - 4)
   int hclen = 19 - 4;
@@ -1422,63 +1521,9 @@ static gcomp_status_t deflate_flush_dynamic_block(
 
   gcomp_free(st->allocator, all_lengths);
 
-  // Write all buffered symbols using the dynamic codes
-  for (size_t i = 0; i < st->sym_buf_used; i++) {
-    uint16_t lit = st->lit_buf[i];
-    uint16_t dist = st->dist_buf[i];
-
-    if (dist == 0) {
-      // Literal byte
-      s = gcomp_deflate_bitwriter_write_bits(
-          &st->bitwriter, lit_codes[lit], lit_lengths[lit]);
-      if (s != GCOMP_OK) {
-        return s;
-      }
-    }
-    else {
-      // Length/distance pair
-      uint32_t len_code = deflate_length_code(lit);
-      uint32_t len_sym = len_code - 257;
-
-      s = gcomp_deflate_bitwriter_write_bits(
-          &st->bitwriter, lit_codes[len_code], lit_lengths[len_code]);
-      if (s != GCOMP_OK) {
-        return s;
-      }
-
-      // Write length extra bits
-      if (k_len_extra[len_sym] > 0) {
-        uint32_t extra = lit - k_len_base[len_sym];
-        s = gcomp_deflate_bitwriter_write_bits(
-            &st->bitwriter, extra, k_len_extra[len_sym]);
-        if (s != GCOMP_OK) {
-          return s;
-        }
-      }
-
-      // Write distance code
-      uint32_t dist_code = deflate_distance_code(dist);
-      s = gcomp_deflate_bitwriter_write_bits(
-          &st->bitwriter, dist_codes[dist_code], dist_lengths[dist_code]);
-      if (s != GCOMP_OK) {
-        return s;
-      }
-
-      // Write distance extra bits
-      if (k_dist_extra[dist_code] > 0) {
-        uint32_t extra = dist - k_dist_base[dist_code];
-        s = gcomp_deflate_bitwriter_write_bits(
-            &st->bitwriter, extra, k_dist_extra[dist_code]);
-        if (s != GCOMP_OK) {
-          return s;
-        }
-      }
-    }
-  }
-
-  // Write end-of-block symbol (256)
-  s = gcomp_deflate_bitwriter_write_bits(
-      &st->bitwriter, lit_codes[256], lit_lengths[256]);
+  // Write all buffered symbols and end-of-block
+  s = deflate_write_dynamic_block_data(
+      st, lit_codes, lit_lengths, dist_codes, dist_lengths);
   if (s != GCOMP_OK) {
     return s;
   }
