@@ -780,6 +780,103 @@ TEST_F(GzipStreamingTest, StreamingWithAllHeaderFields) {
 }
 
 //
+// Very Small Buffer Edge Cases
+// Tests that verify correct behavior with buffer sizes smaller than
+// the gzip trailer (8 bytes) and other critical thresholds.
+// Note: Decoder tests are the focus here as they're security-critical.
+//
+
+TEST_F(GzipStreamingTest, DecodeTwoByteOutputBuffer) {
+  // Test decoder with 2-byte output buffer
+  const char * data = "Two-byte decoder output test";
+  auto compressed = compress(data, strlen(data));
+  ASSERT_FALSE(compressed.empty());
+
+  gcomp_status_t status;
+  gcomp_decoder_t * decoder = nullptr;
+  status = gcomp_decoder_create(registry_, "gzip", nullptr, &decoder);
+  ASSERT_EQ(status, GCOMP_OK);
+
+  std::vector<uint8_t> result;
+  uint8_t two_bytes[2];
+
+  gcomp_buffer_t in_buf = {compressed.data(), compressed.size(), 0};
+
+  while (in_buf.used < compressed.size()) {
+    gcomp_buffer_t out_buf = {two_bytes, 2, 0};
+    status = gcomp_decoder_update(decoder, &in_buf, &out_buf);
+    ASSERT_EQ(status, GCOMP_OK);
+    result.insert(result.end(), two_bytes, two_bytes + out_buf.used);
+  }
+
+  for (int i = 0; i < 10000; i++) {
+    gcomp_buffer_t out_buf = {two_bytes, 2, 0};
+    status = gcomp_decoder_finish(decoder, &out_buf);
+    if (status == GCOMP_OK) {
+      if (out_buf.used > 0) {
+        result.insert(result.end(), two_bytes, two_bytes + out_buf.used);
+      }
+      else {
+        break;
+      }
+    }
+    else {
+      break;
+    }
+  }
+
+  gcomp_decoder_destroy(decoder);
+
+  ASSERT_EQ(result.size(), strlen(data));
+  EXPECT_EQ(memcmp(result.data(), data, strlen(data)), 0);
+}
+
+TEST_F(GzipStreamingTest, DecodeThreeByteOutputBuffer) {
+  // Test decoder with 3-byte output buffer
+  const char * data = "Three-byte decoder output test";
+  auto compressed = compress(data, strlen(data));
+  ASSERT_FALSE(compressed.empty());
+
+  gcomp_status_t status;
+  gcomp_decoder_t * decoder = nullptr;
+  status = gcomp_decoder_create(registry_, "gzip", nullptr, &decoder);
+  ASSERT_EQ(status, GCOMP_OK);
+
+  std::vector<uint8_t> result;
+  uint8_t three_bytes[3];
+
+  gcomp_buffer_t in_buf = {compressed.data(), compressed.size(), 0};
+
+  while (in_buf.used < compressed.size()) {
+    gcomp_buffer_t out_buf = {three_bytes, 3, 0};
+    status = gcomp_decoder_update(decoder, &in_buf, &out_buf);
+    ASSERT_EQ(status, GCOMP_OK);
+    result.insert(result.end(), three_bytes, three_bytes + out_buf.used);
+  }
+
+  for (int i = 0; i < 10000; i++) {
+    gcomp_buffer_t out_buf = {three_bytes, 3, 0};
+    status = gcomp_decoder_finish(decoder, &out_buf);
+    if (status == GCOMP_OK) {
+      if (out_buf.used > 0) {
+        result.insert(result.end(), three_bytes, three_bytes + out_buf.used);
+      }
+      else {
+        break;
+      }
+    }
+    else {
+      break;
+    }
+  }
+
+  gcomp_decoder_destroy(decoder);
+
+  ASSERT_EQ(result.size(), strlen(data));
+  EXPECT_EQ(memcmp(result.data(), data, strlen(data)), 0);
+}
+
+//
 // Empty Input Tests
 //
 

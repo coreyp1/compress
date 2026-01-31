@@ -65,19 +65,6 @@
 #include <string.h>
 
 //
-// Helper: Extract deflate/limits options for pass-through
-//
-
-static gcomp_status_t extract_passthrough_options(
-    const gcomp_options_t * src, gcomp_options_t ** dst_out) {
-  if (!src) {
-    *dst_out = NULL;
-    return GCOMP_OK;
-  }
-  return gcomp_options_clone(src, dst_out);
-}
-
-//
 // Helper: Read decoder options
 //
 
@@ -202,7 +189,7 @@ gcomp_status_t gzip_decoder_init(gcomp_registry_t * registry,
 
   // Extract pass-through options for deflate
   gcomp_options_t * deflate_options = NULL;
-  status = extract_passthrough_options(options, &deflate_options);
+  status = gzip_extract_passthrough_options(options, &deflate_options);
   if (status != GCOMP_OK) {
     free(state);
     return status;
@@ -293,11 +280,7 @@ static gcomp_status_t parse_header_byte(
   case GZIP_HEADER_MTIME:
     state->header_accum[state->header_accum_pos++] = byte;
     if (state->header_accum_pos == 4) {
-      // Little-endian MTIME
-      state->header_info.mtime = (uint32_t)state->header_accum[0] |
-          ((uint32_t)state->header_accum[1] << 8) |
-          ((uint32_t)state->header_accum[2] << 16) |
-          ((uint32_t)state->header_accum[3] << 24);
+      state->header_info.mtime = gzip_read_le32(state->header_accum);
       state->header_stage = GZIP_HEADER_XFL_OS;
       state->header_accum_pos = 0;
     }
@@ -332,9 +315,7 @@ static gcomp_status_t parse_header_byte(
   case GZIP_HEADER_FEXTRA_LEN:
     state->header_accum[state->header_accum_pos++] = byte;
     if (state->header_accum_pos == 2) {
-      // Little-endian length
-      uint16_t extra_len = (uint16_t)state->header_accum[0] |
-          ((uint16_t)state->header_accum[1] << 8);
+      uint16_t extra_len = gzip_read_le16(state->header_accum);
 
       // Check limit
       if (extra_len > state->max_extra_bytes) {
@@ -459,9 +440,7 @@ static gcomp_status_t parse_header_byte(
   case GZIP_HEADER_FHCRC:
     state->header_accum[state->header_accum_pos++] = byte;
     if (state->header_accum_pos == 2) {
-      // Little-endian CRC16
-      uint16_t header_crc = (uint16_t)state->header_accum[0] |
-          ((uint16_t)state->header_accum[1] << 8);
+      uint16_t header_crc = gzip_read_le16(state->header_accum);
       state->header_info.header_crc = header_crc;
 
       // Validate header CRC (lower 16 bits of CRC32)
@@ -672,15 +651,9 @@ gcomp_status_t gzip_decoder_update(gcomp_decoder_t * decoder,
     state->total_input_bytes++;
 
     if (state->trailer_pos >= GZIP_TRAILER_SIZE) {
-      // Parse trailer (little-endian)
-      uint32_t expected_crc = (uint32_t)state->trailer_buf[0] |
-          ((uint32_t)state->trailer_buf[1] << 8) |
-          ((uint32_t)state->trailer_buf[2] << 16) |
-          ((uint32_t)state->trailer_buf[3] << 24);
-      uint32_t expected_isize = (uint32_t)state->trailer_buf[4] |
-          ((uint32_t)state->trailer_buf[5] << 8) |
-          ((uint32_t)state->trailer_buf[6] << 16) |
-          ((uint32_t)state->trailer_buf[7] << 24);
+      // Parse trailer
+      uint32_t expected_crc = gzip_read_le32(state->trailer_buf);
+      uint32_t expected_isize = gzip_read_le32(state->trailer_buf + 4);
 
       // Finalize CRC32
       uint32_t actual_crc = gcomp_crc32_finalize(state->crc32);

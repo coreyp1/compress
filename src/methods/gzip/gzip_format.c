@@ -118,16 +118,14 @@ gcomp_status_t gzip_write_header(const gzip_header_info_t * info, uint8_t * buf,
   }
 
   // Write fixed header (10 bytes)
-  buf[pos++] = GZIP_ID1;                     // ID1
-  buf[pos++] = GZIP_ID2;                     // ID2
-  buf[pos++] = GZIP_CM_DEFLATE;              // CM
-  buf[pos++] = info->flg;                    // FLG
-  buf[pos++] = (uint8_t)(info->mtime);       // MTIME byte 0
-  buf[pos++] = (uint8_t)(info->mtime >> 8);  // MTIME byte 1
-  buf[pos++] = (uint8_t)(info->mtime >> 16); // MTIME byte 2
-  buf[pos++] = (uint8_t)(info->mtime >> 24); // MTIME byte 3
-  buf[pos++] = info->xfl;                    // XFL
-  buf[pos++] = info->os;                     // OS
+  buf[pos++] = GZIP_ID1;        // ID1
+  buf[pos++] = GZIP_ID2;        // ID2
+  buf[pos++] = GZIP_CM_DEFLATE; // CM
+  buf[pos++] = info->flg;       // FLG
+  gzip_write_le32(buf + pos, info->mtime);
+  pos += 4;
+  buf[pos++] = info->xfl; // XFL
+  buf[pos++] = info->os;  // OS
 
   // Track CRC for header (if FHCRC will be written)
   if (info->flg & GZIP_FLG_FHCRC) {
@@ -136,12 +134,11 @@ gcomp_status_t gzip_write_header(const gzip_header_info_t * info, uint8_t * buf,
 
   // FEXTRA
   if (info->flg & GZIP_FLG_FEXTRA) {
-    uint16_t xlen = (uint16_t)info->extra_len;
-    buf[pos++] = (uint8_t)(xlen);
-    buf[pos++] = (uint8_t)(xlen >> 8);
+    gzip_write_le16(buf + pos, (uint16_t)info->extra_len);
     if (info->flg & GZIP_FLG_FHCRC) {
-      header_crc = gcomp_crc32_update(header_crc, buf + pos - 2, 2);
+      header_crc = gcomp_crc32_update(header_crc, buf + pos, 2);
     }
+    pos += 2;
 
     if (info->extra && info->extra_len > 0) {
       memcpy(buf + pos, info->extra, info->extra_len);
@@ -198,8 +195,8 @@ gcomp_status_t gzip_write_header(const gzip_header_info_t * info, uint8_t * buf,
   if (info->flg & GZIP_FLG_FHCRC) {
     uint32_t final_crc = gcomp_crc32_finalize(header_crc);
     uint16_t crc16 = (uint16_t)(final_crc & 0xFFFF);
-    buf[pos++] = (uint8_t)(crc16);
-    buf[pos++] = (uint8_t)(crc16 >> 8);
+    gzip_write_le16(buf + pos, crc16);
+    pos += 2;
   }
 
   *header_len_out = pos;
@@ -225,17 +222,8 @@ void gzip_write_trailer(uint32_t crc32, uint32_t isize, uint8_t * buf) {
     return;
   }
 
-  // CRC32 (little-endian)
-  buf[0] = (uint8_t)(crc32);
-  buf[1] = (uint8_t)(crc32 >> 8);
-  buf[2] = (uint8_t)(crc32 >> 16);
-  buf[3] = (uint8_t)(crc32 >> 24);
-
-  // ISIZE (little-endian)
-  buf[4] = (uint8_t)(isize);
-  buf[5] = (uint8_t)(isize >> 8);
-  buf[6] = (uint8_t)(isize >> 16);
-  buf[7] = (uint8_t)(isize >> 24);
+  gzip_write_le32(buf, crc32);     // CRC32
+  gzip_write_le32(buf + 4, isize); // ISIZE
 }
 
 /**
@@ -269,4 +257,26 @@ void gzip_header_info_free(gzip_header_info_t * info) {
     free(info->comment);
     info->comment = NULL;
   }
+}
+
+/**
+ * Extract options to pass through to the inner deflate encoder/decoder.
+ *
+ * Creates a clone of the source options for pass-through to deflate. The
+ * deflate method will ignore unknown keys (like gzip.*) via its schema
+ * validation, while accepting deflate.* and limits.* keys.
+ *
+ * @param src Source options (may be NULL)
+ * @param dst_out Receives cloned options (set to NULL if src is NULL)
+ * @return GCOMP_OK on success, GCOMP_ERR_MEMORY on allocation failure
+ */
+gcomp_status_t gzip_extract_passthrough_options(
+    const gcomp_options_t * src, gcomp_options_t ** dst_out) {
+  // For now, just clone the entire options object
+  // The deflate method will ignore unknown keys with its schema
+  if (!src) {
+    *dst_out = NULL;
+    return GCOMP_OK;
+  }
+  return gcomp_options_clone(src, dst_out);
 }

@@ -66,21 +66,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-//
-// Helper: Extract deflate/limits options for pass-through
-//
-
-static gcomp_status_t extract_passthrough_options(
-    const gcomp_options_t * src, gcomp_options_t ** dst_out) {
-  // For now, just clone the entire options object
-  // The deflate method will ignore unknown keys with its schema
-  if (!src) {
-    *dst_out = NULL;
-    return GCOMP_OK;
-  }
-  return gcomp_options_clone(src, dst_out);
-}
-
 /**
  * Compute XFL (extra flags) byte based on deflate compression level.
  *
@@ -278,7 +263,7 @@ gcomp_status_t gzip_encoder_init(gcomp_registry_t * registry,
 
   // Extract pass-through options for deflate
   gcomp_options_t * deflate_options = NULL;
-  status = extract_passthrough_options(options, &deflate_options);
+  status = gzip_extract_passthrough_options(options, &deflate_options);
   if (status != GCOMP_OK) {
     gzip_header_info_free(&state->header_info);
     free(state);

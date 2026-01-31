@@ -53,6 +53,46 @@ extern "C" {
 #define GZIP_FLG_RESERVED 0xE0 ///< Reserved bits (must be zero)
 
 //
+// Little-Endian I/O Helpers
+//
+// Gzip uses little-endian byte order for multi-byte integers (RFC 1952).
+// These inline helpers provide consistent, readable access patterns.
+//
+
+/**
+ * @brief Read a 16-bit little-endian value from a byte buffer.
+ */
+static inline uint16_t gzip_read_le16(const uint8_t * buf) {
+  return (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+}
+
+/**
+ * @brief Read a 32-bit little-endian value from a byte buffer.
+ */
+static inline uint32_t gzip_read_le32(const uint8_t * buf) {
+  return (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16) |
+      ((uint32_t)buf[3] << 24);
+}
+
+/**
+ * @brief Write a 16-bit value to a buffer in little-endian order.
+ */
+static inline void gzip_write_le16(uint8_t * buf, uint16_t val) {
+  buf[0] = (uint8_t)(val);
+  buf[1] = (uint8_t)(val >> 8);
+}
+
+/**
+ * @brief Write a 32-bit value to a buffer in little-endian order.
+ */
+static inline void gzip_write_le32(uint8_t * buf, uint32_t val) {
+  buf[0] = (uint8_t)(val);
+  buf[1] = (uint8_t)(val >> 8);
+  buf[2] = (uint8_t)(val >> 16);
+  buf[3] = (uint8_t)(val >> 24);
+}
+
+//
 // Encoder State Machine
 //
 
@@ -292,6 +332,19 @@ void gzip_write_trailer(uint32_t crc32, uint32_t isize, uint8_t * buf);
  * @param info Header info structure to clean up
  */
 void gzip_header_info_free(gzip_header_info_t * info);
+
+/**
+ * @brief Extract options to pass through to the inner deflate encoder/decoder.
+ *
+ * Creates a clone of the source options for pass-through to deflate. The
+ * deflate method will ignore unknown keys via its schema validation.
+ *
+ * @param src Source options (may be NULL)
+ * @param dst_out Receives cloned options (set to NULL if src is NULL)
+ * @return GCOMP_OK on success
+ */
+gcomp_status_t gzip_extract_passthrough_options(
+    const gcomp_options_t * src, gcomp_options_t ** dst_out);
 
 #ifdef __cplusplus
 }

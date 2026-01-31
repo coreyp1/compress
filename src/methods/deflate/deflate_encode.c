@@ -241,7 +241,7 @@ typedef struct gcomp_deflate_encoder_state_s {
   size_t * hash_pos;    ///< Stream position when entry was inserted.
   uint16_t * hash_at;   ///< Hash value at each buffer position (for proactive
                         ///< invalidation when buffer indices are reused).
-  uint32_t hash_value;  ///< Running hash value.
+  uint32_t hash_value; ///< Running hash value.
 
   //
   // Output bitstream
@@ -2230,10 +2230,23 @@ static size_t deflate_estimate_finish_size(
     }
     // Each block: up to 5 bytes header (3 bits rounded + 4 bytes LEN/NLEN)
     // plus the data
-    return num_blocks * 5 + data_bytes + 8; // +8 for safety margin
+    // Check for overflow: num_blocks * 5 + data_bytes + 8
+    if (num_blocks > SIZE_MAX / 5) {
+      return SIZE_MAX / 2;
+    }
+    size_t header_bytes = num_blocks * 5;
+    if (header_bytes > SIZE_MAX - data_bytes - 8) {
+      return SIZE_MAX / 2;
+    }
+    return header_bytes + data_bytes + 8; // +8 for safety margin
   }
 
   // For Huffman blocks, estimate based on symbols
+  // Check for overflow: total_symbols * sym_overhead
+  if (total_symbols > SIZE_MAX / sym_overhead) {
+    // Overflow would occur; return a large but safe value
+    return SIZE_MAX / 2;
+  }
   size_t symbol_bytes = total_symbols * sym_overhead;
 
   // Dynamic Huffman tree overhead: up to ~300 bytes for the tree encoding
@@ -2246,7 +2259,13 @@ static size_t deflate_estimate_finish_size(
   if (num_blocks == 0) {
     num_blocks = 1;
   }
-  size_t block_overhead = num_blocks * (tree_overhead + 8);
+
+  // Check for overflow: num_blocks * (tree_overhead + 8)
+  size_t per_block = tree_overhead + 8;
+  if (num_blocks > SIZE_MAX / per_block) {
+    return SIZE_MAX / 2;
+  }
+  size_t block_overhead = num_blocks * per_block;
 
   // Byte alignment (up to 7 bits = 1 byte)
   size_t alignment = 1;
@@ -2254,7 +2273,17 @@ static size_t deflate_estimate_finish_size(
   // Safety margin
   size_t margin = 64;
 
-  return symbol_bytes + block_overhead + alignment + margin;
+  // Check for overflow in final addition
+  size_t result = symbol_bytes;
+  if (result > SIZE_MAX - block_overhead) {
+    return SIZE_MAX / 2;
+  }
+  result += block_overhead;
+  if (result > SIZE_MAX - alignment - margin) {
+    return SIZE_MAX / 2;
+  }
+
+  return result + alignment + margin;
 }
 
 gcomp_status_t gcomp_deflate_encoder_finish(
