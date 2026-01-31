@@ -19,8 +19,21 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <unistd.h>
 #include <ghoti.io/compress/compress.h>
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#include <process.h>
+#include <windows.h>
+#define close _close
+#define write _write
+#define unlink _unlink
+#define popen _popen
+#define pclose _pclose
+#else
+#include <unistd.h>
+#endif
 #include <ghoti.io/compress/deflate.h>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/limits.h>
@@ -43,16 +56,43 @@ static bool isVerbose() {
   return env && std::string(env) == "1";
 }
 
+// Get the Python command name (python3 on Unix, python on Windows)
+static const char * getPythonCommand() {
+#ifdef _WIN32
+  // On Windows, check if python3 exists, otherwise fall back to python
+  static const char * cmd = nullptr;
+  if (!cmd) {
+    if (system("python3 --version >NUL 2>&1") == 0) {
+      cmd = "python3";
+    }
+    else {
+      cmd = "python";
+    }
+  }
+  return cmd;
+#else
+  return "python3";
+#endif
+}
+
 // Check if Python 3 with zlib is available
 static bool hasPythonZlib() {
-  int result =
-      system("python3 -c 'import zlib' >/dev/null 2>&1");
-  return result == 0;
+  std::string cmd = std::string(getPythonCommand()) + " -c \"import zlib\"";
+#ifdef _WIN32
+  cmd += " >NUL 2>&1";
+#else
+  cmd += " >/dev/null 2>&1";
+#endif
+  return system(cmd.c_str()) == 0;
 }
 
 // Check if gzip is available
 static bool hasGzip() {
+#ifdef _WIN32
+  int result = system("gzip --version >NUL 2>&1");
+#else
   int result = system("gzip --version >/dev/null 2>&1");
+#endif
   return result == 0;
 }
 
@@ -70,18 +110,45 @@ protected:
     has_gzip_ = hasGzip();
 
     if (isVerbose()) {
-      std::cout << "Python zlib available: " << (has_python_zlib_ ? "yes" : "no")
+      std::cout << "Python zlib available: "
+                << (has_python_zlib_ ? "yes" : "no") << std::endl;
+      std::cout << "gzip available: " << (has_gzip_ ? "yes" : "no")
                 << std::endl;
-      std::cout << "gzip available: " << (has_gzip_ ? "yes" : "no") << std::endl;
     }
   }
 
   // Helper to write bytes to a temporary file
-  std::string writeTempFile(const std::vector<uint8_t> & data,
-      const std::string & suffix = ".bin") {
+  std::string writeTempFile(
+      const std::vector<uint8_t> & data, const std::string & suffix = ".bin") {
+#ifdef _WIN32
+    // Windows implementation
+    char tmpdir[MAX_PATH];
+    if (GetTempPathA(MAX_PATH, tmpdir) == 0) {
+      return "";
+    }
+    char tmpname[MAX_PATH];
+    // Generate a unique filename using process ID and a counter
+    static int counter = 0;
+    snprintf(tmpname, sizeof(tmpname), "%sgcomp_oracle_%d_%d%s", tmpdir,
+        _getpid(), counter++, suffix.c_str());
+
+    int fd = _open(tmpname, _O_CREAT | _O_WRONLY | _O_BINARY | _O_EXCL, 0600);
+    if (fd < 0) {
+      return "";
+    }
+    int written =
+        _write(fd, data.data(), static_cast<unsigned int>(data.size()));
+    _close(fd);
+    if (written < 0 || static_cast<size_t>(written) != data.size()) {
+      _unlink(tmpname);
+      return "";
+    }
+    return tmpname;
+#else
+    // POSIX implementation
     char tmpname[256];
-    snprintf(tmpname, sizeof(tmpname), "/tmp/gcomp_oracle_XXXXXX%s",
-        suffix.c_str());
+    snprintf(
+        tmpname, sizeof(tmpname), "/tmp/gcomp_oracle_XXXXXX%s", suffix.c_str());
     int fd = mkstemps(tmpname, static_cast<int>(suffix.length()));
     if (fd < 0) {
       return "";
@@ -93,6 +160,7 @@ protected:
       return "";
     }
     return tmpname;
+#endif
   }
 
   // Helper to read bytes from a file
@@ -101,13 +169,18 @@ protected:
     if (!file) {
       return {};
     }
-    return std::vector<uint8_t>(std::istreambuf_iterator<char>(file),
-        std::istreambuf_iterator<char>());
+    return std::vector<uint8_t>(
+        std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
   }
 
   // Helper to run a command and capture stdout
   std::vector<uint8_t> runCommandGetOutput(const std::string & cmd) {
+#ifdef _WIN32
+    // Windows needs binary mode for popen
+    FILE * pipe = popen(cmd.c_str(), "rb");
+#else
     FILE * pipe = popen(cmd.c_str(), "r");
+#endif
     if (!pipe) {
       return {};
     }
@@ -122,8 +195,8 @@ protected:
   }
 
   // Use Python zlib to compress data (returns raw deflate stream)
-  std::vector<uint8_t> pythonZlibCompress(const std::vector<uint8_t> & data,
-      int level = 6) {
+  std::vector<uint8_t> pythonZlibCompress(
+      const std::vector<uint8_t> & data, int level = 6) {
     if (!has_python_zlib_) {
       return {};
     }
@@ -134,10 +207,19 @@ protected:
     }
 
     // Python script to compress and output raw deflate
+    // Use escaped quotes and forward slashes for cross-platform compatibility
+    std::string escaped_path = tmpfile;
+#ifdef _WIN32
+    // Convert backslashes to forward slashes for Python
+    for (char & c : escaped_path) {
+      if (c == '\\')
+        c = '/';
+    }
+#endif
     std::stringstream cmd;
-    cmd << "python3 -c \""
+    cmd << getPythonCommand() << " -c \""
         << "import zlib,sys;"
-        << "data = open('" << tmpfile << "', 'rb').read();"
+        << "data = open('" << escaped_path << "', 'rb').read();"
         << "comp = zlib.compressobj(" << level << ", zlib.DEFLATED, -15);"
         << "sys.stdout.buffer.write(comp.compress(data) + comp.flush());"
         << "\"";
@@ -159,10 +241,19 @@ protected:
     }
 
     // Python script to decompress raw deflate
+    // Use escaped quotes and forward slashes for cross-platform compatibility
+    std::string escaped_path = tmpfile;
+#ifdef _WIN32
+    // Convert backslashes to forward slashes for Python
+    for (char & c : escaped_path) {
+      if (c == '\\')
+        c = '/';
+    }
+#endif
     std::stringstream cmd;
-    cmd << "python3 -c \""
+    cmd << getPythonCommand() << " -c \""
         << "import zlib,sys;"
-        << "data = open('" << tmpfile << "', 'rb').read();"
+        << "data = open('" << escaped_path << "', 'rb').read();"
         << "decomp = zlib.decompressobj(-15);"
         << "sys.stdout.buffer.write(decomp.decompress(data));"
         << "\"";
@@ -173,8 +264,8 @@ protected:
   }
 
   // Compress with our library
-  std::vector<uint8_t> gcompCompress(const std::vector<uint8_t> & data,
-      int level = 6) {
+  std::vector<uint8_t> gcompCompress(
+      const std::vector<uint8_t> & data, int level = 6) {
     gcomp_options_t * opts = nullptr;
     if (gcomp_options_create(&opts) != GCOMP_OK) {
       return {};
@@ -189,8 +280,8 @@ protected:
     size_t comp_size = 0;
 
     gcomp_status_t status =
-        gcomp_encode_buffer(registry_, "deflate", opts, data.data(), data.size(),
-            compressed.data(), compressed.size(), &comp_size);
+        gcomp_encode_buffer(registry_, "deflate", opts, data.data(),
+            data.size(), compressed.data(), compressed.size(), &comp_size);
     gcomp_options_destroy(opts);
 
     if (status != GCOMP_OK) {
@@ -201,8 +292,8 @@ protected:
   }
 
   // Decompress with our library
-  std::vector<uint8_t> gcompDecompress(const std::vector<uint8_t> & data,
-      size_t expected_size = 0) {
+  std::vector<uint8_t> gcompDecompress(
+      const std::vector<uint8_t> & data, size_t expected_size = 0) {
     if (data.empty()) {
       return {};
     }
@@ -223,9 +314,9 @@ protected:
     std::vector<uint8_t> decompressed(decomp_capacity);
     size_t decomp_size = 0;
 
-    gcomp_status_t status =
-        gcomp_decode_buffer(registry_, "deflate", opts, data.data(), data.size(),
-            decompressed.data(), decompressed.size(), &decomp_size);
+    gcomp_status_t status = gcomp_decode_buffer(registry_, "deflate", opts,
+        data.data(), data.size(), decompressed.data(), decompressed.size(),
+        &decomp_size);
     gcomp_options_destroy(opts);
 
     if (status != GCOMP_OK) {
@@ -354,7 +445,8 @@ TEST_F(OracleTest, OurEncoder_PythonDecoder_HighEntropy) {
   }
 
   std::vector<uint8_t> original = generateHighEntropy(10 * 1024);
-  std::vector<uint8_t> compressed = gcompCompress(original, 1); // Fast for high entropy
+  std::vector<uint8_t> compressed =
+      gcompCompress(original, 1); // Fast for high entropy
   ASSERT_FALSE(compressed.empty()) << "Compression failed";
 
   std::vector<uint8_t> decompressed = pythonZlibDecompress(compressed);
@@ -401,7 +493,8 @@ TEST_F(OracleTest, PythonEncoder_OurDecoder_TextData) {
   std::vector<uint8_t> compressed = pythonZlibCompress(original, 6);
   ASSERT_FALSE(compressed.empty()) << "Python compression failed";
 
-  std::vector<uint8_t> decompressed = gcompDecompress(compressed, original.size());
+  std::vector<uint8_t> decompressed =
+      gcompDecompress(compressed, original.size());
   ASSERT_EQ(decompressed.size(), original.size()) << "Size mismatch";
   ASSERT_EQ(memcmp(decompressed.data(), original.data(), original.size()), 0)
       << "Data mismatch";
@@ -416,7 +509,8 @@ TEST_F(OracleTest, PythonEncoder_OurDecoder_RandomData) {
   std::vector<uint8_t> compressed = pythonZlibCompress(original, 6);
   ASSERT_FALSE(compressed.empty()) << "Python compression failed";
 
-  std::vector<uint8_t> decompressed = gcompDecompress(compressed, original.size());
+  std::vector<uint8_t> decompressed =
+      gcompDecompress(compressed, original.size());
   ASSERT_EQ(decompressed.size(), original.size()) << "Size mismatch";
   ASSERT_EQ(memcmp(decompressed.data(), original.data(), original.size()), 0)
       << "Data mismatch";
@@ -431,7 +525,8 @@ TEST_F(OracleTest, PythonEncoder_OurDecoder_RepeatedPattern) {
   std::vector<uint8_t> compressed = pythonZlibCompress(original, 6);
   ASSERT_FALSE(compressed.empty()) << "Python compression failed";
 
-  std::vector<uint8_t> decompressed = gcompDecompress(compressed, original.size());
+  std::vector<uint8_t> decompressed =
+      gcompDecompress(compressed, original.size());
   ASSERT_EQ(decompressed.size(), original.size()) << "Size mismatch";
   ASSERT_EQ(memcmp(decompressed.data(), original.data(), original.size()), 0)
       << "Data mismatch";
@@ -446,7 +541,8 @@ TEST_F(OracleTest, PythonEncoder_OurDecoder_AllLevels) {
 
   for (int level = 0; level <= 9; level++) {
     std::vector<uint8_t> compressed = pythonZlibCompress(original, level);
-    ASSERT_FALSE(compressed.empty()) << "Python compression failed at level " << level;
+    ASSERT_FALSE(compressed.empty())
+        << "Python compression failed at level " << level;
 
     std::vector<uint8_t> decompressed =
         gcompDecompress(compressed, original.size());
