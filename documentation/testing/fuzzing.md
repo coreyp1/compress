@@ -83,6 +83,58 @@ Compresses input, then decompresses it, and verifies the output matches the inpu
 make fuzz-roundtrip
 ```
 
+## Gzip Fuzz Targets
+
+The gzip method has dedicated fuzz harnesses that test the wrapper functionality:
+
+### Gzip Decoder Fuzzer (`fuzz-gzip-decoder`)
+
+Tests the gzip decoder with arbitrary input bytes. This finds:
+- Header parsing bugs (magic, flags, FNAME, FCOMMENT, FEXTRA, FHCRC)
+- Integration issues between gzip wrapper and deflate decoder
+- Trailer validation (CRC32, ISIZE mismatch handling)
+- Limit enforcement (header field sizes, expansion ratio)
+- Concatenated member handling
+
+```bash
+make fuzz-gzip-decoder
+```
+
+### Gzip Encoder Fuzzer (`fuzz-gzip-encoder`)
+
+Tests the gzip encoder with arbitrary plaintext. This finds:
+- Header generation issues
+- CRC32 computation bugs
+- Integration with inner deflate encoder
+- Memory safety in option handling
+
+```bash
+make fuzz-gzip-encoder
+```
+
+### Gzip Roundtrip Fuzzer (`fuzz-gzip-roundtrip`)
+
+Compresses input as gzip, then decompresses, and verifies the output matches. Tests the complete encode/decode path including:
+- Header/trailer roundtrip correctness
+- CRC32/ISIZE computation and validation
+- Optional fields (name, comment) preservation
+
+```bash
+make fuzz-gzip-roundtrip
+```
+
+### Gzip vs Deflate Fuzzing
+
+| Aspect | Deflate Harnesses | Gzip Harnesses |
+|--------|-------------------|----------------|
+| Format | Raw DEFLATE stream | GZIP wrapper (header + deflate + trailer) |
+| Decoder input | Compressed bytes | Full gzip file format |
+| Validates | Stream integrity | Header, CRC32, ISIZE |
+| Limit testing | Basic limits | Header field limits, expansion ratio |
+| Concatenation | N/A | Multi-member gzip streams |
+
+**Recommendation**: Run both deflate and gzip harnesses. Deflate harnesses test compression core; gzip harnesses test wrapper and format handling.
+
 ## Understanding AFL++ Output
 
 When you run AFL++, you'll see a status screen:
@@ -275,21 +327,30 @@ Ensure the fuzz harness is a compiled binary, not a script.
 
 ```
 fuzz/
-├── fuzz_deflate_decoder.c   # Decoder fuzz harness
-├── fuzz_deflate_encoder.c   # Encoder fuzz harness
-├── fuzz_roundtrip.c         # Roundtrip fuzz harness
+├── fuzz_deflate_decoder.c   # Deflate decoder fuzz harness
+├── fuzz_deflate_encoder.c   # Deflate encoder fuzz harness
+├── fuzz_roundtrip.c         # Deflate roundtrip fuzz harness
+├── fuzz_gzip_decoder.c      # Gzip decoder fuzz harness
+├── fuzz_gzip_encoder.c      # Gzip encoder fuzz harness
+├── fuzz_gzip_roundtrip.c    # Gzip roundtrip fuzz harness
 ├── generate_corpus.c        # Seed corpus generator
 ├── corpus/                  # Seed inputs (generated)
-│   ├── decoder/
-│   ├── encoder/
-│   └── roundtrip/
+│   ├── decoder/             # Raw deflate test inputs
+│   ├── encoder/             # Plaintext inputs for deflate
+│   ├── roundtrip/           # Plaintext for deflate roundtrip
+│   ├── gzip_decoder/        # Gzip format test inputs
+│   ├── gzip_encoder/        # Plaintext inputs for gzip
+│   └── gzip_roundtrip/      # Plaintext for gzip roundtrip
 └── findings/                # AFL++ output (generated)
     ├── decoder/
     │   ├── crashes/         # Crash-inducing inputs
     │   ├── hangs/           # Hang-inducing inputs
     │   └── queue/           # Interesting test cases
     ├── encoder/
-    └── roundtrip/
+    ├── roundtrip/
+    ├── gzip_decoder/
+    ├── gzip_encoder/
+    └── gzip_roundtrip/
 ```
 
 ## References

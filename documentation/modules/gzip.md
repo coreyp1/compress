@@ -28,6 +28,58 @@ gcomp_method_gzip_register(custom);     // Now gzip is available
 
 See [Auto-Registration](../auto-registration.md) for details on disabling auto-registration.
 
+## Architecture
+
+The gzip method is implemented as a **wrapper** around the deflate method. It does not duplicate deflate's compression logic; instead, it delegates all compression and decompression to an inner deflate encoder/decoder while handling the gzip-specific framing.
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                        Gzip Encoder                                │
+│  ┌───────────────┐  ┌──────────────────────┐  ┌─────────────────┐  │
+│  │  Write Header │──│    Inner Deflate     │──│  Write Trailer  │  │
+│  │  (10+ bytes)  │  │      Encoder         │  │    (8 bytes)    │  │
+│  └───────────────┘  │                      │  └─────────────────┘  │
+│         │           │  - Compresses data   │          │            │
+│         │           │  - All compression   │          │            │
+│         v           │    logic is here     │          v            │
+│   [MTIME, OS,       └──────────────────────┘    [CRC32, ISIZE]     │
+│    FNAME, etc.]                                                    │
+└────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────┐
+│                        Gzip Decoder                                │
+│  ┌───────────────┐  ┌──────────────────────┐  ┌─────────────────┐  │
+│  │  Parse Header │──│    Inner Deflate     │──│ Validate Trailer│  │
+│  │  (streaming)  │  │      Decoder         │  │  CRC32 + ISIZE  │  │
+│  └───────────────┘  │                      │  └─────────────────┘  │
+│         │           │  - Decompresses data │          │            │
+│         │           │  - CRC32 tracked on  │          │            │
+│         v           │    decompressed output│          v           │
+│   Validates magic,  └──────────────────────┘    Mismatch →         │
+│   CM, reserved bits                             GCOMP_ERR_CORRUPT  │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+### Data flow
+
+**Encoding:**
+1. Input data flows to gzip encoder
+2. Gzip writes header to output, then passes input to inner deflate encoder
+3. CRC32 is computed incrementally on **uncompressed** input
+4. Deflate compresses data and writes to output
+5. On finish, gzip writes trailer with CRC32 and ISIZE
+
+**Decoding:**
+1. Compressed data flows to gzip decoder
+2. Gzip parses header, validates magic/CM/flags
+3. Remaining data passes to inner deflate decoder
+4. CRC32 is computed incrementally on **decompressed** output
+5. When deflate completes, gzip reads trailer and validates CRC32/ISIZE
+
+### Option pass-through
+
+Options prefixed with `deflate.*` or `limits.*` are automatically forwarded to the inner deflate encoder/decoder. This allows control over compression level, window size, and memory limits without gzip needing to understand every deflate option.
+
 ## Options
 
 ### Gzip-specific options
@@ -275,6 +327,188 @@ if (s != GCOMP_OK) { /* stream incomplete or corrupt */ }
 
 gcomp_decoder_destroy(dec);
 gcomp_options_destroy(opts);
+```
+
+## Reset method usage
+
+Both encoder and decoder support a `reset()` method that allows reusing the same instance for multiple independent compression/decompression operations without the overhead of destroy/create cycles.
+
+### Encoder reset
+
+```c
+gcomp_encoder_t *enc = NULL;
+gcomp_encoder_create(registry, "gzip", opts, &enc);
+
+// First compression
+gcomp_buffer_t in1 = { data1, len1, 0 };
+gcomp_buffer_t out1 = { buf1, cap1, 0 };
+gcomp_encoder_update(enc, &in1, &out1);
+gcomp_encoder_finish(enc, &out1);
+// out1 now contains compressed data1
+
+// Reset for reuse (same options retained)
+gcomp_encoder_reset(enc);
+
+// Second compression - completely independent
+gcomp_buffer_t in2 = { data2, len2, 0 };
+gcomp_buffer_t out2 = { buf2, cap2, 0 };
+gcomp_encoder_update(enc, &in2, &out2);
+gcomp_encoder_finish(enc, &out2);
+// out2 now contains compressed data2
+
+gcomp_encoder_destroy(enc);
+```
+
+### Decoder reset
+
+```c
+gcomp_decoder_t *dec = NULL;
+gcomp_decoder_create(registry, "gzip", opts, &dec);
+
+// First decompression
+gcomp_buffer_t in1 = { compressed1, comp_len1, 0 };
+gcomp_buffer_t out1 = { buf1, cap1, 0 };
+gcomp_decoder_update(dec, &in1, &out1);
+gcomp_decoder_finish(dec, &out1);
+
+// Reset clears all state: CRC32, ISIZE, header info, error state
+gcomp_decoder_reset(dec);
+
+// Second decompression - completely independent
+gcomp_buffer_t in2 = { compressed2, comp_len2, 0 };
+gcomp_buffer_t out2 = { buf2, cap2, 0 };
+gcomp_decoder_update(dec, &in2, &out2);
+gcomp_decoder_finish(dec, &out2);
+
+gcomp_decoder_destroy(dec);
+```
+
+### Reset after error
+
+Reset can recover from error states, allowing continued use after handling a corrupted input:
+
+```c
+gcomp_status_t s = gcomp_decoder_update(dec, &bad_input, &out);
+if (s == GCOMP_ERR_CORRUPT) {
+    // Log error, report to user, etc.
+    printf("Error: %s\n", gcomp_decoder_get_error_detail(dec));
+    
+    // Reset to try another input
+    gcomp_decoder_reset(dec);
+    
+    // Now dec is ready for a new gzip stream
+    s = gcomp_decoder_update(dec, &good_input, &out);
+}
+```
+
+### What reset clears
+
+| State | Encoder | Decoder |
+|-------|---------|---------|
+| CRC32 counter | ✓ Reset to init | ✓ Reset to init |
+| ISIZE counter | ✓ Reset to 0 | ✓ Reset to 0 |
+| Stage | ✓ Back to HEADER | ✓ Back to HEADER |
+| Header parser | - | ✓ Cleared |
+| Parsed header info | - | ✓ Freed and cleared |
+| Trailer buffer | ✓ Position reset | ✓ Position reset |
+| Total bytes counters | - | ✓ Reset to 0 |
+| Error state | ✓ Cleared | ✓ Cleared |
+| Inner deflate | ✓ Reset | ✓ Reset |
+| Options/config | Retained | Retained |
+
+## Buffer convenience helpers
+
+For simple use cases where the entire input fits in memory, use the buffer convenience API:
+
+```c
+#include <ghoti.io/compress/buffer.h>
+
+// Compress data in one call
+uint8_t *compressed = NULL;
+size_t compressed_len = 0;
+
+gcomp_status_t s = gcomp_buffer_compress(
+    registry, "gzip", opts,
+    input_data, input_len,
+    &compressed, &compressed_len);
+
+if (s == GCOMP_OK) {
+    // Use compressed data...
+    free(compressed);  // Caller owns the buffer
+}
+
+// Decompress data in one call
+uint8_t *decompressed = NULL;
+size_t decompressed_len = 0;
+
+s = gcomp_buffer_decompress(
+    registry, "gzip", opts,
+    compressed_data, compressed_len,
+    &decompressed, &decompressed_len);
+
+if (s == GCOMP_OK) {
+    // Use decompressed data...
+    free(decompressed);
+}
+```
+
+**Note:** The buffer helpers allocate output memory automatically. For large data or streaming scenarios, use the streaming API directly for better memory control.
+
+## Callback API usage
+
+For scenarios where you want to process data incrementally without managing buffers, use the callback API:
+
+```c
+#include <ghoti.io/compress/stream_cb.h>
+
+// Output callback - called whenever compressed data is ready
+void on_compressed_data(const void *data, size_t len, void *user_data) {
+    FILE *out = (FILE *)user_data;
+    fwrite(data, 1, len, out);
+}
+
+// Create callback encoder
+gcomp_encoder_cb_t *enc_cb = NULL;
+FILE *output_file = fopen("output.gz", "wb");
+
+gcomp_encoder_cb_create(registry, "gzip", opts,
+                        on_compressed_data, output_file,
+                        &enc_cb);
+
+// Feed input incrementally - callbacks fire as output is ready
+gcomp_encoder_cb_write(enc_cb, chunk1, chunk1_len);
+gcomp_encoder_cb_write(enc_cb, chunk2, chunk2_len);
+// ... more chunks ...
+
+// Finalize
+gcomp_encoder_cb_finish(enc_cb);
+gcomp_encoder_cb_destroy(enc_cb);
+fclose(output_file);
+```
+
+### Decoder callback example
+
+```c
+// Output callback - called whenever decompressed data is ready
+void on_decompressed_data(const void *data, size_t len, void *user_data) {
+    // Process decompressed data incrementally
+    process_data(data, len);
+}
+
+gcomp_decoder_cb_t *dec_cb = NULL;
+gcomp_decoder_cb_create(registry, "gzip", opts,
+                        on_decompressed_data, NULL,
+                        &dec_cb);
+
+// Feed compressed data - decompressed output delivered via callback
+while (has_more_input()) {
+    size_t chunk_len;
+    const void *chunk = get_next_chunk(&chunk_len);
+    gcomp_decoder_cb_write(dec_cb, chunk, chunk_len);
+}
+
+gcomp_decoder_cb_finish(dec_cb);
+gcomp_decoder_cb_destroy(dec_cb);
 ```
 
 ## Interoperability

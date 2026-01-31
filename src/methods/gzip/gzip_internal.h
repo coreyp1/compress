@@ -16,6 +16,7 @@
 #include "../../core/stream_internal.h"
 #include <ghoti.io/compress/crc32.h>
 #include <ghoti.io/compress/errors.h>
+#include <ghoti.io/compress/limits.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
 #include <ghoti.io/compress/stream.h>
@@ -137,6 +138,10 @@ typedef struct {
 
   // Header info (configuration from options)
   gzip_header_info_t header_info;
+
+  // Memory tracking
+  gcomp_memory_tracker_t mem_tracker; ///< Tracks wrapper memory usage
+  uint64_t max_memory_bytes;          ///< Memory limit (0 = unlimited)
 } gzip_encoder_state_t;
 
 //
@@ -182,6 +187,10 @@ typedef struct {
   // Limit tracking
   uint64_t total_input_bytes;
   uint64_t total_output_bytes;
+
+  // Memory tracking
+  gcomp_memory_tracker_t mem_tracker; ///< Tracks wrapper memory usage
+  uint64_t max_memory_bytes;          ///< Memory limit (0 = unlimited)
 } gzip_decoder_state_t;
 
 //

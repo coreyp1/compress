@@ -143,6 +143,20 @@ static void reset_header_parser(gzip_decoder_state_t * state) {
   state->header_accum_pos = 0;
   state->header_field_target = 0;
   state->header_crc_accum = GCOMP_CRC32_INIT;
+
+  // Track frees for header info allocations before freeing
+  if (state->header_info.name) {
+    gcomp_memory_track_free(
+        &state->mem_tracker, strlen(state->header_info.name) + 1);
+  }
+  if (state->header_info.comment) {
+    gcomp_memory_track_free(
+        &state->mem_tracker, strlen(state->header_info.comment) + 1);
+  }
+  if (state->header_info.extra) {
+    gcomp_memory_track_free(&state->mem_tracker, state->header_info.extra_len);
+  }
+
   gzip_header_info_free(&state->header_info);
   memset(&state->header_info, 0, sizeof(state->header_info));
 }
@@ -172,6 +186,12 @@ gcomp_status_t gzip_decoder_init(gcomp_registry_t * registry,
     return gcomp_decoder_set_error(
         decoder, GCOMP_ERR_MEMORY, "failed to allocate gzip decoder state");
   }
+
+  // Initialize memory tracker and track state allocation
+  state->mem_tracker.current_bytes = 0;
+  gcomp_memory_track_alloc(&state->mem_tracker, sizeof(gzip_decoder_state_t));
+  state->max_memory_bytes =
+      gcomp_limits_read_memory_max(options, GCOMP_DEFAULT_MAX_MEMORY_BYTES);
 
   // Read options
   gcomp_status_t status = read_decoder_options(options, state);
@@ -329,6 +349,7 @@ static gcomp_status_t parse_header_byte(
           return gcomp_decoder_set_error(
               decoder, GCOMP_ERR_MEMORY, "failed to allocate FEXTRA buffer");
         }
+        gcomp_memory_track_alloc(&state->mem_tracker, extra_len);
         state->header_info.extra_len = extra_len;
         state->header_field_target = extra_len;
         state->header_stage = GZIP_HEADER_FEXTRA_DATA;
@@ -387,6 +408,7 @@ static gcomp_status_t parse_header_byte(
         return gcomp_decoder_set_error(
             decoder, GCOMP_ERR_MEMORY, "failed to allocate FNAME buffer");
       }
+      gcomp_memory_track_alloc(&state->mem_tracker, state->header_accum_pos);
       memcpy(state->header_info.name, state->header_accum,
           state->header_accum_pos);
 
@@ -419,6 +441,7 @@ static gcomp_status_t parse_header_byte(
         return gcomp_decoder_set_error(
             decoder, GCOMP_ERR_MEMORY, "failed to allocate FCOMMENT buffer");
       }
+      gcomp_memory_track_alloc(&state->mem_tracker, state->header_accum_pos);
       memcpy(state->header_info.comment, state->header_accum,
           state->header_accum_pos);
 
@@ -804,8 +827,24 @@ void gzip_decoder_destroy(gcomp_decoder_t * decoder) {
     state->inner_decoder = NULL;
   }
 
+  // Track frees for header info allocations
+  if (state->header_info.name) {
+    gcomp_memory_track_free(
+        &state->mem_tracker, strlen(state->header_info.name) + 1);
+  }
+  if (state->header_info.comment) {
+    gcomp_memory_track_free(
+        &state->mem_tracker, strlen(state->header_info.comment) + 1);
+  }
+  if (state->header_info.extra) {
+    gcomp_memory_track_free(&state->mem_tracker, state->header_info.extra_len);
+  }
+
   // Free header info
   gzip_header_info_free(&state->header_info);
+
+  // Track state free
+  gcomp_memory_track_free(&state->mem_tracker, sizeof(gzip_decoder_state_t));
 
   // Free state
   free(state);

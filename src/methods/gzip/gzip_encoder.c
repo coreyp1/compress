@@ -118,7 +118,8 @@ static uint8_t compute_xfl(int64_t level) {
 
 static gcomp_status_t read_encoder_options(const gcomp_options_t * options,
     gzip_header_info_t * info, uint8_t * xfl_out, int * has_explicit_xfl,
-    uint8_t * header_flags_out, int * has_explicit_header_flags) {
+    uint8_t * header_flags_out, int * has_explicit_header_flags,
+    gcomp_memory_tracker_t * mem_tracker) {
   gcomp_status_t status;
   uint64_t u64_val;
   int bool_val;
@@ -181,6 +182,7 @@ static gcomp_status_t read_encoder_options(const gcomp_options_t * options,
     }
     memcpy(info->name, str_val, len + 1);
     info->flg |= GZIP_FLG_FNAME;
+    gcomp_memory_track_alloc(mem_tracker, len + 1);
   }
 
   // gzip.comment
@@ -194,6 +196,7 @@ static gcomp_status_t read_encoder_options(const gcomp_options_t * options,
     }
     memcpy(info->comment, str_val, len + 1);
     info->flg |= GZIP_FLG_FCOMMENT;
+    gcomp_memory_track_alloc(mem_tracker, len + 1);
   }
 
   // gzip.extra
@@ -208,6 +211,7 @@ static gcomp_status_t read_encoder_options(const gcomp_options_t * options,
     memcpy(info->extra, bytes_val, bytes_len);
     info->extra_len = bytes_len;
     info->flg |= GZIP_FLG_FEXTRA;
+    gcomp_memory_track_alloc(mem_tracker, bytes_len);
   }
 
   // gzip.header_crc
@@ -245,6 +249,12 @@ gcomp_status_t gzip_encoder_init(gcomp_registry_t * registry,
         encoder, GCOMP_ERR_MEMORY, "failed to allocate gzip encoder state");
   }
 
+  // Initialize memory tracker and track state allocation
+  state->mem_tracker.current_bytes = 0;
+  gcomp_memory_track_alloc(&state->mem_tracker, sizeof(gzip_encoder_state_t));
+  state->max_memory_bytes =
+      gcomp_limits_read_memory_max(options, GCOMP_DEFAULT_MAX_MEMORY_BYTES);
+
   // Read options and prepare header info
   uint8_t explicit_xfl;
   int has_explicit_xfl;
@@ -252,7 +262,7 @@ gcomp_status_t gzip_encoder_init(gcomp_registry_t * registry,
   int has_explicit_header_flags;
   gcomp_status_t status = read_encoder_options(options, &state->header_info,
       &explicit_xfl, &has_explicit_xfl, &explicit_header_flags,
-      &has_explicit_header_flags);
+      &has_explicit_header_flags, &state->mem_tracker);
   if (status != GCOMP_OK) {
     free(state);
     return status;
@@ -521,8 +531,24 @@ void gzip_encoder_destroy(gcomp_encoder_t * encoder) {
     state->inner_encoder = NULL;
   }
 
+  // Track frees for header info allocations
+  if (state->header_info.name) {
+    gcomp_memory_track_free(
+        &state->mem_tracker, strlen(state->header_info.name) + 1);
+  }
+  if (state->header_info.comment) {
+    gcomp_memory_track_free(
+        &state->mem_tracker, strlen(state->header_info.comment) + 1);
+  }
+  if (state->header_info.extra) {
+    gcomp_memory_track_free(&state->mem_tracker, state->header_info.extra_len);
+  }
+
   // Free header info
   gzip_header_info_free(&state->header_info);
+
+  // Track state free
+  gcomp_memory_track_free(&state->mem_tracker, sizeof(gzip_encoder_state_t));
 
   // Free state
   free(state);
