@@ -111,6 +111,9 @@ endif
 # The standard include directories for the project.
 INCLUDE := -I include/ -I $(GEN_DIR)/
 
+# Additional include directories for tests (common helpers, method-specific data)
+TEST_INCLUDE := $(INCLUDE) -I tests/common/ -I tests/methods/deflate/
+
 # Automatically collect all .c source files under the src directory.
 SOURCES := $(shell find src -type f -name '*.c')
 
@@ -124,12 +127,12 @@ TESTFLAGS := `PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --libs --cflags gtes
 VALGRIND_FLAGS := --leak-check=full --show-leak-kinds=definite,indirect,possible --track-origins=yes --error-exitcode=1
 
 # Test helper object file
-TEST_HELPER_OBJ := $(OBJ_DIR)/tests/test_helpers.o
+TEST_HELPER_OBJ := $(OBJ_DIR)/tests/common/test_helpers.o
 
 COMPRESSLIBRARY := -L $(APP_DIR) -l$(SUITE)-$(PROJECT)$(BRANCH)
 
 # Automatically discover all test source files (excluding test_helpers.cpp)
-TEST_SOURCES := $(filter-out tests/test_helpers.cpp, $(shell find tests -type f -name 'test*.cpp' 2>/dev/null))
+TEST_SOURCES := $(filter-out tests/common/test_helpers.cpp, $(shell find tests -type f -name 'test*.cpp' 2>/dev/null))
 
 # Function to convert test source file to executable name
 # test.cpp -> testCompress, test_*.cpp -> test* (capitalized first letter, underscores removed)
@@ -217,16 +220,16 @@ $(APP_DIR)/$(STATIC_TARGET): \
 ####################################################################
 
 # Test helper object (compiled once, linked into all tests)
-$(TEST_HELPER_OBJ): tests/test_helpers.cpp
+$(TEST_HELPER_OBJ): tests/common/test_helpers.cpp
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
+	$(CXX) $(CXXFLAGS) $(TEST_INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
 
 # Pattern rule for compiling test source files to object files
 # This allows tests to be compiled separately from linking
 $(OBJ_DIR)/tests/%.o: tests/%.cpp
 	@printf "\n### Compiling Test Object: $* ###\n"
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
+	$(CXX) $(CXXFLAGS) $(TEST_INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
 
 # Pattern rule for building test executables
 # This automatically handles all test_*.cpp files
@@ -234,9 +237,9 @@ $(OBJ_DIR)/tests/%.o: tests/%.cpp
 # This optimization allows tests to only relink (fast) when library changes but headers don't
 define test-executable-rule
 # Generate test object file path from test source path
-# e.g., tests/test_callback_api.cpp -> build/linux/release/objects/tests/test_callback_api.o
+# e.g., tests/core/test_callback_api.cpp -> build/linux/release/objects/tests/core/test_callback_api.o
 # The object file is built by the pattern rule $(OBJ_DIR)/tests/%.o: tests/%.cpp above
-TEST_OBJ_$1 := $(OBJ_DIR)/tests/$(basename $(notdir $1)).o
+TEST_OBJ_$1 := $(OBJ_DIR)/tests/$(patsubst tests/%.cpp,%.o,$1)
 
 # Rule to link test object file into executable
 $(APP_DIR)/$(call test-name,$1)$(EXE_EXTENSION): \
@@ -669,7 +672,7 @@ ASAN_TARGET := $(BASE_NAME_PREFIX)-asan.so
 ASAN_STATIC_TARGET := $(BASE_NAME_PREFIX)-asan.a
 
 # ASan test helper and executables
-ASAN_TEST_HELPER_OBJ := $(ASAN_OBJ_DIR)/tests/test_helpers.o
+ASAN_TEST_HELPER_OBJ := $(ASAN_OBJ_DIR)/tests/common/test_helpers.o
 ASAN_TEST_EXECUTABLES := $(foreach test,$(TEST_SOURCES),$(ASAN_APP_DIR)/$(call test-name,$(test))$(EXE_EXTENSION))
 
 # Compile flags for ASan builds (include UBSan for comprehensive checking)
@@ -702,19 +705,19 @@ $(ASAN_APP_DIR)/$(ASAN_TARGET): $(ASAN_LIBOBJECTS)
 	$(CXX) $(ASAN_CXXFLAGS) -shared -o $@ $^ $(ASAN_LDFLAGS)
 
 # ASan test helper object
-$(ASAN_OBJ_DIR)/tests/test_helpers.o: tests/test_helpers.cpp
+$(ASAN_OBJ_DIR)/tests/common/test_helpers.o: tests/common/test_helpers.cpp
 	@mkdir -p $(@D)
-	$(CXX) $(ASAN_CXXFLAGS) $(INCLUDE) -c $< -o $@
+	$(CXX) $(ASAN_CXXFLAGS) $(TEST_INCLUDE) -c $< -o $@
 
 # Pattern rule for ASan test object files
 $(ASAN_OBJ_DIR)/tests/%.o: tests/%.cpp
 	@printf "\n### Compiling ASan+UBSan Test Object: $* ###\n"
 	@mkdir -p $(@D)
-	$(CXX) $(ASAN_CXXFLAGS) $(INCLUDE) -c $< -o $@
+	$(CXX) $(ASAN_CXXFLAGS) $(TEST_INCLUDE) -c $< -o $@
 
 # Pattern rule for ASan test executables
 define asan-test-executable-rule
-ASAN_TEST_OBJ_$1 := $(ASAN_OBJ_DIR)/tests/$(basename $(notdir $1)).o
+ASAN_TEST_OBJ_$1 := $(ASAN_OBJ_DIR)/tests/$(patsubst tests/%.cpp,%.o,$1)
 
 $(ASAN_APP_DIR)/$(call test-name,$1)$(EXE_EXTENSION): \
 		$$(ASAN_TEST_OBJ_$1) \

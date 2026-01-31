@@ -7,7 +7,7 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#include "data/deflate/golden_vectors.h"
+#include "data/golden_vectors.h"
 #include "test_helpers.h"
 #include <cstring>
 #include <ghoti.io/compress/deflate.h>
