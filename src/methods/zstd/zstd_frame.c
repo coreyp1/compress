@@ -141,9 +141,9 @@ gcomp_status_t zstd_parse_block_header(const uint8_t * buf, bool * last_out,
     return GCOMP_ERR_INVALID_ARG;
   }
 
-  // Block header is 3 bytes (24 bits):
+  // Block header is 3 bytes (24 bits) per RFC 8878:
   // - Bit 0: Last_Block
-  // - Bits 1-2: Block_Type
+  // - Bits 1-2: Block_Type (0=raw, 1=RLE, 2=compressed, 3=reserved)
   // - Bits 3-23: Block_Size (21 bits)
 
   uint32_t header = buf[0] | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16);

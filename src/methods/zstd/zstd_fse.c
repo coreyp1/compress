@@ -254,7 +254,8 @@ static gcomp_status_t zstd_fse_build_table(const int16_t * norm_counts,
   // First pass: handle symbols with count == -1 (probability less than 1)
   // These symbols are placed at the high end of the table
   // Only set the symbol here; nb_bits and new_state are computed in third pass
-  for (unsigned s = 0; s <= max_symbol; s++) {
+  // IMPORTANT: Iterate in REVERSE order to match zstd reference implementation
+  for (int s = (int)max_symbol; s >= 0; s--) {
     if (norm_counts[s] == -1) {
       table[high_threshold].symbol = (uint8_t)s;
       high_threshold--;

@@ -26,6 +26,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "zstd_internal.h"
+#include <stdlib.h>
 #include <string.h>
 
 //
@@ -640,16 +641,24 @@ gcomp_status_t zstd_sequences_decode(zstd_decoder_state_t * state,
 }
 
 //
-// Encoder: Bit Writer for Sequences
+// Encoder: Bit Writer for Sequences (Backward Stream)
 //
-// FSE bitstreams are written in reverse order. We write bits to a buffer
-// starting from the end and working backward.
+// FSE bitstreams in zstd:
+// - Decoder reads from HIGH bit positions toward LOW bit positions
+// - First bits written should end up at HIGHEST positions (just below marker)
+// - Marker is the highest set bit in the last byte
+//
+// To achieve this:
+// - Add new bits at the LOW end (shifting existing bits up)
+// - First bits added end up at highest positions after all additions
+// - Flush HIGH bytes first to lower addresses
+// - Marker gets added last at LOW position, ends up in last byte
 //
 
 typedef struct {
   uint8_t * buf;          ///< Output buffer (start)
   size_t buf_size;        ///< Buffer capacity
-  size_t byte_pos;        ///< Current position (from end, decreasing)
+  size_t byte_pos;        ///< Current write position (increasing)
   uint64_t bit_container; ///< Bit accumulator
   unsigned bits_used;     ///< Bits used in container (0-64)
 } zstd_enc_bit_writer_t;
@@ -658,51 +667,92 @@ static void zstd_enc_bw_init(
     zstd_enc_bit_writer_t * bw, uint8_t * buf, size_t buf_size) {
   bw->buf = buf;
   bw->buf_size = buf_size;
-  bw->byte_pos = buf_size;
+  bw->byte_pos = 0;
   bw->bit_container = 0;
   bw->bits_used = 0;
 }
 
+/**
+ * @brief Add bits to the bitstream.
+ *
+ * New bits are added at the HIGH end (above existing bits).
+ * First bits added end up at LOW positions; last bits at HIGH positions.
+ * Combined with flushing LOW bytes to increasing addresses, this means:
+ * - First bits added → LOW addresses → LOW bit positions when loaded
+ * - Last bits added (marker) → HIGH addresses → HIGH bit positions when loaded
+ */
 static void zstd_enc_bw_add_bits(
     zstd_enc_bit_writer_t * bw, uint32_t value, unsigned nb_bits) {
   if (nb_bits == 0) {
     return;
   }
-  // Add bits to the LOW end of the container
-  bw->bit_container = (bw->bit_container << nb_bits) | value;
+  // Add new bits above existing bits
+  bw->bit_container |= ((uint64_t)value << bw->bits_used);
   bw->bits_used += nb_bits;
 }
 
+/**
+ * @brief Flush complete bytes from the container to the buffer.
+ *
+ * Writes LOW bytes to increasing addresses. Combined with add_bits at HIGH:
+ * - First bits added (at LOW positions) go to LOW addresses
+ * - Last bits added (at HIGH positions) go to HIGH addresses
+ * After little-endian load: LOW addr → LOW bits, HIGH addr → HIGH bits
+ */
 static void zstd_enc_bw_flush_bits(zstd_enc_bit_writer_t * bw) {
-  // Flush complete bytes from the HIGH end of the container
-  while (bw->bits_used >= 8 && bw->byte_pos > 0) {
-    bw->byte_pos--;
+  // Flush LOW bytes to increasing addresses
+  while (bw->bits_used >= 8 && bw->byte_pos < bw->buf_size) {
+    bw->buf[bw->byte_pos++] = (uint8_t)(bw->bit_container & 0xFF);
+    bw->bit_container >>= 8;
     bw->bits_used -= 8;
-    bw->buf[bw->byte_pos] = (uint8_t)(bw->bit_container >> bw->bits_used);
-    bw->bit_container &= (1ULL << bw->bits_used) - 1;
   }
 }
 
+/**
+ * @brief Close the bitstream and add the marker bit.
+ *
+ * The marker is added at the HIGH end (becomes highest set bit in last byte).
+ * Returns the total stream size.
+ */
 static size_t zstd_enc_bw_close(zstd_enc_bit_writer_t * bw) {
-  // Add marker bit (the highest bit in the final byte)
-  zstd_enc_bw_add_bits(bw, 1, 1);
+  // Add marker bit at HIGH end
+  bw->bit_container |= (1ULL << bw->bits_used);
+  bw->bits_used++;
 
-  // Flush remaining bits (including marker)
-  while (bw->bits_used > 0 && bw->byte_pos > 0) {
-    bw->byte_pos--;
-    unsigned bits_to_write = (bw->bits_used >= 8) ? 8 : bw->bits_used;
-    bw->bits_used -= bits_to_write;
-    bw->buf[bw->byte_pos] = (uint8_t)(bw->bit_container >> bw->bits_used);
-    if (bw->bits_used > 0) {
-      bw->bit_container &= (1ULL << bw->bits_used) - 1;
+  // Flush all remaining bits (LOW bytes to increasing addresses)
+  while (bw->bits_used > 0 && bw->byte_pos < bw->buf_size) {
+    bw->buf[bw->byte_pos++] = (uint8_t)(bw->bit_container & 0xFF);
+    bw->bit_container >>= 8;
+    if (bw->bits_used >= 8) {
+      bw->bits_used -= 8;
     }
     else {
-      bw->bit_container = 0;
+      bw->bits_used = 0;
     }
   }
 
-  // Return the final size (from byte_pos to end)
-  return bw->buf_size - bw->byte_pos;
+  return bw->byte_pos;
+}
+
+/**
+ * @brief Close the bitstream without adding a marker (marker already added).
+ *
+ * Flushes remaining bits. Returns stream size.
+ */
+static size_t zstd_enc_bw_close_no_marker(zstd_enc_bit_writer_t * bw) {
+  // Flush all remaining bits
+  while (bw->bits_used > 0 && bw->byte_pos < bw->buf_size) {
+    bw->buf[bw->byte_pos++] = (uint8_t)(bw->bit_container & 0xFF);
+    bw->bit_container >>= 8;
+    if (bw->bits_used >= 8) {
+      bw->bits_used -= 8;
+    }
+    else {
+      bw->bits_used = 0;
+    }
+  }
+
+  return bw->byte_pos;
 }
 
 //
@@ -853,109 +903,101 @@ static uint8_t zstd_enc_get_of_code(uint32_t offset) {
 }
 
 //
-// Encoder: FSE Encoding Tables
+// Encoder: FSE Encoding State
 //
-// For predefined tables, we need encoding tables that map symbol -> state info
+// For FSE encoding, we track a state value that determines how many bits
+// to output and what the next state will be.
 //
-
-typedef struct {
-  int16_t delta_nb_bits; ///< Delta for bits calculation
-  uint16_t delta_state;  ///< Delta for state update
-  uint32_t base_state;   ///< Base state value
-} zstd_fse_enc_entry_t;
 
 /**
- * @brief Build FSE encoding table from normalized counts.
+ * @brief FSE encoding symbol info.
  *
- * This creates a table that maps (symbol, state_idx) -> encoding info.
- * For each symbol, we track the delta_nb_bits, delta_state, and base values.
+ * For each symbol, we have:
+ * - delta_find_state: offset to add to get base state
+ * - delta_nb_bits: used to calculate number of bits to output
+ * - max_state: threshold for determining nb_bits
  */
-static gcomp_status_t zstd_fse_build_encoding_table(const int16_t * norm_counts,
-    unsigned max_symbol, unsigned table_log, zstd_fse_enc_entry_t * table,
-    uint16_t * symbol_tt_start) {
-  if (!norm_counts || !table || !symbol_tt_start) {
-    return GCOMP_ERR_INVALID_ARG;
-  }
+typedef struct {
+  uint16_t delta_find_state; ///< Offset to find state for this symbol
+  uint16_t delta_nb_bits;    ///< (max_bits << 16) | threshold
+  uint16_t max_bits;         ///< Maximum bits for this symbol
+  uint16_t threshold;        ///< State threshold for extra bit
+} zstd_fse_enc_symbol_t;
 
-  unsigned table_size = 1U << table_log;
-
-  // Build cumulative counts
-  uint16_t cumul[64]; // Max symbol + 1
+/**
+ * @brief Build FSE encoding symbol info from normalized counts.
+ */
+static void zstd_fse_build_enc_symbols(const int16_t * norm_counts,
+    unsigned max_symbol, unsigned table_log, zstd_fse_enc_symbol_t * symbols) {
+  // First compute cumulative counts
+  uint16_t cumul[64];
   cumul[0] = 0;
   for (unsigned s = 0; s <= max_symbol; s++) {
-    if (norm_counts[s] == -1) {
+    int16_t count = norm_counts[s];
+    if (count == -1) {
       cumul[s + 1] = cumul[s] + 1;
     }
-    else if (norm_counts[s] > 0) {
-      cumul[s + 1] = cumul[s] + (uint16_t)norm_counts[s];
+    else if (count > 0) {
+      cumul[s + 1] = cumul[s] + (uint16_t)count;
     }
     else {
       cumul[s + 1] = cumul[s];
     }
   }
 
-  // Build spread table (position -> symbol)
-  uint8_t spread_table[512]; // Max table size
-  unsigned high_threshold = table_size - 1;
-  unsigned position = 0;
-  unsigned step = (table_size >> 1) + (table_size >> 3) + 3;
-  unsigned mask = table_size - 1;
-
-  // First pass: handle -1 probability symbols
+  // Build symbol encoding info
   for (unsigned s = 0; s <= max_symbol; s++) {
-    if (norm_counts[s] == -1) {
-      spread_table[high_threshold--] = (uint8_t)s;
-    }
-  }
-
-  // Second pass: spread remaining symbols
-  for (unsigned s = 0; s <= max_symbol; s++) {
-    int count = norm_counts[s];
-    if (count <= 0) {
+    int16_t count = norm_counts[s];
+    if (count == 0) {
+      // Symbol not present
+      symbols[s].delta_find_state = 0;
+      symbols[s].delta_nb_bits = 0;
+      symbols[s].max_bits = table_log + 1; // Invalid
+      symbols[s].threshold = 0;
       continue;
     }
-    for (int i = 0; i < count; i++) {
-      spread_table[position] = (uint8_t)s;
-      position = (position + step) & mask;
-      while (position > high_threshold) {
-        position = (position + step) & mask;
-      }
-    }
-  }
 
-  // Build encoding table entries
-  uint16_t symbol_next[64];
-  for (unsigned s = 0; s <= max_symbol; s++) {
-    symbol_next[s] = cumul[s];
-  }
+    int freq = (count == -1) ? 1 : count;
 
-  for (unsigned state = 0; state < table_size; state++) {
-    uint8_t symbol = spread_table[state];
-    uint16_t idx = symbol_next[symbol]++;
-
-    // Find nb_bits
-    unsigned nb_bits;
-    int count = (norm_counts[symbol] == -1) ? 1 : (int)norm_counts[symbol];
-    if (count == 1) {
-      nb_bits = table_log;
-    }
-    else {
-      nb_bits = table_log - (31 - __builtin_clz((unsigned)count - 1));
+    // Number of bits = table_log - floor(log2(freq))
+    unsigned nb_bits = table_log;
+    if (freq > 1) {
+      nb_bits = table_log - (31 - __builtin_clz((unsigned)freq));
     }
 
-    // Store encoding info
-    table[idx].delta_nb_bits =
-        (int16_t)((table_log << 16) - ((int)nb_bits << 16));
-    table[idx].delta_state = (uint16_t)((1 << nb_bits) - count);
-    table[idx].base_state = (uint32_t)state;
+    // Threshold determines when we need one extra bit
+    unsigned threshold =
+        (1U << (table_log + 1)) - ((unsigned)freq << (nb_bits + 1));
+
+    symbols[s].delta_find_state = cumul[s];
+    symbols[s].max_bits = (uint16_t)nb_bits;
+    symbols[s].threshold = (uint16_t)(threshold >> (table_log + 1 - nb_bits));
+    symbols[s].delta_nb_bits = (uint16_t)((nb_bits << 12) | threshold);
+  }
+}
+
+/**
+ * @brief Encode a symbol using FSE and update state.
+ */
+static void zstd_fse_encode_symbol(zstd_enc_bit_writer_t * bw, uint16_t * state,
+    const zstd_fse_enc_symbol_t * sym, unsigned table_log) {
+  // Determine number of bits to output
+  unsigned nb_bits = sym->max_bits;
+  uint16_t threshold = sym->threshold;
+
+  // If state is above threshold, we output one fewer bit
+  if (*state >= threshold) {
+    nb_bits--;
   }
 
-  // Record where each symbol's entries start
-  for (unsigned s = 0; s <= max_symbol; s++) {
-    symbol_tt_start[s] = cumul[s];
+  // Output the low bits of state
+  if (nb_bits > 0) {
+    zstd_enc_bw_add_bits(bw, *state & ((1U << nb_bits) - 1), nb_bits);
   }
 
-  return GCOMP_OK;
+  // Update state: shift down and add delta_find_state
+  *state = (*state >> nb_bits) + sym->delta_find_state;
+  (void)table_log;
 }
 
 //
@@ -1027,25 +1069,93 @@ gcomp_status_t zstd_sequences_encode_predefined(
   }
   output[pos++] = 0x00; // All modes = 0 (predefined)
 
-  // 3. Build FSE encoding tables for predefined distributions
+  // 3. Build FSE encoding symbol info for predefined distributions
   // Predefined: LL log=6, OF log=5, ML log=6
-  zstd_fse_enc_entry_t ll_enc_table[64];
-  zstd_fse_enc_entry_t of_enc_table[32];
-  zstd_fse_enc_entry_t ml_enc_table[64];
-  uint16_t ll_tt_start[64];
-  uint16_t of_tt_start[64];
-  uint16_t ml_tt_start[64];
+  zstd_fse_enc_symbol_t ll_symbols[36];
+  zstd_fse_enc_symbol_t of_symbols[32];
+  zstd_fse_enc_symbol_t ml_symbols[53];
 
-  zstd_fse_build_encoding_table(
-      seq_ll_predefined_norm, 35, 6, ll_enc_table, ll_tt_start);
-  zstd_fse_build_encoding_table(
-      seq_of_predefined_norm, 28, 5, of_enc_table, of_tt_start);
-  zstd_fse_build_encoding_table(
-      seq_ml_predefined_norm, 52, 6, ml_enc_table, ml_tt_start);
+  zstd_fse_build_enc_symbols(seq_ll_predefined_norm, 35, 6, ll_symbols);
+  zstd_fse_build_enc_symbols(seq_of_predefined_norm, 28, 5, of_symbols);
+  zstd_fse_build_enc_symbols(seq_ml_predefined_norm, 52, 6, ml_symbols);
 
-  // 4. Encode sequences backwards into bitstream
-  // We'll build the bitstream in a temporary buffer (reversed)
-  size_t max_bitstream = num_sequences * 40 + 32; // Generous estimate
+  // For now, only support encoding a single sequence (no state updates needed)
+  // Multi-sequence encoding with FSE state machine is complex and deferred
+  if (num_sequences > 1) {
+    // Signal to caller to use raw block instead
+    return GCOMP_ERR_LIMIT;
+  }
+
+  // 4. For single sequence: determine initial states and extra bits
+  const zstd_sequence_t * seq = &sequences[0];
+
+  uint8_t ll_code = zstd_enc_get_ll_code(seq->lit_length);
+  uint8_t ml_code = zstd_enc_get_ml_code(seq->match_length);
+  uint8_t of_code = zstd_enc_get_of_code(seq->match_offset);
+
+  // Extra bit values
+  uint32_t ll_extra = seq->lit_length - ll_baseline[ll_code];
+  uint32_t ml_extra = seq->match_length - ml_baseline[ml_code];
+  uint32_t of_extra = (of_code > 0) ? seq->match_offset - (1U << of_code) : 0;
+
+  // Number of extra bits for each
+  unsigned ll_nb_extra = ll_extra_bits[ll_code];
+  unsigned ml_nb_extra = ml_extra_bits[ml_code];
+  unsigned of_nb_extra = of_code; // Offset extra bits = of_code
+
+  // Initial states: find a valid state index in the FSE table that decodes
+  // to the desired symbol code.
+  //
+  // Build predefined decoding tables and search for valid states.
+  // For predefined tables: LL log=6 (64 entries), OF log=5 (32), ML log=6 (64)
+  zstd_fse_entry_t ll_table[64];
+  zstd_fse_entry_t of_table[32];
+  zstd_fse_entry_t ml_table[64];
+
+  zstd_fse_build_predefined_ll_table(ll_table, 64);
+  zstd_fse_build_predefined_of_table(of_table, 32);
+  zstd_fse_build_predefined_ml_table(ml_table, 64);
+
+  // Find initial states by searching for entries that decode to our symbol
+  uint16_t ll_state = 0, of_state = 0, ml_state = 0;
+
+  for (int i = 0; i < 64; i++) {
+    if (ll_table[i].symbol == ll_code) {
+      ll_state = (uint16_t)i;
+      break;
+    }
+  }
+  for (int i = 0; i < 32; i++) {
+    if (of_table[i].symbol == of_code) {
+      of_state = (uint16_t)i;
+      break;
+    }
+  }
+  for (int i = 0; i < 64; i++) {
+    if (ml_table[i].symbol == ml_code) {
+      ml_state = (uint16_t)i;
+      break;
+    }
+  }
+
+  // Suppress unused variable warnings (symbols used for multi-sequence
+  // encoding)
+  (void)ll_symbols;
+  (void)of_symbols;
+  (void)ml_symbols;
+
+  // 5. Build bitstream using backward stream format
+  //
+  // Decoder reads from HIGH to LOW bit positions:
+  //   1. Initial states: LL(6), OF(5), ML(6)
+  //   2. For seq 0 (only sequence): OF_extra, ML_extra, LL_extra
+  //   3. No state updates (last sequence)
+  //
+  // With add_bits adding at HIGH end, bits added FIRST end up at LOW positions.
+  // So we add in REVERSE order: extra_bits, then states (ML, OF, LL), then
+  // marker.
+
+  size_t max_bitstream = 32; // Conservative estimate for 1 sequence
   if (pos + max_bitstream > output_cap) {
     return GCOMP_ERR_LIMIT;
   }
@@ -1053,74 +1163,26 @@ gcomp_status_t zstd_sequences_encode_predefined(
   zstd_enc_bit_writer_t bw;
   zstd_enc_bw_init(&bw, output + pos, output_cap - pos);
 
-  // Initial FSE states (we'll encode these first but they appear last)
-  // Start with state 0 for all
-  uint16_t ll_state = 0;
-  uint16_t of_state = 0;
-  uint16_t ml_state = 0;
-
-  // Process sequences in REVERSE order (bitstream is written backwards)
-  for (size_t i = num_sequences; i > 0; i--) {
-    const zstd_sequence_t * seq = &sequences[i - 1];
-
-    // Get codes for this sequence
-    uint8_t ll_code = zstd_enc_get_ll_code(seq->lit_length);
-    uint8_t ml_code = zstd_enc_get_ml_code(seq->match_length);
-    uint8_t of_code = zstd_enc_get_of_code(seq->match_offset);
-
-    // Calculate extra bits
-    uint32_t ll_extra = seq->lit_length - ll_baseline[ll_code];
-    uint32_t ml_extra = seq->match_length - ml_baseline[ml_code];
-    uint32_t of_extra = (of_code > 0) ? seq->match_offset - (1U << of_code) : 0;
-
-    // Write state updates (except for last sequence in reverse = first in
-    // forward)
-    if (i < num_sequences) {
-      // Encode current states using FSE
-      // OF state
-      zstd_enc_bw_add_bits(&bw,
-          of_state & ((1U << of_enc_table[of_state].delta_nb_bits) - 1),
-          of_enc_table[of_state].delta_nb_bits);
-      // ML state
-      zstd_enc_bw_add_bits(&bw,
-          ml_state & ((1U << ml_enc_table[ml_state].delta_nb_bits) - 1),
-          ml_enc_table[ml_state].delta_nb_bits);
-      // LL state
-      zstd_enc_bw_add_bits(&bw,
-          ll_state & ((1U << ll_enc_table[ll_state].delta_nb_bits) - 1),
-          ll_enc_table[ll_state].delta_nb_bits);
-    }
-
-    // Write extra bits (in reverse order: LL, ML, OF)
-    if (ll_extra_bits[ll_code] > 0) {
-      zstd_enc_bw_add_bits(&bw, ll_extra, ll_extra_bits[ll_code]);
-    }
-    if (ml_extra_bits[ml_code] > 0) {
-      zstd_enc_bw_add_bits(&bw, ml_extra, ml_extra_bits[ml_code]);
-    }
-    if (of_code > 0) {
-      zstd_enc_bw_add_bits(&bw, of_extra, of_code);
-    }
-
-    // Update FSE states for next iteration (going backwards)
-    ll_state = ll_tt_start[ll_code];
-    ml_state = ml_tt_start[ml_code];
-    of_state = of_tt_start[of_code];
-
-    zstd_enc_bw_flush_bits(&bw);
+  // Add extra bits FIRST (decoder reads these last)
+  // Order: LL, ML, OF (reverse of decoder read order: OF, ML, LL)
+  if (ll_nb_extra > 0) {
+    zstd_enc_bw_add_bits(&bw, ll_extra, ll_nb_extra);
+  }
+  if (ml_nb_extra > 0) {
+    zstd_enc_bw_add_bits(&bw, ml_extra, ml_nb_extra);
+  }
+  if (of_nb_extra > 0) {
+    zstd_enc_bw_add_bits(&bw, of_extra, of_nb_extra);
   }
 
-  // Write initial states (these appear last in the bitstream)
-  zstd_enc_bw_add_bits(&bw, ml_state, 6); // ML initial state
-  zstd_enc_bw_add_bits(&bw, of_state, 5); // OF initial state
-  zstd_enc_bw_add_bits(&bw, ll_state, 6); // LL initial state
+  // Add initial states (decoder reads these first, so we add them after extras)
+  // Order: ML, OF, LL (reverse of decoder read order: LL, OF, ML)
+  zstd_enc_bw_add_bits(&bw, ml_state, 6);
+  zstd_enc_bw_add_bits(&bw, of_state, 5);
+  zstd_enc_bw_add_bits(&bw, ll_state, 6);
 
-  // Close bitstream (adds marker and flushes)
+  // Close bitstream - adds marker at HIGH end and flushes
   size_t bitstream_size = zstd_enc_bw_close(&bw);
-
-  // Move bitstream to correct position (it was written from end)
-  memmove(output + pos, output + pos + (output_cap - pos) - bitstream_size,
-      bitstream_size);
 
   *output_len_out = pos + bitstream_size;
   return GCOMP_OK;

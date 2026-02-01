@@ -70,7 +70,10 @@ extern "C" {
 #define ZSTD_FHD_FCS_FLAG_MASK 0xC0       ///< Frame content size flag (2 bits)
 #define ZSTD_FHD_FCS_FLAG_SHIFT 6
 
-// Block header bits
+// Block header bits (per RFC 8878 Section 3.1.1.2)
+// Bit 0: Last_Block flag
+// Bits 1-2: Block_Type (0=raw, 1=RLE, 2=compressed, 3=reserved)
+// Bits 3-23: Block_Size (21 bits)
 #define ZSTD_BLOCK_LAST_FLAG 0x01 ///< Last block flag (bit 0)
 #define ZSTD_BLOCK_TYPE_MASK 0x06 ///< Block type (bits 1-2)
 #define ZSTD_BLOCK_TYPE_SHIFT 1

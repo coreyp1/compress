@@ -123,6 +123,9 @@ gcomp_status_t zstd_block_decompress_compressed(zstd_decoder_state_t * state,
 // Maximum sequences per block (block_size / min_match)
 #define MAX_SEQUENCES_PER_BLOCK (ZSTD_BLOCK_SIZE_MAX / 3)
 
+// Minimum input size to attempt compression (small blocks rarely compress well)
+#define MIN_COMPRESSION_SIZE 64
+
 gcomp_status_t zstd_block_compress(zstd_encoder_state_t * state,
     const uint8_t * input, size_t input_len, uint8_t * output,
     size_t output_cap, size_t * output_len_out, uint8_t * type_out) {
@@ -159,17 +162,50 @@ gcomp_status_t zstd_block_compress(zstd_encoder_state_t * state,
     return GCOMP_OK;
   }
 
-  // TODO: Implement compressed blocks with proper FSE encoding
-  // For now, compressed blocks are disabled due to FSE encoding complexity.
-  // The match finder and sequence generation work, but the FSE bitstream
-  // encoding needs to be properly implemented.
-  //
-  // When enabled, this section would:
-  // 1. Generate sequences using match finder
-  // 2. Encode literals section
-  // 3. Encode sequences section with FSE
-  // 4. Compare compressed size to raw size
-  (void)state; // Suppress unused warning
+  // Try compressed block if we have a match finder and sufficient input
+  // Note: Currently only single-sequence blocks are fully supported.
+  // Multi-sequence FSE encoding is still in development.
+  if (state && state->match_finder && state->seq_buffer &&
+      state->literals_buffer && input_len >= MIN_COMPRESSION_SIZE) {
+    // Generate sequences using match finder
+    size_t num_sequences = 0;
+    size_t literals_size = 0;
+
+    gcomp_status_t status = zstd_mf_generate_sequences(state->match_finder,
+        input, input_len, state->seq_buffer, state->seq_buffer_capacity,
+        &num_sequences, state->literals_buffer, &literals_size,
+        &state->rep_offset_1, &state->rep_offset_2, &state->rep_offset_3);
+
+    if (status == GCOMP_OK && num_sequences > 0) {
+      // We have sequences - try to compress
+
+      // Encode literals section (raw for now - Huffman encoding is future work)
+      size_t literals_encoded_size = 0;
+      status = zstd_literals_encode_raw(state->literals_buffer, literals_size,
+          output, output_cap, &literals_encoded_size);
+
+      if (status == GCOMP_OK) {
+        // Encode sequences section
+        size_t sequences_encoded_size = 0;
+        status = zstd_sequences_encode_predefined(state->seq_buffer,
+            num_sequences, output + literals_encoded_size,
+            output_cap - literals_encoded_size, &sequences_encoded_size);
+
+        if (status == GCOMP_OK) {
+          size_t compressed_size =
+              literals_encoded_size + sequences_encoded_size;
+
+          // Only use compressed block if it's actually smaller
+          if (compressed_size < input_len) {
+            *output_len_out = compressed_size;
+            *type_out = ZSTD_BLOCK_TYPE_COMPRESSED;
+            return GCOMP_OK;
+          }
+        }
+      }
+    }
+    // If compression failed or didn't help, fall through to raw block
+  }
 
   // Use raw block (no compression or compression not beneficial)
   if (input_len > output_cap) {
