@@ -184,12 +184,18 @@ static gcomp_status_t set_entry(gcomp_options_t * opts, const char * key,
       const void * data;
       size_t size;
     } * bytes = value_ptr;
-    entry->value.bytes.data = gcomp_malloc(alloc, bytes->size);
-    if (!entry->value.bytes.data) {
-      return GCOMP_ERR_MEMORY;
+    // Handle empty bytes (size 0) - no allocation or copy needed
+    if (bytes->size == 0) {
+      entry->value.bytes.data = NULL;
+      entry->value.bytes.size = 0;
+    } else {
+      entry->value.bytes.data = gcomp_malloc(alloc, bytes->size);
+      if (!entry->value.bytes.data) {
+        return GCOMP_ERR_MEMORY;
+      }
+      memcpy(entry->value.bytes.data, bytes->data, bytes->size);
+      entry->value.bytes.size = bytes->size;
     }
-    memcpy(entry->value.bytes.data, bytes->data, bytes->size);
-    entry->value.bytes.size = bytes->size;
     break;
   }
   case GCOMP_OPT_FLOAT:
