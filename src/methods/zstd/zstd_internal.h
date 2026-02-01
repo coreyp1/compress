@@ -173,6 +173,16 @@ typedef struct {
 } zstd_fse_entry_t;
 
 //
+// FSE Decoder State
+//
+
+typedef struct {
+  uint16_t state;                 ///< Current FSE state
+  const zstd_fse_entry_t * table; ///< Pointer to decoding table
+  unsigned table_log;             ///< Log2 of table size
+} zstd_fse_state_t;
+
+//
 // Huffman Decoding Table Entry
 //
 
@@ -304,11 +314,15 @@ typedef struct {
   size_t fse_lit_table_size;
   size_t fse_match_table_size;
   size_t fse_offset_table_size;
+  unsigned fse_ll_log; ///< Literal length FSE table log
+  unsigned fse_ml_log; ///< Match length FSE table log
+  unsigned fse_of_log; ///< Offset FSE table log
 
   // Huffman decoding table
   zstd_huf_entry_t * huf_table;
   size_t huf_table_size;
-  bool huf_table_valid; ///< For treeless literals
+  unsigned huf_max_bits; ///< Max bits for current Huffman table
+  bool huf_table_valid;  ///< For treeless literals
 
   // Options
   bool concat_enabled;
@@ -477,6 +491,174 @@ gcomp_status_t zstd_block_decompress_compressed(zstd_decoder_state_t * state,
 gcomp_status_t zstd_block_compress(zstd_encoder_state_t * state,
     const uint8_t * input, size_t input_len, uint8_t * output,
     size_t output_cap, size_t * output_len_out, uint8_t * type_out);
+
+//
+// Internal API: FSE (Finite State Entropy)
+//
+
+/**
+ * @brief Read FSE table header and decode normalized counts.
+ *
+ * @param src Source data
+ * @param src_size Source size
+ * @param norm_counts Output: normalized counts for each symbol
+ * @param max_symbol_out Output: maximum symbol value
+ * @param table_log_out Output: log2 of table size
+ * @param bytes_read_out Output: bytes consumed from source
+ * @return GCOMP_OK on success
+ */
+gcomp_status_t zstd_fse_read_table_header(const uint8_t * src, size_t src_size,
+    int16_t * norm_counts, unsigned * max_symbol_out, unsigned * table_log_out,
+    size_t * bytes_read_out);
+
+/**
+ * @brief Build complete FSE decoding table from bitstream.
+ *
+ * @param src Source data containing table header
+ * @param src_size Source size
+ * @param table Output: decoding table
+ * @param table_capacity Table capacity (must be >= 1 << table_log)
+ * @param table_log_out Output: log2 of table size
+ * @param max_symbol_out Output: maximum symbol value
+ * @param bytes_read_out Output: bytes consumed from source
+ * @return GCOMP_OK on success
+ */
+gcomp_status_t zstd_fse_build_decoding_table(const uint8_t * src,
+    size_t src_size, zstd_fse_entry_t * table, size_t table_capacity,
+    unsigned * table_log_out, unsigned * max_symbol_out,
+    size_t * bytes_read_out);
+
+/**
+ * @brief Build predefined literal length FSE table.
+ */
+gcomp_status_t zstd_fse_build_predefined_ll_table(
+    zstd_fse_entry_t * table, size_t table_capacity);
+
+/**
+ * @brief Build predefined match length FSE table.
+ */
+gcomp_status_t zstd_fse_build_predefined_ml_table(
+    zstd_fse_entry_t * table, size_t table_capacity);
+
+/**
+ * @brief Build predefined offset FSE table.
+ */
+gcomp_status_t zstd_fse_build_predefined_of_table(
+    zstd_fse_entry_t * table, size_t table_capacity);
+
+//
+// Internal API: Huffman Decoding
+//
+
+/**
+ * @brief Read Huffman table from bitstream.
+ *
+ * Parses the Huffman tree description and builds a decoding table.
+ *
+ * @param src Source data containing Huffman tree description
+ * @param src_size Source size
+ * @param table Output: decoding table (must be at least 2^11 entries)
+ * @param table_capacity Table capacity
+ * @param max_bits_out Output: maximum code length (table log)
+ * @param bytes_read_out Output: bytes consumed from source
+ * @return GCOMP_OK on success
+ */
+gcomp_status_t zstd_huf_read_table(const uint8_t * src, size_t src_size,
+    zstd_huf_entry_t * table, size_t table_capacity, unsigned * max_bits_out,
+    size_t * bytes_read_out);
+
+/**
+ * @brief Decode a single Huffman stream.
+ *
+ * @param table Huffman decoding table
+ * @param max_bits Table log (maximum code length)
+ * @param src Source compressed data
+ * @param src_size Source size
+ * @param dst Destination buffer
+ * @param dst_size Destination capacity
+ * @param decoded_size_out Output: actual bytes decoded
+ * @return GCOMP_OK on success
+ */
+gcomp_status_t zstd_huf_decode_1stream(const zstd_huf_entry_t * table,
+    unsigned max_bits, const uint8_t * src, size_t src_size, uint8_t * dst,
+    size_t dst_size, size_t * decoded_size_out);
+
+/**
+ * @brief Decode 4 interleaved Huffman streams.
+ *
+ * Used for large literal sections (> 1024 bytes typically).
+ *
+ * @param table Huffman decoding table
+ * @param max_bits Table log (maximum code length)
+ * @param src Source compressed data
+ * @param src_size Source size
+ * @param jump_table Array of 3 offsets for streams 2, 3, 4
+ * @param dst Destination buffer
+ * @param dst_size Destination capacity
+ * @param decoded_size_out Output: actual bytes decoded
+ * @return GCOMP_OK on success
+ */
+gcomp_status_t zstd_huf_decode_4streams(const zstd_huf_entry_t * table,
+    unsigned max_bits, const uint8_t * src, size_t src_size,
+    const uint32_t * jump_table, uint8_t * dst, size_t dst_size,
+    size_t * decoded_size_out);
+
+//
+// Internal API: Literals Section Decoding
+//
+
+// Maximum Huffman table size
+#define HUF_MAX_TABLE_SIZE 2048
+
+/**
+ * @brief Decode literals section from compressed block.
+ *
+ * Handles all four literals types: raw, RLE, compressed, treeless.
+ *
+ * @param state Decoder state (for Huffman table storage)
+ * @param src Source data (literals section)
+ * @param src_size Source size
+ * @param dst Destination buffer for decoded literals
+ * @param dst_capacity Destination capacity
+ * @param regenerated_size_out Output: actual decoded size
+ * @param bytes_read_out Output: bytes consumed from source
+ * @return GCOMP_OK on success
+ */
+gcomp_status_t zstd_literals_decode(zstd_decoder_state_t * state,
+    const uint8_t * src, size_t src_size, uint8_t * dst, size_t dst_capacity,
+    size_t * regenerated_size_out, size_t * bytes_read_out);
+
+/**
+ * @brief Get size of literals section header.
+ *
+ * @param src Source data
+ * @param src_size Source size
+ * @return Header size in bytes, or 0 on error
+ */
+size_t zstd_literals_header_size(const uint8_t * src, size_t src_size);
+
+//
+// Internal API: Sequences Section Decoding
+//
+
+/**
+ * @brief Decode sequences section and execute to produce output.
+ *
+ * @param state Decoder state (for FSE tables and repeat offsets)
+ * @param src Source data (sequences section)
+ * @param src_size Source size
+ * @param literals Decoded literals from literals section
+ * @param literals_size Size of literals buffer
+ * @param dst Destination buffer for output
+ * @param dst_capacity Destination capacity
+ * @param output_size_out Output: actual output size
+ * @param bytes_read_out Output: bytes consumed from source
+ * @return GCOMP_OK on success
+ */
+gcomp_status_t zstd_sequences_decode(zstd_decoder_state_t * state,
+    const uint8_t * src, size_t src_size, const uint8_t * literals,
+    size_t literals_size, uint8_t * dst, size_t dst_capacity,
+    size_t * output_size_out, size_t * bytes_read_out);
 
 #ifdef __cplusplus
 }
