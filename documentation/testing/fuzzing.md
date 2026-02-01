@@ -135,6 +135,61 @@ make fuzz-gzip-roundtrip
 
 **Recommendation**: Run both deflate and gzip harnesses. Deflate harnesses test compression core; gzip harnesses test wrapper and format handling.
 
+## LZ4 Fuzz Targets
+
+The LZ4 method has dedicated fuzz harnesses that test the LZ4 Frame Format implementation:
+
+### LZ4 Decoder Fuzzer (`fuzz-lz4-decoder`)
+
+Tests the LZ4 decoder with arbitrary input bytes. This finds:
+- Frame header parsing bugs (magic, FLG, BD, content size, dictionary ID, header checksum)
+- Block decompression issues (token parsing, match offsets, literal copies)
+- Checksum validation bugs (block and content checksums)
+- Limit enforcement (output size, expansion ratio, memory)
+- Concatenated frame handling (when `lz4.concat` enabled)
+
+```bash
+make fuzz-lz4-decoder
+```
+
+### LZ4 Encoder Fuzzer (`fuzz-lz4-encoder`)
+
+Tests the LZ4 encoder with arbitrary plaintext and various options. This finds:
+- Block compression bugs (hash table, match finding, literal encoding)
+- Frame header generation issues
+- Checksum computation bugs
+- Memory safety with different block sizes
+- Edge cases in option handling
+
+```bash
+make fuzz-lz4-encoder
+```
+
+### LZ4 Roundtrip Fuzzer (`fuzz-lz4-roundtrip`)
+
+Compresses input as LZ4, then decompresses, and verifies the output matches. This is the most powerful test because any mismatch is definitely a bug.
+
+Tests include:
+- Various option combinations (checksums, block sizes, independent vs dependent blocks)
+- Streaming patterns (single-shot vs chunked processing)
+- Data integrity across the full encode/decode cycle
+
+```bash
+make fuzz-lz4-roundtrip
+```
+
+### LZ4 Fuzzing Considerations
+
+| Aspect | Notes |
+|--------|-------|
+| Block format | LZ4 uses a simpler, faster compression format than DEFLATE |
+| Match window | 64KB sliding window (vs DEFLATE's 32KB) |
+| Checksums | Optional per-block and content xxHash32 checksums |
+| Block modes | Independent blocks (parallel-friendly) vs dependent blocks (better ratio) |
+| Concatenation | Multiple frames can be concatenated; decoder handles with `lz4.concat` option |
+
+**Recommendation**: The roundtrip fuzzer is most effective for LZ4 because it tests the full encode/decode path. The decoder fuzzer is important for security testing with untrusted input.
+
 ## Understanding AFL++ Output
 
 When you run AFL++, you'll see a status screen:
@@ -333,6 +388,9 @@ fuzz/
 ├── fuzz_gzip_decoder.c      # Gzip decoder fuzz harness
 ├── fuzz_gzip_encoder.c      # Gzip encoder fuzz harness
 ├── fuzz_gzip_roundtrip.c    # Gzip roundtrip fuzz harness
+├── fuzz_lz4_decoder.c       # LZ4 decoder fuzz harness
+├── fuzz_lz4_encoder.c       # LZ4 encoder fuzz harness
+├── fuzz_lz4_roundtrip.c     # LZ4 roundtrip fuzz harness
 ├── generate_corpus.c        # Seed corpus generator
 ├── corpus/                  # Seed inputs (generated)
 │   ├── decoder/             # Raw deflate test inputs
@@ -340,7 +398,10 @@ fuzz/
 │   ├── roundtrip/           # Plaintext for deflate roundtrip
 │   ├── gzip_decoder/        # Gzip format test inputs
 │   ├── gzip_encoder/        # Plaintext inputs for gzip
-│   └── gzip_roundtrip/      # Plaintext for gzip roundtrip
+│   ├── gzip_roundtrip/      # Plaintext for gzip roundtrip
+│   ├── lz4_decoder/         # LZ4 frame format test inputs
+│   ├── lz4_encoder/         # Plaintext inputs for LZ4
+│   └── lz4_roundtrip/       # Plaintext for LZ4 roundtrip
 └── findings/                # AFL++ output (generated)
     ├── decoder/
     │   ├── crashes/         # Crash-inducing inputs
@@ -350,7 +411,10 @@ fuzz/
     ├── roundtrip/
     ├── gzip_decoder/
     ├── gzip_encoder/
-    └── gzip_roundtrip/
+    ├── gzip_roundtrip/
+    ├── lz4_decoder/
+    ├── lz4_encoder/
+    └── lz4_roundtrip/
 ```
 
 ## References

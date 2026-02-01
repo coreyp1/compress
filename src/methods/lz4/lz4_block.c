@@ -55,12 +55,19 @@
  * 2. **Greedy matching**: At each position, check if hash table has a match
  *    - Match must be within 64KB window
  *    - Match must be at least 4 bytes
- *    - Extend match as far as possible
+ *    - Extend match as far as possible (but not past `match_limit`)
  *
  * 3. **Literal accumulation**: Non-matching bytes accumulate as literals
  *
- * 4. **Last literals**: Final 12 bytes are always emitted as literals
- *    (ensures safe memory access during match extension)
+ * 4. **Last literals requirement** (critical for spec compliance):
+ *    - The LZ4 spec mandates: "The last sequence is incomplete, and stops
+ *      right after literals field."
+ *    - This means the final sequence MUST be literals-only (no match).
+ *    - We enforce this by:
+ *      a. Not starting matches in the last 12 bytes (MFLIMIT - for safe reads)
+ *      b. Not extending matches past `src_end - 5` (LZ4_LAST_LITERALS)
+ *      c. Always emitting a final literals-only sequence with >= 5 bytes
+ *    - Violating this produces output that reference decoders reject.
  *
  * The algorithm prioritizes speed over compression ratio. For better
  * compression, consider using higher-level strategies like HC (hash chains)

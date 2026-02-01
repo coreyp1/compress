@@ -196,7 +196,7 @@ myfile.c:42:15: runtime error: signed integer overflow: 2147483647 + 1 cannot be
 
 ## Oracle Tests
 
-Oracle tests compare our implementation against Python's zlib library to verify correctness.
+Oracle tests compare our implementation against external reference implementations to verify correctness. These tests cross-validate that our encoder produces output that external decoders can read, and vice versa.
 
 ### Running Oracle Tests
 
@@ -204,7 +204,7 @@ Oracle tests compare our implementation against Python's zlib library to verify 
 # Oracle tests run automatically with make test
 make test
 
-# Skip oracle tests (if Python unavailable)
+# Skip oracle tests (if dependencies unavailable)
 GCOMP_SKIP_ORACLE_TESTS=1 make test
 
 # Verbose oracle test output
@@ -213,8 +213,38 @@ GCOMP_ORACLE_VERBOSE=1 make test
 
 ### Requirements
 
+**For gzip/deflate oracle tests:**
 - Python 3 with zlib module (standard library)
-- Tests skip gracefully if Python is unavailable
+
+**For LZ4 oracle tests (optional):**
+- Python 3 with lz4 module: `pip3 install lz4`
+- LZ4 CLI tools: `sudo apt install lz4`
+
+Tests skip gracefully if dependencies are unavailable.
+
+### What Oracle Tests Verify
+
+| Method | External Tools | Tests |
+|--------|----------------|-------|
+| gzip | Python zlib | Compress with us, decompress with Python; compress with Python, decompress with us |
+| lz4 | Python lz4.frame, lz4/unlz4 CLI | Bidirectional cross-validation, checksum verification, concatenated frames |
+
+### LZ4 Oracle Tests
+
+The LZ4 oracle tests perform extensive cross-validation:
+
+```bash
+# Run just the LZ4 oracle tests
+./build/linux/release/apps/testLz4_oracle
+```
+
+**Tests include:**
+- Golden vectors (verified against Python lz4 v4.4.5)
+- Our encoder → Python decoder (various data patterns and sizes)
+- Python encoder → Our decoder (various options and checksums)
+- CLI tools validation (lz4/unlz4 if installed)
+- Concatenated frame handling
+- Content and block checksum verification
 
 ## Stress Tests
 
@@ -250,31 +280,57 @@ See [fuzzing.md](fuzzing.md) for comprehensive fuzz testing documentation.
 
 ```
 tests/
-├── test_options.cpp          # Options API tests
-├── test_registry.cpp         # Registry tests
-├── test_stream.cpp           # Stream infrastructure tests
-├── test_limits.cpp           # Safety limits tests
-├── test_crc32.cpp            # CRC32 utility tests
-├── test_buffer_wrappers.cpp  # Buffer convenience API tests
-├── test_callback_api.cpp     # Callback streaming API tests
-├── test_schema.cpp           # Option schema introspection tests
-├── test_autoreg.cpp          # Auto-registration tests
-├── test_passthru.cpp         # Pass-thru method tests
-├── test_deflate_bitio.cpp    # Bit I/O primitives tests
-├── test_deflate_huffman.cpp  # Huffman table tests
-├── test_deflate_decoder.cpp  # Deflate decoder tests
-├── test_deflate_encoder.cpp  # Deflate encoder tests
-├── test_deflate_malformed.cpp # Malformed input tests
-├── test_expansion_ratio.cpp  # Decompression bomb protection tests
-├── test_state_machine.cpp    # State machine robustness tests
-├── test_oracle.cpp           # Cross-tool validation tests
-├── test_stress.cpp           # Stress and stability tests
-├── test_helpers.h            # Test utility functions
-├── test_helpers.cpp          # Test utility implementations
-├── passthru_method.h         # Pass-thru method for testing
-└── data/                     # Test data files
-    └── deflate/
-        └── golden_vectors.h  # Known good test vectors
+├── core/                         # Core infrastructure tests
+│   ├── test_allocator.cpp        # Memory allocator tests
+│   ├── test_buffer_wrappers.cpp  # Buffer convenience API tests
+│   ├── test_callback_api.cpp     # Callback streaming API tests
+│   ├── test_crc32.cpp            # CRC32 utility tests
+│   ├── test_errors.cpp           # Error handling tests
+│   ├── test_job_queue.cpp        # Job queue tests
+│   ├── test_limits.cpp           # Safety limits tests
+│   ├── test_options.cpp          # Options API tests
+│   ├── test_registry.cpp         # Registry tests
+│   ├── test_schema.cpp           # Option schema introspection tests
+│   ├── test_state_machine.cpp    # State machine robustness tests
+│   ├── test_stream.cpp           # Stream infrastructure tests
+│   ├── test_thread_pool.cpp      # Thread pool tests
+│   └── test_xxhash32.cpp         # xxHash32 utility tests
+├── integration/                  # Integration tests
+│   ├── test_autoreg.cpp          # Auto-registration tests
+│   ├── test_expansion_ratio.cpp  # Decompression bomb protection tests
+│   ├── test_oracle.cpp           # General cross-tool validation
+│   ├── test_passthru.cpp         # Pass-thru method tests
+│   └── test_stress.cpp           # Stress and stability tests
+├── methods/
+│   ├── deflate/                  # Deflate method tests
+│   │   ├── test_deflate_bitio.cpp
+│   │   ├── test_deflate_decoder.cpp
+│   │   ├── test_deflate_encoder.cpp
+│   │   ├── test_deflate_huffman.cpp
+│   │   ├── test_deflate_malformed.cpp
+│   │   └── data/golden_vectors.h
+│   ├── gzip/                     # Gzip method tests
+│   │   ├── test_gzip_*.cpp       # (various gzip tests)
+│   │   └── data/golden_vectors.h
+│   └── lz4/                      # LZ4 method tests
+│       ├── test_lz4_concat.cpp   # Concatenated frame tests
+│       ├── test_lz4_corruption.cpp # Corruption handling tests
+│       ├── test_lz4_decoder.cpp  # Decoder tests
+│       ├── test_lz4_encoder.cpp  # Encoder tests
+│       ├── test_lz4_format.cpp   # Frame format tests
+│       ├── test_lz4_limits.cpp   # Limit enforcement tests
+│       ├── test_lz4_options.cpp  # Option handling tests
+│       ├── test_lz4_oracle.cpp   # Cross-tool validation (Python lz4, CLI)
+│       ├── test_lz4_parallel.cpp # Parallel compression tests
+│       ├── test_lz4_register.cpp # Registration tests
+│       ├── test_lz4_reset.cpp    # Encoder/decoder reset tests
+│       ├── test_lz4_robustness.cpp # Robustness tests
+│       ├── test_lz4_roundtrip.cpp # Encode/decode roundtrip tests
+│       ├── test_lz4_streaming.cpp # Streaming API tests
+│       └── data/golden_vectors.h # Verified test vectors (Python lz4 v4.4.5)
+└── common/
+    ├── test_helpers.h            # Test utility functions
+    └── test_helpers.cpp          # Test utility implementations
 ```
 
 ## Continuous Integration
