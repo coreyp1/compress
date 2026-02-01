@@ -98,6 +98,7 @@ extern "C" {
 #define LZ4_BLOCK_UNCOMPRESSED_FLAG 0x80000000U ///< High bit = uncompressed
 #define LZ4_BLOCK_SIZE_MASK 0x7FFFFFFFU         ///< Size without flag bit
 #define LZ4_MIN_MATCH 4                         ///< Minimum match length
+#define LZ4_LAST_LITERALS 5                     ///< Minimum literals in last sequence
 #define LZ4_HISTORY_SIZE 65536                  ///< History window size (64KB)
 
 // Limit defaults

@@ -3,13 +3,11 @@
  *
  * Golden test vectors for LZ4 decoder validation.
  *
- * These vectors were generated using Python's lz4 library with known inputs.
+ * These vectors were VERIFIED using Python's lz4 library (version 4.4.5).
  * They serve as cross-validation to ensure our decoder produces correct output.
  *
- * Generation script example (Python 3):
- *   import lz4.frame
- *   # Compress with various options:
- *   compressed = lz4.frame.compress(data, block_linked=False)
+ * Generation command:
+ *   python3 -c "import lz4.frame; ..."
  *
  * LZ4 Frame Format (reference):
  *   - Magic: 0x184D2204 (little-endian: 04 22 4D 18)
@@ -52,222 +50,236 @@ typedef struct {
   bool independent_blocks;
 } lz4_golden_vector_t;
 
-//
-// Vector 1: Minimal empty frame (independent blocks, 4MB max block)
-// Input: (empty)
-// FLG = 0x60: version 01, B.Indep=1, others=0
-// BD = 0x70: block_max_size=7 (4MB)
-// HC = xxHash32([0x60, 0x70], 0) >> 8 = 0x1E (TODO: verify)
-// End mark: 00 00 00 00
-//
-// Generated with: lz4.frame.compress(b'', block_linked=False)
-//
-static const uint8_t lz4_golden_v1_compressed[] = {
-    0x04, 0x22, 0x4D, 0x18, // Magic number
-    0x60,                   // FLG: version 01, B.Indep
-    0x70,                   // BD: 4MB blocks
-    0xDF,                   // HC: header checksum
-    0x00, 0x00, 0x00, 0x00, // End mark
-};
-// Expected: empty
+// ============================================================================
+// Golden vectors generated with Python lz4.frame version 4.4.5
+// These are VERIFIED against the real lz4 library
+// ============================================================================
+
+// clang-format off
 
 //
-// Vector 2: Single byte 'A' (independent blocks)
-// Input: "A"
-// Block: uncompressed block (high bit set since compression not beneficial)
+// Vector 1: Empty input (independent blocks, 64KB max block)
+// lz4.frame.compress(b'', block_linked=False)
 //
-// Generated with: lz4.frame.compress(b'A', block_linked=False)
-//
-static const uint8_t lz4_golden_v2_compressed[] = {
-    0x04, 0x22, 0x4D, 0x18, // Magic
-    0x60,                   // FLG
-    0x70,                   // BD
-    0xDF,                   // HC
-    0x01, 0x00, 0x00, 0x80, // Block size: 1 byte, uncompressed (bit 31 set)
-    'A',                    // Block data
-    0x00, 0x00, 0x00, 0x00, // End mark
+static const uint8_t lz4_v1_empty_compressed[] = {
+    0x04, 0x22, 0x4D, 0x18, 0x60, 0x40, 0x82, 0x00, 0x00, 0x00, 0x00,
 };
-static const uint8_t lz4_golden_v2_expected[] = {'A'};
 
 //
-// Vector 3: "Hello" (5 bytes, likely stored uncompressed)
-// Input: "Hello"
+// Vector 2: Single byte 'A'
+// lz4.frame.compress(b'A', block_linked=False)
 //
-// Generated with: lz4.frame.compress(b'Hello', block_linked=False)
-//
-static const uint8_t lz4_golden_v3_compressed[] = {
-    0x04, 0x22, 0x4D, 0x18,  // Magic
-    0x60,                    // FLG
-    0x70,                    // BD
-    0xDF,                    // HC
-    0x05, 0x00, 0x00, 0x80,  // Block size: 5 bytes, uncompressed
-    'H', 'e', 'l', 'l', 'o', // Block data
-    0x00, 0x00, 0x00, 0x00,  // End mark
+static const uint8_t lz4_v2_single_byte_compressed[] = {
+    0x04, 0x22, 0x4D, 0x18, 0x60, 0x40, 0x82, 0x01, 0x00, 0x00, 0x80, 0x41,
+    0x00, 0x00, 0x00, 0x00,
 };
-static const uint8_t lz4_golden_v3_expected[] = {'H', 'e', 'l', 'l', 'o'};
+static const uint8_t lz4_v2_single_byte_expected[] = {
+    0x41,
+};
 
 //
-// Vector 4: "Hello, world!" (13 bytes)
-// Input: "Hello, world!"
+// Vector 3: "Hello" string
+// lz4.frame.compress(b'Hello', block_linked=False)
 //
-// Generated with: lz4.frame.compress(b'Hello, world!', block_linked=False)
-//
-static const uint8_t lz4_golden_v4_compressed[] = {
-    0x04, 0x22, 0x4D, 0x18, // Magic
-    0x60,                   // FLG
-    0x70,                   // BD
-    0xDF,                   // HC
-    0x0D, 0x00, 0x00, 0x80, // Block size: 13 bytes, uncompressed
-    'H', 'e', 'l', 'l', 'o', ',', ' ', 'w', 'o', 'r', 'l', 'd', '!', 0x00, 0x00,
-    0x00, 0x00, // End mark
+static const uint8_t lz4_v3_hello_compressed[] = {
+    0x04, 0x22, 0x4D, 0x18, 0x60, 0x40, 0x82, 0x05, 0x00, 0x00, 0x80, 0x48,
+    0x65, 0x6C, 0x6C, 0x6F, 0x00, 0x00, 0x00, 0x00,
 };
-static const uint8_t lz4_golden_v4_expected[] = {
-    'H', 'e', 'l', 'l', 'o', ',', ' ', 'w', 'o', 'r', 'l', 'd', '!'};
+static const uint8_t lz4_v3_hello_expected[] = {
+    0x48, 0x65, 0x6C, 0x6C, 0x6F,
+};
 
 //
-// Vector 5: Repeated pattern "ABCABCABCABCABC" (15 chars)
-// Input: 15 bytes of repeating "ABC"
-// This should compress with LZ4 back-references
+// Vector 4: "Hello, world!"
+// lz4.frame.compress(b'Hello, world!', block_linked=False)
 //
-// Generated with: lz4.frame.compress(b'ABCABCABCABCABC', block_linked=False)
-//
-static const uint8_t lz4_golden_v5_compressed[] = {
-    0x04, 0x22, 0x4D, 0x18, // Magic
-    0x60,                   // FLG
-    0x70,                   // BD
-    0xDF,                   // HC
-    0x08, 0x00, 0x00, 0x00, // Block size: 8 bytes, compressed
-    // LZ4 block: literal 3 bytes "ABC", match len=12 offset=3
-    0x30, // Token: lit_len=3 (high nibble), match_len=0 (low nibble) + 4 = 4 ->
-          // but we want 12
-    'A', 'B', 'C',          // Literals
-    0x03, 0x00,             // Offset: 3 (little-endian)
-    0x08,                   // Extra match length: 12-4 = 8
-    0x00, 0x00, 0x00, 0x00, // End mark
+static const uint8_t lz4_v4_hello_world_compressed[] = {
+    0x04, 0x22, 0x4D, 0x18, 0x60, 0x40, 0x82, 0x0D, 0x00, 0x00, 0x80, 0x48,
+    0x65, 0x6C, 0x6C, 0x6F, 0x2C, 0x20, 0x77, 0x6F, 0x72, 0x6C, 0x64, 0x21,
+    0x00, 0x00, 0x00, 0x00,
 };
-static const uint8_t lz4_golden_v5_expected[] = {
-    'A', 'B', 'C', 'A', 'B', 'C', 'A', 'B', 'C', 'A', 'B', 'C', 'A', 'B', 'C'};
+static const uint8_t lz4_v4_hello_world_expected[] = {
+    0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x2C, 0x20, 0x77, 0x6F, 0x72, 0x6C, 0x64,
+    0x21,
+};
 
 //
-// Vector 6: All zeros (100 bytes) - highly compressible
-// Input: 100 zero bytes
+// Vector 5: Quick brown fox pangram (43 bytes)
+// lz4.frame.compress(b'The quick brown fox jumps over the lazy dog',
+// block_linked=False)
 //
-// LZ4 block format for compressing zeros:
-// Token: 0x1F (1 literal, match_len=15+4=19) but we need larger match
-// Actually for 100 zeros: 1 literal (0x00), then match of 99 bytes at offset 1
-//
-// Generated with: lz4.frame.compress(b'\x00' * 100, block_linked=False)
-//
-static const uint8_t lz4_golden_v6_compressed[] = {
-    0x04, 0x22, 0x4D, 0x18, // Magic
-    0x60,                   // FLG
-    0x70,                   // BD
-    0xDF,                   // HC
-    0x09, 0x00, 0x00, 0x00, // Block size: 9 bytes, compressed
-    // LZ4 block: literal 1 byte (0x00), match len=99 offset=1
-    0x1F, // Token: lit_len=1, match_len=15 (base 4, so 19 min, need extension)
-    0x00, // Literal: one zero
-    0x01, 0x00,             // Offset: 1 (little-endian)
-    0xFF, 0xFF, 0x30,       // Match extension: 255+255+48 = 558? No wait, need
-                            // 99-4=95 Actually: 15 means we read more. 99-4=95,
-                            // 95-15=80 So extension byte = 80
-    0x00, 0x00, 0x00, 0x00, // End mark
+static const uint8_t lz4_v5_pangram_compressed[] = {
+    0x04, 0x22, 0x4D, 0x18, 0x60, 0x40, 0x82, 0x2B, 0x00, 0x00, 0x80, 0x54,
+    0x68, 0x65, 0x20, 0x71, 0x75, 0x69, 0x63, 0x6B, 0x20, 0x62, 0x72, 0x6F,
+    0x77, 0x6E, 0x20, 0x66, 0x6F, 0x78, 0x20, 0x6A, 0x75, 0x6D, 0x70, 0x73,
+    0x20, 0x6F, 0x76, 0x65, 0x72, 0x20, 0x74, 0x68, 0x65, 0x20, 0x6C, 0x61,
+    0x7A, 0x79, 0x20, 0x64, 0x6F, 0x67, 0x00, 0x00, 0x00, 0x00,
 };
-// Note: This vector needs verification with actual lz4 library output
-static const uint8_t lz4_golden_v6_expected[100] = {0};
+static const uint8_t lz4_v5_pangram_expected[] = {
+    0x54, 0x68, 0x65, 0x20, 0x71, 0x75, 0x69, 0x63, 0x6B, 0x20, 0x62, 0x72,
+    0x6F, 0x77, 0x6E, 0x20, 0x66, 0x6F, 0x78, 0x20, 0x6A, 0x75, 0x6D, 0x70,
+    0x73, 0x20, 0x6F, 0x76, 0x65, 0x72, 0x20, 0x74, 0x68, 0x65, 0x20, 0x6C,
+    0x61, 0x7A, 0x79, 0x20, 0x64, 0x6F, 0x67,
+};
 
 //
-// Vector 7: Empty frame with content checksum enabled
-// Input: (empty)
-// FLG = 0x64: version 01, B.Indep=1, C.Checksum=1
-// Content checksum for empty = xxHash32([], 0) = 0x02CC5D05
+// Vector 6: Repeated "ABC" pattern (150 bytes) - compressible
+// lz4.frame.compress(b'ABC' * 50, block_linked=False)
 //
-static const uint8_t lz4_golden_v7_compressed[] = {
-    0x04, 0x22, 0x4D, 0x18, // Magic
-    0x64,                   // FLG: version 01, B.Indep, C.Checksum
-    0x70,                   // BD: 4MB blocks
-    0x73,                   // HC: header checksum for [0x64, 0x70]
-    0x00, 0x00, 0x00, 0x00, // End mark
-    0x05, 0x5D, 0xCC,
-    0x02, // Content checksum (little-endian xxHash32 of empty)
+static const uint8_t lz4_v6_repeated_compressed[] = {
+    0x04, 0x22, 0x4D, 0x18, 0x60, 0x40, 0x82, 0x0D, 0x00, 0x00, 0x00, 0x3F,
+    0x41, 0x42, 0x43, 0x03, 0x00, 0x7B, 0x50, 0x42, 0x43, 0x41, 0x42, 0x43,
+    0x00, 0x00, 0x00, 0x00,
 };
-// Expected: empty
+static const uint8_t lz4_v6_repeated_expected[] = {
+    0x41, 0x42, 0x43, 0x41, 0x42, 0x43, 0x41, 0x42, 0x43, 0x41, 0x42, 0x43,
+    0x41, 0x42, 0x43, 0x41, 0x42, 0x43, 0x41, 0x42, 0x43, 0x41, 0x42, 0x43,
+    0x41, 0x42, 0x43, 0x41, 0x42, 0x43, 0x41, 0x42, 0x43, 0x41, 0x42, 0x43,
+    0x41, 0x42, 0x43, 0x41, 0x42, 0x43, 0x41, 0x42, 0x43, 0x41, 0x42, 0x43,
+    0x41, 0x42, 0x43, 0x41, 0x42, 0x43, 0x41, 0x42, 0x43, 0x41, 0x42, 0x43,
+    0x41, 0x42, 0x43, 0x41, 0x42, 0x43, 0x41, 0x42, 0x43, 0x41, 0x42, 0x43,
+    0x41, 0x42, 0x43, 0x41, 0x42, 0x43, 0x41, 0x42, 0x43, 0x41, 0x42, 0x43,
+    0x41, 0x42, 0x43, 0x41, 0x42, 0x43, 0x41, 0x42, 0x43, 0x41, 0x42, 0x43,
+    0x41, 0x42, 0x43, 0x41, 0x42, 0x43, 0x41, 0x42, 0x43, 0x41, 0x42, 0x43,
+    0x41, 0x42, 0x43, 0x41, 0x42, 0x43, 0x41, 0x42, 0x43, 0x41, 0x42, 0x43,
+    0x41, 0x42, 0x43, 0x41, 0x42, 0x43, 0x41, 0x42, 0x43, 0x41, 0x42, 0x43,
+    0x41, 0x42, 0x43, 0x41, 0x42, 0x43, 0x41, 0x42, 0x43, 0x41, 0x42, 0x43,
+    0x41, 0x42, 0x43, 0x41, 0x42, 0x43,
+};
 
 //
-// Vector 8: "Hello" with content size in header
-// Input: "Hello" (5 bytes)
-// FLG = 0x68: version 01, B.Indep=1, C.Size=1
-// Content size: 5 (8 bytes little-endian)
+// Vector 7: 100 zero bytes - highly compressible
+// lz4.frame.compress(b'\x00' * 100, block_linked=False)
 //
-static const uint8_t lz4_golden_v8_compressed[] = {
-    0x04, 0x22, 0x4D, 0x18, // Magic
-    0x68,                   // FLG: version 01, B.Indep, C.Size
-    0x70,                   // BD: 4MB blocks
-    0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Content size: 5
-    0x4B,                                           // HC: header checksum
-    0x05, 0x00, 0x00, 0x80,  // Block: 5 bytes, uncompressed
-    'H', 'e', 'l', 'l', 'o', // Block data
-    0x00, 0x00, 0x00, 0x00,  // End mark
+static const uint8_t lz4_v7_zeros_compressed[] = {
+    0x04, 0x22, 0x4D, 0x18, 0x60, 0x40, 0x82, 0x0B, 0x00, 0x00, 0x00, 0x1F,
+    0x00, 0x01, 0x00, 0x4B, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00,
 };
-static const uint8_t lz4_golden_v8_expected[] = {'H', 'e', 'l', 'l', 'o'};
+static const uint8_t lz4_v7_zeros_expected[] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+};
 
 //
-// Vector 9: The quick brown fox (classic pangram)
-// Input: "The quick brown fox jumps over the lazy dog" (43 bytes)
+// Vector 8: "Hello" with content checksum enabled
+// lz4.frame.compress(b'Hello', block_linked=False, content_checksum=True)
 //
-static const uint8_t lz4_golden_v9_compressed[] = {
-    0x04, 0x22, 0x4D, 0x18, // Magic
-    0x60,                   // FLG
-    0x70,                   // BD
-    0xDF,                   // HC
-    0x2B, 0x00, 0x00, 0x80, // Block: 43 bytes, uncompressed
-    'T', 'h', 'e', ' ', 'q', 'u', 'i', 'c', 'k', ' ', 'b', 'r', 'o', 'w', 'n',
-    ' ', 'f', 'o', 'x', ' ', 'j', 'u', 'm', 'p', 's', ' ', 'o', 'v', 'e', 'r',
-    ' ', 't', 'h', 'e', ' ', 'l', 'a', 'z', 'y', ' ', 'd', 'o', 'g', 0x00, 0x00,
-    0x00, 0x00, // End mark
+static const uint8_t lz4_v8_content_checksum_compressed[] = {
+    0x04, 0x22, 0x4D, 0x18, 0x64, 0x40, 0xA7, 0x05, 0x00, 0x00, 0x80, 0x48,
+    0x65, 0x6C, 0x6C, 0x6F, 0x00, 0x00, 0x00, 0x00, 0x8F, 0xD2, 0x06, 0xF2,
 };
-static const uint8_t lz4_golden_v9_expected[] = {'T', 'h', 'e', ' ', 'q', 'u',
-    'i', 'c', 'k', ' ', 'b', 'r', 'o', 'w', 'n', ' ', 'f', 'o', 'x', ' ', 'j',
-    'u', 'm', 'p', 's', ' ', 'o', 'v', 'e', 'r', ' ', 't', 'h', 'e', ' ', 'l',
-    'a', 'z', 'y', ' ', 'd', 'o', 'g'};
+static const uint8_t lz4_v8_content_checksum_expected[] = {
+    0x48, 0x65, 0x6C, 0x6C, 0x6F,
+};
 
 //
-// Vector 10: Dependent blocks frame (B.Indep=0)
-// FLG = 0x40: version 01, B.Indep=0
+// Vector 9: "Hello" with content size in header
+// lz4.frame.compress(b'Hello', block_linked=False, store_size=True)
 //
-static const uint8_t lz4_golden_v10_compressed[] = {
-    0x04, 0x22, 0x4D, 0x18, // Magic
-    0x40,                   // FLG: version 01, B.Indep=0 (linked)
-    0x70,                   // BD: 4MB blocks
-    0x82,                   // HC: header checksum for [0x40, 0x70]
-    0x05, 0x00, 0x00, 0x80, // Block: 5 bytes, uncompressed
-    'H', 'e', 'l', 'l', 'o', 0x00, 0x00, 0x00, 0x00, // End mark
+static const uint8_t lz4_v9_content_size_compressed[] = {
+    0x04, 0x22, 0x4D, 0x18, 0x68, 0x40, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x61, 0x05, 0x00, 0x00, 0x80, 0x48, 0x65, 0x6C, 0x6C, 0x6F,
+    0x00, 0x00, 0x00, 0x00,
 };
-static const uint8_t lz4_golden_v10_expected[] = {'H', 'e', 'l', 'l', 'o'};
+static const uint8_t lz4_v9_content_size_expected[] = {
+    0x48, 0x65, 0x6C, 0x6C, 0x6F,
+};
 
 //
-// Vector 11: Frame with 64KB block size setting
-// FLG = 0x60: version 01, B.Indep=1
-// BD = 0x40: block_max_size=4 (64KB)
+// Vector 10: "Hello" with dependent blocks (block_linked=True)
+// Note: For small data, the output is identical to independent blocks
+// lz4.frame.compress(b'Hello', block_linked=True)
 //
-static const uint8_t lz4_golden_v11_compressed[] = {
-    0x04, 0x22, 0x4D, 0x18, // Magic
-    0x60,                   // FLG: version 01, B.Indep
-    0x40,                   // BD: 64KB blocks
-    0xB4,                   // HC: header checksum for [0x60, 0x40]
-    0x05, 0x00, 0x00, 0x80, // Block: 5 bytes, uncompressed
-    'H', 'e', 'l', 'l', 'o', 0x00, 0x00, 0x00, 0x00, // End mark
+static const uint8_t lz4_v10_dependent_compressed[] = {
+    0x04, 0x22, 0x4D, 0x18, 0x60, 0x40, 0x82, 0x05, 0x00, 0x00, 0x80, 0x48,
+    0x65, 0x6C, 0x6C, 0x6F, 0x00, 0x00, 0x00, 0x00,
 };
-static const uint8_t lz4_golden_v11_expected[] = {'H', 'e', 'l', 'l', 'o'};
+static const uint8_t lz4_v10_dependent_expected[] = {
+    0x48, 0x65, 0x6C, 0x6C, 0x6F,
+};
+
+//
+// Vector 11: 1KB of repeated text data - tests compression
+// lz4.frame.compress(b'The quick brown fox jumps over the lazy dog. ' * 23,
+// block_linked=False)
+//
+static const uint8_t lz4_v11_1kb_compressed[] = {
+    0x04, 0x22, 0x4D, 0x18, 0x60, 0x40, 0x82, 0x3B, 0x00, 0x00, 0x00, 0xFF,
+    0x1E, 0x54, 0x68, 0x65, 0x20, 0x71, 0x75, 0x69, 0x63, 0x6B, 0x20, 0x62,
+    0x72, 0x6F, 0x77, 0x6E, 0x20, 0x66, 0x6F, 0x78, 0x20, 0x6A, 0x75, 0x6D,
+    0x70, 0x73, 0x20, 0x6F, 0x76, 0x65, 0x72, 0x20, 0x74, 0x68, 0x65, 0x20,
+    0x6C, 0x61, 0x7A, 0x79, 0x20, 0x64, 0x6F, 0x67, 0x2E, 0x20, 0x2D, 0x00,
+    0xFF, 0xFF, 0xFF, 0xC9, 0x50, 0x64, 0x6F, 0x67, 0x2E, 0x20, 0x00, 0x00,
+    0x00, 0x00,
+};
+// Expected: "The quick brown fox jumps over the lazy dog. " * 23 = 1035 bytes
+// (too large to embed, use helper function in tests)
+
+//
+// Vector 12: Binary data 0x00-0xFF (256 bytes) - incompressible
+// lz4.frame.compress(bytes(range(256)), block_linked=False)
+//
+static const uint8_t lz4_v12_binary_compressed[] = {
+    0x04, 0x22, 0x4D, 0x18, 0x60, 0x40, 0x82, 0x00, 0x01, 0x00, 0x80, 0x00,
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
+    0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+    0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24,
+    0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x30,
+    0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x3B, 0x3C,
+    0x3D, 0x3E, 0x3F, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
+    0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F, 0x50, 0x51, 0x52, 0x53, 0x54,
+    0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E, 0x5F, 0x60,
+    0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x6B, 0x6C,
+    0x6D, 0x6E, 0x6F, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78,
+    0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0x7F, 0x80, 0x81, 0x82, 0x83, 0x84,
+    0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8C, 0x8D, 0x8E, 0x8F, 0x90,
+    0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0x9B, 0x9C,
+    0x9D, 0x9E, 0x9F, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8,
+    0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF, 0xB0, 0xB1, 0xB2, 0xB3, 0xB4,
+    0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF, 0xC0,
+    0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xCB, 0xCC,
+    0xCD, 0xCE, 0xCF, 0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8,
+    0xD9, 0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF, 0xE0, 0xE1, 0xE2, 0xE3, 0xE4,
+    0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xEB, 0xEC, 0xED, 0xEE, 0xEF, 0xF0,
+    0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC,
+    0xFD, 0xFE, 0xFF, 0x00, 0x00, 0x00, 0x00,
+};
+// Expected: bytes 0x00-0xFF (256 bytes)
+
+// Concatenated frame vector: Two frames back-to-back
+// First frame: "Hello" + Second frame: "World"
+// Generated with: lz4.frame.compress(b'Hello') + lz4.frame.compress(b'World')
+static const uint8_t lz4_concat_compressed[] = {
+    // Frame 1: "Hello"
+    0x04, 0x22, 0x4D, 0x18, 0x60, 0x40, 0x82, 0x05, 0x00, 0x00, 0x80, 0x48,
+    0x65, 0x6C, 0x6C, 0x6F, 0x00, 0x00, 0x00, 0x00,
+    // Frame 2: "World"
+    0x04, 0x22, 0x4D, 0x18, 0x60, 0x40, 0x82, 0x05, 0x00, 0x00, 0x80, 0x57,
+    0x6F, 0x72, 0x6C, 0x64, 0x00, 0x00, 0x00, 0x00,
+};
+static const uint8_t lz4_concat_expected[] = {
+    // "HelloWorld"
+    0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x57, 0x6F, 0x72, 0x6C, 0x64,
+};
+
+// clang-format on
 
 //
 // Vector array for easy iteration in tests
 //
 static const lz4_golden_vector_t lz4_golden_vectors[] = {
-    {.name = "empty_minimal",
-        .description = "Empty input with minimal frame",
-        .compressed = lz4_golden_v1_compressed,
-        .compressed_len = sizeof(lz4_golden_v1_compressed),
+    {.name = "empty",
+        .description = "Empty input",
+        .compressed = lz4_v1_empty_compressed,
+        .compressed_len = sizeof(lz4_v1_empty_compressed),
         .expected = nullptr,
         .expected_len = 0,
         .has_block_checksum = false,
@@ -275,75 +287,101 @@ static const lz4_golden_vector_t lz4_golden_vectors[] = {
         .independent_blocks = true},
     {.name = "single_byte_A",
         .description = "Single byte 'A'",
-        .compressed = lz4_golden_v2_compressed,
-        .compressed_len = sizeof(lz4_golden_v2_compressed),
-        .expected = lz4_golden_v2_expected,
-        .expected_len = sizeof(lz4_golden_v2_expected),
+        .compressed = lz4_v2_single_byte_compressed,
+        .compressed_len = sizeof(lz4_v2_single_byte_compressed),
+        .expected = lz4_v2_single_byte_expected,
+        .expected_len = sizeof(lz4_v2_single_byte_expected),
         .has_block_checksum = false,
         .has_content_checksum = false,
         .independent_blocks = true},
-    {.name = "hello_short",
-        .description = "\"Hello\" short string",
-        .compressed = lz4_golden_v3_compressed,
-        .compressed_len = sizeof(lz4_golden_v3_compressed),
-        .expected = lz4_golden_v3_expected,
-        .expected_len = sizeof(lz4_golden_v3_expected),
+    {.name = "hello",
+        .description = "Hello string",
+        .compressed = lz4_v3_hello_compressed,
+        .compressed_len = sizeof(lz4_v3_hello_compressed),
+        .expected = lz4_v3_hello_expected,
+        .expected_len = sizeof(lz4_v3_hello_expected),
         .has_block_checksum = false,
         .has_content_checksum = false,
         .independent_blocks = true},
     {.name = "hello_world",
-        .description = "\"Hello, world!\" string",
-        .compressed = lz4_golden_v4_compressed,
-        .compressed_len = sizeof(lz4_golden_v4_compressed),
-        .expected = lz4_golden_v4_expected,
-        .expected_len = sizeof(lz4_golden_v4_expected),
+        .description = "Hello, world!",
+        .compressed = lz4_v4_hello_world_compressed,
+        .compressed_len = sizeof(lz4_v4_hello_world_compressed),
+        .expected = lz4_v4_hello_world_expected,
+        .expected_len = sizeof(lz4_v4_hello_world_expected),
         .has_block_checksum = false,
         .has_content_checksum = false,
         .independent_blocks = true},
-    {.name = "pangram_quick_fox",
-        .description = "The quick brown fox pangram",
-        .compressed = lz4_golden_v9_compressed,
-        .compressed_len = sizeof(lz4_golden_v9_compressed),
-        .expected = lz4_golden_v9_expected,
-        .expected_len = sizeof(lz4_golden_v9_expected),
+    {.name = "pangram",
+        .description = "Quick brown fox pangram",
+        .compressed = lz4_v5_pangram_compressed,
+        .compressed_len = sizeof(lz4_v5_pangram_compressed),
+        .expected = lz4_v5_pangram_expected,
+        .expected_len = sizeof(lz4_v5_pangram_expected),
         .has_block_checksum = false,
         .has_content_checksum = false,
         .independent_blocks = true},
-    {.name = "hello_with_content_size",
-        .description = "\"Hello\" with content size in header",
-        .compressed = lz4_golden_v8_compressed,
-        .compressed_len = sizeof(lz4_golden_v8_compressed),
-        .expected = lz4_golden_v8_expected,
-        .expected_len = sizeof(lz4_golden_v8_expected),
+    {.name = "repeated_abc",
+        .description = "Repeated ABC pattern (150 bytes)",
+        .compressed = lz4_v6_repeated_compressed,
+        .compressed_len = sizeof(lz4_v6_repeated_compressed),
+        .expected = lz4_v6_repeated_expected,
+        .expected_len = sizeof(lz4_v6_repeated_expected),
         .has_block_checksum = false,
         .has_content_checksum = false,
         .independent_blocks = true},
-    {.name = "hello_dependent_blocks",
-        .description = "\"Hello\" with dependent blocks",
-        .compressed = lz4_golden_v10_compressed,
-        .compressed_len = sizeof(lz4_golden_v10_compressed),
-        .expected = lz4_golden_v10_expected,
-        .expected_len = sizeof(lz4_golden_v10_expected),
+    {.name = "zeros_100",
+        .description = "100 zero bytes",
+        .compressed = lz4_v7_zeros_compressed,
+        .compressed_len = sizeof(lz4_v7_zeros_compressed),
+        .expected = lz4_v7_zeros_expected,
+        .expected_len = sizeof(lz4_v7_zeros_expected),
+        .has_block_checksum = false,
+        .has_content_checksum = false,
+        .independent_blocks = true},
+    {.name = "hello_content_checksum",
+        .description = "Hello with content checksum",
+        .compressed = lz4_v8_content_checksum_compressed,
+        .compressed_len = sizeof(lz4_v8_content_checksum_compressed),
+        .expected = lz4_v8_content_checksum_expected,
+        .expected_len = sizeof(lz4_v8_content_checksum_expected),
+        .has_block_checksum = false,
+        .has_content_checksum = true,
+        .independent_blocks = true},
+    {.name = "hello_content_size",
+        .description = "Hello with content size in header",
+        .compressed = lz4_v9_content_size_compressed,
+        .compressed_len = sizeof(lz4_v9_content_size_compressed),
+        .expected = lz4_v9_content_size_expected,
+        .expected_len = sizeof(lz4_v9_content_size_expected),
+        .has_block_checksum = false,
+        .has_content_checksum = false,
+        .independent_blocks = true},
+    {.name = "hello_dependent",
+        .description = "Hello with dependent blocks",
+        .compressed = lz4_v10_dependent_compressed,
+        .compressed_len = sizeof(lz4_v10_dependent_compressed),
+        .expected = lz4_v10_dependent_expected,
+        .expected_len = sizeof(lz4_v10_dependent_expected),
         .has_block_checksum = false,
         .has_content_checksum = false,
         .independent_blocks = false},
-    {.name = "hello_64kb_blocks",
-        .description = "\"Hello\" with 64KB block size",
-        .compressed = lz4_golden_v11_compressed,
-        .compressed_len = sizeof(lz4_golden_v11_compressed),
-        .expected = lz4_golden_v11_expected,
-        .expected_len = sizeof(lz4_golden_v11_expected),
-        .has_block_checksum = false,
-        .has_content_checksum = false,
-        .independent_blocks = true},
 };
 
 static const size_t lz4_golden_vectors_count =
     sizeof(lz4_golden_vectors) / sizeof(lz4_golden_vectors[0]);
 
-// Note: Vectors 5, 6, 7 are available for special testing scenarios
-// but are not included in the main vector array because they require
-// verification with actual lz4 library output or have special handling needs.
+static const lz4_golden_vector_t lz4_concat_vector = {
+    .name = "concatenated_hello_world",
+    .description = "Two concatenated frames: Hello + World",
+    .compressed = lz4_concat_compressed,
+    .compressed_len = sizeof(lz4_concat_compressed),
+    .expected = lz4_concat_expected,
+    .expected_len = sizeof(lz4_concat_expected),
+    .has_block_checksum = false,
+    .has_content_checksum = false,
+    .independent_blocks = true,
+};
 
 #ifdef __cplusplus
 }

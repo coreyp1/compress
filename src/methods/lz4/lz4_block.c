@@ -133,11 +133,39 @@ gcomp_status_t lz4_block_compress(const uint8_t * input, size_t input_len,
 
   const uint8_t * src = input;
   const uint8_t * src_end = input + input_len;
-  const uint8_t * src_limit = src_end - 12; // Leave room for last literals
+  // The last 5 bytes MUST be literals (per LZ4 spec), and we reserve some
+  // buffer for safe 4-byte reads during match finding.
+  // MFLIMIT ensures we don't start a match too close to the end.
+  const uint8_t * src_limit = src_end - 12; // Don't start matches in last 12 bytes
+  // Match limit: matches must end before the last 5 bytes (last literals requirement)
+  const uint8_t * match_limit = src_end - 5;
   const uint8_t * anchor = src;             // Start of literal run
 
   uint8_t * dst = output;
   uint8_t * dst_end = output + output_cap;
+
+  // Handle small inputs: if < 5 bytes, just write as literals
+  if (input_len < LZ4_LAST_LITERALS) {
+    // Token for last literals (no match)
+    size_t needed = 1 + (input_len >= 15 ? (input_len - 15) / 255 + 1 : 0) + input_len;
+    if (needed > output_cap) {
+      return GCOMP_ERR_LIMIT;
+    }
+    uint8_t token = (input_len >= 15) ? 0xF0 : (uint8_t)(input_len << 4);
+    *dst++ = token;
+    if (input_len >= 15) {
+      size_t remaining = input_len - 15;
+      while (remaining >= 255) {
+        *dst++ = 255;
+        remaining -= 255;
+      }
+      *dst++ = (uint8_t)remaining;
+    }
+    memcpy(dst, input, input_len);
+    dst += input_len;
+    *output_len_out = (size_t)(dst - output);
+    return GCOMP_OK;
+  }
 
   // Skip first byte (no match possible)
   src++;
@@ -154,10 +182,10 @@ gcomp_status_t lz4_block_compress(const uint8_t * input, size_t input_len,
     // Check for match (at least 4 bytes, within 64KB window)
     if (match_pos > 0 && src - match_ref <= 65535 &&
         lz4_read_le32(match_ref) == lz4_read_le32(src)) {
-      // Found a match! Extend it
+      // Found a match! Extend it, but not past match_limit
       size_t match_len = 4;
       while (
-          src + match_len < src_end && match_ref[match_len] == src[match_len]) {
+          src + match_len < match_limit && match_ref[match_len] == src[match_len]) {
         match_len++;
       }
 
