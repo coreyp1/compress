@@ -3,9 +3,114 @@
  *
  * LZ4-specific parallel block compression implementation.
  *
- * This module integrates the thread pool and job queue to provide parallel
- * block compression for LZ4. It handles memory allocation for per-job
- * buffers and hash tables.
+ * This module provides parallel block compression for LZ4 by integrating
+ * the generic thread pool and job queue infrastructure with LZ4-specific
+ * compression logic.
+ *
+ * ## Architecture
+ *
+ * The parallel compression system has three layers:
+ *
+ * ```
+ * ┌─────────────────────────────────────────────────────────────┐
+ * │                    lz4_parallel_ctx_t                       │
+ * │         (LZ4-specific parallel compression context)         │
+ * └───────────────────────────┬─────────────────────────────────┘
+ *                             │
+ *           ┌─────────────────┼─────────────────┐
+ *           │                 │                 │
+ *           v                 v                 v
+ * ┌─────────────────┐ ┌───────────────┐ ┌────────────────────┐
+ * │ gcomp_thread_   │ │ gcomp_job_    │ │ Per-Job Resources  │
+ * │ pool_t          │ │ queue_t       │ │ (hash tables,      │
+ * │ (worker threads)│ │ (ordering)    │ │  output buffers)   │
+ * └─────────────────┘ └───────────────┘ └────────────────────┘
+ * ```
+ *
+ * ## Modes of Operation
+ *
+ * ### Inline Mode (is_inline = true)
+ *
+ * When `threads.count <= 1` or `lz4.independent_blocks = false`, compression
+ * runs in the calling thread without any threading overhead:
+ *
+ * - `submit()` compresses the block immediately and returns
+ * - `get_result()` returns the already-completed job
+ * - No thread pool or job queue is created
+ * - Single hash table and output buffer are reused
+ *
+ * ### Threaded Mode (is_inline = false)
+ *
+ * When `threads.count > 1` AND `lz4.independent_blocks = true`:
+ *
+ * - Worker threads compress blocks in parallel
+ * - Job queue ensures results are returned in submission order
+ * - Each in-flight job has its own hash table and output buffer
+ * - Bounded memory: max_in_flight limits concurrent jobs
+ *
+ * ## Memory Management
+ *
+ * Memory is tracked carefully to enforce `limits.max_memory_bytes`:
+ *
+ * | Resource | Per-Job | Total |
+ * |----------|---------|-------|
+ * | Context struct | - | 1 |
+ * | Thread pool | - | 1 |
+ * | Job queue | - | 1 |
+ * | Hash tables | max_in_flight | 16K × 4 bytes = 64KB each |
+ * | Output buffers | max_in_flight | block_max_size + overhead |
+ *
+ * In inline mode, only one hash table and output buffer are allocated.
+ *
+ * ## Job Lifecycle
+ *
+ * ```
+ *   ┌────────────────┐
+ *   │  submit(job)   │
+ *   └───────┬────────┘
+ *           │ Allocate resources, enqueue
+ *           v
+ *   ┌────────────────┐
+ *   │   PENDING      │──────────────────┐
+ *   └───────┬────────┘                  │
+ *           │ Worker picks up           │ (inline: immediate)
+ *           v                           │
+ *   ┌────────────────┐                  │
+ *   │  COMPRESSING   │◄─────────────────┘
+ *   └───────┬────────┘
+ *           │ Compression complete
+ *           v
+ *   ┌────────────────┐
+ *   │   COMPLETE     │
+ *   └───────┬────────┘
+ *           │ get_result() retrieves in order
+ *           v
+ *   ┌────────────────┐
+ *   │   RETURNED     │
+ *   └────────────────┘
+ * ```
+ *
+ * ## Block Checksums
+ *
+ * When `lz4.block_checksum = true`, the xxHash32 of each compressed block
+ * is computed after compression. The checksum is stored in the job result
+ * for the encoder to append to the output stream.
+ *
+ * ## Error Handling
+ *
+ * - Memory allocation failures return GCOMP_ERR_MEMORY
+ * - Compression errors are stored in job->status for retrieval
+ * - If a worker thread encounters an error, it's propagated to get_result()
+ *
+ * ## Thread Safety
+ *
+ * - `lz4_parallel_create()` / `destroy()`: NOT thread-safe (call from main)
+ * - `lz4_parallel_submit()`: Thread-safe (uses job queue mutex)
+ * - `lz4_parallel_get_result()`: Thread-safe (uses job queue mutex)
+ *
+ * Typically, a single thread (the encoder's main thread) calls submit()
+ * and get_result() sequentially, so thread safety is primarily relevant
+ * for internal coordination with worker threads.
  *
  * Copyright 2026 by Corey Pennycuff
  */

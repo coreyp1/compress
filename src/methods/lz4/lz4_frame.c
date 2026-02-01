@@ -4,7 +4,75 @@
  * LZ4 frame format helpers.
  *
  * This file provides functions for building and parsing LZ4 frame headers
- * and block metadata.
+ * and block metadata according to the LZ4 Frame Format specification:
+ * https://github.com/lz4/lz4/blob/dev/doc/lz4_Frame_format.md
+ *
+ * ## Frame Header Structure
+ *
+ * ```
+ * ┌────────────────┬─────┬─────┬────────────────┬──────────┬─────┐
+ * │  Magic Number  │ FLG │ BD  │ [Content Size] │ [DictID] │ HC  │
+ * │   (4 bytes)    │(1B) │(1B) │   (8 bytes)    │(4 bytes) │(1B) │
+ * └────────────────┴─────┴─────┴────────────────┴──────────┴─────┘
+ *   0x184D2204       │      │         │              │        │
+ *   (little-endian)  │      │         │              │        └─ Header Checksum
+ *                    │      │         │              └─ Dictionary ID (optional)
+ *                    │      │         └─ Original size (optional)
+ *                    │      └─ Block Descriptor
+ *                    └─ Flags byte
+ * ```
+ *
+ * ## FLG Byte (Flags)
+ *
+ * | Bit | Mask | Name | Description |
+ * |-----|------|------|-------------|
+ * | 7-6 | 0xC0 | Version | Must be 01 (value 0x40) |
+ * | 5 | 0x20 | B.Indep | Block independence (1 = independent) |
+ * | 4 | 0x10 | B.Checksum | Block checksum present |
+ * | 3 | 0x08 | C.Size | Content size field present |
+ * | 2 | 0x04 | C.Checksum | Content checksum in trailer |
+ * | 1 | 0x02 | Reserved | Must be 0 |
+ * | 0 | 0x01 | DictID | Dictionary ID field present |
+ *
+ * ## BD Byte (Block Descriptor)
+ *
+ * | Bit | Mask | Name | Description |
+ * |-----|------|------|-------------|
+ * | 7 | 0x80 | Reserved | Must be 0 |
+ * | 6-4 | 0x70 | Block MaxSize | Block size code (4-7) |
+ * | 3-0 | 0x0F | Reserved | Must be 0 |
+ *
+ * Block size codes:
+ * - 4 → 64 KB (65536 bytes)
+ * - 5 → 256 KB (262144 bytes)
+ * - 6 → 1 MB (1048576 bytes)
+ * - 7 → 4 MB (4194304 bytes)
+ *
+ * ## Header Checksum (HC)
+ *
+ * The header checksum is computed as:
+ * ```
+ * HC = (xxHash32(FLG || BD || [Content Size] || [DictID], seed=0) >> 8) & 0xFF
+ * ```
+ *
+ * Only the second-lowest byte of the hash is used. This provides basic
+ * integrity checking with minimal overhead (1 byte).
+ *
+ * ## Block Size Field
+ *
+ * Each data block is preceded by a 4-byte size field:
+ * - Bit 31: Uncompressed flag (1 = data stored uncompressed)
+ * - Bits 30-0: Block size in bytes
+ * - Value 0x00000000: End of frame marker
+ *
+ * ## xxHash32 Usage
+ *
+ * LZ4 uses xxHash32 for all checksums:
+ * - Header checksum: second byte of hash
+ * - Block checksums: full 32-bit hash of compressed block data
+ * - Content checksum: full 32-bit hash of all uncompressed data
+ *
+ * All checksums use seed value 0.
  *
  * Copyright 2026 by Corey Pennycuff
  */

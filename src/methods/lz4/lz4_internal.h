@@ -260,6 +260,7 @@ typedef struct {
   uint8_t * compressed_buffer;   ///< Compressed block output
   size_t compressed_buffer_size; ///< Capacity
   size_t compressed_buffer_pos;  ///< Read position for output
+  size_t compressed_buffer_len;  ///< Valid bytes in compressed buffer
 
   // Hash table for match finding
   uint32_t * hash_table;  ///< Hash table for compression

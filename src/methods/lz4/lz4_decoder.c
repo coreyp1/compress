@@ -4,16 +4,110 @@
  * LZ4 frame format decoder implementation.
  *
  * This file implements the streaming decoder for LZ4 frame format
- * decompression.
+ * decompression. The decoder accepts input conforming to the LZ4 Frame
+ * Format specification:
+ * https://github.com/lz4/lz4/blob/dev/doc/lz4_Frame_format.md
  *
  * ## Decoder State Machine
  *
- * 1. HEADER: Parse frame header and validate
- * 2. BLOCK_SIZE: Read 4-byte block size
- * 3. BLOCK_DATA: Decompress block content
- * 4. BLOCK_CHECKSUM: Validate block checksum (if enabled)
- * 5. CONTENT_CHECKSUM: Validate content checksum (if enabled)
- * 6. DONE: Frame complete (may restart for concatenated frames)
+ * The decoder is implemented as a state machine that processes input
+ * incrementally, allowing it to work with arbitrarily small input/output
+ * buffers:
+ *
+ * ```
+ *   ┌──────────┐
+ *   │  HEADER  │◄─── init(), parse magic/FLG/BD/optional fields/HC
+ *   └────┬─────┘
+ *        │ header complete
+ *        v
+ *   ┌────────────┐
+ *   │ BLOCK_SIZE │◄──────────────────────────────────────┐
+ *   └─────┬──────┘                                       │
+ *         │ size > 0                                     │
+ *         v                                              │
+ *   ┌────────────┐                                       │
+ *   │ BLOCK_DATA │──── decompress block                  │
+ *   └─────┬──────┘                                       │
+ *         │                                              │
+ *         v                                              │
+ *   ┌────────────────┐ (if block checksum enabled)       │
+ *   │ BLOCK_CHECKSUM │───────────────────────────────────┘
+ *   └────────────────┘
+ *         │ size == 0 (end mark)
+ *         v
+ *   ┌──────────────────┐ (if content checksum enabled)
+ *   │ CONTENT_CHECKSUM │
+ *   └────────┬─────────┘
+ *            │
+ *            v
+ *   ┌──────────┐
+ *   │   DONE   │──── if concat enabled, may return to HEADER
+ *   └──────────┘
+ * ```
+ *
+ * ## Header Parsing Sub-State Machine
+ *
+ * Header parsing has its own state machine within the HEADER stage:
+ *
+ * 1. **MAGIC**: Read 4-byte magic number (0x184D2204)
+ * 2. **FLG_BD**: Read FLG and BD bytes
+ * 3. **CONTENT_SIZE**: Read 8-byte content size (if FLG.C_SIZE set)
+ * 4. **DICT_ID**: Read 4-byte dictionary ID (if FLG.DICT_ID set)
+ * 5. **HC**: Read 1-byte header checksum
+ *
+ * ## Block Decompression
+ *
+ * For each block:
+ * 1. Read 4-byte block size (little-endian)
+ *    - High bit (0x80000000) indicates uncompressed block
+ *    - Size 0 indicates end of frame
+ * 2. Read block data into buffer
+ * 3. Decompress using `lz4_block_decompress()` (or copy if uncompressed)
+ * 4. Update content checksum if enabled
+ * 5. Update history buffer for dependent blocks
+ *
+ * ## History Buffer (Dependent Blocks)
+ *
+ * When `lz4.independent_blocks=false` in the frame header, blocks can
+ * reference data from previous blocks. The decoder maintains a sliding
+ * window history buffer:
+ *
+ * - Capacity: 64KB (LZ4_HISTORY_SIZE) - maximum back-reference distance
+ * - After each block, the last 64KB of output is retained as history
+ * - The history slides forward as new data is produced
+ *
+ * For independent blocks, no history is needed and the buffer may be NULL.
+ *
+ * ## Concatenated Frames
+ *
+ * When `lz4.concat=true`, after reaching DONE state:
+ * - If more input is available, the decoder returns to HEADER state
+ * - Each frame is validated independently (checksums, content size)
+ * - Output is continuous across frames
+ * - Limits apply to cumulative output across all frames
+ *
+ * ## Safety Limits
+ *
+ * The decoder enforces multiple safety limits:
+ *
+ * | Limit | Check Point | Error |
+ * |-------|-------------|-------|
+ * | max_output_bytes | After each block decompression | GCOMP_ERR_LIMIT |
+ * | max_block_bytes | When reading block size | GCOMP_ERR_LIMIT |
+ * | max_expansion_ratio | After each block decompression | GCOMP_ERR_LIMIT |
+ * | max_memory_bytes | During init allocation | GCOMP_ERR_MEMORY |
+ *
+ * ## Error Handling
+ *
+ * When an error occurs, the decoder enters the ERROR stage and subsequent
+ * update() calls return GCOMP_ERR_INTERNAL. Use reset() to recover and
+ * start a new stream. Error details are available via
+ * `gcomp_decoder_get_error_detail()`.
+ *
+ * ## Thread Safety
+ *
+ * A single decoder instance is NOT thread-safe. Each thread should have
+ * its own decoder instance.
  *
  * Copyright 2026 by Corey Pennycuff
  */
@@ -471,7 +565,17 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
         }
 
         if (state->current_block_size == 0) {
-          // End mark - go to content checksum or done
+          // End mark - validate content size if present in header
+          if (state->header.content_size_present &&
+              state->total_output_bytes != state->header.content_size) {
+            state->stage = LZ4_DEC_STAGE_ERROR;
+            return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+                "lz4 content size mismatch: header specified %llu bytes, "
+                "got %llu bytes",
+                (unsigned long long)state->header.content_size,
+                (unsigned long long)state->total_output_bytes);
+          }
+          // Go to content checksum or done
           if (state->header.content_checksum) {
             state->stage = LZ4_DEC_STAGE_CONTENT_CHECKSUM;
             state->content_checksum_buf_pos = 0;

@@ -6,16 +6,95 @@
  * This file implements the LZ4 block compression algorithm as specified in:
  * https://github.com/lz4/lz4/blob/dev/doc/lz4_Block_format.md
  *
- * ## Block Format
+ * ## Block Format Overview
  *
- * A block consists of sequences, each containing:
- * 1. Token byte: high nibble = literal length, low nibble = match length
- * 2. Optional literal length extension bytes (if literal length == 15)
- * 3. Literal bytes
- * 4. Match offset (2 bytes, little-endian)
- * 5. Optional match length extension bytes (if match length nibble == 15)
+ * LZ4 block format uses a sequence-based structure optimized for fast
+ * decompression. Each sequence represents either literal bytes or a
+ * back-reference to previously seen data.
  *
- * The last sequence may omit the match section.
+ * ```
+ * ┌─────────┬───────────────┬──────────┬────────┬───────────────┐
+ * │  Token  │  Lit Length   │ Literals │ Offset │ Match Length  │
+ * │ (1 byte)│   (0+ bytes)  │(variable)│(2 bytes│  (0+ bytes)   │
+ * └─────────┴───────────────┴──────────┴────────┴───────────────┘
+ *      │                                    │
+ *      └─ High 4 bits: literal length       │
+ *         Low 4 bits: match length - 4      │
+ *                                           └─ Little-endian, 1-65535
+ * ```
+ *
+ * ## Token Byte Encoding
+ *
+ * The token byte encodes two values:
+ * - **High nibble (4 bits)**: Literal length (0-14, or 15 = extended)
+ * - **Low nibble (4 bits)**: Match length minus 4 (0-14, or 15 = extended)
+ *
+ * When either nibble is 15, additional extension bytes follow:
+ * - Each 0xFF byte adds 255 to the length
+ * - The first non-0xFF byte adds its value and terminates the extension
+ *
+ * Example: Literal length 300 = 15 + 255 + 30 → token high nibble 15,
+ * followed by bytes 0xFF (255) and 0x1E (30).
+ *
+ * ## Match Mechanics
+ *
+ * - **Minimum match**: 4 bytes (encoded length 0 in token)
+ * - **Offset range**: 1-65535 bytes back (offset 0 is invalid)
+ * - **Overlapping matches**: When match length > offset, the pattern repeats.
+ *   For example, offset=1, length=10 copies the previous byte 10 times.
+ *
+ * ## Compression Algorithm (lz4_block_compress)
+ *
+ * The compressor uses a simple, fast LZ77-style algorithm:
+ *
+ * 1. **Hash table**: Maps 4-byte sequences to their last occurrence position
+ *    - Hash function: multiply first 4 bytes by prime 2654435761, shift >> 16
+ *    - Table size: 64K entries (covers 64KB window)
+ *    - Single entry per hash (no chaining)
+ *
+ * 2. **Greedy matching**: At each position, check if hash table has a match
+ *    - Match must be within 64KB window
+ *    - Match must be at least 4 bytes
+ *    - Extend match as far as possible
+ *
+ * 3. **Literal accumulation**: Non-matching bytes accumulate as literals
+ *
+ * 4. **Last literals**: Final 12 bytes are always emitted as literals
+ *    (ensures safe memory access during match extension)
+ *
+ * The algorithm prioritizes speed over compression ratio. For better
+ * compression, consider using higher-level strategies like HC (hash chains)
+ * which are not implemented here.
+ *
+ * ## Decompression Algorithm (lz4_block_decompress)
+ *
+ * The decompressor is straightforward and very fast:
+ *
+ * 1. Read token byte
+ * 2. Decode literal length (with optional extension)
+ * 3. Copy literal bytes from input to output
+ * 4. If not at end of block:
+ *    a. Read 2-byte offset (little-endian)
+ *    b. Decode match length (with optional extension, plus 4)
+ *    c. Copy match bytes from (output - offset) to output
+ * 5. Repeat until input exhausted
+ *
+ * ## History Buffer Support
+ *
+ * For dependent blocks (block independence = false), matches can reference
+ * data from previous blocks. The `history` and `history_len` parameters
+ * provide this context. When a match offset exceeds the current output
+ * position, the decompressor looks in the history buffer.
+ *
+ * ## Error Cases
+ *
+ * The decompressor returns GCOMP_ERR_CORRUPT for:
+ * - Offset == 0 (invalid back-reference)
+ * - Offset exceeds (output position + history length)
+ * - Input exhausted before block complete
+ * - Literal length exceeds remaining input
+ *
+ * Returns GCOMP_ERR_LIMIT if output buffer is too small.
  *
  * Copyright 2026 by Corey Pennycuff
  */

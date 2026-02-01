@@ -4,21 +4,85 @@
  * LZ4 frame format encoder implementation.
  *
  * This file implements the streaming encoder for LZ4 frame format compression.
+ * The encoder produces output conforming to the LZ4 Frame Format specification:
+ * https://github.com/lz4/lz4/blob/dev/doc/lz4_Frame_format.md
  *
  * ## Encoder State Machine
  *
- * 1. HEADER: Write frame header with configuration
- * 2. BLOCKS: Compress input data into blocks
- * 3. END_MARK: Write 4-byte end mark (0x00000000)
- * 4. TRAILER: Write content checksum (if enabled)
- * 5. DONE: Frame complete
+ * The encoder progresses through these stages:
+ *
+ * ```
+ *   ┌──────────┐
+ *   │  HEADER  │◄─── init()
+ *   └────┬─────┘
+ *        │ header bytes emitted
+ *        v
+ *   ┌──────────┐
+ *   │  BLOCKS  │◄─── update() collects input, emits blocks when full
+ *   └────┬─────┘
+ *        │ finish() called, final block emitted
+ *        v
+ *   ┌──────────┐
+ *   │ END_MARK │──── 4 bytes: 0x00000000
+ *   └────┬─────┘
+ *        │
+ *        v
+ *   ┌──────────┐
+ *   │ TRAILER  │──── content checksum (if enabled)
+ *   └────┬─────┘
+ *        │
+ *        v
+ *   ┌──────────┐
+ *   │   DONE   │
+ *   └──────────┘
+ * ```
+ *
+ * ## Data Flow
+ *
+ * 1. **Input buffering**: Data from update() is collected in `block_buffer`
+ *    until it reaches `block_size` bytes.
+ *
+ * 2. **Block compression**: When the buffer is full (or finish() is called),
+ *    the data is compressed using `lz4_block_compress()`. If compression
+ *    doesn't reduce size, the block is stored uncompressed (high bit set
+ *    in block size field).
+ *
+ * 3. **Checksum computation**: If `lz4.content_checksum` is enabled, the
+ *    xxHash32 is computed incrementally over all uncompressed input.
+ *
+ * 4. **Incremental output**: All output (header, blocks, trailer) supports
+ *    incremental emission when the output buffer is small. State variables
+ *    track progress to resume on subsequent calls.
  *
  * ## Memory Management
  *
- * The encoder allocates:
- * - Block buffer (block_size bytes) for collecting input
- * - Compressed buffer (block_size + overhead) for block output
- * - Hash table for match finding
+ * The encoder allocates these buffers (tracked via `gcomp_memory_tracker_t`):
+ *
+ * | Buffer | Size | Purpose |
+ * |--------|------|---------|
+ * | block_buffer | block_size | Collect uncompressed input |
+ * | compressed_buffer | block_size + overhead | Hold compressed block for output |
+ * | hash_table | 64K entries (256KB) | Match finding for LZ77 |
+ *
+ * Total memory is checked against `limits.max_memory_bytes` after allocation.
+ *
+ * ## Hash Table for Match Finding
+ *
+ * The encoder uses a simple hash table for LZ77 match finding:
+ * - Hash function: multiply first 4 bytes by prime, shift right
+ * - Hash table stores position of last occurrence of each hash
+ * - Only checks most recent match (no hash chains)
+ * - Matches must be within 64KB window and at least 4 bytes
+ *
+ * For independent blocks, the hash table is cleared after each block.
+ * For dependent blocks, it persists (though the current implementation
+ * doesn't fully utilize cross-block matching).
+ *
+ * ## Thread Safety
+ *
+ * A single encoder instance is NOT thread-safe. Each thread should have
+ * its own encoder instance. The encoder itself does not use threading;
+ * parallel compression is handled at a higher level via lz4_parallel.c.
  *
  * Copyright 2026 by Corey Pennycuff
  */
@@ -160,6 +224,7 @@ gcomp_status_t lz4_encoder_init(gcomp_registry_t * registry,
   }
   gcomp_memory_track_alloc(&state->mem_tracker, state->compressed_buffer_size);
   state->compressed_buffer_pos = 0;
+  state->compressed_buffer_len = 0;
 
   // Allocate hash table for compression (64KB entries)
   state->hash_table_size = 65536;
@@ -407,7 +472,23 @@ gcomp_status_t lz4_encoder_finish(
 
   // Flush any remaining buffered data as a final block
   if (state->stage == LZ4_ENC_STAGE_BLOCKS && !state->blocks_finished) {
-    if (state->block_buffer_pos > 0) {
+    // Check if we have compressed data still being output
+    if (state->compressed_buffer_len > 0) {
+      // Continue outputting previously compressed block
+      while (state->compressed_buffer_pos < state->compressed_buffer_len &&
+          output->used < output->size) {
+        ((uint8_t *)output->data)[output->used++] =
+            state->compressed_buffer[state->compressed_buffer_pos++];
+      }
+      if (state->compressed_buffer_pos < state->compressed_buffer_len) {
+        return GCOMP_OK; // Need more output space
+      }
+      // Done with this block
+      state->compressed_buffer_len = 0;
+      state->compressed_buffer_pos = 0;
+      state->block_buffer_pos = 0;
+    }
+    else if (state->block_buffer_pos > 0) {
       // Compress final block
       size_t compressed_len;
       gcomp_status_t status =
@@ -438,16 +519,20 @@ gcomp_status_t lz4_encoder_finish(
       }
 
       // Output final block
-      size_t block_pos = 0;
-      while (block_pos < total_block_len && output->used < output->size) {
+      state->compressed_buffer_len = total_block_len;
+      state->compressed_buffer_pos = 0;
+      while (state->compressed_buffer_pos < state->compressed_buffer_len &&
+          output->used < output->size) {
         ((uint8_t *)output->data)[output->used++] =
-            state->compressed_buffer[block_pos++];
+            state->compressed_buffer[state->compressed_buffer_pos++];
       }
 
-      if (block_pos < total_block_len) {
-        return GCOMP_OK;
+      if (state->compressed_buffer_pos < state->compressed_buffer_len) {
+        return GCOMP_OK; // Need more output space
       }
 
+      state->compressed_buffer_len = 0;
+      state->compressed_buffer_pos = 0;
       state->block_buffer_pos = 0;
     }
     state->blocks_finished = true;
@@ -516,6 +601,7 @@ gcomp_status_t lz4_encoder_reset(gcomp_encoder_t * encoder) {
   state->header_pos = 0;
   state->block_buffer_pos = 0;
   state->compressed_buffer_pos = 0;
+  state->compressed_buffer_len = 0;
   state->end_mark_pos = 0;
   state->trailer_pos = 0;
   state->total_input_bytes = 0;

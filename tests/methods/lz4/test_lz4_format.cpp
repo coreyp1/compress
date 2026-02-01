@@ -386,6 +386,46 @@ TEST_F(Lz4FormatTest, ContentSizeInHeader) {
   EXPECT_EQ(status, GCOMP_OK);
 }
 
+TEST_F(Lz4FormatTest, ContentSizeMismatch) {
+  // Create frame with declared content size that doesn't match actual data
+  gcomp_options_t * opts = nullptr;
+  gcomp_status_t status = gcomp_options_create(&opts);
+  ASSERT_EQ(status, GCOMP_OK);
+  // Declare 64 bytes, but we'll only send 32
+  status = gcomp_options_set_uint64(opts, "lz4.content_size", 64);
+  ASSERT_EQ(status, GCOMP_OK);
+
+  gcomp_encoder_t * encoder = nullptr;
+  status = gcomp_encoder_create(registry_, "lz4", opts, &encoder);
+  ASSERT_EQ(status, GCOMP_OK);
+
+  // Only encode 32 bytes (mismatches declared 64)
+  char test_data[32];
+  memset(test_data, 'Y', sizeof(test_data));
+
+  std::vector<uint8_t> output(256);
+  gcomp_buffer_t in_buf = {test_data, sizeof(test_data), 0};
+  gcomp_buffer_t out_buf = {output.data(), output.size(), 0};
+
+  status = gcomp_encoder_update(encoder, &in_buf, &out_buf);
+  ASSERT_EQ(status, GCOMP_OK);
+
+  status = gcomp_encoder_finish(encoder, &out_buf);
+  ASSERT_EQ(status, GCOMP_OK);
+  output.resize(out_buf.used);
+
+  gcomp_encoder_destroy(encoder);
+  gcomp_options_destroy(opts);
+
+  // Verify the header has content size flag set
+  ASSERT_TRUE(output[4] & 0x08) << "Content size flag should be set";
+
+  // Decode should fail with corrupt error due to size mismatch
+  status = tryDecode(output.data(), output.size());
+  EXPECT_EQ(status, GCOMP_ERR_CORRUPT)
+      << "Decoder should reject content size mismatch";
+}
+
 //
 // Block Size Variant Tests
 //
