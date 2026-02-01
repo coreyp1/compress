@@ -48,18 +48,22 @@ extern "C" {
 // Forward declaration
 typedef struct lz4_parallel_ctx_s lz4_parallel_ctx_t;
 
+// Forward declaration for linked list
+typedef struct lz4_parallel_job_s lz4_parallel_job_t;
+
 /**
  * @brief LZ4 parallel block job.
  *
  * Extends gcomp_block_job_t with LZ4-specific fields.
  */
-typedef struct {
-  gcomp_block_job_t base;  ///< Base job structure
-  uint32_t * hash_table;   ///< Per-job hash table for compression
-  size_t hash_table_size;  ///< Hash table size in entries
-  bool store_uncompressed; ///< Output uncompressed block
-  uint32_t block_checksum; ///< Block checksum (if enabled)
-} lz4_parallel_job_t;
+struct lz4_parallel_job_s {
+  gcomp_block_job_t base;           ///< Base job structure
+  uint32_t * hash_table;            ///< Per-job hash table for compression
+  size_t hash_table_size;           ///< Hash table size in entries
+  bool store_uncompressed;          ///< Output uncompressed block
+  uint32_t block_checksum;          ///< Block checksum (if enabled)
+  lz4_parallel_job_t * next_inline; ///< Next job in inline result queue
+};
 
 /**
  * @brief LZ4 parallel compression configuration.

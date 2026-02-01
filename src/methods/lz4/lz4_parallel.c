@@ -57,6 +57,11 @@ struct lz4_parallel_ctx_s {
 
   // Mode
   bool is_inline;
+
+  // Inline mode: completed job queue (simple linked list)
+  lz4_parallel_job_t * inline_head;
+  lz4_parallel_job_t * inline_tail;
+  uint32_t inline_count;
 };
 
 //
@@ -154,6 +159,9 @@ gcomp_status_t lz4_parallel_create(
     ctx->pool = NULL;
     ctx->queue = NULL;
     ctx->max_in_flight = 1;
+    ctx->inline_head = NULL;
+    ctx->inline_tail = NULL;
+    ctx->inline_count = 0;
     *ctx_out = ctx;
     return GCOMP_OK;
   }
@@ -309,7 +317,7 @@ gcomp_status_t lz4_parallel_submit(
     return GCOMP_ERR_INVALID_ARG;
   }
 
-  // Inline mode: compress immediately
+  // Inline mode: compress immediately and add to result queue
   if (ctx->is_inline) {
     gcomp_status_t status = lz4_parallel_process_job(job);
     job->base.status =
@@ -321,6 +329,17 @@ gcomp_status_t lz4_parallel_submit(
       job->block_checksum =
           gcomp_xxhash32(job->base.output, job->base.output_size, 0);
     }
+
+    // Add to inline result queue
+    job->next_inline = NULL;
+    if (ctx->inline_tail) {
+      ctx->inline_tail->next_inline = job;
+    }
+    else {
+      ctx->inline_head = job;
+    }
+    ctx->inline_tail = job;
+    ctx->inline_count++;
 
     return GCOMP_OK;
   }
@@ -351,9 +370,23 @@ gcomp_status_t lz4_parallel_get_result(
 
   *job_out = NULL;
 
-  // Inline mode: job is already complete after submit
+  // Inline mode: return from inline result queue
   if (ctx->is_inline) {
-    return GCOMP_ERR_INVALID_ARG; // No pending jobs in inline mode
+    if (!ctx->inline_head) {
+      return GCOMP_ERR_INVALID_ARG; // No pending jobs
+    }
+
+    // Pop from head
+    lz4_parallel_job_t * job = ctx->inline_head;
+    ctx->inline_head = job->next_inline;
+    if (!ctx->inline_head) {
+      ctx->inline_tail = NULL;
+    }
+    job->next_inline = NULL;
+    ctx->inline_count--;
+
+    *job_out = job;
+    return GCOMP_OK;
   }
 
   // Get next result from queue
@@ -378,8 +411,11 @@ gcomp_status_t lz4_parallel_get_result(
 }
 
 bool lz4_parallel_result_ready(const lz4_parallel_ctx_t * ctx) {
-  if (!ctx || ctx->is_inline) {
+  if (!ctx) {
     return false;
+  }
+  if (ctx->is_inline) {
+    return ctx->inline_head != NULL;
   }
   return gcomp_job_queue_result_ready(ctx->queue);
 }
@@ -401,8 +437,11 @@ bool lz4_parallel_is_inline(const lz4_parallel_ctx_t * ctx) {
 }
 
 uint32_t lz4_parallel_pending_count(const lz4_parallel_ctx_t * ctx) {
-  if (!ctx || ctx->is_inline) {
+  if (!ctx) {
     return 0;
+  }
+  if (ctx->is_inline) {
+    return ctx->inline_count;
   }
   return gcomp_job_queue_pending_count(ctx->queue);
 }
@@ -413,6 +452,12 @@ gcomp_status_t lz4_parallel_reset(lz4_parallel_ctx_t * ctx) {
   }
 
   if (ctx->is_inline) {
+    // Check that no jobs are pending
+    if (ctx->inline_count > 0) {
+      return GCOMP_ERR_INVALID_ARG;
+    }
+    ctx->inline_head = NULL;
+    ctx->inline_tail = NULL;
     return GCOMP_OK;
   }
 
