@@ -86,7 +86,10 @@ CFLAGS := -pedantic-errors -Wall -Wextra -Werror -Wno-error=unused-function -Wfa
 # GCOMP_BUILD enables DLL export on Windows (checked by GCOMP_API macro)
 # GCOMP_TEST_BUILD enables export of internal functions for testing (checked by GCOMP_INTERNAL_API macro)
 LIB_CFLAGS := $(CFLAGS) -DGCOMP_BUILD -DGCOMP_TEST_BUILD
-LDFLAGS := -L /usr/lib -lstdc++ -lm
+# Link cutil library for threading support
+CUTIL_CFLAGS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --cflags ghoti.io-cutil-dev 2>/dev/null)
+CUTIL_LIBS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --libs ghoti.io-cutil-dev 2>/dev/null)
+LDFLAGS := -L /usr/lib -lstdc++ -lm $(CUTIL_LIBS) -lpthread
 BUILD_DIR := ./build/$(BUILD)
 OBJ_DIR := $(BUILD_DIR)/objects
 GEN_DIR := $(BUILD_DIR)/generated
@@ -109,7 +112,8 @@ else
 endif
 
 # The standard include directories for the project.
-INCLUDE := -I include/ -I $(GEN_DIR)/
+# Include cutil headers for threading support (via pkg-config)
+INCLUDE := -I include/ -I $(GEN_DIR)/ $(CUTIL_CFLAGS)
 
 # Additional include directories for tests (common helpers, method-specific data)
 TEST_INCLUDE := $(INCLUDE) -I tests/common/ -I tests/methods/deflate/
