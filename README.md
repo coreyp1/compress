@@ -63,29 +63,76 @@ Findings are saved to `fuzz/findings/<target>/crashes/`. See `documentation/test
 
 ### Oracle Testing (Optional)
 
-The library includes oracle tests that cross-validate our compression/decompression against external reference implementations. These tests require optional dependencies:
+The library includes oracle tests that cross-validate our compression/decompression against external reference implementations. These tests require optional dependencies.
 
-**LZ4 CLI tools** (for `lz4` oracle tests):
+Without these dependencies, the oracle tests will skip the external validation tests but still run internal validation. All core functionality tests run without optional dependencies.
+
+**Install all oracle dependencies at once:**
+```bash
+# CLI tools
+sudo apt install gzip lz4 zstd
+
+# Python modules
+pip3 install lz4 zstandard
+```
+
+#### Gzip Oracle
+
+Python's built-in `gzip` module is used (no extra install needed). The `gzip` CLI tool is typically pre-installed on Linux systems.
+
+```bash
+# Verify
+gzip --version
+python3 -c "import gzip; print('gzip module available')"
+```
+
+#### LZ4 Oracle
+
+**CLI tools:**
 ```bash
 sudo apt install lz4
 ```
 
-This installs `lz4` and `unlz4` command-line tools used to verify our LZ4 implementation produces output compatible with the reference library.
-
-**Python lz4 module** (for `lz4` oracle tests):
+**Python module:**
 ```bash
 pip3 install lz4
 ```
 
-This enables cross-validation tests that compress data with our library and decompress with Python's lz4 (and vice versa).
+**Verification:**
+```bash
+lz4 --version
+python3 -c "import lz4.frame; print(lz4.__version__)"
+```
+
+#### Zstd Oracle
+
+**CLI tools:**
+```bash
+sudo apt install zstd
+```
+
+**Python module:**
+```bash
+pip3 install zstandard
+```
 
 **Verification:**
 ```bash
-lz4 --version        # Should show lz4 version
-python3 -c "import lz4.frame; print(lz4.__version__)"  # Should print version
+zstd --version
+python3 -c "import zstandard; print(zstandard.__version__)"
 ```
 
-Without these dependencies, the oracle tests will skip the external validation tests but still run internal validation. All core functionality tests run without optional dependencies.
+#### Controlling Oracle Tests
+
+Oracle tests can be controlled with environment variables:
+
+```bash
+# Skip all oracle tests
+GCOMP_SKIP_ORACLE_TESTS=1 make test
+
+# Enable verbose oracle test output
+GCOMP_ORACLE_VERBOSE=1 make test
+```
 
 ## Installation
 
