@@ -23,6 +23,7 @@
 #include <string.h>
 
 #include "ghoti.io/compress/compress.h"
+#include "ghoti.io/compress/macros.h"
 #include "ghoti.io/compress/options.h"
 #include "ghoti.io/compress/stream.h"
 
@@ -188,9 +189,7 @@ static void fuzz_encoder_strategies(
   gcomp_options_destroy(opts);
 }
 
-int main(int argc, char ** argv) {
-  (void)argc;
-  (void)argv;
+int main(GCOMP_MAYBE_UNUSED(int argc), GCOMP_MAYBE_UNUSED(char ** argv)) {
 
   size_t input_size = 0;
   uint8_t * input = read_stdin(&input_size);

@@ -9,33 +9,30 @@
 #include "test_helpers.h"
 #include <cstring>
 #include <ghoti.io/compress/errors.h>
+#include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/method.h>
 #include <ghoti.io/compress/registry.h>
 #include <gtest/gtest.h>
 
 // Mock method for testing
-static gcomp_status_t mock_create_encoder(gcomp_registry_t * registry,
-    gcomp_options_t * options, gcomp_encoder_t ** encoder_out) {
-  (void)registry;
-  (void)options;
-  (void)encoder_out;
+static gcomp_status_t mock_create_encoder(
+    GCOMP_MAYBE_UNUSED(gcomp_registry_t * registry),
+    GCOMP_MAYBE_UNUSED(gcomp_options_t * options),
+    GCOMP_MAYBE_UNUSED(gcomp_encoder_t ** encoder_out)) {
   return GCOMP_ERR_UNSUPPORTED; // Mock doesn't actually create encoders
 }
 
-static gcomp_status_t mock_create_decoder(gcomp_registry_t * registry,
-    gcomp_options_t * options, gcomp_decoder_t ** decoder_out) {
-  (void)registry;
-  (void)options;
-  (void)decoder_out;
+static gcomp_status_t mock_create_decoder(
+    GCOMP_MAYBE_UNUSED(gcomp_registry_t * registry),
+    GCOMP_MAYBE_UNUSED(gcomp_options_t * options),
+    GCOMP_MAYBE_UNUSED(gcomp_decoder_t ** decoder_out)) {
   return GCOMP_ERR_UNSUPPORTED; // Mock doesn't actually create decoders
 }
 
-static void mock_destroy_encoder(gcomp_encoder_t * encoder) {
-  (void)encoder;
+static void mock_destroy_encoder(GCOMP_MAYBE_UNUSED(gcomp_encoder_t * encoder)) {
 }
 
-static void mock_destroy_decoder(gcomp_decoder_t * decoder) {
-  (void)decoder;
+static void mock_destroy_decoder(GCOMP_MAYBE_UNUSED(gcomp_decoder_t * decoder)) {
 }
 
 // Create a mock method for testing

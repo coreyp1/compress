@@ -10,6 +10,7 @@
 #include <cstring>
 #include <ghoti.io/compress/deflate.h>
 #include <ghoti.io/compress/errors.h>
+#include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/method.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
@@ -20,42 +21,37 @@
 #include "../src/core/stream_internal.h"
 
 // Mock update/finish functions for testing
-static gcomp_status_t mock_encoder_update(gcomp_encoder_t * encoder,
-    gcomp_buffer_t * input, gcomp_buffer_t * output) {
-  (void)encoder;
-  (void)input;
-  (void)output;
+static gcomp_status_t mock_encoder_update(
+    GCOMP_MAYBE_UNUSED(gcomp_encoder_t * encoder),
+    GCOMP_MAYBE_UNUSED(gcomp_buffer_t * input),
+    GCOMP_MAYBE_UNUSED(gcomp_buffer_t * output)) {
   return GCOMP_OK;
 }
 
 static gcomp_status_t mock_encoder_finish(
-    gcomp_encoder_t * encoder, gcomp_buffer_t * output) {
-  (void)encoder;
-  (void)output;
+    GCOMP_MAYBE_UNUSED(gcomp_encoder_t * encoder),
+    GCOMP_MAYBE_UNUSED(gcomp_buffer_t * output)) {
   return GCOMP_OK;
 }
 
-static gcomp_status_t mock_decoder_update(gcomp_decoder_t * decoder,
-    gcomp_buffer_t * input, gcomp_buffer_t * output) {
-  (void)decoder;
-  (void)input;
-  (void)output;
+static gcomp_status_t mock_decoder_update(
+    GCOMP_MAYBE_UNUSED(gcomp_decoder_t * decoder),
+    GCOMP_MAYBE_UNUSED(gcomp_buffer_t * input),
+    GCOMP_MAYBE_UNUSED(gcomp_buffer_t * output)) {
   return GCOMP_OK;
 }
 
 static gcomp_status_t mock_decoder_finish(
-    gcomp_decoder_t * decoder, gcomp_buffer_t * output) {
-  (void)decoder;
-  (void)output;
+    GCOMP_MAYBE_UNUSED(gcomp_decoder_t * decoder),
+    GCOMP_MAYBE_UNUSED(gcomp_buffer_t * output)) {
   return GCOMP_OK;
 }
 
 // Mock create_encoder that sets up the encoder properly
-static gcomp_status_t mock_create_encoder(gcomp_registry_t * registry,
-    gcomp_options_t * options, gcomp_encoder_t ** encoder_out) {
-  (void)registry;
-  (void)options;
-
+static gcomp_status_t mock_create_encoder(
+    GCOMP_MAYBE_UNUSED(gcomp_registry_t * registry),
+    GCOMP_MAYBE_UNUSED(gcomp_options_t * options),
+    gcomp_encoder_t ** encoder_out) {
   // The encoder structure is already allocated by gcomp_encoder_create
   // We just need to set up the function pointers
   if (encoder_out && *encoder_out) {
@@ -68,11 +64,10 @@ static gcomp_status_t mock_create_encoder(gcomp_registry_t * registry,
 }
 
 // Mock create_decoder that sets up the decoder properly
-static gcomp_status_t mock_create_decoder(gcomp_registry_t * registry,
-    gcomp_options_t * options, gcomp_decoder_t ** decoder_out) {
-  (void)registry;
-  (void)options;
-
+static gcomp_status_t mock_create_decoder(
+    GCOMP_MAYBE_UNUSED(gcomp_registry_t * registry),
+    GCOMP_MAYBE_UNUSED(gcomp_options_t * options),
+    gcomp_decoder_t ** decoder_out) {
   // The decoder structure is already allocated by gcomp_decoder_create
   // We just need to set up the function pointers
   if (decoder_out && *decoder_out) {
@@ -84,13 +79,11 @@ static gcomp_status_t mock_create_decoder(gcomp_registry_t * registry,
   return GCOMP_OK;
 }
 
-static void mock_destroy_encoder(gcomp_encoder_t * encoder) {
-  (void)encoder;
+static void mock_destroy_encoder(GCOMP_MAYBE_UNUSED(gcomp_encoder_t * encoder)) {
   // No-op for mock
 }
 
-static void mock_destroy_decoder(gcomp_decoder_t * decoder) {
-  (void)decoder;
+static void mock_destroy_decoder(GCOMP_MAYBE_UNUSED(gcomp_decoder_t * decoder)) {
   // No-op for mock
 }
 

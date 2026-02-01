@@ -55,6 +55,7 @@
 
 #include <cstring>
 #include <ghoti.io/compress/errors.h>
+#include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/method.h>
 #include <ghoti.io/compress/stream.h>
 
@@ -64,10 +65,9 @@ namespace gcomp_test {
 
 // --- Encoder: update and finish ---
 
-inline static gcomp_status_t passthru_encoder_update(gcomp_encoder_t * encoder,
-    gcomp_buffer_t * input, gcomp_buffer_t * output) {
-  (void)encoder;
-
+inline static gcomp_status_t passthru_encoder_update(
+    GCOMP_MAYBE_UNUSED(gcomp_encoder_t * encoder), gcomp_buffer_t * input,
+    gcomp_buffer_t * output) {
   if (!input || !output) {
     return GCOMP_ERR_INVALID_ARG;
   }
@@ -90,8 +90,7 @@ inline static gcomp_status_t passthru_encoder_update(gcomp_encoder_t * encoder,
 }
 
 inline static gcomp_status_t passthru_encoder_finish(
-    gcomp_encoder_t * encoder, gcomp_buffer_t * output) {
-  (void)encoder;
+    GCOMP_MAYBE_UNUSED(gcomp_encoder_t * encoder), gcomp_buffer_t * output) {
   if (!output) {
     return GCOMP_ERR_INVALID_ARG;
   }
@@ -100,10 +99,9 @@ inline static gcomp_status_t passthru_encoder_finish(
 
 // --- Decoder: update and finish (same logic as encoder) ---
 
-inline static gcomp_status_t passthru_decoder_update(gcomp_decoder_t * decoder,
-    gcomp_buffer_t * input, gcomp_buffer_t * output) {
-  (void)decoder;
-
+inline static gcomp_status_t passthru_decoder_update(
+    GCOMP_MAYBE_UNUSED(gcomp_decoder_t * decoder), gcomp_buffer_t * input,
+    gcomp_buffer_t * output) {
   if (!input || !output) {
     return GCOMP_ERR_INVALID_ARG;
   }
@@ -126,8 +124,7 @@ inline static gcomp_status_t passthru_decoder_update(gcomp_decoder_t * decoder,
 }
 
 inline static gcomp_status_t passthru_decoder_finish(
-    gcomp_decoder_t * decoder, gcomp_buffer_t * output) {
-  (void)decoder;
+    GCOMP_MAYBE_UNUSED(gcomp_decoder_t * decoder), gcomp_buffer_t * output) {
   if (!output) {
     return GCOMP_ERR_INVALID_ARG;
   }
@@ -137,11 +134,9 @@ inline static gcomp_status_t passthru_decoder_finish(
 // --- Lifecycle: create and destroy ---
 
 inline static gcomp_status_t passthru_create_encoder(
-    gcomp_registry_t * registry, gcomp_options_t * options,
+    GCOMP_MAYBE_UNUSED(gcomp_registry_t * registry),
+    GCOMP_MAYBE_UNUSED(gcomp_options_t * options),
     gcomp_encoder_t ** encoder_out) {
-  (void)registry;
-  (void)options;
-
   if (!encoder_out || !*encoder_out) {
     return GCOMP_ERR_INVALID_ARG;
   }
@@ -153,11 +148,9 @@ inline static gcomp_status_t passthru_create_encoder(
 }
 
 inline static gcomp_status_t passthru_create_decoder(
-    gcomp_registry_t * registry, gcomp_options_t * options,
+    GCOMP_MAYBE_UNUSED(gcomp_registry_t * registry),
+    GCOMP_MAYBE_UNUSED(gcomp_options_t * options),
     gcomp_decoder_t ** decoder_out) {
-  (void)registry;
-  (void)options;
-
   if (!decoder_out || !*decoder_out) {
     return GCOMP_ERR_INVALID_ARG;
   }
@@ -168,12 +161,12 @@ inline static gcomp_status_t passthru_create_decoder(
   return GCOMP_OK;
 }
 
-inline static void passthru_destroy_encoder(gcomp_encoder_t * encoder) {
-  (void)encoder;
+inline static void passthru_destroy_encoder(
+    GCOMP_MAYBE_UNUSED(gcomp_encoder_t * encoder)) {
 }
 
-inline static void passthru_destroy_decoder(gcomp_decoder_t * decoder) {
-  (void)decoder;
+inline static void passthru_destroy_decoder(
+    GCOMP_MAYBE_UNUSED(gcomp_decoder_t * decoder)) {
 }
 
 // --- Method descriptor factory ---

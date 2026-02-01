@@ -32,6 +32,7 @@
 
 #include "ghoti.io/compress/compress.h"
 #include "ghoti.io/compress/gzip.h"
+#include "ghoti.io/compress/macros.h"
 #include "ghoti.io/compress/options.h"
 #include "ghoti.io/compress/stream.h"
 
@@ -186,9 +187,7 @@ static void fuzz_encoder_buffer(
   }
 }
 
-int main(int argc, char ** argv) {
-  (void)argc;
-  (void)argv;
+int main(GCOMP_MAYBE_UNUSED(int argc), GCOMP_MAYBE_UNUSED(char ** argv)) {
 
   // Read input from stdin
   size_t input_size = 0;
