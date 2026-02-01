@@ -32,8 +32,8 @@
 #include <stdint.h>
 #include <string.h>
 
-#include "cutil/mutex.h"
-#include "cutil/semaphore.h"
+#include <cutil/mutex.h>
+#include <cutil/semaphore.h>
 
 #include "alloc_internal.h"
 

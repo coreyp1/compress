@@ -339,6 +339,7 @@ $(APP_DIR)/fuzz/%$(EXE_EXTENSION): fuzz/%.c $(APP_DIR)/$(AFL_STATIC_TARGET)
 # Fuzz commands
 .PHONY: fuzz-build fuzz-corpus fuzz-decoder fuzz-encoder fuzz-roundtrip fuzz-help
 .PHONY: fuzz-gzip-decoder fuzz-gzip-encoder fuzz-gzip-roundtrip
+.PHONY: fuzz-lz4-decoder fuzz-lz4-encoder fuzz-lz4-roundtrip
 # Sanitizer commands
 .PHONY: test-asan test-asan-quiet test-ubsan sanitizer-help
 
@@ -452,10 +453,15 @@ fuzz-help: ## Show fuzzing help and instructions
 	@printf "    make fuzz-gzip-encoder  - Run gzip encoder fuzzer\n"
 	@printf "    make fuzz-gzip-roundtrip- Run gzip roundtrip fuzzer\n"
 	@printf "\n"
+	@printf "  LZ4 fuzzers:\n"
+	@printf "    make fuzz-lz4-decoder   - Run LZ4 decoder fuzzer\n"
+	@printf "    make fuzz-lz4-encoder   - Run LZ4 encoder fuzzer\n"
+	@printf "    make fuzz-lz4-roundtrip - Run LZ4 roundtrip fuzzer\n"
+	@printf "\n"
 	@printf "Workflow:\n"
 	@printf "  1. make fuzz-corpus        # Generate seed inputs\n"
 	@printf "  2. make fuzz-build         # Build library + harnesses with AFL\n"
-	@printf "  3. make fuzz-gzip-decoder  # Start fuzzing (Ctrl+C to stop)\n"
+	@printf "  3. make fuzz-lz4-decoder   # Start fuzzing (Ctrl+C to stop)\n"
 	@printf "\n"
 	@printf "Core pattern setup (for crash detection):\n"
 	@printf "  echo core | sudo tee /proc/sys/kernel/core_pattern\n"
@@ -591,6 +597,51 @@ fuzz-gzip-roundtrip: $(APP_DIR)/fuzz/fuzz_gzip_roundtrip$(EXE_EXTENSION)
 		printf 'Hello' > fuzz/corpus/gzip_roundtrip/hello.bin; \
 	fi
 	$(AFL_ENV) afl-fuzz -i fuzz/corpus/gzip_roundtrip -o fuzz/findings/gzip_roundtrip -- $(APP_DIR)/fuzz/fuzz_gzip_roundtrip$(EXE_EXTENSION)
+
+fuzz-lz4-decoder: ## Run LZ4 decoder fuzzer (Ctrl+C to stop)
+fuzz-lz4-decoder: $(APP_DIR)/fuzz/fuzz_lz4_decoder$(EXE_EXTENSION)
+	@printf "\033[0;32m\n"
+	@printf "######################################\n"
+	@printf "### Running LZ4 Decoder Fuzzer     ###\n"
+	@printf "######################################\n"
+	@printf "\033[0m\n"
+	@mkdir -p fuzz/findings/lz4_decoder
+	@if [ ! -d fuzz/corpus/lz4_decoder ] || [ -z "$$(ls -A fuzz/corpus/lz4_decoder 2>/dev/null)" ]; then \
+		printf "\033[0;33mWarning: No seed corpus found. Creating minimal seed...\033[0m\n"; \
+		mkdir -p fuzz/corpus/lz4_decoder; \
+		printf '\x04\x22\x4d\x18\x60\x70\xdf\x00\x00\x00\x00' > fuzz/corpus/lz4_decoder/empty.lz4; \
+	fi
+	$(AFL_ENV) afl-fuzz -i fuzz/corpus/lz4_decoder -o fuzz/findings/lz4_decoder -- $(APP_DIR)/fuzz/fuzz_lz4_decoder$(EXE_EXTENSION)
+
+fuzz-lz4-encoder: ## Run LZ4 encoder fuzzer (Ctrl+C to stop)
+fuzz-lz4-encoder: $(APP_DIR)/fuzz/fuzz_lz4_encoder$(EXE_EXTENSION)
+	@printf "\033[0;32m\n"
+	@printf "######################################\n"
+	@printf "### Running LZ4 Encoder Fuzzer     ###\n"
+	@printf "######################################\n"
+	@printf "\033[0m\n"
+	@mkdir -p fuzz/findings/lz4_encoder
+	@if [ ! -d fuzz/corpus/lz4_encoder ] || [ -z "$$(ls -A fuzz/corpus/lz4_encoder 2>/dev/null)" ]; then \
+		printf "\033[0;33mWarning: No seed corpus found. Creating minimal seed...\033[0m\n"; \
+		mkdir -p fuzz/corpus/lz4_encoder; \
+		printf 'Hello' > fuzz/corpus/lz4_encoder/hello.bin; \
+	fi
+	$(AFL_ENV) afl-fuzz -i fuzz/corpus/lz4_encoder -o fuzz/findings/lz4_encoder -- $(APP_DIR)/fuzz/fuzz_lz4_encoder$(EXE_EXTENSION)
+
+fuzz-lz4-roundtrip: ## Run LZ4 roundtrip fuzzer (Ctrl+C to stop)
+fuzz-lz4-roundtrip: $(APP_DIR)/fuzz/fuzz_lz4_roundtrip$(EXE_EXTENSION)
+	@printf "\033[0;32m\n"
+	@printf "######################################\n"
+	@printf "### Running LZ4 Roundtrip Fuzzer   ###\n"
+	@printf "######################################\n"
+	@printf "\033[0m\n"
+	@mkdir -p fuzz/findings/lz4_roundtrip
+	@if [ ! -d fuzz/corpus/lz4_roundtrip ] || [ -z "$$(ls -A fuzz/corpus/lz4_roundtrip 2>/dev/null)" ]; then \
+		printf "\033[0;33mWarning: No seed corpus found. Creating minimal seed...\033[0m\n"; \
+		mkdir -p fuzz/corpus/lz4_roundtrip; \
+		printf 'Hello' > fuzz/corpus/lz4_roundtrip/hello.bin; \
+	fi
+	$(AFL_ENV) afl-fuzz -i fuzz/corpus/lz4_roundtrip -o fuzz/findings/lz4_roundtrip -- $(APP_DIR)/fuzz/fuzz_lz4_roundtrip$(EXE_EXTENSION)
 
 test: ## Make and run the Unit tests
 test: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES)
@@ -997,4 +1048,4 @@ cloc: ## Count the lines of code used in the project
 	cloc src include tests Makefile
 
 help: ## Display this help
-	@grep -E '^[ a-zA-Z_-]+:.*?## .*$$' Makefile | sort | sed 's/\([^:]*\):.*## \(.*\)/\1:\2/' | awk -F: '{printf "%-15s %s\n", $$1, $$2}' | sed "s/(SUITE)/$(SUITE)/g; s/(PROJECT)/$(PROJECT)/g; s/(BRANCH)/$(BRANCH)/g"
+	@grep -E '^[ a-zA-Z0-9_-]+:.*?## .*$$' Makefile | sort | sed 's/\([^:]*\):.*## \(.*\)/\1:\2/' | awk -F: '{printf "%-15s %s\n", $$1, $$2}' | sed "s/(SUITE)/$(SUITE)/g; s/(PROJECT)/$(PROJECT)/g; s/(BRANCH)/$(BRANCH)/g"
