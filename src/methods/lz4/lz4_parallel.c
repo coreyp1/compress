@@ -386,7 +386,8 @@ gcomp_status_t lz4_parallel_get_result(
     ctx->inline_count--;
 
     *job_out = job;
-    return GCOMP_OK;
+    // Propagate job error if the job failed
+    return job->base.result;
   }
 
   // Get next result from queue
@@ -407,7 +408,8 @@ gcomp_status_t lz4_parallel_get_result(
   }
 
   *job_out = job;
-  return GCOMP_OK;
+  // Propagate job error if the job failed
+  return job->base.result;
 }
 
 bool lz4_parallel_result_ready(const lz4_parallel_ctx_t * ctx) {

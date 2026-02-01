@@ -21,6 +21,7 @@
 #include "lz4_internal.h"
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/options.h>
+#include <ghoti.io/compress/stream.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -172,7 +173,8 @@ gcomp_status_t lz4_decoder_init(gcomp_registry_t * registry,
   lz4_decoder_state_t * state =
       (lz4_decoder_state_t *)calloc(1, sizeof(lz4_decoder_state_t));
   if (!state) {
-    return GCOMP_ERR_MEMORY;
+    return gcomp_decoder_set_error(
+        decoder, GCOMP_ERR_MEMORY, "failed to allocate lz4 decoder state");
   }
 
   // Track memory usage (tracker is zero-initialized by calloc)
@@ -268,7 +270,9 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
           uint32_t magic = lz4_read_le32(state->header_accum);
           if (magic != LZ4_MAGIC) {
             state->stage = LZ4_DEC_STAGE_ERROR;
-            return GCOMP_ERR_CORRUPT;
+            return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+                "invalid lz4 magic: 0x%08X (expected 0x%08X)", magic,
+                LZ4_MAGIC);
           }
           state->header_stage = LZ4_HEADER_FLG_BD;
         }
@@ -337,7 +341,24 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
           gcomp_status_t status = lz4_decoder_parse_header(state);
           if (status != GCOMP_OK) {
             state->stage = LZ4_DEC_STAGE_ERROR;
-            return status;
+            // Determine specific error based on what failed
+            uint8_t flg = state->header_accum[4];
+            if ((flg & LZ4_FLG_VERSION_MASK) != LZ4_FLG_VERSION_VALUE) {
+              return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+                  "invalid lz4 FLG version bits: 0x%02X (expected 0x40)",
+                  flg & LZ4_FLG_VERSION_MASK);
+            }
+            if (flg & LZ4_FLG_RESERVED) {
+              return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+                  "invalid lz4 FLG byte: reserved bit set (0x%02X)", flg);
+            }
+            uint8_t bd = state->header_accum[5];
+            if (bd & LZ4_BD_RESERVED) {
+              return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+                  "invalid lz4 BD byte: reserved bits set (0x%02X)", bd);
+            }
+            return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+                "lz4 header checksum mismatch or invalid block size");
           }
           state->header_stage = LZ4_HEADER_DONE;
 
@@ -345,28 +366,75 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
           uint32_t block_size = state->header.block_max_size;
           if (block_size > state->max_block_bytes) {
             state->stage = LZ4_DEC_STAGE_ERROR;
-            return GCOMP_ERR_LIMIT;
+            return gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
+                "lz4 block max size %u exceeds limit %llu", block_size,
+                (unsigned long long)state->max_block_bytes);
           }
 
-          state->block_buffer = (uint8_t *)malloc(block_size);
-          state->block_buffer_size = block_size;
-          state->output_buffer = (uint8_t *)malloc(block_size);
-          state->output_buffer_size = block_size;
+          // Reuse existing buffers if large enough, otherwise reallocate
+          if (!state->block_buffer || state->block_buffer_size < block_size) {
+            if (state->block_buffer) {
+              free(state->block_buffer);
+              gcomp_memory_track_free(
+                  &state->mem_tracker, state->block_buffer_size);
+            }
+            state->block_buffer = (uint8_t *)malloc(block_size);
+            state->block_buffer_size = block_size;
+            if (state->block_buffer) {
+              gcomp_memory_track_alloc(&state->mem_tracker, block_size);
+            }
+          }
+          if (!state->output_buffer || state->output_buffer_size < block_size) {
+            if (state->output_buffer) {
+              free(state->output_buffer);
+              gcomp_memory_track_free(
+                  &state->mem_tracker, state->output_buffer_size);
+            }
+            state->output_buffer = (uint8_t *)malloc(block_size);
+            state->output_buffer_size = block_size;
+            if (state->output_buffer) {
+              gcomp_memory_track_alloc(&state->mem_tracker, block_size);
+            }
+          }
 
           if (!state->block_buffer || !state->output_buffer) {
             state->stage = LZ4_DEC_STAGE_ERROR;
-            return GCOMP_ERR_MEMORY;
+            return gcomp_decoder_set_error(decoder, GCOMP_ERR_MEMORY,
+                "failed to allocate lz4 block buffers (%u bytes)", block_size);
           }
 
           // Allocate history buffer for dependent blocks
           if (!state->header.block_independence) {
-            state->history_capacity = LZ4_HISTORY_SIZE;
-            state->history_buffer = (uint8_t *)malloc(state->history_capacity);
-            if (!state->history_buffer) {
-              state->stage = LZ4_DEC_STAGE_ERROR;
-              return GCOMP_ERR_MEMORY;
+            if (!state->history_buffer ||
+                state->history_capacity < LZ4_HISTORY_SIZE) {
+              if (state->history_buffer) {
+                free(state->history_buffer);
+                gcomp_memory_track_free(
+                    &state->mem_tracker, state->history_capacity);
+              }
+              state->history_capacity = LZ4_HISTORY_SIZE;
+              state->history_buffer =
+                  (uint8_t *)malloc(state->history_capacity);
+              if (!state->history_buffer) {
+                state->stage = LZ4_DEC_STAGE_ERROR;
+                return gcomp_decoder_set_error(decoder, GCOMP_ERR_MEMORY,
+                    "failed to allocate lz4 history buffer (%zu bytes)",
+                    state->history_capacity);
+              }
+              gcomp_memory_track_alloc(
+                  &state->mem_tracker, state->history_capacity);
             }
             state->history_size = 0;
+          }
+
+          // Check memory limit
+          if (state->max_memory_bytes > 0 &&
+              state->mem_tracker.current_bytes > state->max_memory_bytes) {
+            state->stage = LZ4_DEC_STAGE_ERROR;
+            return gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
+                "lz4 decoder memory usage %llu exceeds limit %llu",
+                (unsigned long long)state->mem_tracker.current_bytes,
+                (unsigned long long)state->max_memory_bytes);
           }
 
           // Initialize content checksum if enabled
@@ -398,7 +466,8 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
             &state->current_block_size, &state->current_block_uncompressed);
         if (status != GCOMP_OK) {
           state->stage = LZ4_DEC_STAGE_ERROR;
-          return status;
+          return gcomp_decoder_set_error(
+              decoder, status, "failed to parse lz4 block size field");
         }
 
         if (state->current_block_size == 0) {
@@ -415,7 +484,10 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
           // Check block size limit
           if (state->current_block_size > state->max_block_bytes) {
             state->stage = LZ4_DEC_STAGE_ERROR;
-            return GCOMP_ERR_LIMIT;
+            return gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
+                "lz4 block size %u exceeds limit %llu",
+                state->current_block_size,
+                (unsigned long long)state->max_block_bytes);
           }
           state->block_bytes_remaining = state->current_block_size;
           state->block_buffer_pos = 0;
@@ -465,7 +537,16 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
               state->history_buffer, state->history_size);
           if (status != GCOMP_OK) {
             state->stage = LZ4_DEC_STAGE_ERROR;
-            return status;
+            if (status == GCOMP_ERR_CORRUPT) {
+              return gcomp_decoder_set_error(decoder, status,
+                  "corrupt lz4 block data (invalid match offset or bounds)");
+            }
+            if (status == GCOMP_ERR_LIMIT) {
+              return gcomp_decoder_set_error(decoder, status,
+                  "lz4 block decompressed size exceeds buffer capacity");
+            }
+            return gcomp_decoder_set_error(
+                decoder, status, "lz4 block decompression failed");
           }
         }
 
@@ -477,7 +558,10 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
         // Check output limit
         if (state->total_output_bytes > state->max_output_bytes) {
           state->stage = LZ4_DEC_STAGE_ERROR;
-          return GCOMP_ERR_LIMIT;
+          return gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
+              "lz4 output size %llu exceeds limit %llu",
+              (unsigned long long)state->total_output_bytes,
+              (unsigned long long)state->max_output_bytes);
         }
 
         // Check expansion ratio
@@ -485,7 +569,13 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
           uint64_t ratio = state->total_output_bytes / state->total_input_bytes;
           if (ratio > state->max_expansion_ratio) {
             state->stage = LZ4_DEC_STAGE_ERROR;
-            return GCOMP_ERR_LIMIT;
+            return gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
+                "lz4 expansion ratio %llu exceeds limit %llu "
+                "(input=%llu, output=%llu)",
+                (unsigned long long)ratio,
+                (unsigned long long)state->max_expansion_ratio,
+                (unsigned long long)state->total_input_bytes,
+                (unsigned long long)state->total_output_bytes);
           }
         }
 
@@ -548,7 +638,9 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
             gcomp_xxhash32(state->block_buffer, state->current_block_size, 0);
         if (expected != computed) {
           state->stage = LZ4_DEC_STAGE_ERROR;
-          return GCOMP_ERR_CORRUPT;
+          return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+              "lz4 block checksum mismatch: expected 0x%08X, computed 0x%08X",
+              expected, computed);
         }
         state->stage = LZ4_DEC_STAGE_BLOCK_SIZE;
         state->block_size_buf_pos = 0;
@@ -568,7 +660,9 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
         uint32_t computed = gcomp_xxhash32_finalize(&state->content_hash);
         if (expected != computed) {
           state->stage = LZ4_DEC_STAGE_ERROR;
-          return GCOMP_ERR_CORRUPT;
+          return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+              "lz4 content checksum mismatch: expected 0x%08X, computed 0x%08X",
+              expected, computed);
         }
         state->stage = LZ4_DEC_STAGE_DONE;
       }
@@ -628,8 +722,37 @@ gcomp_status_t lz4_decoder_finish(
     return GCOMP_ERR_INTERNAL;
   }
 
-  // Incomplete stream
-  return GCOMP_ERR_CORRUPT;
+  // Incomplete stream - provide specific error message based on stage
+  switch (state->stage) {
+  case LZ4_DEC_STAGE_HEADER:
+    return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+        "lz4 stream truncated in header (sub-stage %d, pos %zu)",
+        state->header_stage, state->header_accum_pos);
+
+  case LZ4_DEC_STAGE_BLOCK_SIZE:
+    return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+        "lz4 stream truncated in block size (%zu of 4 bytes)",
+        state->block_size_buf_pos);
+
+  case LZ4_DEC_STAGE_BLOCK_DATA:
+    return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+        "lz4 stream truncated in block data (%zu bytes remaining)",
+        state->block_bytes_remaining);
+
+  case LZ4_DEC_STAGE_BLOCK_CHECKSUM:
+    return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+        "lz4 stream truncated in block checksum (%zu of 4 bytes)",
+        state->block_checksum_buf_pos);
+
+  case LZ4_DEC_STAGE_CONTENT_CHECKSUM:
+    return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+        "lz4 stream truncated in content checksum (%zu of 4 bytes)",
+        state->content_checksum_buf_pos);
+
+  default:
+    return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+        "lz4 stream incomplete (unexpected stage %d)", state->stage);
+  }
 }
 
 gcomp_status_t lz4_decoder_reset(gcomp_decoder_t * decoder) {
@@ -638,6 +761,27 @@ gcomp_status_t lz4_decoder_reset(gcomp_decoder_t * decoder) {
   }
 
   lz4_decoder_state_t * state = (lz4_decoder_state_t *)decoder->method_state;
+
+  // Free dynamically allocated buffers (they'll be reallocated for next stream)
+  if (state->block_buffer) {
+    free(state->block_buffer);
+    state->block_buffer = NULL;
+    state->block_buffer_size = 0;
+  }
+  if (state->output_buffer) {
+    free(state->output_buffer);
+    state->output_buffer = NULL;
+    state->output_buffer_size = 0;
+  }
+  if (state->history_buffer) {
+    free(state->history_buffer);
+    state->history_buffer = NULL;
+    state->history_size = 0;
+    state->history_capacity = 0;
+  }
+
+  // Reset memory tracker (buffers freed, only state struct remains)
+  state->mem_tracker.current_bytes = sizeof(lz4_decoder_state_t);
 
   // Reset parsing state
   state->stage = LZ4_DEC_STAGE_HEADER;
@@ -652,10 +796,6 @@ gcomp_status_t lz4_decoder_reset(gcomp_decoder_t * decoder) {
   state->output_buffer_len = 0;
   state->total_input_bytes = 0;
   state->total_output_bytes = 0;
-
-  if (state->history_buffer) {
-    state->history_size = 0;
-  }
 
   // Clear header info
   memset(&state->header, 0, sizeof(state->header));

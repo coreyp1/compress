@@ -26,6 +26,7 @@
 #include "lz4_internal.h"
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/options.h>
+#include <ghoti.io/compress/stream.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -120,7 +121,8 @@ gcomp_status_t lz4_encoder_init(gcomp_registry_t * registry,
   lz4_encoder_state_t * state =
       (lz4_encoder_state_t *)calloc(1, sizeof(lz4_encoder_state_t));
   if (!state) {
-    return GCOMP_ERR_MEMORY;
+    return gcomp_encoder_set_error(
+        encoder, GCOMP_ERR_MEMORY, "failed to allocate lz4 encoder state");
   }
 
   // Track memory usage (tracker is zero-initialized by calloc)
@@ -138,7 +140,9 @@ gcomp_status_t lz4_encoder_init(gcomp_registry_t * registry,
   state->block_buffer = (uint8_t *)malloc(state->block_buffer_size);
   if (!state->block_buffer) {
     free(state);
-    return GCOMP_ERR_MEMORY;
+    return gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
+        "failed to allocate lz4 block buffer (%zu bytes)",
+        state->block_buffer_size);
   }
   gcomp_memory_track_alloc(&state->mem_tracker, state->block_buffer_size);
   state->block_buffer_pos = 0;
@@ -150,7 +154,9 @@ gcomp_status_t lz4_encoder_init(gcomp_registry_t * registry,
   if (!state->compressed_buffer) {
     free(state->block_buffer);
     free(state);
-    return GCOMP_ERR_MEMORY;
+    return gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
+        "failed to allocate lz4 compressed buffer (%zu bytes)",
+        state->compressed_buffer_size);
   }
   gcomp_memory_track_alloc(&state->mem_tracker, state->compressed_buffer_size);
   state->compressed_buffer_pos = 0;
@@ -163,7 +169,9 @@ gcomp_status_t lz4_encoder_init(gcomp_registry_t * registry,
     free(state->compressed_buffer);
     free(state->block_buffer);
     free(state);
-    return GCOMP_ERR_MEMORY;
+    return gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
+        "failed to allocate lz4 hash table (%zu bytes)",
+        state->hash_table_size * sizeof(uint32_t));
   }
   gcomp_memory_track_alloc(
       &state->mem_tracker, state->hash_table_size * sizeof(uint32_t));
@@ -176,7 +184,10 @@ gcomp_status_t lz4_encoder_init(gcomp_registry_t * registry,
     free(state->compressed_buffer);
     free(state->block_buffer);
     free(state);
-    return GCOMP_ERR_MEMORY;
+    return gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
+        "lz4 encoder memory usage %llu exceeds limit %llu",
+        (unsigned long long)state->mem_tracker.current_bytes,
+        (unsigned long long)state->max_memory_bytes);
   }
 
   // Build FLG and BD bytes
@@ -344,7 +355,10 @@ gcomp_status_t lz4_encoder_update(gcomp_encoder_t * encoder,
         if (block_pos < total_block_len) {
           // TODO: Handle partial block output
           state->stage = LZ4_ENC_STAGE_ERROR;
-          return GCOMP_ERR_LIMIT;
+          return gcomp_encoder_set_error(encoder, GCOMP_ERR_LIMIT,
+              "lz4 output buffer too small for block (%zu of %zu bytes "
+              "written)",
+              block_pos, total_block_len);
         }
 
         // Reset block buffer

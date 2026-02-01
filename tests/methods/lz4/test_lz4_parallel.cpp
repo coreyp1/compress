@@ -433,6 +433,160 @@ TEST_F(Lz4ParallelTest, ThreadedModeWithBlockChecksum) {
 }
 
 //
+// Error Propagation Tests
+//
+
+TEST_F(Lz4ParallelTest, InlineModeErrorPropagation) {
+  lz4_parallel_config_t config = {};
+  config.num_threads = 0; // Inline mode
+  config.block_max_size = 65536;
+
+  lz4_parallel_ctx_t * ctx = nullptr;
+  gcomp_status_t status = lz4_parallel_create(&config, &ctx);
+  ASSERT_EQ(status, GCOMP_OK);
+  EXPECT_TRUE(lz4_parallel_is_inline(ctx));
+
+  // Allocate a job
+  lz4_parallel_job_t * job = nullptr;
+  status = lz4_parallel_alloc_job(ctx, &job);
+  ASSERT_EQ(status, GCOMP_OK);
+
+  // Fill with random/incompressible data that will expand when compressed
+  for (size_t i = 0; i < 1000; i++) {
+    const_cast<uint8_t *>(job->base.input)[i] = (uint8_t)(i * 17 + 31);
+  }
+  job->base.input_size = 1000;
+
+  // Sabotage the output buffer capacity to be too small to store uncompressed
+  // This will trigger GCOMP_ERR_LIMIT when compression expands and fallback
+  // to uncompressed storage fails
+  job->base.output_capacity = 100; // Too small for 1000 byte input
+
+  // Submit - should complete inline but with error
+  status = lz4_parallel_submit(ctx, job);
+  ASSERT_EQ(status, GCOMP_OK); // Submit itself succeeds
+
+  // Get result - should propagate the job's error
+  lz4_parallel_job_t * result = nullptr;
+  status = lz4_parallel_get_result(ctx, &result);
+  EXPECT_EQ(status, GCOMP_ERR_LIMIT); // Error should be propagated
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(result->base.status, GCOMP_JOB_ERROR);
+  EXPECT_EQ(result->base.result, GCOMP_ERR_LIMIT);
+
+  lz4_parallel_free_job(ctx, job);
+  lz4_parallel_destroy(ctx);
+}
+
+TEST_F(Lz4ParallelTest, ThreadedModeErrorPropagation) {
+  lz4_parallel_config_t config = {};
+  config.num_threads = 2;
+  config.block_max_size = 65536;
+
+  lz4_parallel_ctx_t * ctx = nullptr;
+  gcomp_status_t status = lz4_parallel_create(&config, &ctx);
+  ASSERT_EQ(status, GCOMP_OK);
+  EXPECT_FALSE(lz4_parallel_is_inline(ctx));
+
+  // Allocate a job
+  lz4_parallel_job_t * job = nullptr;
+  status = lz4_parallel_alloc_job(ctx, &job);
+  ASSERT_EQ(status, GCOMP_OK);
+
+  // Fill with random/incompressible data
+  for (size_t i = 0; i < 1000; i++) {
+    const_cast<uint8_t *>(job->base.input)[i] = (uint8_t)(i * 17 + 31);
+  }
+  job->base.input_size = 1000;
+
+  // Sabotage the output buffer capacity
+  job->base.output_capacity = 100; // Too small
+
+  // Submit
+  status = lz4_parallel_submit(ctx, job);
+  ASSERT_EQ(status, GCOMP_OK);
+
+  // Get result - should propagate the job's error
+  lz4_parallel_job_t * result = nullptr;
+  status = lz4_parallel_get_result(ctx, &result);
+  EXPECT_EQ(status, GCOMP_ERR_LIMIT);
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(result->base.status, GCOMP_JOB_ERROR);
+  EXPECT_EQ(result->base.result, GCOMP_ERR_LIMIT);
+
+  lz4_parallel_free_job(ctx, job);
+  lz4_parallel_destroy(ctx);
+}
+
+TEST_F(Lz4ParallelTest, MixedSuccessAndFailureJobs) {
+  lz4_parallel_config_t config = {};
+  config.num_threads = 2;
+  config.block_max_size = 65536;
+
+  lz4_parallel_ctx_t * ctx = nullptr;
+  gcomp_status_t status = lz4_parallel_create(&config, &ctx);
+  ASSERT_EQ(status, GCOMP_OK);
+
+  // Submit 3 jobs: success, failure, success
+  lz4_parallel_job_t * jobs[3];
+
+  // Job 0: will succeed
+  status = lz4_parallel_alloc_job(ctx, &jobs[0]);
+  ASSERT_EQ(status, GCOMP_OK);
+  const char * good_data = "This is compressible data that will succeed";
+  memcpy(
+      const_cast<uint8_t *>(jobs[0]->base.input), good_data, strlen(good_data));
+  jobs[0]->base.input_size = strlen(good_data);
+  status = lz4_parallel_submit(ctx, jobs[0]);
+  ASSERT_EQ(status, GCOMP_OK);
+
+  // Job 1: will fail (sabotaged output capacity)
+  status = lz4_parallel_alloc_job(ctx, &jobs[1]);
+  ASSERT_EQ(status, GCOMP_OK);
+  for (size_t i = 0; i < 1000; i++) {
+    const_cast<uint8_t *>(jobs[1]->base.input)[i] = (uint8_t)(i * 17 + 31);
+  }
+  jobs[1]->base.input_size = 1000;
+  jobs[1]->base.output_capacity = 100; // Sabotage
+  status = lz4_parallel_submit(ctx, jobs[1]);
+  ASSERT_EQ(status, GCOMP_OK);
+
+  // Job 2: will succeed
+  status = lz4_parallel_alloc_job(ctx, &jobs[2]);
+  ASSERT_EQ(status, GCOMP_OK);
+  memcpy(
+      const_cast<uint8_t *>(jobs[2]->base.input), good_data, strlen(good_data));
+  jobs[2]->base.input_size = strlen(good_data);
+  status = lz4_parallel_submit(ctx, jobs[2]);
+  ASSERT_EQ(status, GCOMP_OK);
+
+  // Retrieve in order - job 0 should succeed
+  lz4_parallel_job_t * result = nullptr;
+  status = lz4_parallel_get_result(ctx, &result);
+  EXPECT_EQ(status, GCOMP_OK);
+  EXPECT_EQ(result, jobs[0]);
+  EXPECT_EQ(result->base.result, GCOMP_OK);
+
+  // Job 1 should fail
+  status = lz4_parallel_get_result(ctx, &result);
+  EXPECT_EQ(status, GCOMP_ERR_LIMIT);
+  EXPECT_EQ(result, jobs[1]);
+  EXPECT_EQ(result->base.result, GCOMP_ERR_LIMIT);
+
+  // Job 2 should succeed despite job 1 failing
+  status = lz4_parallel_get_result(ctx, &result);
+  EXPECT_EQ(status, GCOMP_OK);
+  EXPECT_EQ(result, jobs[2]);
+  EXPECT_EQ(result->base.result, GCOMP_OK);
+
+  // Cleanup
+  for (int i = 0; i < 3; i++) {
+    lz4_parallel_free_job(ctx, jobs[i]);
+  }
+  lz4_parallel_destroy(ctx);
+}
+
+//
 // Integration Tests with Encoder
 //
 
