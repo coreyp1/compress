@@ -21,6 +21,7 @@
 
 #include "../../core/alloc_internal.h"
 #include "../../core/registry_internal.h"
+#include "../../core/stream_internal.h"
 #include "bitwriter.h"
 #include "deflate_internal.h"
 #include "huffman.h"
@@ -1883,7 +1884,8 @@ gcomp_status_t gcomp_deflate_encoder_reset(gcomp_encoder_t * encoder) {
   gcomp_deflate_encoder_state_t * st =
       (gcomp_deflate_encoder_state_t *)encoder->method_state;
   if (!st) {
-    return GCOMP_ERR_INTERNAL;
+    return gcomp_encoder_set_error(
+        encoder, GCOMP_ERR_INTERNAL, "deflate encoder state is NULL");
   }
 
   const gcomp_allocator_t * alloc =
@@ -1957,7 +1959,8 @@ gcomp_status_t gcomp_deflate_encoder_update(gcomp_encoder_t * encoder,
   gcomp_deflate_encoder_state_t * st =
       (gcomp_deflate_encoder_state_t *)encoder->method_state;
   if (!st) {
-    return GCOMP_ERR_INTERNAL;
+    return gcomp_encoder_set_error(
+        encoder, GCOMP_ERR_INTERNAL, "deflate encoder state is NULL");
   }
 
   if (st->stage == DEFLATE_ENC_STAGE_DONE) {
@@ -2300,7 +2303,8 @@ gcomp_status_t gcomp_deflate_encoder_finish(
   gcomp_deflate_encoder_state_t * st =
       (gcomp_deflate_encoder_state_t *)encoder->method_state;
   if (!st) {
-    return GCOMP_ERR_INTERNAL;
+    return gcomp_encoder_set_error(
+        encoder, GCOMP_ERR_INTERNAL, "deflate encoder state is NULL");
   }
 
   if (st->final_block_written) {
@@ -2318,7 +2322,8 @@ gcomp_status_t gcomp_deflate_encoder_finish(
     // Allocate the finish buffer
     st->finish_buf = (uint8_t *)gcomp_malloc(alloc, buf_size);
     if (!st->finish_buf) {
-      return GCOMP_ERR_MEMORY;
+      return gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
+          "failed to allocate deflate finish buffer (%zu bytes)", buf_size);
     }
     st->finish_buf_size = buf_size;
     st->finish_buf_used = 0;

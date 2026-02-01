@@ -31,7 +31,18 @@ The library is organized into the following major components:
 │  │  └──────────────────┘  └──────────────────┘  └───────────────┘  │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │                      (future: gzip, zstd, lz4)                  │    │
+│  │                          gzip/                                  │    │
+│  │  ┌──────────────────┐  ┌──────────────────┐  ┌───────────────┐  │    │
+│  │  │  gzip_encoder.c  │  │  gzip_decoder.c  │  │ gzip_format.c │  │    │
+│  │  │                  │  │                  │  │  (RFC 1952)   │  │    │
+│  │  └──────────────────┘  └──────────────────┘  └───────────────┘  │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                           lz4/                                  │    │
+│  │  ┌──────────────────┐  ┌──────────────────┐  ┌───────────────┐  │    │
+│  │  │  lz4_encoder.c   │  │  lz4_decoder.c   │  │  lz4_block.c  │  │    │
+│  │  │  lz4_parallel.c  │  │                  │  │  lz4_frame.c  │  │    │
+│  │  └──────────────────┘  └──────────────────┘  └───────────────┘  │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -426,6 +437,8 @@ compress/
 │   ├── allocator.h               # Memory allocation
 │   ├── limits.h                  # Safety limits
 │   ├── deflate.h                 # Deflate-specific API
+│   ├── gzip.h                    # Gzip-specific API
+│   ├── lz4.h                     # LZ4-specific API
 │   └── macros.h                  # Cross-compiler utilities
 │
 ├── src/
@@ -445,13 +458,25 @@ compress/
 │   │   └── autoreg_platform.h    # Platform-specific constructors
 │   │
 │   └── methods/                  # Compression method implementations
-│       └── deflate/
-│           ├── deflate_encode.c  # Encoder (LZ77 + Huffman)
-│           ├── deflate_decode.c  # Decoder
-│           ├── deflate_register.c# Vtable and registration
-│           ├── huffman.c         # Huffman table building
-│           ├── bitreader.c       # Bit-level input
-│           └── bitwriter.c       # Bit-level output
+│       ├── deflate/
+│       │   ├── deflate_encode.c  # Encoder (LZ77 + Huffman)
+│       │   ├── deflate_decode.c  # Decoder
+│       │   ├── deflate_register.c# Vtable and registration
+│       │   ├── huffman.c         # Huffman table building
+│       │   ├── bitreader.c       # Bit-level input
+│       │   └── bitwriter.c       # Bit-level output
+│       ├── gzip/
+│       │   ├── gzip_encoder.c    # Gzip wrapper encoder (RFC 1952)
+│       │   ├── gzip_decoder.c    # Gzip wrapper decoder
+│       │   ├── gzip_format.c     # Header/trailer parsing
+│       │   └── gzip_register.c   # Vtable and registration
+│       └── lz4/
+│           ├── lz4_encoder.c     # LZ4 frame encoder
+│           ├── lz4_decoder.c     # LZ4 frame decoder
+│           ├── lz4_block.c       # Block compression/decompression
+│           ├── lz4_frame.c       # Frame header/trailer
+│           ├── lz4_parallel.c    # Parallel encoding support
+│           └── lz4_register.c    # Vtable and registration
 │
 ├── tests/                        # Unit tests (Google Test)
 ├── examples/                     # Example programs
@@ -464,6 +489,8 @@ compress/
 
 - [Streaming API](api/streaming.md) - Detailed streaming usage patterns
 - [Deflate Module](modules/deflate.md) - Deflate-specific options and usage
+- [Gzip Module](modules/gzip.md) - Gzip-specific options and usage
+- [LZ4 Module](modules/lz4.md) - LZ4-specific options and usage
 - [Auto-Registration](auto-registration.md) - How methods are automatically registered
 - [Wrapper Methods](wrapper-methods.md) - Implementing wrapper methods (gzip, etc.)
 - [Testing](testing/testing.md) - Testing infrastructure

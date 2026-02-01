@@ -256,20 +256,24 @@ static gcomp_status_t lz4_decoder_parse_header(lz4_decoder_state_t * state) {
 // Internal API Implementation
 //
 
-gcomp_status_t lz4_decoder_init(GCOMP_MAYBE_UNUSED(gcomp_registry_t * registry),
+gcomp_status_t lz4_decoder_init(gcomp_registry_t * registry,
     gcomp_options_t * options, gcomp_decoder_t * decoder) {
 
   if (!decoder) {
     return GCOMP_ERR_INVALID_ARG;
   }
 
+  // Get allocator from registry
+  const gcomp_allocator_t * alloc = gcomp_registry_get_allocator(registry);
+
   // Allocate state
   lz4_decoder_state_t * state =
-      (lz4_decoder_state_t *)calloc(1, sizeof(lz4_decoder_state_t));
+      (lz4_decoder_state_t *)gcomp_calloc(alloc, 1, sizeof(lz4_decoder_state_t));
   if (!state) {
     return gcomp_decoder_set_error(
         decoder, GCOMP_ERR_MEMORY, "failed to allocate lz4 decoder state");
   }
+  state->allocator = alloc;
 
   // Track memory usage (tracker is zero-initialized by calloc)
   gcomp_memory_track_alloc(&state->mem_tracker, sizeof(lz4_decoder_state_t));
@@ -277,7 +281,7 @@ gcomp_status_t lz4_decoder_init(GCOMP_MAYBE_UNUSED(gcomp_registry_t * registry),
   // Read options
   gcomp_status_t status = lz4_decoder_read_options(options, state);
   if (status != GCOMP_OK) {
-    free(state);
+    gcomp_free(alloc, state);
     return status;
   }
 
@@ -310,18 +314,19 @@ void lz4_decoder_destroy(gcomp_decoder_t * decoder) {
   }
 
   lz4_decoder_state_t * state = (lz4_decoder_state_t *)decoder->method_state;
+  const gcomp_allocator_t * alloc = state->allocator;
 
   if (state->history_buffer) {
-    free(state->history_buffer);
+    gcomp_free(alloc, state->history_buffer);
   }
   if (state->output_buffer) {
-    free(state->output_buffer);
+    gcomp_free(alloc, state->output_buffer);
   }
   if (state->block_buffer) {
-    free(state->block_buffer);
+    gcomp_free(alloc, state->block_buffer);
   }
 
-  free(state);
+  gcomp_free(alloc, state);
   decoder->method_state = NULL;
 }
 
@@ -471,13 +476,14 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
           }
 
           // Reuse existing buffers if large enough, otherwise reallocate
+          const gcomp_allocator_t * alloc = state->allocator;
           if (!state->block_buffer || state->block_buffer_size < block_size) {
             if (state->block_buffer) {
-              free(state->block_buffer);
+              gcomp_free(alloc, state->block_buffer);
               gcomp_memory_track_free(
                   &state->mem_tracker, state->block_buffer_size);
             }
-            state->block_buffer = (uint8_t *)malloc(block_size);
+            state->block_buffer = (uint8_t *)gcomp_malloc(alloc, block_size);
             state->block_buffer_size = block_size;
             if (state->block_buffer) {
               gcomp_memory_track_alloc(&state->mem_tracker, block_size);
@@ -485,11 +491,11 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
           }
           if (!state->output_buffer || state->output_buffer_size < block_size) {
             if (state->output_buffer) {
-              free(state->output_buffer);
+              gcomp_free(alloc, state->output_buffer);
               gcomp_memory_track_free(
                   &state->mem_tracker, state->output_buffer_size);
             }
-            state->output_buffer = (uint8_t *)malloc(block_size);
+            state->output_buffer = (uint8_t *)gcomp_malloc(alloc, block_size);
             state->output_buffer_size = block_size;
             if (state->output_buffer) {
               gcomp_memory_track_alloc(&state->mem_tracker, block_size);
@@ -499,14 +505,14 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
           if (!state->block_buffer || !state->output_buffer) {
             // Clean up any successful allocations before returning error
             if (state->block_buffer) {
-              free(state->block_buffer);
+              gcomp_free(alloc, state->block_buffer);
               gcomp_memory_track_free(
                   &state->mem_tracker, state->block_buffer_size);
               state->block_buffer = NULL;
               state->block_buffer_size = 0;
             }
             if (state->output_buffer) {
-              free(state->output_buffer);
+              gcomp_free(alloc, state->output_buffer);
               gcomp_memory_track_free(
                   &state->mem_tracker, state->output_buffer_size);
               state->output_buffer = NULL;
@@ -522,24 +528,24 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
             if (!state->history_buffer ||
                 state->history_capacity < LZ4_HISTORY_SIZE) {
               if (state->history_buffer) {
-                free(state->history_buffer);
+                gcomp_free(alloc, state->history_buffer);
                 gcomp_memory_track_free(
                     &state->mem_tracker, state->history_capacity);
               }
               state->history_capacity = LZ4_HISTORY_SIZE;
               state->history_buffer =
-                  (uint8_t *)malloc(state->history_capacity);
+                  (uint8_t *)gcomp_malloc(alloc, state->history_capacity);
               if (!state->history_buffer) {
                 // Clean up block and output buffers before returning error
                 if (state->block_buffer) {
-                  free(state->block_buffer);
+                  gcomp_free(alloc, state->block_buffer);
                   gcomp_memory_track_free(
                       &state->mem_tracker, state->block_buffer_size);
                   state->block_buffer = NULL;
                   state->block_buffer_size = 0;
                 }
                 if (state->output_buffer) {
-                  free(state->output_buffer);
+                  gcomp_free(alloc, state->output_buffer);
                   gcomp_memory_track_free(
                       &state->mem_tracker, state->output_buffer_size);
                   state->output_buffer = NULL;
@@ -902,38 +908,36 @@ gcomp_status_t lz4_decoder_reset(gcomp_decoder_t * decoder) {
 
   lz4_decoder_state_t * state = (lz4_decoder_state_t *)decoder->method_state;
 
-  // Free dynamically allocated buffers (they'll be reallocated for next stream)
+  // Keep buffers allocated for reuse (consistent with deflate/gzip behavior).
+  // Buffers will be resized on next header parse if the new stream has a
+  // different block size requirement.
+
+  // Reset buffer usage state (not the allocations)
+  state->block_buffer_pos = 0;
+  state->output_buffer_pos = 0;
+  state->output_buffer_len = 0;
+  state->history_size = 0;
+
+  // Memory tracker reflects retained allocations
+  state->mem_tracker.current_bytes = sizeof(lz4_decoder_state_t);
   if (state->block_buffer) {
-    free(state->block_buffer);
-    state->block_buffer = NULL;
-    state->block_buffer_size = 0;
+    state->mem_tracker.current_bytes += state->block_buffer_size;
   }
   if (state->output_buffer) {
-    free(state->output_buffer);
-    state->output_buffer = NULL;
-    state->output_buffer_size = 0;
+    state->mem_tracker.current_bytes += state->output_buffer_size;
   }
   if (state->history_buffer) {
-    free(state->history_buffer);
-    state->history_buffer = NULL;
-    state->history_size = 0;
-    state->history_capacity = 0;
+    state->mem_tracker.current_bytes += state->history_capacity;
   }
-
-  // Reset memory tracker (buffers freed, only state struct remains)
-  state->mem_tracker.current_bytes = sizeof(lz4_decoder_state_t);
 
   // Reset parsing state
   state->stage = LZ4_DEC_STAGE_HEADER;
   state->header_stage = LZ4_HEADER_MAGIC;
   state->header_accum_pos = 0;
   state->block_size_buf_pos = 0;
-  state->block_buffer_pos = 0;
   state->block_bytes_remaining = 0;
   state->block_checksum_buf_pos = 0;
   state->content_checksum_buf_pos = 0;
-  state->output_buffer_pos = 0;
-  state->output_buffer_len = 0;
   state->total_input_bytes = 0;
   state->total_output_bytes = 0;
 

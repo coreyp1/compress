@@ -193,24 +193,83 @@ GCOMP_API gcomp_status_t gcomp_options_get_bool(
     const gcomp_options_t * options, const char * key, int * value_out);
 
 /**
- * @brief Get a string option value
+ * @brief Get a string option value.
+ *
+ * Returns a pointer to the string value stored internally in the options
+ * object. The returned pointer is valid only while:
+ * 1. The options object has not been destroyed
+ * 2. The key has not been modified (via set_string) or removed
+ * 3. For frozen options: the pointer remains valid until destroy
+ *
+ * @warning Do not store this pointer long-term. If you need the value after
+ * any options modification, copy the string immediately using strdup() or
+ * similar.
+ *
+ * @warning For thread safety, only access the returned pointer while holding
+ * any necessary synchronization. For frozen options, concurrent reads of the
+ * same key are safe without synchronization.
  *
  * @param options The options object
  * @param key The option key
- * @param value_out Output parameter for the value (pointer to internal storage)
- * @return Status code
+ * @param[out] value_out Output parameter for the string value (pointer to
+ *             internal storage, valid until options is modified or destroyed)
+ * @return ::GCOMP_OK on success
+ * @return ::GCOMP_ERR_INVALID_ARG if options, key, or value_out is NULL
+ * @return ::GCOMP_ERR_INVALID_ARG if key does not exist or is not a string
+ *
+ * @code
+ * const char *name = NULL;
+ * if (gcomp_options_get_string(opts, "gzip.name", &name) == GCOMP_OK) {
+ *     // Use name immediately or copy it
+ *     printf("Filename: %s\n", name);
+ *
+ *     // If needed later, copy it:
+ *     char *name_copy = strdup(name);
+ * }
+ * @endcode
  */
 GCOMP_API gcomp_status_t gcomp_options_get_string(
     const gcomp_options_t * options, const char * key, const char ** value_out);
 
 /**
- * @brief Get a bytes option value
+ * @brief Get a bytes option value.
+ *
+ * Returns a pointer to the byte data stored internally in the options object.
+ * The returned pointer is valid only while:
+ * 1. The options object has not been destroyed
+ * 2. The key has not been modified (via set_bytes) or removed
+ * 3. For frozen options: the pointer remains valid until destroy
+ *
+ * @warning Do not store this pointer long-term. If you need the data after
+ * any options modification, copy it immediately using memcpy() or similar.
+ *
+ * @warning For thread safety, only access the returned pointer while holding
+ * any necessary synchronization. For frozen options, concurrent reads of the
+ * same key are safe without synchronization.
  *
  * @param options The options object
  * @param key The option key
- * @param data_out Output parameter for the data pointer
- * @param size_out Output parameter for the size
- * @return Status code
+ * @param[out] data_out Output parameter for the data pointer (pointer to
+ *             internal storage, valid until options is modified or destroyed)
+ * @param[out] size_out Output parameter for the size in bytes
+ * @return ::GCOMP_OK on success
+ * @return ::GCOMP_ERR_INVALID_ARG if options, key, data_out, or size_out is
+ * NULL
+ * @return ::GCOMP_ERR_INVALID_ARG if key does not exist or is not bytes type
+ *
+ * @code
+ * const void *extra_data = NULL;
+ * size_t extra_len = 0;
+ * if (gcomp_options_get_bytes(opts, "gzip.extra", &extra_data, &extra_len) ==
+ *     GCOMP_OK) {
+ *     // Use data immediately or copy it
+ *     process_extra(extra_data, extra_len);
+ *
+ *     // If needed later, copy it:
+ *     void *copy = malloc(extra_len);
+ *     memcpy(copy, extra_data, extra_len);
+ * }
+ * @endcode
  */
 GCOMP_API gcomp_status_t gcomp_options_get_bytes(
     const gcomp_options_t * options, const char * key, const void ** data_out,

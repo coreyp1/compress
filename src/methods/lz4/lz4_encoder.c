@@ -174,39 +174,45 @@ static gcomp_status_t lz4_encoder_read_options(
 // Internal API Implementation
 //
 
-gcomp_status_t lz4_encoder_init(GCOMP_MAYBE_UNUSED(gcomp_registry_t * registry),
+gcomp_status_t lz4_encoder_init(gcomp_registry_t * registry,
     gcomp_options_t * options, gcomp_encoder_t * encoder) {
 
   if (!encoder) {
     return GCOMP_ERR_INVALID_ARG;
   }
 
+  // Get allocator from registry
+  const gcomp_allocator_t * alloc = gcomp_registry_get_allocator(registry);
+
+  gcomp_status_t status = GCOMP_OK;
+  lz4_encoder_state_t * state = NULL;
+
   // Allocate state
-  lz4_encoder_state_t * state =
-      (lz4_encoder_state_t *)calloc(1, sizeof(lz4_encoder_state_t));
+  state =
+      (lz4_encoder_state_t *)gcomp_calloc(alloc, 1, sizeof(lz4_encoder_state_t));
   if (!state) {
     return gcomp_encoder_set_error(
         encoder, GCOMP_ERR_MEMORY, "failed to allocate lz4 encoder state");
   }
+  state->allocator = alloc;
 
   // Track memory usage (tracker is zero-initialized by calloc)
   gcomp_memory_track_alloc(&state->mem_tracker, sizeof(lz4_encoder_state_t));
 
   // Read options
-  gcomp_status_t status = lz4_encoder_read_options(options, state);
+  status = lz4_encoder_read_options(options, state);
   if (status != GCOMP_OK) {
-    free(state);
-    return status;
+    goto cleanup;
   }
 
   // Allocate block buffer
   state->block_buffer_size = state->header.block_max_size;
-  state->block_buffer = (uint8_t *)malloc(state->block_buffer_size);
+  state->block_buffer = (uint8_t *)gcomp_malloc(alloc, state->block_buffer_size);
   if (!state->block_buffer) {
-    free(state);
-    return gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
+    status = gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
         "failed to allocate lz4 block buffer (%zu bytes)",
         state->block_buffer_size);
+    goto cleanup;
   }
   gcomp_memory_track_alloc(&state->mem_tracker, state->block_buffer_size);
   state->block_buffer_pos = 0;
@@ -214,13 +220,13 @@ gcomp_status_t lz4_encoder_init(GCOMP_MAYBE_UNUSED(gcomp_registry_t * registry),
   // Allocate compressed buffer (block + header + checksum overhead)
   state->compressed_buffer_size = state->header.block_max_size +
       LZ4_BLOCK_HEADER_SIZE + LZ4_BLOCK_CHECKSUM_SIZE + 16; // Extra for safety
-  state->compressed_buffer = (uint8_t *)malloc(state->compressed_buffer_size);
+  state->compressed_buffer =
+      (uint8_t *)gcomp_malloc(alloc, state->compressed_buffer_size);
   if (!state->compressed_buffer) {
-    free(state->block_buffer);
-    free(state);
-    return gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
+    status = gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
         "failed to allocate lz4 compressed buffer (%zu bytes)",
         state->compressed_buffer_size);
+    goto cleanup;
   }
   gcomp_memory_track_alloc(&state->mem_tracker, state->compressed_buffer_size);
   state->compressed_buffer_pos = 0;
@@ -229,14 +235,12 @@ gcomp_status_t lz4_encoder_init(GCOMP_MAYBE_UNUSED(gcomp_registry_t * registry),
   // Allocate hash table for compression (64KB entries)
   state->hash_table_size = 65536;
   state->hash_table =
-      (uint32_t *)malloc(state->hash_table_size * sizeof(uint32_t));
+      (uint32_t *)gcomp_malloc(alloc, state->hash_table_size * sizeof(uint32_t));
   if (!state->hash_table) {
-    free(state->compressed_buffer);
-    free(state->block_buffer);
-    free(state);
-    return gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
+    status = gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
         "failed to allocate lz4 hash table (%zu bytes)",
         state->hash_table_size * sizeof(uint32_t));
+    goto cleanup;
   }
   gcomp_memory_track_alloc(
       &state->mem_tracker, state->hash_table_size * sizeof(uint32_t));
@@ -245,15 +249,11 @@ gcomp_status_t lz4_encoder_init(GCOMP_MAYBE_UNUSED(gcomp_registry_t * registry),
   // Check memory limit
   if (state->max_memory_bytes > 0 &&
       state->mem_tracker.current_bytes > state->max_memory_bytes) {
-    uint64_t current_bytes = state->mem_tracker.current_bytes;
-    uint64_t max_bytes = state->max_memory_bytes;
-    free(state->hash_table);
-    free(state->compressed_buffer);
-    free(state->block_buffer);
-    free(state);
-    return gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
+    status = gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
         "lz4 encoder memory usage %llu exceeds limit %llu",
-        (unsigned long long)current_bytes, (unsigned long long)max_bytes);
+        (unsigned long long)state->mem_tracker.current_bytes,
+        (unsigned long long)state->max_memory_bytes);
+    goto cleanup;
   }
 
   // Build FLG and BD bytes
@@ -282,11 +282,7 @@ gcomp_status_t lz4_encoder_init(GCOMP_MAYBE_UNUSED(gcomp_registry_t * registry),
   status = lz4_write_frame_header(&state->header, state->header_buf,
       sizeof(state->header_buf), &state->header_len);
   if (status != GCOMP_OK) {
-    free(state->hash_table);
-    free(state->compressed_buffer);
-    free(state->block_buffer);
-    free(state);
-    return status;
+    goto cleanup;
   }
   state->header_pos = 0;
 
@@ -301,8 +297,19 @@ gcomp_status_t lz4_encoder_init(GCOMP_MAYBE_UNUSED(gcomp_registry_t * registry),
   state->finish_called = false;
   state->blocks_finished = false;
 
+  // Success
   encoder->method_state = state;
   return GCOMP_OK;
+
+cleanup:
+  // Single cleanup path for all error cases
+  if (state) {
+    gcomp_free(alloc, state->hash_table);
+    gcomp_free(alloc, state->compressed_buffer);
+    gcomp_free(alloc, state->block_buffer);
+    gcomp_free(alloc, state);
+  }
+  return status;
 }
 
 void lz4_encoder_destroy(gcomp_encoder_t * encoder) {
@@ -311,18 +318,19 @@ void lz4_encoder_destroy(gcomp_encoder_t * encoder) {
   }
 
   lz4_encoder_state_t * state = (lz4_encoder_state_t *)encoder->method_state;
+  const gcomp_allocator_t * alloc = state->allocator;
 
   if (state->hash_table) {
-    free(state->hash_table);
+    gcomp_free(alloc, state->hash_table);
   }
   if (state->compressed_buffer) {
-    free(state->compressed_buffer);
+    gcomp_free(alloc, state->compressed_buffer);
   }
   if (state->block_buffer) {
-    free(state->block_buffer);
+    gcomp_free(alloc, state->block_buffer);
   }
 
-  free(state);
+  gcomp_free(alloc, state);
   encoder->method_state = NULL;
 }
 

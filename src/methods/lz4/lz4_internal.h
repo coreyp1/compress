@@ -32,7 +32,9 @@
 #ifndef GHOTI_IO_GCOMP_LZ4_INTERNAL_H
 #define GHOTI_IO_GCOMP_LZ4_INTERNAL_H
 
+#include "../../core/alloc_internal.h"
 #include "../../core/endian.h"
+#include "../../core/registry_internal.h"
 #include "../../core/stream_internal.h"
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/limits.h>
@@ -99,8 +101,8 @@ extern "C" {
 #define LZ4_BLOCK_UNCOMPRESSED_FLAG 0x80000000U ///< High bit = uncompressed
 #define LZ4_BLOCK_SIZE_MASK 0x7FFFFFFFU         ///< Size without flag bit
 #define LZ4_MIN_MATCH 4                         ///< Minimum match length
-#define LZ4_LAST_LITERALS 5                     ///< Minimum literals in last sequence
-#define LZ4_HISTORY_SIZE 65536                  ///< History window size (64KB)
+#define LZ4_LAST_LITERALS 5    ///< Minimum literals in last sequence
+#define LZ4_HISTORY_SIZE 65536 ///< History window size (64KB)
 
 // Limit defaults
 #define LZ4_DEFAULT_MAX_OUTPUT_BYTES (512ULL * 1024 * 1024) ///< 512 MiB
@@ -171,6 +173,9 @@ typedef struct {
 //
 
 typedef struct {
+  // Allocator for memory management
+  const gcomp_allocator_t * allocator;
+
   // Stage tracking
   lz4_encoder_stage_t stage;
 
@@ -224,6 +229,9 @@ typedef struct {
 //
 
 typedef struct {
+  // Allocator for memory management
+  const gcomp_allocator_t * allocator;
+
   // Stage tracking
   lz4_decoder_stage_t stage;
   lz4_header_parse_stage_t header_stage;
