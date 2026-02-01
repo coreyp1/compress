@@ -457,7 +457,12 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
       return GCOMP_ERR_CORRUPT;
     }
 
-    state->block_bytes_remaining = state->current_block_size;
+    // For RLE blocks, the input size is 1 byte (the byte to repeat)
+    // For other blocks, input size equals block_size
+    state->block_bytes_remaining =
+        (state->current_block_type == ZSTD_BLOCK_TYPE_RLE)
+        ? 1
+        : state->current_block_size;
     state->block_buffer_pos = 0;
     state->block_header_buf_pos = 0;
     state->stage = ZSTD_DEC_STAGE_BLOCK_DATA;
@@ -466,12 +471,14 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
   // Read and decompress block data
   if (state->stage == ZSTD_DEC_STAGE_BLOCK_DATA) {
     // Read block data into buffer
-    while (state->block_buffer_pos < state->current_block_size &&
-        input->used < input->size) {
+    // For RLE, we only need 1 byte; for others, we need block_size bytes
+    size_t bytes_to_read = state->block_bytes_remaining;
+    while (
+        state->block_buffer_pos < bytes_to_read && input->used < input->size) {
       state->block_buffer[state->block_buffer_pos++] = in_ptr[input->used++];
       state->total_input_bytes++;
     }
-    if (state->block_buffer_pos < state->current_block_size) {
+    if (state->block_buffer_pos < bytes_to_read) {
       return GCOMP_OK;
     }
 
@@ -485,7 +492,6 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
       break;
 
     case ZSTD_BLOCK_TYPE_RLE:
-      // For RLE, the block size is the regenerated size
       status = zstd_block_decompress_rle(state->block_buffer, 1,
           state->output_buffer, state->output_buffer_capacity,
           &decompressed_len, state->current_block_size);
@@ -529,8 +535,9 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
     }
 
     // Check expansion ratio (CORRECT-1)
-    if (!gcomp_limits_check_expansion_ratio(state->total_input_bytes,
-            state->total_output_bytes, state->max_expansion_ratio)) {
+    if (gcomp_limits_check_expansion_ratio(state->total_input_bytes,
+            state->total_output_bytes,
+            state->max_expansion_ratio) != GCOMP_OK) {
       state->stage = ZSTD_DEC_STAGE_ERROR;
       gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
           "expansion ratio exceeded: %llu/%llu > %llu",

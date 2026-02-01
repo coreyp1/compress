@@ -86,6 +86,7 @@ gcomp_status_t zstd_block_decompress_compressed(zstd_decoder_state_t * state,
   // 4. Huffman table decoding
   // 5. Sequence execution (literal copies + match copies)
 
+  (void)input_len; // suppress unused parameter warning
   return GCOMP_ERR_UNSUPPORTED;
 }
 

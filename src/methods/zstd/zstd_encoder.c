@@ -307,8 +307,9 @@ gcomp_status_t zstd_encoder_update(gcomp_encoder_t * encoder,
       if (state->block_buffer_pos >= state->block_buffer_capacity) {
         uint8_t block_type;
         size_t compressed_len;
+        size_t input_len = state->block_buffer_pos;
         gcomp_status_t status = zstd_block_compress(state, state->block_buffer,
-            state->block_buffer_pos, state->compressed_buffer + 3,
+            input_len, state->compressed_buffer + 3,
             state->compressed_buffer_capacity - 3, &compressed_len,
             &block_type);
         if (status != GCOMP_OK) {
@@ -318,8 +319,12 @@ gcomp_status_t zstd_encoder_update(gcomp_encoder_t * encoder,
         }
 
         // Write block header
-        zstd_write_block_header(state->compressed_buffer, false, block_type,
-            (uint32_t)compressed_len);
+        // For RLE blocks, the header size field is the regenerated size
+        uint32_t header_size = (block_type == ZSTD_BLOCK_TYPE_RLE)
+            ? (uint32_t)input_len
+            : (uint32_t)compressed_len;
+        zstd_write_block_header(
+            state->compressed_buffer, false, block_type, header_size);
         state->compressed_buffer_len = 3 + compressed_len;
         state->compressed_buffer_pos = 0;
 
@@ -403,8 +408,9 @@ gcomp_status_t zstd_encoder_finish(
       if (state->block_buffer_pos > 0) {
         uint8_t block_type;
         size_t compressed_len;
+        size_t input_len = state->block_buffer_pos;
         gcomp_status_t status = zstd_block_compress(state, state->block_buffer,
-            state->block_buffer_pos, state->compressed_buffer + 3,
+            input_len, state->compressed_buffer + 3,
             state->compressed_buffer_capacity - 3, &compressed_len,
             &block_type);
         if (status != GCOMP_OK) {
@@ -415,8 +421,14 @@ gcomp_status_t zstd_encoder_finish(
         }
 
         // Write block header (last block)
-        zstd_write_block_header(state->compressed_buffer, true, block_type,
-            (uint32_t)compressed_len);
+        // For RLE blocks, the header size field is the regenerated size
+        // (input_len) For RAW blocks, it's the compressed size (same as
+        // input_len)
+        uint32_t header_size = (block_type == ZSTD_BLOCK_TYPE_RLE)
+            ? (uint32_t)input_len
+            : (uint32_t)compressed_len;
+        zstd_write_block_header(
+            state->compressed_buffer, true, block_type, header_size);
         state->compressed_buffer_len = 3 + compressed_len;
         state->compressed_buffer_pos = 0;
         state->block_buffer_pos = 0;
