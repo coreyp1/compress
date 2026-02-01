@@ -165,6 +165,42 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
   state->compressed_buffer_capacity = compressed_buffer_size;
   gcomp_memory_track_alloc(&state->mem_tracker, compressed_buffer_size);
 
+  // Allocate match finder
+  state->match_finder = gcomp_calloc(alloc, 1, sizeof(zstd_match_finder_t));
+  if (!state->match_finder) {
+    status = GCOMP_ERR_MEMORY;
+    goto cleanup;
+  }
+  gcomp_memory_track_alloc(&state->mem_tracker, sizeof(zstd_match_finder_t));
+
+  status = zstd_mf_init(state->match_finder, alloc, state->compression_level,
+      state->header.window_size, &state->mem_tracker);
+  if (status != GCOMP_OK) {
+    goto cleanup;
+  }
+
+  // Allocate sequence buffer
+  // Maximum sequences = block_size / min_match_length
+  state->seq_buffer_capacity = block_buffer_size / 3;
+  state->seq_buffer =
+      gcomp_malloc(alloc, state->seq_buffer_capacity * sizeof(zstd_sequence_t));
+  if (!state->seq_buffer) {
+    status = GCOMP_ERR_MEMORY;
+    goto cleanup;
+  }
+  gcomp_memory_track_alloc(&state->mem_tracker,
+      state->seq_buffer_capacity * sizeof(zstd_sequence_t));
+
+  // Allocate literals buffer
+  state->literals_buffer_capacity = block_buffer_size;
+  state->literals_buffer = gcomp_malloc(alloc, state->literals_buffer_capacity);
+  if (!state->literals_buffer) {
+    status = GCOMP_ERR_MEMORY;
+    goto cleanup;
+  }
+  gcomp_memory_track_alloc(
+      &state->mem_tracker, state->literals_buffer_capacity);
+
   // Check memory limits
   if (state->mem_tracker.current_bytes > max_memory) {
     status = GCOMP_ERR_LIMIT;
@@ -192,8 +228,15 @@ cleanup:
     if (state->compressed_buffer) {
       gcomp_free(alloc, state->compressed_buffer);
     }
-    if (state->hash_table) {
-      gcomp_free(alloc, state->hash_table);
+    if (state->match_finder) {
+      zstd_mf_destroy(state->match_finder, alloc, NULL);
+      gcomp_free(alloc, state->match_finder);
+    }
+    if (state->seq_buffer) {
+      gcomp_free(alloc, state->seq_buffer);
+    }
+    if (state->literals_buffer) {
+      gcomp_free(alloc, state->literals_buffer);
     }
     gcomp_free(alloc, state);
   }
@@ -218,8 +261,15 @@ void zstd_encoder_destroy(gcomp_encoder_t * encoder) {
   if (state->compressed_buffer) {
     gcomp_free(alloc, state->compressed_buffer);
   }
-  if (state->hash_table) {
-    gcomp_free(alloc, state->hash_table);
+  if (state->match_finder) {
+    zstd_mf_destroy(state->match_finder, alloc, NULL);
+    gcomp_free(alloc, state->match_finder);
+  }
+  if (state->seq_buffer) {
+    gcomp_free(alloc, state->seq_buffer);
+  }
+  if (state->literals_buffer) {
+    gcomp_free(alloc, state->literals_buffer);
   }
   gcomp_free(alloc, state);
   encoder->method_state = NULL;

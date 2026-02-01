@@ -120,16 +120,21 @@ gcomp_status_t zstd_block_decompress_compressed(zstd_decoder_state_t * state,
 // Block Compression
 //
 
-// For now, we only support raw blocks
-// Full compression requires FSE + Huffman encoding
+// Maximum sequences per block (block_size / min_match)
+#define MAX_SEQUENCES_PER_BLOCK (ZSTD_BLOCK_SIZE_MAX / 3)
 
 gcomp_status_t zstd_block_compress(zstd_encoder_state_t * state,
     const uint8_t * input, size_t input_len, uint8_t * output,
     size_t output_cap, size_t * output_len_out, uint8_t * type_out) {
-  (void)state;
-
   if (!input || !output || !output_len_out || !type_out) {
     return GCOMP_ERR_INVALID_ARG;
+  }
+
+  // Handle empty input
+  if (input_len == 0) {
+    *output_len_out = 0;
+    *type_out = ZSTD_BLOCK_TYPE_RAW;
+    return GCOMP_OK;
   }
 
   // Check if RLE is beneficial (all same bytes)
@@ -143,7 +148,7 @@ gcomp_status_t zstd_block_compress(zstd_encoder_state_t * state,
     }
   }
 
-  if (all_same && input_len > 0) {
+  if (all_same) {
     // Use RLE block
     if (output_cap < 1) {
       return GCOMP_ERR_LIMIT;
@@ -154,7 +159,19 @@ gcomp_status_t zstd_block_compress(zstd_encoder_state_t * state,
     return GCOMP_OK;
   }
 
-  // Use raw block (no compression)
+  // TODO: Implement compressed blocks with proper FSE encoding
+  // For now, compressed blocks are disabled due to FSE encoding complexity.
+  // The match finder and sequence generation work, but the FSE bitstream
+  // encoding needs to be properly implemented.
+  //
+  // When enabled, this section would:
+  // 1. Generate sequences using match finder
+  // 2. Encode literals section
+  // 3. Encode sequences section with FSE
+  // 4. Compare compressed size to raw size
+  (void)state; // Suppress unused warning
+
+  // Use raw block (no compression or compression not beneficial)
   if (input_len > output_cap) {
     return GCOMP_ERR_LIMIT;
   }

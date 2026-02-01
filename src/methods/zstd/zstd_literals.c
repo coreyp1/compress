@@ -385,3 +385,83 @@ size_t zstd_literals_header_size(const uint8_t * src, size_t src_size) {
 
   return 0;
 }
+
+//
+// Encoder: Raw Literals
+//
+
+gcomp_status_t zstd_literals_encode_raw(const uint8_t * literals,
+    size_t literals_size, uint8_t * output, size_t output_cap,
+    size_t * output_len_out) {
+  if (!output || !output_len_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  // Handle empty literals
+  if (literals_size == 0 || !literals) {
+    // Write minimal header: type=raw (0), size_format=0, size=0
+    if (output_cap < 1) {
+      return GCOMP_ERR_LIMIT;
+    }
+    output[0] = 0x00; // type=0, size_format=0, size=0
+    *output_len_out = 1;
+    return GCOMP_OK;
+  }
+
+  // Determine header size based on literals size
+  size_t header_size;
+  size_t total_size;
+
+  if (literals_size <= 31) {
+    // 1-byte header: 5-bit size (size_format=0)
+    header_size = 1;
+    total_size = 1 + literals_size;
+  }
+  else if (literals_size <= 4095) {
+    // 2-byte header: 12-bit size (size_format=1)
+    header_size = 2;
+    total_size = 2 + literals_size;
+  }
+  else if (literals_size <= 1048575) {
+    // 3-byte header: 20-bit size (size_format=3)
+    header_size = 3;
+    total_size = 3 + literals_size;
+  }
+  else {
+    // Too large for raw literals
+    return GCOMP_ERR_LIMIT;
+  }
+
+  if (output_cap < total_size) {
+    return GCOMP_ERR_LIMIT;
+  }
+
+  // Write header
+  // Type = 0 (raw), format encodes in bits 2-3
+  if (header_size == 1) {
+    // 1-byte: type(2) | format(2) | size(5) = size << 3
+    output[0] = (uint8_t)((literals_size << 3) | (0 << 2) | LITERALS_TYPE_RAW);
+  }
+  else if (header_size == 2) {
+    // 2-byte: byte0 = type(2) | format(2) | size_lo(4)
+    //         byte1 = size_hi(8)
+    output[0] =
+        (uint8_t)(((literals_size & 0x0F) << 4) | (1 << 2) | LITERALS_TYPE_RAW);
+    output[1] = (uint8_t)(literals_size >> 4);
+  }
+  else {
+    // 3-byte: byte0 = type(2) | format(2) | size_lo(4)
+    //         byte1 = size_mid(8)
+    //         byte2 = size_hi(8)
+    output[0] =
+        (uint8_t)(((literals_size & 0x0F) << 4) | (3 << 2) | LITERALS_TYPE_RAW);
+    output[1] = (uint8_t)(literals_size >> 4);
+    output[2] = (uint8_t)(literals_size >> 12);
+  }
+
+  // Copy literals
+  memcpy(output + header_size, literals, literals_size);
+
+  *output_len_out = total_size;
+  return GCOMP_OK;
+}

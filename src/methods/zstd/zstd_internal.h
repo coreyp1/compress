@@ -192,6 +192,30 @@ typedef struct {
 } zstd_huf_entry_t;
 
 //
+// Match Finder Context (for encoder)
+//
+
+typedef struct {
+  uint32_t * hash_table;  ///< Hash table: hash -> position
+  uint32_t * chain_table; ///< Chain table: position -> previous position
+  unsigned hash_log;      ///< Log2 of hash table size
+  size_t hash_size;       ///< Hash table size
+  size_t chain_size;      ///< Chain table size (= window size)
+  unsigned search_depth;  ///< Maximum chain search depth
+  size_t window_size;     ///< Window size for match offsets
+} zstd_match_finder_t;
+
+//
+// Sequence Structure (for encoder)
+//
+
+typedef struct {
+  uint32_t lit_length;   ///< Literal length (bytes to copy from input)
+  uint32_t match_offset; ///< Match offset (encoded, +3 for new offsets)
+  uint32_t match_length; ///< Match length
+} zstd_sequence_t;
+
+//
 // Encoder State Structure
 //
 
@@ -229,9 +253,16 @@ typedef struct {
   size_t compressed_buffer_pos; ///< Read position for output
   size_t compressed_buffer_len; ///< Valid bytes in buffer
 
-  // Hash table for match finding
-  uint32_t * hash_table;  ///< Hash table for compression
-  size_t hash_table_size; ///< Hash table size
+  // Match finder for compression
+  zstd_match_finder_t * match_finder; ///< Match finder context
+
+  // Sequence buffer for compression
+  zstd_sequence_t * seq_buffer; ///< Sequence buffer
+  size_t seq_buffer_capacity;   ///< Sequence buffer capacity
+
+  // Literals buffer for compression
+  uint8_t * literals_buffer;       ///< Literals buffer
+  size_t literals_buffer_capacity; ///< Literals buffer capacity
 
   // Content tracking
   uint64_t total_input_bytes; ///< Total uncompressed bytes
@@ -659,6 +690,81 @@ gcomp_status_t zstd_sequences_decode(zstd_decoder_state_t * state,
     const uint8_t * src, size_t src_size, const uint8_t * literals,
     size_t literals_size, uint8_t * dst, size_t dst_capacity,
     size_t * output_size_out, size_t * bytes_read_out);
+
+//
+// Internal API: Encoder - Match Finding and Compression
+//
+
+/**
+ * @brief Initialize match finder.
+ */
+gcomp_status_t zstd_mf_init(zstd_match_finder_t * mf,
+    const gcomp_allocator_t * alloc, int level, size_t window_size,
+    gcomp_memory_tracker_t * mem_tracker);
+
+/**
+ * @brief Destroy match finder.
+ */
+void zstd_mf_destroy(zstd_match_finder_t * mf, const gcomp_allocator_t * alloc,
+    gcomp_memory_tracker_t * mem_tracker);
+
+/**
+ * @brief Reset match finder for new block.
+ */
+void zstd_mf_reset(zstd_match_finder_t * mf);
+
+/**
+ * @brief Generate sequences from input data.
+ */
+gcomp_status_t zstd_mf_generate_sequences(zstd_match_finder_t * mf,
+    const uint8_t * data, size_t data_size, zstd_sequence_t * sequences,
+    size_t max_sequences, size_t * num_sequences_out, uint8_t * literals_out,
+    size_t * literals_size_out, uint32_t * rep_offset_1,
+    uint32_t * rep_offset_2, uint32_t * rep_offset_3);
+
+/**
+ * @brief Encode literals section (raw mode).
+ *
+ * @param literals Literals data
+ * @param literals_size Literals size
+ * @param output Output buffer
+ * @param output_cap Output capacity
+ * @param output_len_out Output: bytes written
+ * @return GCOMP_OK on success
+ */
+gcomp_status_t zstd_literals_encode_raw(const uint8_t * literals,
+    size_t literals_size, uint8_t * output, size_t output_cap,
+    size_t * output_len_out);
+
+/**
+ * @brief Encode sequences section using predefined FSE tables.
+ *
+ * @param sequences Sequence array
+ * @param num_sequences Number of sequences
+ * @param output Output buffer
+ * @param output_cap Output capacity
+ * @param output_len_out Output: bytes written
+ * @return GCOMP_OK on success
+ */
+gcomp_status_t zstd_sequences_encode_predefined(
+    const zstd_sequence_t * sequences, size_t num_sequences, uint8_t * output,
+    size_t output_cap, size_t * output_len_out);
+
+/**
+ * @brief Compress a block using full LZ77 + entropy encoding.
+ *
+ * @param state Encoder state
+ * @param input Input data
+ * @param input_len Input size
+ * @param output Output buffer
+ * @param output_cap Output capacity
+ * @param output_len_out Output: compressed size
+ * @param type_out Output: block type
+ * @return GCOMP_OK on success
+ */
+gcomp_status_t zstd_compress_block_full(zstd_encoder_state_t * state,
+    const uint8_t * input, size_t input_len, uint8_t * output,
+    size_t output_cap, size_t * output_len_out, uint8_t * type_out);
 
 #ifdef __cplusplus
 }
