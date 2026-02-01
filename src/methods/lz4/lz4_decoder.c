@@ -114,6 +114,7 @@
 
 #include "lz4_internal.h"
 #include <ghoti.io/compress/errors.h>
+#include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/stream.h>
 #include <stdlib.h>
@@ -221,7 +222,7 @@ static gcomp_status_t lz4_decoder_parse_header(lz4_decoder_state_t * state) {
 
   // Content size (if present)
   if (state->header.content_size_present) {
-    state->header.content_size = lz4_read_le64(buf + pos);
+    state->header.content_size = gcomp_read_le64(buf + pos);
     pos += 8;
   }
   else {
@@ -230,7 +231,7 @@ static gcomp_status_t lz4_decoder_parse_header(lz4_decoder_state_t * state) {
 
   // Dictionary ID (if present)
   if (state->header.dict_id_present) {
-    state->header.dict_id = lz4_read_le32(buf + pos);
+    state->header.dict_id = gcomp_read_le32(buf + pos);
     pos += 4;
   }
   else {
@@ -255,9 +256,8 @@ static gcomp_status_t lz4_decoder_parse_header(lz4_decoder_state_t * state) {
 // Internal API Implementation
 //
 
-gcomp_status_t lz4_decoder_init(gcomp_registry_t * registry,
+gcomp_status_t lz4_decoder_init(GCOMP_MAYBE_UNUSED(gcomp_registry_t * registry),
     gcomp_options_t * options, gcomp_decoder_t * decoder) {
-  (void)registry;
 
   if (!decoder) {
     return GCOMP_ERR_INVALID_ARG;
@@ -330,6 +330,11 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
   if (!decoder || !decoder->method_state || !input || !output) {
     return GCOMP_ERR_INVALID_ARG;
   }
+  // Check data pointers if size > 0
+  if ((input->size > 0 && !input->data) ||
+      (output->size > 0 && !output->data)) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
 
   lz4_decoder_state_t * state = (lz4_decoder_state_t *)decoder->method_state;
 
@@ -361,7 +366,7 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
         }
         if (state->header_accum_pos >= 4) {
           // Validate magic
-          uint32_t magic = lz4_read_le32(state->header_accum);
+          uint32_t magic = gcomp_read_le32(state->header_accum);
           if (magic != LZ4_MAGIC) {
             state->stage = LZ4_DEC_STAGE_ERROR;
             return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
@@ -492,6 +497,21 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
           }
 
           if (!state->block_buffer || !state->output_buffer) {
+            // Clean up any successful allocations before returning error
+            if (state->block_buffer) {
+              free(state->block_buffer);
+              gcomp_memory_track_free(
+                  &state->mem_tracker, state->block_buffer_size);
+              state->block_buffer = NULL;
+              state->block_buffer_size = 0;
+            }
+            if (state->output_buffer) {
+              free(state->output_buffer);
+              gcomp_memory_track_free(
+                  &state->mem_tracker, state->output_buffer_size);
+              state->output_buffer = NULL;
+              state->output_buffer_size = 0;
+            }
             state->stage = LZ4_DEC_STAGE_ERROR;
             return gcomp_decoder_set_error(decoder, GCOMP_ERR_MEMORY,
                 "failed to allocate lz4 block buffers (%u bytes)", block_size);
@@ -510,10 +530,26 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
               state->history_buffer =
                   (uint8_t *)malloc(state->history_capacity);
               if (!state->history_buffer) {
+                // Clean up block and output buffers before returning error
+                if (state->block_buffer) {
+                  free(state->block_buffer);
+                  gcomp_memory_track_free(
+                      &state->mem_tracker, state->block_buffer_size);
+                  state->block_buffer = NULL;
+                  state->block_buffer_size = 0;
+                }
+                if (state->output_buffer) {
+                  free(state->output_buffer);
+                  gcomp_memory_track_free(
+                      &state->mem_tracker, state->output_buffer_size);
+                  state->output_buffer = NULL;
+                  state->output_buffer_size = 0;
+                }
+                state->history_capacity = 0;
                 state->stage = LZ4_DEC_STAGE_ERROR;
                 return gcomp_decoder_set_error(decoder, GCOMP_ERR_MEMORY,
                     "failed to allocate lz4 history buffer (%zu bytes)",
-                    state->history_capacity);
+                    LZ4_HISTORY_SIZE);
               }
               gcomp_memory_track_alloc(
                   &state->mem_tracker, state->history_capacity);
@@ -668,15 +704,15 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
               (unsigned long long)state->max_output_bytes);
         }
 
-        // Check expansion ratio
-        if (state->total_input_bytes > 0 && state->max_expansion_ratio > 0) {
-          uint64_t ratio = state->total_output_bytes / state->total_input_bytes;
-          if (ratio > state->max_expansion_ratio) {
+        // Check expansion ratio using proper multiplication-based check
+        if (state->max_expansion_ratio > 0) {
+          gcomp_status_t ratio_status = gcomp_limits_check_expansion_ratio(
+              state->total_input_bytes, state->total_output_bytes,
+              state->max_expansion_ratio);
+          if (ratio_status != GCOMP_OK) {
             state->stage = LZ4_DEC_STAGE_ERROR;
             return gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
-                "lz4 expansion ratio %llu exceeds limit %llu "
-                "(input=%llu, output=%llu)",
-                (unsigned long long)ratio,
+                "lz4 expansion ratio exceeds limit %llu (input=%llu, output=%llu)",
                 (unsigned long long)state->max_expansion_ratio,
                 (unsigned long long)state->total_input_bytes,
                 (unsigned long long)state->total_output_bytes);
@@ -737,7 +773,7 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
             ((const uint8_t *)input->data)[input->used++];
       }
       if (state->block_checksum_buf_pos >= 4) {
-        uint32_t expected = lz4_read_le32(state->block_checksum_buf);
+        uint32_t expected = gcomp_read_le32(state->block_checksum_buf);
         uint32_t computed =
             gcomp_xxhash32(state->block_buffer, state->current_block_size, 0);
         if (expected != computed) {
@@ -760,7 +796,7 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
             ((const uint8_t *)input->data)[input->used++];
       }
       if (state->content_checksum_buf_pos >= 4) {
-        uint32_t expected = lz4_read_le32(state->content_checksum_buf);
+        uint32_t expected = gcomp_read_le32(state->content_checksum_buf);
         uint32_t computed = gcomp_xxhash32_finalize(&state->content_hash);
         if (expected != computed) {
           state->stage = LZ4_DEC_STAGE_ERROR;

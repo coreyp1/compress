@@ -32,6 +32,7 @@
 #ifndef GHOTI_IO_GCOMP_LZ4_INTERNAL_H
 #define GHOTI_IO_GCOMP_LZ4_INTERNAL_H
 
+#include "../../core/endian.h"
 #include "../../core/stream_internal.h"
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/limits.h>
@@ -107,67 +108,6 @@ extern "C" {
 #define LZ4_DEFAULT_MAX_EXPANSION_RATIO 1000                ///< 1000x
 
 //
-// Little-Endian I/O Helpers
-//
-// LZ4 uses little-endian byte order for multi-byte integers.
-//
-
-/**
- * @brief Read a 16-bit little-endian value from a byte buffer.
- */
-static inline uint16_t lz4_read_le16(const uint8_t * buf) {
-  return (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
-}
-
-/**
- * @brief Read a 32-bit little-endian value from a byte buffer.
- */
-static inline uint32_t lz4_read_le32(const uint8_t * buf) {
-  return (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16) |
-      ((uint32_t)buf[3] << 24);
-}
-
-/**
- * @brief Read a 64-bit little-endian value from a byte buffer.
- */
-static inline uint64_t lz4_read_le64(const uint8_t * buf) {
-  return (uint64_t)buf[0] | ((uint64_t)buf[1] << 8) | ((uint64_t)buf[2] << 16) |
-      ((uint64_t)buf[3] << 24) | ((uint64_t)buf[4] << 32) |
-      ((uint64_t)buf[5] << 40) | ((uint64_t)buf[6] << 48) |
-      ((uint64_t)buf[7] << 56);
-}
-
-/**
- * @brief Write a 16-bit value to a buffer in little-endian order.
- */
-static inline void lz4_write_le16(uint8_t * buf, uint16_t val) {
-  buf[0] = (uint8_t)(val);
-  buf[1] = (uint8_t)(val >> 8);
-}
-
-/**
- * @brief Write a 32-bit value to a buffer in little-endian order.
- */
-static inline void lz4_write_le32(uint8_t * buf, uint32_t val) {
-  buf[0] = (uint8_t)(val);
-  buf[1] = (uint8_t)(val >> 8);
-  buf[2] = (uint8_t)(val >> 16);
-  buf[3] = (uint8_t)(val >> 24);
-}
-
-/**
- * @brief Write a 64-bit value to a buffer in little-endian order.
- */
-static inline void lz4_write_le64(uint8_t * buf, uint64_t val) {
-  buf[0] = (uint8_t)(val);
-  buf[1] = (uint8_t)(val >> 8);
-  buf[2] = (uint8_t)(val >> 16);
-  buf[3] = (uint8_t)(val >> 24);
-  buf[4] = (uint8_t)(val >> 32);
-  buf[5] = (uint8_t)(val >> 40);
-  buf[6] = (uint8_t)(val >> 48);
-  buf[7] = (uint8_t)(val >> 56);
-}
 
 //
 // Encoder State Machine

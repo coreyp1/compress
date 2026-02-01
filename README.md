@@ -6,7 +6,7 @@ Cross-platform C library implementing streaming compression with no external dep
 
 The `compress` library provides:
 - Streaming compression and decompression for files, memory buffers, and pipes/sockets
-- Support for multiple compression methods (deflate, gzip, zstd, lz4)
+- Support for multiple compression methods (deflate, gzip, lz4)
 - Global default registry and explicit registries for compression methods
 - Key/value option system for rich configuration
 - Intelligent safety defaults with overridable resource limits

@@ -1948,6 +1948,11 @@ gcomp_status_t gcomp_deflate_encoder_update(gcomp_encoder_t * encoder,
   if (!encoder || !input || !output) {
     return GCOMP_ERR_INVALID_ARG;
   }
+  // Check data pointers if size > 0
+  if ((input->size > 0 && !input->data) ||
+      (output->size > 0 && !output->data)) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
 
   gcomp_deflate_encoder_state_t * st =
       (gcomp_deflate_encoder_state_t *)encoder->method_state;

@@ -1567,6 +1567,11 @@ gcomp_status_t gcomp_deflate_decoder_update(gcomp_decoder_t * decoder,
   if (!decoder || !input || !output) {
     return GCOMP_ERR_INVALID_ARG;
   }
+  // Check data pointers if size > 0
+  if ((input->size > 0 && !input->data) ||
+      (output->size > 0 && !output->data)) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
 
   gcomp_deflate_decoder_state_t * st =
       (gcomp_deflate_decoder_state_t *)decoder->method_state;

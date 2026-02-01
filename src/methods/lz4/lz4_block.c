@@ -115,7 +115,7 @@
 
 static inline uint32_t lz4_hash_position(const uint8_t * p) {
   // Read 4 bytes and compute hash
-  uint32_t v = lz4_read_le32(p);
+  uint32_t v = gcomp_read_le32(p);
   return (v * 2654435761U) >> 16;
 }
 
@@ -188,7 +188,7 @@ gcomp_status_t lz4_block_compress(const uint8_t * input, size_t input_len,
 
     // Check for match (at least 4 bytes, within 64KB window)
     if (match_pos > 0 && src - match_ref <= 65535 &&
-        lz4_read_le32(match_ref) == lz4_read_le32(src)) {
+        gcomp_read_le32(match_ref) == gcomp_read_le32(src)) {
       // Found a match! Extend it, but not past match_limit
       size_t match_len = 4;
       while (
@@ -364,7 +364,7 @@ gcomp_status_t lz4_block_decompress(const uint8_t * input, size_t input_len,
     if (src + 2 > src_end) {
       return GCOMP_ERR_CORRUPT;
     }
-    uint16_t offset = lz4_read_le16(src);
+    uint16_t offset = gcomp_read_le16(src);
     src += 2;
 
     if (offset == 0) {
@@ -407,14 +407,20 @@ gcomp_status_t lz4_block_decompress(const uint8_t * input, size_t input_len,
     // Copy match (byte-by-byte for overlapping matches)
     for (size_t i = 0; i < match_len; i++) {
       // Handle case where match_src is in history and crosses into output
-      if (match_src >= history && match_src < history + history_len) {
+      if (history && match_src >= history && match_src < history + history_len) {
         *dst++ = *match_src++;
+        // Check boundary AFTER increment for next iteration
         if (match_src >= history + history_len) {
           match_src = output; // Continue from start of output
         }
       }
-      else {
+      else if (match_src >= output && match_src < dst) {
+        // Match is in already-decompressed output - valid for overlapping matches
         *dst++ = *match_src++;
+      }
+      else {
+        // Pointer is outside valid ranges - corrupt data
+        return GCOMP_ERR_CORRUPT;
       }
     }
   }

@@ -59,6 +59,7 @@
 #include "gzip_internal.h"
 #include <ghoti.io/compress/crc32.h>
 #include <ghoti.io/compress/limits.h>
+#include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/stream.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -280,7 +281,7 @@ static gcomp_status_t parse_header_byte(
   case GZIP_HEADER_MTIME:
     state->header_accum[state->header_accum_pos++] = byte;
     if (state->header_accum_pos == 4) {
-      state->header_info.mtime = gzip_read_le32(state->header_accum);
+      state->header_info.mtime = gcomp_read_le32(state->header_accum);
       state->header_stage = GZIP_HEADER_XFL_OS;
       state->header_accum_pos = 0;
     }
@@ -315,7 +316,7 @@ static gcomp_status_t parse_header_byte(
   case GZIP_HEADER_FEXTRA_LEN:
     state->header_accum[state->header_accum_pos++] = byte;
     if (state->header_accum_pos == 2) {
-      uint16_t extra_len = gzip_read_le16(state->header_accum);
+      uint16_t extra_len = gcomp_read_le16(state->header_accum);
 
       // Check limit
       if (extra_len > state->max_extra_bytes) {
@@ -440,7 +441,7 @@ static gcomp_status_t parse_header_byte(
   case GZIP_HEADER_FHCRC:
     state->header_accum[state->header_accum_pos++] = byte;
     if (state->header_accum_pos == 2) {
-      uint16_t header_crc = gzip_read_le16(state->header_accum);
+      uint16_t header_crc = gcomp_read_le16(state->header_accum);
       state->header_info.header_crc = header_crc;
 
       // Validate header CRC (lower 16 bits of CRC32)
@@ -511,6 +512,11 @@ static gcomp_status_t parse_header_byte(
 gcomp_status_t gzip_decoder_update(gcomp_decoder_t * decoder,
     gcomp_buffer_t * input, gcomp_buffer_t * output) {
   if (!decoder || !decoder->method_state || !input || !output) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  // Check data pointers if size > 0
+  if ((input->size > 0 && !input->data) ||
+      (output->size > 0 && !output->data)) {
     return GCOMP_ERR_INVALID_ARG;
   }
 
@@ -652,8 +658,8 @@ gcomp_status_t gzip_decoder_update(gcomp_decoder_t * decoder,
 
     if (state->trailer_pos >= GZIP_TRAILER_SIZE) {
       // Parse trailer
-      uint32_t expected_crc = gzip_read_le32(state->trailer_buf);
-      uint32_t expected_isize = gzip_read_le32(state->trailer_buf + 4);
+      uint32_t expected_crc = gcomp_read_le32(state->trailer_buf);
+      uint32_t expected_isize = gcomp_read_le32(state->trailer_buf + 4);
 
       // Finalize CRC32
       uint32_t actual_crc = gcomp_crc32_finalize(state->crc32);
@@ -715,7 +721,7 @@ gcomp_status_t gzip_decoder_update(gcomp_decoder_t * decoder,
 //
 
 gcomp_status_t gzip_decoder_finish(
-    gcomp_decoder_t * decoder, gcomp_buffer_t * output) {
+    gcomp_decoder_t * decoder, GCOMP_MAYBE_UNUSED(gcomp_buffer_t * output)) {
   if (!decoder || !decoder->method_state) {
     return GCOMP_ERR_INVALID_ARG;
   }
@@ -746,8 +752,6 @@ gcomp_status_t gzip_decoder_finish(
     return gcomp_decoder_set_error(decoder, GCOMP_ERR_INTERNAL,
         "unexpected gzip decoder stage: %d", state->stage);
   }
-
-  (void)output; // Output not used in finish
 }
 
 //

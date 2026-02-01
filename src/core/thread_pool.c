@@ -119,6 +119,9 @@ static gcomp_job_t * gcomp_thread_pool_pop_job(gcomp_thread_pool_t * pool) {
  */
 static void gcomp_thread_pool_job_done(
     gcomp_thread_pool_t * pool, gcomp_status_t status) {
+  // Acquire both mutexes to safely check active_jobs and pending_count.
+  // Always acquire queue_mutex first to avoid deadlock with wait().
+  GCU_MUTEX_LOCK(pool->queue_mutex);
   GCU_MUTEX_LOCK(pool->wait_mutex);
 
   // Track first error
@@ -134,6 +137,7 @@ static void gcomp_thread_pool_job_done(
   }
 
   GCU_MUTEX_UNLOCK(pool->wait_mutex);
+  GCU_MUTEX_UNLOCK(pool->queue_mutex);
 }
 
 /**
@@ -396,18 +400,23 @@ gcomp_status_t gcomp_thread_pool_wait(gcomp_thread_pool_t * pool) {
     return result;
   }
 
-  // Check if already done
+  // Check if already done - need both mutexes since pending_count is protected
+  // by queue_mutex and active_jobs/waiting are protected by wait_mutex.
+  // Always acquire queue_mutex first to avoid deadlock.
+  GCU_MUTEX_LOCK(pool->queue_mutex);
   GCU_MUTEX_LOCK(pool->wait_mutex);
   if (pool->active_jobs == 0 && pool->pending_count == 0) {
     gcomp_status_t result = pool->first_error;
     pool->first_error = GCOMP_OK;
     GCU_MUTEX_UNLOCK(pool->wait_mutex);
+    GCU_MUTEX_UNLOCK(pool->queue_mutex);
     return result;
   }
 
   // Mark that we're waiting
   pool->waiting = true;
   GCU_MUTEX_UNLOCK(pool->wait_mutex);
+  GCU_MUTEX_UNLOCK(pool->queue_mutex);
 
   // Wait for completion signal
   gcu_semaphore_wait(&pool->jobs_complete);

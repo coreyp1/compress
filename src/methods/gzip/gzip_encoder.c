@@ -408,6 +408,11 @@ gcomp_status_t gzip_encoder_update(gcomp_encoder_t * encoder,
   if (!encoder || !encoder->method_state || !input || !output) {
     return GCOMP_ERR_INVALID_ARG;
   }
+  // Check data pointers if size > 0
+  if ((input->size > 0 && !input->data) ||
+      (output->size > 0 && !output->data)) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
 
   gzip_encoder_state_t * state = (gzip_encoder_state_t *)encoder->method_state;
   gcomp_status_t status;

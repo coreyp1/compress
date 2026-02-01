@@ -122,7 +122,7 @@ gcomp_status_t gzip_write_header(const gzip_header_info_t * info, uint8_t * buf,
   buf[pos++] = GZIP_ID2;        // ID2
   buf[pos++] = GZIP_CM_DEFLATE; // CM
   buf[pos++] = info->flg;       // FLG
-  gzip_write_le32(buf + pos, info->mtime);
+  gcomp_write_le32(buf + pos, info->mtime);
   pos += 4;
   buf[pos++] = info->xfl; // XFL
   buf[pos++] = info->os;  // OS
@@ -134,7 +134,7 @@ gcomp_status_t gzip_write_header(const gzip_header_info_t * info, uint8_t * buf,
 
   // FEXTRA
   if (info->flg & GZIP_FLG_FEXTRA) {
-    gzip_write_le16(buf + pos, (uint16_t)info->extra_len);
+    gcomp_write_le16(buf + pos, (uint16_t)info->extra_len);
     if (info->flg & GZIP_FLG_FHCRC) {
       header_crc = gcomp_crc32_update(header_crc, buf + pos, 2);
     }
@@ -195,7 +195,7 @@ gcomp_status_t gzip_write_header(const gzip_header_info_t * info, uint8_t * buf,
   if (info->flg & GZIP_FLG_FHCRC) {
     uint32_t final_crc = gcomp_crc32_finalize(header_crc);
     uint16_t crc16 = (uint16_t)(final_crc & 0xFFFF);
-    gzip_write_le16(buf + pos, crc16);
+    gcomp_write_le16(buf + pos, crc16);
     pos += 2;
   }
 
@@ -222,8 +222,8 @@ void gzip_write_trailer(uint32_t crc32, uint32_t isize, uint8_t * buf) {
     return;
   }
 
-  gzip_write_le32(buf, crc32);     // CRC32
-  gzip_write_le32(buf + 4, isize); // ISIZE
+  gcomp_write_le32(buf, crc32);     // CRC32
+  gcomp_write_le32(buf + 4, isize); // ISIZE
 }
 
 /**

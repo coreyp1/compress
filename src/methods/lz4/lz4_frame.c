@@ -141,7 +141,7 @@ gcomp_status_t lz4_write_frame_header(const lz4_frame_header_t * header,
   }
 
   // Magic number
-  lz4_write_le32(buf + pos, LZ4_MAGIC);
+  gcomp_write_le32(buf + pos, LZ4_MAGIC);
   pos += 4;
 
   // FLG byte
@@ -152,13 +152,13 @@ gcomp_status_t lz4_write_frame_header(const lz4_frame_header_t * header,
 
   // Content size (if present)
   if (header->content_size_present) {
-    lz4_write_le64(buf + pos, header->content_size);
+    gcomp_write_le64(buf + pos, header->content_size);
     pos += 8;
   }
 
   // Dictionary ID (if present)
   if (header->dict_id_present) {
-    lz4_write_le32(buf + pos, header->dict_id);
+    gcomp_write_le32(buf + pos, header->dict_id);
     pos += 4;
   }
 
@@ -181,7 +181,7 @@ gcomp_status_t lz4_parse_block_size(
     return GCOMP_ERR_INVALID_ARG;
   }
 
-  uint32_t raw = lz4_read_le32(buf);
+  uint32_t raw = gcomp_read_le32(buf);
 
   *uncompressed_out = (raw & LZ4_BLOCK_UNCOMPRESSED_FLAG) != 0;
   *size_out = raw & LZ4_BLOCK_SIZE_MASK;

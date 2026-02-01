@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <ghoti.io/compress/errors.h>
+#include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/thread_pool.h>
 #include <gtest/gtest.h>
 #include <thread>
@@ -41,8 +42,7 @@ static std::atomic<int> g_job_counter{0};
 static std::atomic<int> g_complete_counter{0};
 
 // Simple job that increments counter
-static gcomp_status_t simple_job(void * ctx) {
-  (void)ctx;
+static gcomp_status_t simple_job(GCOMP_MAYBE_UNUSED(void * ctx)) {
   g_job_counter.fetch_add(1);
   return GCOMP_OK;
 }
@@ -69,17 +69,14 @@ static gcomp_status_t slow_job(void * ctx) {
 }
 
 // Job that returns an error
-static gcomp_status_t failing_job(void * ctx) {
-  (void)ctx;
+static gcomp_status_t failing_job(GCOMP_MAYBE_UNUSED(void * ctx)) {
   return GCOMP_ERR_INTERNAL;
 }
 
 // Completion callback
-static void job_complete_callback(
-    void * ctx, gcomp_status_t status, void * user_data) {
-  (void)ctx;
-  (void)status;
-  (void)user_data;
+static void job_complete_callback(GCOMP_MAYBE_UNUSED(void * ctx),
+    GCOMP_MAYBE_UNUSED(gcomp_status_t status),
+    GCOMP_MAYBE_UNUSED(void * user_data)) {
   g_complete_counter.fetch_add(1);
 }
 

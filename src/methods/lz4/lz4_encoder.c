@@ -89,6 +89,7 @@
 
 #include "lz4_internal.h"
 #include <ghoti.io/compress/errors.h>
+#include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/stream.h>
 #include <stdlib.h>
@@ -173,9 +174,8 @@ static gcomp_status_t lz4_encoder_read_options(
 // Internal API Implementation
 //
 
-gcomp_status_t lz4_encoder_init(gcomp_registry_t * registry,
+gcomp_status_t lz4_encoder_init(GCOMP_MAYBE_UNUSED(gcomp_registry_t * registry),
     gcomp_options_t * options, gcomp_encoder_t * encoder) {
-  (void)registry;
 
   if (!encoder) {
     return GCOMP_ERR_INVALID_ARG;
@@ -331,6 +331,11 @@ gcomp_status_t lz4_encoder_update(gcomp_encoder_t * encoder,
   if (!encoder || !encoder->method_state || !input || !output) {
     return GCOMP_ERR_INVALID_ARG;
   }
+  // Check data pointers if size > 0
+  if ((input->size > 0 && !input->data) ||
+      (output->size > 0 && !output->data)) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
 
   lz4_encoder_state_t * state = (lz4_encoder_state_t *)encoder->method_state;
 
@@ -390,14 +395,14 @@ gcomp_status_t lz4_encoder_update(gcomp_encoder_t * encoder,
           // Compression didn't help, store uncompressed
           uint32_t block_size =
               (uint32_t)state->block_buffer_pos | LZ4_BLOCK_UNCOMPRESSED_FLAG;
-          lz4_write_le32(state->compressed_buffer, block_size);
+          gcomp_write_le32(state->compressed_buffer, block_size);
           memcpy(state->compressed_buffer + 4, state->block_buffer,
               state->block_buffer_pos);
           compressed_len = state->block_buffer_pos;
         }
         else {
           // Use compressed data
-          lz4_write_le32(state->compressed_buffer, (uint32_t)compressed_len);
+          gcomp_write_le32(state->compressed_buffer, (uint32_t)compressed_len);
         }
 
         // Add block checksum if enabled
@@ -405,7 +410,7 @@ gcomp_status_t lz4_encoder_update(gcomp_encoder_t * encoder,
         if (state->header.block_checksum) {
           uint32_t checksum =
               gcomp_xxhash32(state->compressed_buffer + 4, compressed_len, 0);
-          lz4_write_le32(state->compressed_buffer + total_block_len, checksum);
+          gcomp_write_le32(state->compressed_buffer + total_block_len, checksum);
           total_block_len += 4;
         }
 
@@ -501,13 +506,13 @@ gcomp_status_t lz4_encoder_finish(
         // Store uncompressed
         uint32_t block_size =
             (uint32_t)state->block_buffer_pos | LZ4_BLOCK_UNCOMPRESSED_FLAG;
-        lz4_write_le32(state->compressed_buffer, block_size);
+        gcomp_write_le32(state->compressed_buffer, block_size);
         memcpy(state->compressed_buffer + 4, state->block_buffer,
             state->block_buffer_pos);
         compressed_len = state->block_buffer_pos;
       }
       else {
-        lz4_write_le32(state->compressed_buffer, (uint32_t)compressed_len);
+        gcomp_write_le32(state->compressed_buffer, (uint32_t)compressed_len);
       }
 
       // Add block checksum if enabled
@@ -515,7 +520,7 @@ gcomp_status_t lz4_encoder_finish(
       if (state->header.block_checksum) {
         uint32_t checksum =
             gcomp_xxhash32(state->compressed_buffer + 4, compressed_len, 0);
-        lz4_write_le32(state->compressed_buffer + total_block_len, checksum);
+        gcomp_write_le32(state->compressed_buffer + total_block_len, checksum);
         total_block_len += 4;
       }
 
@@ -540,7 +545,7 @@ gcomp_status_t lz4_encoder_finish(
     state->stage = LZ4_ENC_STAGE_END_MARK;
 
     // Prepare end mark
-    lz4_write_le32(state->end_mark_buf, LZ4_END_MARK);
+    gcomp_write_le32(state->end_mark_buf, LZ4_END_MARK);
     state->end_mark_pos = 0;
   }
 
@@ -558,7 +563,7 @@ gcomp_status_t lz4_encoder_finish(
       state->trailer_pos = 0;
       if (state->header.content_checksum) {
         uint32_t checksum = gcomp_xxhash32_finalize(&state->content_hash);
-        lz4_write_le32(state->trailer_buf, checksum);
+        gcomp_write_le32(state->trailer_buf, checksum);
         state->trailer_len = 4;
       }
     }
