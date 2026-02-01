@@ -245,14 +245,15 @@ gcomp_status_t lz4_encoder_init(gcomp_registry_t * registry,
   // Check memory limit
   if (state->max_memory_bytes > 0 &&
       state->mem_tracker.current_bytes > state->max_memory_bytes) {
+    uint64_t current_bytes = state->mem_tracker.current_bytes;
+    uint64_t max_bytes = state->max_memory_bytes;
     free(state->hash_table);
     free(state->compressed_buffer);
     free(state->block_buffer);
     free(state);
     return gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
         "lz4 encoder memory usage %llu exceeds limit %llu",
-        (unsigned long long)state->mem_tracker.current_bytes,
-        (unsigned long long)state->max_memory_bytes);
+        (unsigned long long)current_bytes, (unsigned long long)max_bytes);
   }
 
   // Build FLG and BD bytes
