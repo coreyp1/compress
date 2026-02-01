@@ -50,6 +50,7 @@
 
 #include "../../core/alloc_internal.h"
 #include "../../core/registry_internal.h"
+#include "../../core/safe_math.h"
 #include "../../core/stream_internal.h"
 #include "deflate_internal.h"
 #include "huffman.h"
@@ -627,7 +628,12 @@ static gcomp_status_t deflate_huff_decode_symbol(
   uint32_t full_rev = reverse_bits(full_peek, full_bits);
   uint32_t low_mask = (1u << extra) - 1u;
   uint32_t low = full_rev & low_mask;
-  size_t long_idx = (size_t)table->long_base[idx] + (size_t)low;
+
+  // Use safe math for index calculation to prevent overflow
+  size_t long_idx;
+  if (!gcomp_safe_add_size((size_t)table->long_base[idx], (size_t)low, &long_idx)) {
+    return GCOMP_ERR_CORRUPT;
+  }
   if (long_idx >= table->long_table_count) {
     return GCOMP_ERR_CORRUPT;
   }
@@ -1032,6 +1038,7 @@ gcomp_status_t gcomp_deflate_decoder_init(gcomp_registry_t * registry,
     return GCOMP_ERR_INVALID_ARG;
   }
 
+  gcomp_status_t status = GCOMP_OK;
   const gcomp_allocator_t * alloc = gcomp_registry_get_allocator(registry);
 
   // Read memory limit early to check before allocations
@@ -1099,14 +1106,14 @@ gcomp_status_t gcomp_deflate_decoder_init(gcomp_registry_t * registry,
       gcomp_limits_read_window_max(options, (uint64_t)st->window_size);
   if (st->max_window_bytes != 0 &&
       (uint64_t)st->window_size > st->max_window_bytes) {
-    gcomp_free(alloc, st);
-    return GCOMP_ERR_LIMIT;
+    status = GCOMP_ERR_LIMIT;
+    goto cleanup;
   }
 
   st->window = (uint8_t *)gcomp_malloc(alloc, st->window_size);
   if (!st->window) {
-    gcomp_free(alloc, st);
-    return GCOMP_ERR_MEMORY;
+    status = GCOMP_ERR_MEMORY;
+    goto cleanup;
   }
   // Track window allocation
   gcomp_memory_track_alloc(&st->mem_tracker, st->window_size);
@@ -1130,11 +1137,9 @@ gcomp_status_t gcomp_deflate_decoder_init(gcomp_registry_t * registry,
   memset(&st->dyn_dist, 0, sizeof(st->dyn_dist));
   memset(&st->dyn_clen_table, 0, sizeof(st->dyn_clen_table));
 
-  gcomp_status_t ft = deflate_build_fixed_tables(st);
-  if (ft != GCOMP_OK) {
-    gcomp_free(alloc, st->window);
-    gcomp_free(alloc, st);
-    return ft;
+  status = deflate_build_fixed_tables(st);
+  if (status != GCOMP_OK) {
+    goto cleanup;
   }
   // Track fixed Huffman table allocations
   track_huffman_table_alloc(st, &st->fixed_litlen);
@@ -1143,11 +1148,18 @@ gcomp_status_t gcomp_deflate_decoder_init(gcomp_registry_t * registry,
   st->cur_litlen = NULL;
   st->cur_dist = NULL;
 
+  // Success path
   decoder->method_state = st;
   decoder->update_fn = gcomp_deflate_decoder_update;
   decoder->finish_fn = gcomp_deflate_decoder_finish;
   decoder->reset_fn = gcomp_deflate_decoder_reset;
   return GCOMP_OK;
+
+cleanup:
+  // Clean up all allocations on error (gcomp_free handles NULL safely)
+  gcomp_free(alloc, st->window);
+  gcomp_free(alloc, st);
+  return status;
 }
 
 void gcomp_deflate_decoder_destroy(gcomp_decoder_t * decoder) {

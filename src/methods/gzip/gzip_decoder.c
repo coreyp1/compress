@@ -167,13 +167,22 @@ gcomp_status_t gzip_decoder_init(gcomp_registry_t * registry,
         "gzip requires deflate method to be registered");
   }
 
+  // Get allocator from registry
+  const gcomp_allocator_t * alloc = gcomp_registry_get_allocator(registry);
+  gcomp_status_t status = GCOMP_OK;
+  const char * error_msg = NULL;
+  gcomp_options_t * deflate_options = NULL;
+
   // Allocate state
   gzip_decoder_state_t * state =
-      (gzip_decoder_state_t *)calloc(1, sizeof(gzip_decoder_state_t));
+      (gzip_decoder_state_t *)gcomp_calloc(alloc, 1, sizeof(gzip_decoder_state_t));
   if (!state) {
     return gcomp_decoder_set_error(
         decoder, GCOMP_ERR_MEMORY, "failed to allocate gzip decoder state");
   }
+
+  // Store allocator for later use
+  state->allocator = alloc;
 
   // Initialize memory tracker and track state allocation
   state->mem_tracker.current_bytes = 0;
@@ -182,18 +191,15 @@ gcomp_status_t gzip_decoder_init(gcomp_registry_t * registry,
       gcomp_limits_read_memory_max(options, GCOMP_DEFAULT_MAX_MEMORY_BYTES);
 
   // Read options
-  gcomp_status_t status = read_decoder_options(options, state);
+  status = read_decoder_options(options, state);
   if (status != GCOMP_OK) {
-    free(state);
-    return status;
+    goto cleanup;
   }
 
   // Extract pass-through options for deflate
-  gcomp_options_t * deflate_options = NULL;
   status = gzip_extract_passthrough_options(options, &deflate_options);
   if (status != GCOMP_OK) {
-    free(state);
-    return status;
+    goto cleanup;
   }
 
   // Create inner deflate decoder
@@ -201,11 +207,11 @@ gcomp_status_t gzip_decoder_init(gcomp_registry_t * registry,
       registry, "deflate", deflate_options, &state->inner_decoder);
   if (deflate_options) {
     gcomp_options_destroy(deflate_options);
+    deflate_options = NULL;
   }
   if (status != GCOMP_OK) {
-    free(state);
-    return gcomp_decoder_set_error(
-        decoder, status, "failed to create inner deflate decoder");
+    error_msg = "failed to create inner deflate decoder";
+    goto cleanup;
   }
 
   // Initialize state
@@ -217,8 +223,23 @@ gcomp_status_t gzip_decoder_init(gcomp_registry_t * registry,
   state->total_input_bytes = 0;
   state->total_output_bytes = 0;
 
+  // Success path
   decoder->method_state = state;
   return GCOMP_OK;
+
+cleanup:
+  // Clean up all resources on error
+  if (deflate_options) {
+    gcomp_options_destroy(deflate_options);
+  }
+  if (state->inner_decoder) {
+    gcomp_decoder_destroy(state->inner_decoder);
+  }
+  gcomp_free(alloc, state);
+  if (error_msg) {
+    return gcomp_decoder_set_error(decoder, status, error_msg);
+  }
+  return status;
 }
 
 //
@@ -797,6 +818,7 @@ void gzip_decoder_destroy(gcomp_decoder_t * decoder) {
   }
 
   gzip_decoder_state_t * state = (gzip_decoder_state_t *)decoder->method_state;
+  const gcomp_allocator_t * alloc = state->allocator;
 
   // Destroy inner decoder
   if (state->inner_decoder) {
@@ -817,13 +839,13 @@ void gzip_decoder_destroy(gcomp_decoder_t * decoder) {
     gcomp_memory_track_free(&state->mem_tracker, state->header_info.extra_len);
   }
 
-  // Free header info
+  // Free header info (still uses free() for name/comment/extra fields)
   gzip_header_info_free(&state->header_info);
 
   // Track state free
   gcomp_memory_track_free(&state->mem_tracker, sizeof(gzip_decoder_state_t));
 
-  // Free state
-  free(state);
+  // Free state using allocator
+  gcomp_free(alloc, state);
   decoder->method_state = NULL;
 }

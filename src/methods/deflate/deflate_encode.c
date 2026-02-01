@@ -1621,6 +1621,7 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
     return GCOMP_ERR_INVALID_ARG;
   }
 
+  gcomp_status_t status = GCOMP_OK;
   const gcomp_allocator_t * alloc = gcomp_registry_get_allocator(registry);
 
   // Read max memory limit early so we can check it during allocation
@@ -1699,8 +1700,8 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
   // Allocate sliding window
   st->window = (uint8_t *)gcomp_malloc(alloc, st->window_size);
   if (!st->window) {
-    gcomp_free(alloc, st);
-    return GCOMP_ERR_MEMORY;
+    status = GCOMP_ERR_MEMORY;
+    goto cleanup;
   }
   gcomp_memory_track_alloc(&st->mem_tracker, st->window_size);
 
@@ -1722,13 +1723,8 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
   st->hash_at =
       (uint16_t *)gcomp_calloc(alloc, st->window_size, sizeof(uint16_t));
   if (!st->hash_head || !st->hash_prev || !st->hash_pos || !st->hash_at) {
-    gcomp_free(alloc, st->hash_at);
-    gcomp_free(alloc, st->hash_pos);
-    gcomp_free(alloc, st->hash_prev);
-    gcomp_free(alloc, st->hash_head);
-    gcomp_free(alloc, st->window);
-    gcomp_free(alloc, st);
-    return GCOMP_ERR_MEMORY;
+    status = GCOMP_ERR_MEMORY;
+    goto cleanup;
   }
   gcomp_memory_track_alloc(&st->mem_tracker, hash_head_size);
   gcomp_memory_track_alloc(&st->mem_tracker, hash_prev_size);
@@ -1742,13 +1738,8 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
     st->block_buffer_size = DEFLATE_MAX_STORED_BLOCK;
     st->block_buffer = (uint8_t *)gcomp_malloc(alloc, st->block_buffer_size);
     if (!st->block_buffer) {
-      gcomp_free(alloc, st->hash_at);
-      gcomp_free(alloc, st->hash_pos);
-      gcomp_free(alloc, st->hash_prev);
-      gcomp_free(alloc, st->hash_head);
-      gcomp_free(alloc, st->window);
-      gcomp_free(alloc, st);
-      return GCOMP_ERR_MEMORY;
+      status = GCOMP_ERR_MEMORY;
+      goto cleanup;
     }
     gcomp_memory_track_alloc(&st->mem_tracker, st->block_buffer_size);
     st->block_buffer_used = 0;
@@ -1763,15 +1754,8 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
     st->lit_buf = (uint16_t *)gcomp_malloc(alloc, sym_buf_bytes);
     st->dist_buf = (uint16_t *)gcomp_malloc(alloc, sym_buf_bytes);
     if (!st->lit_buf || !st->dist_buf) {
-      gcomp_free(alloc, st->dist_buf);
-      gcomp_free(alloc, st->lit_buf);
-      gcomp_free(alloc, st->hash_at);
-      gcomp_free(alloc, st->hash_pos);
-      gcomp_free(alloc, st->hash_prev);
-      gcomp_free(alloc, st->hash_head);
-      gcomp_free(alloc, st->window);
-      gcomp_free(alloc, st);
-      return GCOMP_ERR_MEMORY;
+      status = GCOMP_ERR_MEMORY;
+      goto cleanup;
     }
     gcomp_memory_track_alloc(&st->mem_tracker, sym_buf_bytes); // lit_buf
     gcomp_memory_track_alloc(&st->mem_tracker, sym_buf_bytes); // dist_buf
@@ -1787,64 +1771,48 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
       st->dist_freq = (uint32_t *)gcomp_calloc(
           alloc, DEFLATE_MAX_DIST_SYMBOLS, sizeof(uint32_t));
       if (!st->lit_freq || !st->dist_freq) {
-        gcomp_free(alloc, st->dist_freq);
-        gcomp_free(alloc, st->lit_freq);
-        gcomp_free(alloc, st->dist_buf);
-        gcomp_free(alloc, st->lit_buf);
-        gcomp_free(alloc, st->hash_at);
-        gcomp_free(alloc, st->hash_pos);
-        gcomp_free(alloc, st->hash_prev);
-        gcomp_free(alloc, st->hash_head);
-        gcomp_free(alloc, st->window);
-        gcomp_free(alloc, st);
-        return GCOMP_ERR_MEMORY;
+        status = GCOMP_ERR_MEMORY;
+        goto cleanup;
       }
       gcomp_memory_track_alloc(&st->mem_tracker, lit_freq_size);
       gcomp_memory_track_alloc(&st->mem_tracker, dist_freq_size);
     }
 
     // Build fixed Huffman codes
-    gcomp_status_t s = deflate_build_fixed_codes(st);
-    if (s != GCOMP_OK) {
-      gcomp_free(alloc, st->dist_freq);
-      gcomp_free(alloc, st->lit_freq);
-      gcomp_free(alloc, st->dist_buf);
-      gcomp_free(alloc, st->lit_buf);
-      gcomp_free(alloc, st->hash_at);
-      gcomp_free(alloc, st->hash_pos);
-      gcomp_free(alloc, st->hash_prev);
-      gcomp_free(alloc, st->hash_head);
-      gcomp_free(alloc, st->window);
-      gcomp_free(alloc, st);
-      return s;
+    status = deflate_build_fixed_codes(st);
+    if (status != GCOMP_OK) {
+      goto cleanup;
     }
   }
 
   // Check memory limit after all allocations
-  gcomp_status_t mem_check =
-      gcomp_memory_check_limit(&st->mem_tracker, st->max_memory_bytes);
-  if (mem_check != GCOMP_OK) {
-    gcomp_free(alloc, st->dist_freq);
-    gcomp_free(alloc, st->lit_freq);
-    gcomp_free(alloc, st->dist_buf);
-    gcomp_free(alloc, st->lit_buf);
-    gcomp_free(alloc, st->block_buffer);
-    gcomp_free(alloc, st->hash_at);
-    gcomp_free(alloc, st->hash_pos);
-    gcomp_free(alloc, st->hash_prev);
-    gcomp_free(alloc, st->hash_head);
-    gcomp_free(alloc, st->window);
-    gcomp_free(alloc, st);
-    return mem_check;
+  status = gcomp_memory_check_limit(&st->mem_tracker, st->max_memory_bytes);
+  if (status != GCOMP_OK) {
+    goto cleanup;
   }
 
+  // Success path
   st->stage = DEFLATE_ENC_STAGE_ACCEPTING;
-
   encoder->method_state = st;
   encoder->update_fn = gcomp_deflate_encoder_update;
   encoder->finish_fn = gcomp_deflate_encoder_finish;
   encoder->reset_fn = gcomp_deflate_encoder_reset;
   return GCOMP_OK;
+
+cleanup:
+  // Clean up all allocations on error (gcomp_free handles NULL safely)
+  gcomp_free(alloc, st->dist_freq);
+  gcomp_free(alloc, st->lit_freq);
+  gcomp_free(alloc, st->dist_buf);
+  gcomp_free(alloc, st->lit_buf);
+  gcomp_free(alloc, st->block_buffer);
+  gcomp_free(alloc, st->hash_at);
+  gcomp_free(alloc, st->hash_pos);
+  gcomp_free(alloc, st->hash_prev);
+  gcomp_free(alloc, st->hash_head);
+  gcomp_free(alloc, st->window);
+  gcomp_free(alloc, st);
+  return status;
 }
 
 void gcomp_deflate_encoder_destroy(gcomp_encoder_t * encoder) {

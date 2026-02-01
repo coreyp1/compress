@@ -308,13 +308,23 @@ gcomp_status_t gzip_encoder_init(gcomp_registry_t * registry,
         "gzip requires deflate method to be registered");
   }
 
+  // Get allocator from registry
+  const gcomp_allocator_t * alloc = gcomp_registry_get_allocator(registry);
+  gcomp_status_t status = GCOMP_OK;
+  const char * error_msg = NULL;
+  gcomp_options_t * deflate_options = NULL;
+  int header_info_initialized = 0;
+
   // Allocate state
   gzip_encoder_state_t * state =
-      (gzip_encoder_state_t *)calloc(1, sizeof(gzip_encoder_state_t));
+      (gzip_encoder_state_t *)gcomp_calloc(alloc, 1, sizeof(gzip_encoder_state_t));
   if (!state) {
     return gcomp_encoder_set_error(
         encoder, GCOMP_ERR_MEMORY, "failed to allocate gzip encoder state");
   }
+
+  // Store allocator for later use
+  state->allocator = alloc;
 
   // Initialize memory tracker and track state allocation
   state->mem_tracker.current_bytes = 0;
@@ -327,13 +337,13 @@ gcomp_status_t gzip_encoder_init(gcomp_registry_t * registry,
   int has_explicit_xfl;
   uint8_t explicit_header_flags;
   int has_explicit_header_flags;
-  gcomp_status_t status = read_encoder_options(options, &state->header_info,
+  status = read_encoder_options(options, &state->header_info,
       &explicit_xfl, &has_explicit_xfl, &explicit_header_flags,
       &has_explicit_header_flags, &state->mem_tracker);
   if (status != GCOMP_OK) {
-    free(state);
-    return status;
+    goto cleanup;
   }
+  header_info_initialized = 1;
 
   // Apply explicit header_flags if provided
   // Note: Explicit header_flags is OR'd with flags required for provided
@@ -344,12 +354,9 @@ gcomp_status_t gzip_encoder_init(gcomp_registry_t * registry,
   }
 
   // Extract pass-through options for deflate
-  gcomp_options_t * deflate_options = NULL;
   status = gzip_extract_passthrough_options(options, &deflate_options);
   if (status != GCOMP_OK) {
-    gzip_header_info_free(&state->header_info);
-    free(state);
-    return status;
+    goto cleanup;
   }
 
   // Create inner deflate encoder
@@ -357,12 +364,11 @@ gcomp_status_t gzip_encoder_init(gcomp_registry_t * registry,
       registry, "deflate", deflate_options, &state->inner_encoder);
   if (deflate_options) {
     gcomp_options_destroy(deflate_options);
+    deflate_options = NULL;
   }
   if (status != GCOMP_OK) {
-    gzip_header_info_free(&state->header_info);
-    free(state);
-    return gcomp_encoder_set_error(
-        encoder, status, "failed to create inner deflate encoder");
+    error_msg = "failed to create inner deflate encoder";
+    goto cleanup;
   }
 
   // Compute XFL if not explicitly set
@@ -381,11 +387,8 @@ gcomp_status_t gzip_encoder_init(gcomp_registry_t * registry,
   status = gzip_write_header(&state->header_info, state->header_buf,
       sizeof(state->header_buf), &state->header_len);
   if (status != GCOMP_OK) {
-    gcomp_encoder_destroy(state->inner_encoder);
-    gzip_header_info_free(&state->header_info);
-    free(state);
-    return gcomp_encoder_set_error(
-        encoder, status, "failed to build gzip header");
+    error_msg = "failed to build gzip header";
+    goto cleanup;
   }
 
   // Initialize state
@@ -395,8 +398,26 @@ gcomp_status_t gzip_encoder_init(gcomp_registry_t * registry,
   state->header_pos = 0;
   state->trailer_pos = 0;
 
+  // Success path
   encoder->method_state = state;
   return GCOMP_OK;
+
+cleanup:
+  // Clean up all resources on error
+  if (deflate_options) {
+    gcomp_options_destroy(deflate_options);
+  }
+  if (state->inner_encoder) {
+    gcomp_encoder_destroy(state->inner_encoder);
+  }
+  if (header_info_initialized) {
+    gzip_header_info_free(&state->header_info);
+  }
+  gcomp_free(alloc, state);
+  if (error_msg) {
+    return gcomp_encoder_set_error(encoder, status, error_msg);
+  }
+  return status;
 }
 
 //
@@ -596,6 +617,7 @@ void gzip_encoder_destroy(gcomp_encoder_t * encoder) {
   }
 
   gzip_encoder_state_t * state = (gzip_encoder_state_t *)encoder->method_state;
+  const gcomp_allocator_t * alloc = state->allocator;
 
   // Destroy inner encoder
   if (state->inner_encoder) {
@@ -616,13 +638,13 @@ void gzip_encoder_destroy(gcomp_encoder_t * encoder) {
     gcomp_memory_track_free(&state->mem_tracker, state->header_info.extra_len);
   }
 
-  // Free header info
+  // Free header info (still uses free() for name/comment/extra fields)
   gzip_header_info_free(&state->header_info);
 
   // Track state free
   gcomp_memory_track_free(&state->mem_tracker, sizeof(gzip_encoder_state_t));
 
-  // Free state
-  free(state);
+  // Free state using allocator
+  gcomp_free(alloc, state);
   encoder->method_state = NULL;
 }

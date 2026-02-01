@@ -142,6 +142,9 @@ typedef struct {
 //
 
 typedef struct {
+  // Allocator (for memory operations)
+  const gcomp_allocator_t * allocator;
+
   // Inner deflate encoder (owned)
   gcomp_encoder_t * inner_encoder;
 
@@ -174,6 +177,9 @@ typedef struct {
 //
 
 typedef struct {
+  // Allocator (for memory operations)
+  const gcomp_allocator_t * allocator;
+
   // Inner deflate decoder (owned)
   gcomp_decoder_t * inner_decoder;
 
