@@ -144,9 +144,10 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
     gcomp_xxhash64_reset(&state->content_hash, 0);
   }
 
-  // Allocate block buffer
+  // Allocate block buffer (use calloc to satisfy valgrind - hash function
+  // may read bytes before they're fully populated during streaming)
   size_t block_buffer_size = ZSTD_BLOCK_SIZE_MAX;
-  state->block_buffer = gcomp_malloc(alloc, block_buffer_size);
+  state->block_buffer = gcomp_calloc(alloc, 1, block_buffer_size);
   if (!state->block_buffer) {
     status = GCOMP_ERR_MEMORY;
     goto cleanup;
@@ -566,6 +567,11 @@ gcomp_status_t zstd_encoder_reset(gcomp_encoder_t * encoder) {
   // Reset content hash if enabled
   if (state->checksum_enabled) {
     gcomp_xxhash64_reset(&state->content_hash, 0);
+  }
+
+  // Reset match finder state (clear hash tables, not free) (BP-4)
+  if (state->match_finder) {
+    zstd_mf_reset(state->match_finder);
   }
 
   // Rebuild frame header

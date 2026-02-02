@@ -167,24 +167,22 @@ gcomp_status_t zstd_mf_init(zstd_match_finder_t * mf,
   mf->chain_size =
       (window_size < ZSTD_BLOCK_SIZE_MAX) ? window_size : ZSTD_BLOCK_SIZE_MAX;
 
-  // Allocate hash table
-  mf->hash_table = gcomp_malloc(alloc, mf->hash_size * sizeof(uint32_t));
+  // Allocate hash table (use calloc to initialize to zero)
+  mf->hash_table = gcomp_calloc(alloc, mf->hash_size, sizeof(uint32_t));
   if (!mf->hash_table) {
     return GCOMP_ERR_MEMORY;
   }
-  memset(mf->hash_table, 0, mf->hash_size * sizeof(uint32_t));
   if (mem_tracker) {
     gcomp_memory_track_alloc(mem_tracker, mf->hash_size * sizeof(uint32_t));
   }
 
-  // Allocate chain table
-  mf->chain_table = gcomp_malloc(alloc, mf->chain_size * sizeof(uint32_t));
+  // Allocate chain table (use calloc to initialize to zero)
+  mf->chain_table = gcomp_calloc(alloc, mf->chain_size, sizeof(uint32_t));
   if (!mf->chain_table) {
     gcomp_free(alloc, mf->hash_table);
     mf->hash_table = NULL;
     return GCOMP_ERR_MEMORY;
   }
-  memset(mf->chain_table, 0, mf->chain_size * sizeof(uint32_t));
   if (mem_tracker) {
     gcomp_memory_track_alloc(mem_tracker, mf->chain_size * sizeof(uint32_t));
   }

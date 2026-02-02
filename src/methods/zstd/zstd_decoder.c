@@ -556,6 +556,18 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
 
     // Determine next stage
     if (state->current_block_last) {
+      // Validate content size if present in header (Z3.3)
+      if (state->header.content_size_present) {
+        if (state->total_output_bytes != state->header.content_size) {
+          state->stage = ZSTD_DEC_STAGE_ERROR;
+          gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+              "content size mismatch: expected %lu bytes, got %lu bytes",
+              (unsigned long)state->header.content_size,
+              (unsigned long)state->total_output_bytes);
+          return GCOMP_ERR_CORRUPT;
+        }
+      }
+
       if (state->header.content_checksum) {
         state->stage = ZSTD_DEC_STAGE_CONTENT_CHECKSUM;
         state->content_checksum_buf_pos = 0;
