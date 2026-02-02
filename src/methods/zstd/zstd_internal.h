@@ -105,6 +105,12 @@ extern "C" {
 #define ZSTD_DEFAULT_MAX_EXPANSION_RATIO 1000                ///< 1000x
 #define ZSTD_DEFAULT_MAX_WINDOW_BYTES (1ULL << 27)           ///< 128 MiB
 
+// Parallel compression constants
+#define ZSTD_DEFAULT_JOB_SIZE (512 * 1024)   ///< Default job size: 512 KB
+#define ZSTD_MIN_JOB_SIZE (64 * 1024)        ///< Minimum job size: 64 KB
+#define ZSTD_MAX_JOB_SIZE (16 * 1024 * 1024) ///< Maximum job size: 16 MB
+#define ZSTD_DEFAULT_MAX_IN_FLIGHT_MULT 2 ///< In-flight multiplier per thread
+
 // Initial repeat offsets per specification
 #define ZSTD_REP_OFFSET_1_INIT 1
 #define ZSTD_REP_OFFSET_2_INIT 4
@@ -369,6 +375,8 @@ typedef struct {
   // Limit tracking
   uint64_t total_input_bytes;
   uint64_t total_output_bytes;
+  uint64_t frame_output_bytes; ///< Output bytes for current frame (for content
+                               ///< size check)
 
   // Memory tracking
   gcomp_memory_tracker_t mem_tracker;

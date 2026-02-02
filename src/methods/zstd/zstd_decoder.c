@@ -80,6 +80,11 @@ gcomp_status_t zstd_decoder_init(gcomp_registry_t * registry,
   state->stage = ZSTD_DEC_STAGE_HEADER;
   state->header_stage = ZSTD_HEADER_MAGIC;
 
+  // Explicitly initialize counters (should be 0 from calloc, but be explicit)
+  state->total_input_bytes = 0;
+  state->total_output_bytes = 0;
+  state->frame_output_bytes = 0;
+
   // Allocate block buffer (will be resized based on header)
   size_t block_buffer_size = ZSTD_BLOCK_SIZE_MAX;
   state->block_buffer = gcomp_malloc(alloc, block_buffer_size);
@@ -359,6 +364,8 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
       state->rep_offset_1 = ZSTD_REP_OFFSET_1_INIT;
       state->rep_offset_2 = ZSTD_REP_OFFSET_2_INIT;
       state->rep_offset_3 = ZSTD_REP_OFFSET_3_INIT;
+      // Reset per-frame counter for content size validation
+      state->frame_output_bytes = 0;
       // Note: don't reset total_input_bytes/total_output_bytes - they
       // accumulate across frames for limit checking
     }
@@ -582,6 +589,7 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
 
     // Check output limits
     state->total_output_bytes += decompressed_len;
+    state->frame_output_bytes += decompressed_len;
     if (state->total_output_bytes > state->max_output_bytes) {
       state->stage = ZSTD_DEC_STAGE_ERROR;
       gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
@@ -614,13 +622,15 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
     // Determine next stage
     if (state->current_block_last) {
       // Validate content size if present in header (Z3.3)
+      // Use frame_output_bytes for per-frame validation (not total across
+      // concat)
       if (state->header.content_size_present) {
-        if (state->total_output_bytes != state->header.content_size) {
+        if (state->frame_output_bytes != state->header.content_size) {
           state->stage = ZSTD_DEC_STAGE_ERROR;
           gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
               "content size mismatch: expected %lu bytes, got %lu bytes",
               (unsigned long)state->header.content_size,
-              (unsigned long)state->total_output_bytes);
+              (unsigned long)state->frame_output_bytes);
           return GCOMP_ERR_CORRUPT;
         }
       }
@@ -750,6 +760,7 @@ gcomp_status_t zstd_decoder_reset(gcomp_decoder_t * decoder) {
   // Reset counters
   state->total_input_bytes = 0;
   state->total_output_bytes = 0;
+  state->frame_output_bytes = 0;
 
   // Reset repeat offsets
   state->rep_offset_1 = ZSTD_REP_OFFSET_1_INIT;
