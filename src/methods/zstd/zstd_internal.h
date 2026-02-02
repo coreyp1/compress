@@ -288,6 +288,34 @@ typedef struct {
   // Finish state
   bool finish_called;
   bool blocks_finished;
+
+  // ─────────────────────────────────────────────────────────────────────
+  // Parallel Compression State (when threads.count > 1)
+  // ─────────────────────────────────────────────────────────────────────
+  //
+  // When parallel mode is active (parallel_ctx != NULL):
+  // - Input is accumulated in parallel_job's buffer until job_size
+  // - Full jobs are submitted to parallel_ctx for compression
+  // - Each job produces an independent zstd frame
+  // - Results are collected in order via parallel_output_buf
+  // - Output is valid concatenated zstd frames
+  //
+  // When single-threaded (parallel_ctx == NULL):
+  // - Uses block_buffer, match_finder for streaming compression
+  // - Produces a single zstd frame
+  //
+  struct zstd_parallel_ctx_s *
+      parallel_ctx; ///< Parallel context (NULL = single-threaded)
+  struct zstd_parallel_job_s *
+      parallel_job;     ///< Current job being filled with input
+  uint32_t num_threads; ///< Thread count from options (0/1 = single-threaded)
+  uint64_t job_size;    ///< Target bytes per parallel job
+  uint8_t *
+      parallel_output_buf; ///< Buffer for compressed frames awaiting output
+  size_t parallel_output_buf_cap; ///< Allocated capacity of parallel_output_buf
+  size_t
+      parallel_output_buf_pos; ///< Current read position (bytes already output)
+  size_t parallel_output_buf_len; ///< Valid bytes in buffer (write position)
 } zstd_encoder_state_t;
 
 //

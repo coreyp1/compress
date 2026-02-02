@@ -268,12 +268,79 @@ If an error occurs, methods must:
 
 Do not leave orphaned threads running after returning an error.
 
+## Core Threading Infrastructure
+
+The compress library provides core threading infrastructure that methods can use:
+
+### Thread Pool (`core/thread_pool.h`)
+
+A reusable thread pool for parallel job processing:
+
+```c
+#include "core/thread_pool.h"
+
+gcomp_thread_pool_t *pool = NULL;
+gcomp_thread_pool_create(4, allocator, &pool);  // 4 workers
+
+// Submit work
+gcomp_thread_pool_submit(pool, work_func, work_ctx, complete_cb, user_data);
+
+// Cleanup
+gcomp_thread_pool_destroy(pool);
+```
+
+### Job Queue (`core/job_queue.h`)
+
+An ordered job queue for collecting results in submission order:
+
+```c
+#include "core/job_queue.h"
+
+gcomp_job_queue_t *queue = NULL;
+gcomp_job_queue_create(max_in_flight, allocator, &queue);
+
+// Submit jobs (assigns sequence numbers)
+gcomp_job_queue_submit(queue, &job->base);
+
+// Mark job complete
+gcomp_job_queue_complete(queue, &job->base, status);
+
+// Get next completed job in order (blocks if not ready)
+gcomp_block_job_t *completed = NULL;
+gcomp_job_queue_get_next(queue, &completed);
+```
+
+## Method-Specific Options
+
+Methods may define additional threading-related options beyond `threads.count`:
+
+| Option | Used By | Description |
+|--------|---------|-------------|
+| `zstd.job_size` | Zstd | Size of each parallel compression job |
+
+## Existing Implementations
+
+### Zstd Parallel Compression
+
+The Zstd encoder implements parallel compression using the core thread pool and job queue:
+
+- **Location**: `src/methods/zstd/zstd_parallel.c`
+- **Options**: `threads.count`, `zstd.job_size`
+- **Output format**: Concatenated independent frames
+
+See [Zstd Module Documentation](modules/zstd.md#parallel-compression) for details.
+
+### LZ4 Parallel Compression
+
+The LZ4 encoder also supports parallel compression:
+
+- **Location**: `src/methods/lz4/lz4_parallel.c`
+- **Options**: `threads.count`, `lz4.block_size`
+- **Output format**: LZ4 framed stream with independent blocks
+
 ## Future Considerations
 
-The following may be added to the framework if multiple methods need them:
+Additional threading features may be added as needed:
 
-- **Thread pool helper** - Shared pool to avoid thread creation overhead
 - **Atomic memory tracker** - Lock-free memory accounting
-- **Job queue abstraction** - Generic producer/consumer queue
-
-These will be implemented when a concrete need arises, not speculatively.
+- **Parallel decompression** - For formats that support it

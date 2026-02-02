@@ -4,7 +4,8 @@
  * Zstandard decoder implementation for the Ghoti.io Compress library.
  *
  * This file implements the streaming Zstd decoder, which parses
- * Zstandard frame format input.
+ * Zstandard frame format input. The decoder supports both single-frame
+ * and concatenated multi-frame streams.
  *
  * ## State Machine
  *
@@ -14,6 +15,44 @@
  * 3. BLOCK_DATA: Decompress block content
  * 4. CONTENT_CHECKSUM: Read content checksum (if enabled)
  * 5. DONE: Frame complete
+ *
+ * ## Concatenated Frames (zstd.concat=true)
+ *
+ * When `zstd.concat` is enabled, the decoder can process multiple
+ * independent zstd frames concatenated together:
+ *
+ * ```
+ * Input:  [Frame 1][Frame 2][Frame 3]...
+ * Output: [Decompressed 1][Decompressed 2][Decompressed 3]...
+ * ```
+ *
+ * Frame transition logic (in update()):
+ * 1. When stage == DONE and concat enabled and more input available:
+ *    - Reset per-frame state for new frame
+ *    - Keep total byte counters (for limit checking)
+ *    - Drain any buffered output from previous frame
+ * 2. Parse next frame starting from HEADER stage
+ * 3. Repeat until all input consumed
+ *
+ * ### Per-Frame State Reset
+ *
+ * When transitioning between concatenated frames, the following must be reset:
+ * - `header_accum_pos`: For accumulating new frame header
+ * - `rep_offset_{1,2,3}`: Each frame starts with standard repeat offsets
+ * - `frame_output_bytes`: For content size validation per frame
+ * - `window_pos`, `window_size`: Each frame has independent history window
+ * - `huf_table_valid`: Huffman tables don't carry across frames
+ *
+ * ### Not Reset Between Frames
+ *
+ * - `total_input_bytes`, `total_output_bytes`: Accumulate for limit checking
+ * - `output_buffer`, `block_buffer`: Retained for reuse (BP-4)
+ * - `fse_*_table`: Overwritten by each block anyway
+ *
+ * ## Use Case: Parallel Encoder Output
+ *
+ * The parallel encoder produces concatenated frames (one per job). This decoder
+ * mode enables decompression of that output without external tools.
  *
  * Copyright 2026 by Corey Pennycuff
  */
@@ -366,6 +405,12 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
       state->rep_offset_3 = ZSTD_REP_OFFSET_3_INIT;
       // Reset per-frame counter for content size validation
       state->frame_output_bytes = 0;
+      // Reset window buffer for new frame (each frame starts with empty
+      // history)
+      state->window_pos = 0;
+      state->window_size = 0;
+      // Reset Huffman table validity (each frame is independent)
+      state->huf_table_valid = false;
       // Note: don't reset total_input_bytes/total_output_bytes - they
       // accumulate across frames for limit checking
     }

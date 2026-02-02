@@ -131,6 +131,225 @@ TEST_F(ZstdEncoderTest, NullInputWithSize) {
   gcomp_encoder_destroy(enc);
 }
 
+//
+// Parallel Encoding Tests
+//
+
+class ZstdParallelEncoderTest : public ::testing::Test {
+protected:
+  void SetUp() override {
+    registry_ = gcomp_registry_default();
+  }
+
+  // Helper to decode data with concat support
+  std::vector<uint8_t> decode(const void * data, size_t len) {
+    gcomp_decoder_t * dec = nullptr;
+    gcomp_options_t * opts = nullptr;
+    gcomp_options_create(&opts);
+    gcomp_options_set_bool(opts, "zstd.concat", true);
+    if (gcomp_decoder_create(registry_, "zstd", opts, &dec) != GCOMP_OK) {
+      gcomp_options_destroy(opts);
+      return {};
+    }
+    // Use large buffer to handle decompressed data (compressed len * expansion)
+    std::vector<uint8_t> out(len * 100 + 65536);
+    gcomp_buffer_t in = {const_cast<void *>(data), len, 0};
+    gcomp_buffer_t ob = {out.data(), out.size(), 0};
+
+    // Loop until all input is consumed
+    gcomp_status_t status;
+    while (in.used < in.size) {
+      status = gcomp_decoder_update(dec, &in, &ob);
+      if (status != GCOMP_OK) {
+        gcomp_decoder_destroy(dec);
+        gcomp_options_destroy(opts);
+        return {};
+      }
+    }
+
+    status = gcomp_decoder_finish(dec, &ob);
+    gcomp_decoder_destroy(dec);
+    gcomp_options_destroy(opts);
+    if (status != GCOMP_OK) {
+      return {};
+    }
+    out.resize(ob.used);
+    return out;
+  }
+
+  gcomp_registry_t * registry_ = nullptr;
+};
+
+TEST_F(ZstdParallelEncoderTest, ParallelEncodeBasic) {
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  gcomp_options_set_uint64(opts, "threads.count", 2);
+
+  gcomp_encoder_t * enc = nullptr;
+  ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", opts, &enc), GCOMP_OK);
+
+  const char data[] = "Hello, parallel zstd!";
+  std::vector<uint8_t> out(4096);
+  gcomp_buffer_t in = {(void *)data, strlen(data), 0};
+  gcomp_buffer_t ob = {out.data(), out.size(), 0};
+
+  EXPECT_EQ(gcomp_encoder_update(enc, &in, &ob), GCOMP_OK);
+  EXPECT_EQ(in.used, strlen(data));
+  EXPECT_EQ(gcomp_encoder_finish(enc, &ob), GCOMP_OK);
+  EXPECT_GT(ob.used, 0u);
+
+  // Verify output can be decoded
+  auto decoded = decode(out.data(), ob.used);
+  ASSERT_EQ(decoded.size(), strlen(data));
+  EXPECT_EQ(memcmp(decoded.data(), data, strlen(data)), 0);
+
+  gcomp_encoder_destroy(enc);
+  gcomp_options_destroy(opts);
+}
+
+TEST_F(ZstdParallelEncoderTest, ParallelEncodeLarge) {
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  gcomp_options_set_uint64(opts, "threads.count", 4);
+  // Use smaller job size to force multiple jobs
+  gcomp_options_set_uint64(opts, "zstd.job_size", 64 * 1024);
+
+  gcomp_encoder_t * enc = nullptr;
+  ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", opts, &enc), GCOMP_OK);
+
+  // Create data larger than job size to force multiple jobs
+  std::vector<uint8_t> data(200 * 1024); // 200 KB
+  for (size_t i = 0; i < data.size(); i++) {
+    data[i] = (uint8_t)(i * 17 + i / 256);
+  }
+
+  std::vector<uint8_t> out(data.size() + 65536);
+  gcomp_buffer_t in = {data.data(), data.size(), 0};
+  gcomp_buffer_t ob = {out.data(), out.size(), 0};
+
+  gcomp_status_t status = gcomp_encoder_update(enc, &in, &ob);
+  EXPECT_EQ(status, GCOMP_OK);
+  EXPECT_EQ(in.used, data.size());
+
+  status = gcomp_encoder_finish(enc, &ob);
+  EXPECT_EQ(status, GCOMP_OK);
+  EXPECT_GT(ob.used, 0u);
+
+  // Verify output can be decoded by our decoder (uses concat mode)
+  auto decoded = decode(out.data(), ob.used);
+  ASSERT_EQ(decoded.size(), data.size())
+      << "Decoded size should match original data size";
+  EXPECT_EQ(memcmp(decoded.data(), data.data(), data.size()), 0)
+      << "Decoded content should match original data";
+
+  gcomp_encoder_destroy(enc);
+  gcomp_options_destroy(opts);
+}
+
+TEST_F(ZstdParallelEncoderTest, ParallelEncodeWithChecksum) {
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  gcomp_options_set_uint64(opts, "threads.count", 2);
+  gcomp_options_set_bool(opts, "zstd.checksum", true);
+
+  gcomp_encoder_t * enc = nullptr;
+  ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", opts, &enc), GCOMP_OK);
+
+  const char data[] = "Parallel checksum test data!";
+  std::vector<uint8_t> out(4096);
+  gcomp_buffer_t in = {(void *)data, strlen(data), 0};
+  gcomp_buffer_t ob = {out.data(), out.size(), 0};
+
+  EXPECT_EQ(gcomp_encoder_update(enc, &in, &ob), GCOMP_OK);
+  EXPECT_EQ(gcomp_encoder_finish(enc, &ob), GCOMP_OK);
+
+  // Verify output can be decoded
+  auto decoded = decode(out.data(), ob.used);
+  ASSERT_EQ(decoded.size(), strlen(data));
+  EXPECT_EQ(memcmp(decoded.data(), data, strlen(data)), 0);
+
+  gcomp_encoder_destroy(enc);
+  gcomp_options_destroy(opts);
+}
+
+TEST_F(ZstdParallelEncoderTest, ParallelEncodeReset) {
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  gcomp_options_set_uint64(opts, "threads.count", 2);
+
+  gcomp_encoder_t * enc = nullptr;
+  ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", opts, &enc), GCOMP_OK);
+
+  // First compression
+  const char data1[] = "First parallel stream";
+  std::vector<uint8_t> out1(4096);
+  gcomp_buffer_t in1 = {(void *)data1, strlen(data1), 0};
+  gcomp_buffer_t ob1 = {out1.data(), out1.size(), 0};
+  EXPECT_EQ(gcomp_encoder_update(enc, &in1, &ob1), GCOMP_OK);
+  EXPECT_EQ(gcomp_encoder_finish(enc, &ob1), GCOMP_OK);
+
+  auto decoded1 = decode(out1.data(), ob1.used);
+  ASSERT_EQ(decoded1.size(), strlen(data1));
+
+  // Reset and compress again
+  EXPECT_EQ(gcomp_encoder_reset(enc), GCOMP_OK);
+
+  const char data2[] = "Second parallel stream after reset";
+  std::vector<uint8_t> out2(4096);
+  gcomp_buffer_t in2 = {(void *)data2, strlen(data2), 0};
+  gcomp_buffer_t ob2 = {out2.data(), out2.size(), 0};
+  EXPECT_EQ(gcomp_encoder_update(enc, &in2, &ob2), GCOMP_OK);
+  EXPECT_EQ(gcomp_encoder_finish(enc, &ob2), GCOMP_OK);
+
+  auto decoded2 = decode(out2.data(), ob2.used);
+  ASSERT_EQ(decoded2.size(), strlen(data2));
+  EXPECT_EQ(memcmp(decoded2.data(), data2, strlen(data2)), 0);
+
+  gcomp_encoder_destroy(enc);
+  gcomp_options_destroy(opts);
+}
+
+TEST_F(ZstdParallelEncoderTest, ParallelEncodeEmpty) {
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  gcomp_options_set_uint64(opts, "threads.count", 2);
+
+  gcomp_encoder_t * enc = nullptr;
+  ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", opts, &enc), GCOMP_OK);
+
+  std::vector<uint8_t> out(4096);
+  gcomp_buffer_t in = {nullptr, 0, 0};
+  gcomp_buffer_t ob = {out.data(), out.size(), 0};
+
+  EXPECT_EQ(gcomp_encoder_update(enc, &in, &ob), GCOMP_OK);
+  EXPECT_EQ(gcomp_encoder_finish(enc, &ob), GCOMP_OK);
+
+  // Empty input should produce empty or minimal output
+  // (no jobs submitted, just finish returns OK with no output)
+
+  gcomp_encoder_destroy(enc);
+  gcomp_options_destroy(opts);
+}
+
+TEST_F(ZstdParallelEncoderTest, ParallelDestroyWithoutFinish) {
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  gcomp_options_set_uint64(opts, "threads.count", 2);
+
+  gcomp_encoder_t * enc = nullptr;
+  ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", opts, &enc), GCOMP_OK);
+
+  const char data[] = "Unfinished parallel data";
+  std::vector<uint8_t> out(4096);
+  gcomp_buffer_t in = {(void *)data, strlen(data), 0};
+  gcomp_buffer_t ob = {out.data(), out.size(), 0};
+
+  gcomp_encoder_update(enc, &in, &ob);
+  // Destroy without calling finish - should not crash or leak
+  gcomp_encoder_destroy(enc);
+  gcomp_options_destroy(opts);
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

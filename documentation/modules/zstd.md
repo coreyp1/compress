@@ -99,6 +99,15 @@ Compressed blocks contain two sections:
 | `zstd.content_size` | uint64 | (none) | Content size to write in header (optional) |
 | `zstd.dictionary_id` | uint32 | (none) | Dictionary ID (parsing only, not yet used) |
 | `zstd.concat` | bool | false | Decoder: support concatenated frames |
+| `zstd.job_size` | uint64 | 0 (auto) | Encoder: job size for parallel compression (min 64KB) |
+
+### Threading options (encoder only)
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `threads.count` | uint64 | 1 | Number of worker threads (0 or 1 = single-threaded) |
+
+When `threads.count > 1`, the encoder uses parallel compression where input is split into independent jobs. See [Parallel Compression](#parallel-compression) below.
 
 ### Core limit options
 
@@ -167,6 +176,98 @@ This enables:
 - Progress reporting during decompression
 - Pre-allocation of output buffers
 - Validation that all data was received
+
+## Parallel compression
+
+The Zstd encoder supports parallel compression for improved throughput on multi-core systems. When enabled, input data is split into independent jobs that are compressed concurrently.
+
+### Enabling parallel compression
+
+```c
+gcomp_options_t *opts = NULL;
+gcomp_options_create(&opts);
+gcomp_options_set_uint64(opts, "threads.count", 4);  // Use 4 worker threads
+
+gcomp_encoder_t *enc = NULL;
+gcomp_encoder_create(registry, "zstd", opts, &enc);
+```
+
+### How it works
+
+1. Input data is accumulated until `zstd.job_size` bytes are buffered (default: auto-calculated based on compression level)
+2. Each full job is submitted to a thread pool for compression
+3. Each job produces a complete, independent Zstd frame
+4. Compressed frames are collected in order and written to the output
+5. The final output is valid concatenated Zstd frames
+
+```
+┌───────────────────────────────────────────────────────────────────────┐
+│                    Parallel Compression Flow                          │
+│                                                                       │
+│  Input Stream:    ────────────────────────────────────────────────►   │
+│                   │  job_size  │  job_size  │  job_size  │ partial │  │
+│                                                                       │
+│  Worker Threads:  ┌────────┐   ┌────────┐   ┌────────┐                │
+│                   │ Thread │   │ Thread │   │ Thread │   ...          │
+│                   │   1    │   │   2    │   │   3    │                │
+│                   └────────┘   └────────┘   └────────┘                │
+│                        ↓           ↓           ↓                      │
+│  Output:          [Frame 1]   [Frame 2]   [Frame 3]   [Frame 4]       │
+│                   ◄───────────────────────────────────────────────    │
+│                         (concatenated, ordered output)                │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+### Job size configuration
+
+| `zstd.job_size` | Behavior |
+|-----------------|----------|
+| 0 (default) | Auto-calculated: ~4× window size, minimum 64KB |
+| 64KB - 16MB | Use specified size |
+| < 64KB | Clamped to 64KB minimum |
+
+Larger job sizes provide better compression (more context for the match finder) but reduce parallelism. Smaller job sizes enable more parallelism but may reduce compression ratio slightly.
+
+### Output format
+
+Parallel compression produces **concatenated Zstd frames**. Each frame is complete and valid:
+
+- Standard tools (`zstd`, `unzstd`) can decompress the output directly
+- When decoding with this library, enable `zstd.concat=true` to decode all frames
+
+```c
+// Decoding parallel-compressed output
+gcomp_options_t *dec_opts = NULL;
+gcomp_options_create(&dec_opts);
+gcomp_options_set_bool(dec_opts, "zstd.concat", true);  // Required for multi-frame
+
+gcomp_decoder_t *dec = NULL;
+gcomp_decoder_create(registry, "zstd", dec_opts, &dec);
+```
+
+### Single-threaded fallback
+
+When `threads.count` is 0 or 1, the encoder operates in single-threaded mode:
+
+- No threading overhead
+- Produces a single Zstd frame (not concatenated)
+- Standard streaming compression behavior
+
+### Memory usage
+
+Parallel compression uses additional memory:
+- Per-job input buffer (`job_size` bytes each)
+- Per-job output buffer (up to `job_size + overhead` bytes)
+- Match finder state per in-flight job
+
+The encoder respects `limits.max_memory_bytes` by limiting the number of concurrent in-flight jobs.
+
+### Error handling
+
+If any worker thread encounters an error:
+- The error is propagated to the main encoder
+- Subsequent `update()` or `finish()` calls return the error
+- All in-flight jobs are cleaned up
 
 ## Concatenated frames
 

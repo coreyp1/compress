@@ -4,9 +4,10 @@
  * Zstandard encoder implementation for the Ghoti.io Compress library.
  *
  * This file implements the streaming Zstd encoder, which produces
- * Zstandard frame format output.
+ * Zstandard frame format output. The encoder supports both single-threaded
+ * and parallel compression modes.
  *
- * ## State Machine
+ * ## State Machine (Single-Threaded Mode)
  *
  * The encoder progresses through these stages:
  * 1. HEADER: Write frame header (magic + header descriptor)
@@ -14,12 +15,58 @@
  * 3. CHECKSUM: Write content checksum (if enabled)
  * 4. DONE: Frame complete
  *
+ * ## Parallel Mode (threads.count > 1)
+ *
+ * When parallel mode is enabled via `threads.count > 1`:
+ *
+ * ```
+ * ┌────────────────────────────────────────────────────────────────────┐
+ * │                    Parallel Encoder Flow                           │
+ * │                                                                    │
+ * │  update() called with input:                                       │
+ * │  ┌───────────────────────────────────────────────────────────────┐ │
+ * │  │ 1. Drain any buffered parallel output                         │ │
+ * │  │ 2. Collect any ready parallel results                         │ │
+ * │  │ 3. Accumulate input into current job's buffer                 │ │
+ * │  │ 4. When job buffer full (job_size), submit to parallel ctx    │ │
+ * │  │ 5. Allocate new job for next input                            │ │
+ * │  └───────────────────────────────────────────────────────────────┘ │
+ * │                                                                    │
+ * │  finish() called:                                                  │
+ * │  ┌───────────────────────────────────────────────────────────────┐ │
+ * │  │ 1. Submit any partial job with remaining input                │ │
+ * │  │ 2. Wait for all parallel jobs to complete                     │ │
+ * │  │ 3. Collect all remaining results in order                     │ │
+ * │  │ 4. Set stage to DONE                                          │ │
+ * │  └───────────────────────────────────────────────────────────────┘ │
+ * │                                                                    │
+ * │  Output: Concatenated independent zstd frames (one per job)        │
+ * └────────────────────────────────────────────────────────────────────┘
+ * ```
+ *
+ * Key design decisions:
+ * - Each parallel job produces a complete, independent zstd frame
+ * - Frames are collected in submission order (guaranteed ordering)
+ * - Output is valid concatenated zstd stream (decode with zstd.concat=true)
+ * - Single-threaded mode (threads.count <= 1) produces a single frame
+ *
+ * ## Memory Management
+ *
+ * In parallel mode, the encoder maintains:
+ * - `parallel_ctx`: The parallel compression context
+ * - `parallel_job`: Current job being filled with input
+ * - `parallel_output_buf`: Buffer for collecting compressed output
+ *
+ * Memory is tracked via `gcomp_memory_tracker_t` and respects
+ * `limits.max_memory_bytes`.
+ *
  * Copyright 2026 by Corey Pennycuff
  */
 
 #define _POSIX_C_SOURCE 200809L
 
 #include "zstd_internal.h"
+#include "zstd_parallel.h"
 #include <string.h>
 
 //
@@ -59,6 +106,274 @@ uint32_t zstd_window_log_to_size(uint8_t window_log) {
 }
 
 //
+// Parallel Mode Helpers
+//
+
+/**
+ * @brief Drain pending parallel output to the output buffer.
+ *
+ * Copies data from the internal parallel output buffer to the caller's output.
+ *
+ * @param state Encoder state
+ * @param output Output buffer
+ * @return true if all pending output was drained, false if more space needed
+ */
+static bool zstd_encoder_drain_parallel_output(
+    zstd_encoder_state_t * state, gcomp_buffer_t * output) {
+  uint8_t * out_ptr = (uint8_t *)output->data;
+  while (state->parallel_output_buf_pos < state->parallel_output_buf_len &&
+      output->used < output->size) {
+    out_ptr[output->used++] =
+        state->parallel_output_buf[state->parallel_output_buf_pos++];
+  }
+  return state->parallel_output_buf_pos >= state->parallel_output_buf_len;
+}
+
+/**
+ * @brief Collect completed parallel jobs and copy to output buffer.
+ *
+ * Checks for completed jobs and copies their output to either the parallel
+ * output buffer (for buffering) or directly to the output.
+ *
+ * @param state Encoder state
+ * @param output Output buffer
+ * @return GCOMP_OK on success, error code on failure
+ */
+static gcomp_status_t zstd_encoder_collect_parallel_results(
+    zstd_encoder_state_t * state, gcomp_buffer_t * output) {
+  uint8_t * out_ptr = (uint8_t *)output->data;
+
+  // Check if there are completed results
+  while (zstd_parallel_result_ready(state->parallel_ctx)) {
+    zstd_parallel_job_t * completed = NULL;
+    gcomp_status_t status =
+        zstd_parallel_get_result(state->parallel_ctx, &completed);
+    if (status != GCOMP_OK) {
+      return status;
+    }
+
+    // Check if job had an error
+    if (completed->base.status == GCOMP_JOB_ERROR ||
+        completed->base.result != GCOMP_OK) {
+      status = completed->base.result;
+      zstd_parallel_free_job(state->parallel_ctx, completed);
+      return status;
+    }
+
+    // Copy job output to our buffer or directly to output
+    size_t output_len = completed->base.output_size;
+    const uint8_t * output_data = completed->base.output;
+
+    // First, try to copy directly to output
+    size_t direct_copy = output->size - output->used;
+    if (direct_copy > output_len) {
+      direct_copy = output_len;
+    }
+    if (direct_copy > 0) {
+      memcpy(out_ptr + output->used, output_data, direct_copy);
+      output->used += direct_copy;
+    }
+
+    // If there's remaining data, buffer it
+    size_t remaining = output_len - direct_copy;
+    if (remaining > 0) {
+      // Ensure buffer has space
+      if (remaining > state->parallel_output_buf_cap) {
+        // Buffer too small - this shouldn't happen with proper sizing
+        zstd_parallel_free_job(state->parallel_ctx, completed);
+        return GCOMP_ERR_INTERNAL;
+      }
+      memcpy(state->parallel_output_buf, output_data + direct_copy, remaining);
+      state->parallel_output_buf_pos = 0;
+      state->parallel_output_buf_len = remaining;
+    }
+
+    zstd_parallel_free_job(state->parallel_ctx, completed);
+
+    // If we buffered data, stop collecting more results
+    if (remaining > 0) {
+      break;
+    }
+  }
+
+  return GCOMP_OK;
+}
+
+/**
+ * @brief Submit the current parallel job and allocate a new one.
+ *
+ * @param state Encoder state
+ * @return GCOMP_OK on success, error code on failure
+ */
+static gcomp_status_t zstd_encoder_submit_parallel_job(
+    zstd_encoder_state_t * state) {
+  if (!state->parallel_job) {
+    return GCOMP_ERR_INTERNAL;
+  }
+
+  // Submit the job
+  gcomp_status_t status =
+      zstd_parallel_submit(state->parallel_ctx, state->parallel_job);
+  if (status != GCOMP_OK) {
+    return status;
+  }
+
+  state->parallel_job = NULL; // Job is now owned by parallel context
+
+  // Allocate a new job for the next chunk
+  status = zstd_parallel_alloc_job(state->parallel_ctx, &state->parallel_job);
+  return status;
+}
+
+/**
+ * @brief Process input in parallel mode.
+ *
+ * Accumulates input until job_size, then submits jobs for compression.
+ *
+ * @param encoder Encoder
+ * @param state Encoder state
+ * @param input Input buffer
+ * @param output Output buffer
+ * @return GCOMP_OK on success, error code on failure
+ */
+static gcomp_status_t zstd_encoder_update_parallel(gcomp_encoder_t * encoder,
+    zstd_encoder_state_t * state, gcomp_buffer_t * input,
+    gcomp_buffer_t * output) {
+  (void)encoder;
+  gcomp_status_t status;
+
+  // First, drain any pending output from previous results
+  if (!zstd_encoder_drain_parallel_output(state, output)) {
+    return GCOMP_OK; // Need more output space
+  }
+
+  // Collect any ready results
+  status = zstd_encoder_collect_parallel_results(state, output);
+  if (status != GCOMP_OK) {
+    return status;
+  }
+
+  // Check if we need to drain again after collecting
+  if (!zstd_encoder_drain_parallel_output(state, output)) {
+    return GCOMP_OK; // Need more output space
+  }
+
+  // Get job size from parallel context
+  uint64_t job_size = zstd_parallel_get_job_size(state->parallel_ctx);
+
+  // Accumulate input into current job
+  while (input->used < input->size) {
+    if (!state->parallel_job) {
+      return GCOMP_ERR_INTERNAL; // Should always have a job
+    }
+
+    // How much space in current job?
+    size_t job_space = job_size - state->parallel_job->base.input_size;
+    size_t input_avail = input->size - input->used;
+    size_t to_copy = (input_avail < job_space) ? input_avail : job_space;
+
+    if (to_copy > 0) {
+      const uint8_t * in_ptr = (const uint8_t *)input->data;
+      // Cast away const - the input buffer was allocated by alloc_job and is
+      // mutable during filling. It's const in the job structure because during
+      // compression it's read-only.
+      uint8_t * job_input = (uint8_t *)state->parallel_job->base.input;
+      memcpy(job_input + state->parallel_job->base.input_size,
+          in_ptr + input->used, to_copy);
+      state->parallel_job->base.input_size += to_copy;
+      input->used += to_copy;
+      state->total_input_bytes += to_copy;
+    }
+
+    // If job is full, submit it
+    if (state->parallel_job->base.input_size >= job_size) {
+      status = zstd_encoder_submit_parallel_job(state);
+      if (status != GCOMP_OK) {
+        return status;
+      }
+
+      // Try to collect results and drain output
+      status = zstd_encoder_collect_parallel_results(state, output);
+      if (status != GCOMP_OK) {
+        return status;
+      }
+
+      if (!zstd_encoder_drain_parallel_output(state, output)) {
+        return GCOMP_OK; // Need more output space
+      }
+    }
+  }
+
+  return GCOMP_OK;
+}
+
+/**
+ * @brief Finish parallel encoding.
+ *
+ * Submits final partial job and collects all remaining results.
+ *
+ * @param encoder Encoder
+ * @param state Encoder state
+ * @param output Output buffer
+ * @return GCOMP_OK when complete, error code on failure
+ */
+static gcomp_status_t zstd_encoder_finish_parallel(gcomp_encoder_t * encoder,
+    zstd_encoder_state_t * state, gcomp_buffer_t * output) {
+  (void)encoder;
+  gcomp_status_t status;
+
+  // First, drain any pending output
+  if (!zstd_encoder_drain_parallel_output(state, output)) {
+    return GCOMP_OK; // Need more output space
+  }
+
+  // Submit final partial job if not already done
+  if (!state->blocks_finished && state->parallel_job) {
+    // Only submit if there's data in the job
+    if (state->parallel_job->base.input_size > 0) {
+      status = zstd_parallel_submit(state->parallel_ctx, state->parallel_job);
+      if (status != GCOMP_OK) {
+        return status;
+      }
+      state->parallel_job = NULL; // Job is now owned by parallel context
+    }
+    else {
+      // No data in job, just free it
+      zstd_parallel_free_job(state->parallel_ctx, state->parallel_job);
+      state->parallel_job = NULL;
+    }
+    state->blocks_finished = true;
+  }
+
+  // Wait for all pending jobs and collect results
+  status = zstd_parallel_wait(state->parallel_ctx);
+  if (status != GCOMP_OK) {
+    return status;
+  }
+
+  // Collect all remaining results
+  status = zstd_encoder_collect_parallel_results(state, output);
+  if (status != GCOMP_OK) {
+    return status;
+  }
+
+  // Drain any buffered output
+  if (!zstd_encoder_drain_parallel_output(state, output)) {
+    return GCOMP_OK; // Need more output space
+  }
+
+  // Check if there are still pending results
+  if (zstd_parallel_pending_count(state->parallel_ctx) > 0) {
+    // Shouldn't happen after wait, but be defensive
+    return GCOMP_OK;
+  }
+
+  // All done
+  state->stage = ZSTD_ENC_STAGE_DONE;
+  return GCOMP_OK;
+}
+
+//
 // Initialization
 //
 
@@ -91,6 +406,8 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
   uint64_t content_size = 0;
   bool content_size_present = false;
   uint64_t max_memory = ZSTD_DEFAULT_MAX_MEMORY_BYTES;
+  uint64_t num_threads = 1;
+  uint64_t job_size = 0;
 
   if (options) {
     gcomp_options_get_int64(options, "zstd.level", &level);
@@ -101,7 +418,13 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
       content_size_present = true;
     }
     gcomp_options_get_uint64(options, "limits.max_memory_bytes", &max_memory);
+    gcomp_options_get_uint64(options, "threads.count", &num_threads);
+    gcomp_options_get_uint64(options, "zstd.job_size", &job_size);
   }
+
+  // Store threading options
+  state->num_threads = (uint32_t)num_threads;
+  state->job_size = job_size;
 
   // Validate and set compression level
   if (level < ZSTD_LEVEL_MIN || level > ZSTD_LEVEL_MAX) {
@@ -208,14 +531,56 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
     goto cleanup;
   }
 
-  // Set initial stage
-  state->stage = ZSTD_ENC_STAGE_HEADER;
+  // Initialize parallel context if threads > 1
+  if (state->num_threads > 1) {
+    zstd_parallel_config_t pconfig = {
+        .num_threads = state->num_threads,
+        .max_in_flight = 0, // Auto
+        .job_size = state->job_size,
+        .checksum_enabled = state->checksum_enabled,
+        .compression_level = state->compression_level,
+        .window_log = effective_window_log,
+        .max_memory_bytes = max_memory,
+        .allocator = alloc,
+    };
+    status = zstd_parallel_create(&pconfig, &state->parallel_ctx);
+    if (status != GCOMP_OK) {
+      goto cleanup;
+    }
 
-  // Build frame header
-  status = zstd_write_frame_header(&state->header, state->header_buf,
-      sizeof(state->header_buf), &state->header_len);
-  if (status != GCOMP_OK) {
-    goto cleanup;
+    // Allocate first job for parallel mode
+    status = zstd_parallel_alloc_job(state->parallel_ctx, &state->parallel_job);
+    if (status != GCOMP_OK) {
+      goto cleanup;
+    }
+
+    // Allocate parallel output buffer for collecting results
+    // Size to hold at least one job's output with some margin
+    uint64_t actual_job_size = zstd_parallel_get_job_size(state->parallel_ctx);
+    state->parallel_output_buf_cap =
+        actual_job_size + 4096; // Extra for frame overhead
+    state->parallel_output_buf =
+        gcomp_malloc(alloc, state->parallel_output_buf_cap);
+    if (!state->parallel_output_buf) {
+      status = GCOMP_ERR_MEMORY;
+      goto cleanup;
+    }
+    gcomp_memory_track_alloc(
+        &state->mem_tracker, state->parallel_output_buf_cap);
+
+    // Set initial stage - parallel mode doesn't use HEADER stage
+    state->stage = ZSTD_ENC_STAGE_BLOCKS;
+  }
+  else {
+    // Single-threaded mode: Set initial stage and build header
+    state->stage = ZSTD_ENC_STAGE_HEADER;
+
+    // Build frame header
+    status = zstd_write_frame_header(&state->header, state->header_buf,
+        sizeof(state->header_buf), &state->header_len);
+    if (status != GCOMP_OK) {
+      goto cleanup;
+    }
   }
 
   encoder->method_state = state;
@@ -238,6 +603,15 @@ cleanup:
     }
     if (state->literals_buffer) {
       gcomp_free(alloc, state->literals_buffer);
+    }
+    if (state->parallel_output_buf) {
+      gcomp_free(alloc, state->parallel_output_buf);
+    }
+    if (state->parallel_job) {
+      zstd_parallel_free_job(state->parallel_ctx, state->parallel_job);
+    }
+    if (state->parallel_ctx) {
+      zstd_parallel_destroy(state->parallel_ctx);
     }
     gcomp_free(alloc, state);
   }
@@ -271,6 +645,15 @@ void zstd_encoder_destroy(gcomp_encoder_t * encoder) {
   }
   if (state->literals_buffer) {
     gcomp_free(alloc, state->literals_buffer);
+  }
+  if (state->parallel_output_buf) {
+    gcomp_free(alloc, state->parallel_output_buf);
+  }
+  if (state->parallel_job) {
+    zstd_parallel_free_job(state->parallel_ctx, state->parallel_job);
+  }
+  if (state->parallel_ctx) {
+    zstd_parallel_destroy(state->parallel_ctx);
   }
   gcomp_free(alloc, state);
   encoder->method_state = NULL;
@@ -309,7 +692,12 @@ gcomp_status_t zstd_encoder_update(gcomp_encoder_t * encoder,
     return GCOMP_OK;
   }
 
-  // Write header if needed
+  // Parallel mode: use dedicated parallel update path
+  if (state->parallel_ctx) {
+    return zstd_encoder_update_parallel(encoder, state, input, output);
+  }
+
+  // Single-threaded mode: write header if needed
   if (state->stage == ZSTD_ENC_STAGE_HEADER) {
     while (
         state->header_pos < state->header_len && output->used < output->size) {
@@ -428,7 +816,12 @@ gcomp_status_t zstd_encoder_finish(
 
   state->finish_called = true;
 
-  // First, drain any remaining header
+  // Parallel mode: use dedicated parallel finish path
+  if (state->parallel_ctx) {
+    return zstd_encoder_finish_parallel(encoder, state, output);
+  }
+
+  // Single-threaded mode: drain any remaining header
   if (state->stage == ZSTD_ENC_STAGE_HEADER) {
     while (
         state->header_pos < state->header_len && output->used < output->size) {
@@ -543,16 +936,7 @@ gcomp_status_t zstd_encoder_reset(gcomp_encoder_t * encoder) {
   }
 
   zstd_encoder_state_t * state = encoder->method_state;
-
-  // Reset stage
-  state->stage = ZSTD_ENC_STAGE_HEADER;
-
-  // Reset positions (BP-4: retain buffers)
-  state->header_pos = 0;
-  state->checksum_pos = 0;
-  state->block_buffer_pos = 0;
-  state->compressed_buffer_pos = 0;
-  state->compressed_buffer_len = 0;
+  gcomp_status_t status = GCOMP_OK;
 
   // Reset counters
   state->total_input_bytes = 0;
@@ -569,14 +953,51 @@ gcomp_status_t zstd_encoder_reset(gcomp_encoder_t * encoder) {
     gcomp_xxhash64_reset(&state->content_hash, 0);
   }
 
-  // Reset match finder state (clear hash tables, not free) (BP-4)
-  if (state->match_finder) {
-    zstd_mf_reset(state->match_finder);
-  }
+  // Parallel mode reset
+  if (state->parallel_ctx) {
+    // Reset parallel context
+    status = zstd_parallel_reset(state->parallel_ctx);
+    if (status != GCOMP_OK) {
+      return status;
+    }
 
-  // Rebuild frame header
-  gcomp_status_t status = zstd_write_frame_header(&state->header,
-      state->header_buf, sizeof(state->header_buf), &state->header_len);
+    // Free and reallocate current job if needed
+    if (state->parallel_job) {
+      zstd_parallel_free_job(state->parallel_ctx, state->parallel_job);
+      state->parallel_job = NULL;
+    }
+    status = zstd_parallel_alloc_job(state->parallel_ctx, &state->parallel_job);
+    if (status != GCOMP_OK) {
+      return status;
+    }
+
+    // Reset parallel output buffer
+    state->parallel_output_buf_pos = 0;
+    state->parallel_output_buf_len = 0;
+
+    // Set stage to BLOCKS (parallel mode doesn't use HEADER stage)
+    state->stage = ZSTD_ENC_STAGE_BLOCKS;
+  }
+  else {
+    // Single-threaded mode reset
+    state->stage = ZSTD_ENC_STAGE_HEADER;
+
+    // Reset positions (BP-4: retain buffers)
+    state->header_pos = 0;
+    state->checksum_pos = 0;
+    state->block_buffer_pos = 0;
+    state->compressed_buffer_pos = 0;
+    state->compressed_buffer_len = 0;
+
+    // Reset match finder state (clear hash tables, not free) (BP-4)
+    if (state->match_finder) {
+      zstd_mf_reset(state->match_finder);
+    }
+
+    // Rebuild frame header
+    status = zstd_write_frame_header(&state->header, state->header_buf,
+        sizeof(state->header_buf), &state->header_len);
+  }
 
   return status;
 }
