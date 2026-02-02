@@ -347,8 +347,24 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
   if (state->stage == ZSTD_DEC_STAGE_ERROR) {
     return GCOMP_ERR_INTERNAL;
   }
+
+  // Handle concatenated frames: if DONE and concat enabled, check for more
+  // frames
   if (state->stage == ZSTD_DEC_STAGE_DONE) {
-    return GCOMP_OK;
+    if (state->concat_enabled && input->used < input->size) {
+      // Reset for next frame (keep buffers per BP-4)
+      state->stage = ZSTD_DEC_STAGE_HEADER;
+      state->header_stage = ZSTD_HEADER_MAGIC;
+      state->header_accum_pos = 0;
+      state->rep_offset_1 = ZSTD_REP_OFFSET_1_INIT;
+      state->rep_offset_2 = ZSTD_REP_OFFSET_2_INIT;
+      state->rep_offset_3 = ZSTD_REP_OFFSET_3_INIT;
+      // Note: don't reset total_input_bytes/total_output_bytes - they
+      // accumulate across frames for limit checking
+    }
+    else {
+      return GCOMP_OK;
+    }
   }
 
   gcomp_status_t status = GCOMP_OK;
@@ -609,16 +625,11 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
     state->stage = ZSTD_DEC_STAGE_DONE;
   }
 
-  // Handle concatenated frames
+  // If we reached DONE and concat is enabled and there's more input,
+  // continue processing (recursive call to handle next frame)
   if (state->stage == ZSTD_DEC_STAGE_DONE && state->concat_enabled &&
       input->used < input->size) {
-    // Reset for next frame
-    state->stage = ZSTD_DEC_STAGE_HEADER;
-    state->header_stage = ZSTD_HEADER_MAGIC;
-    state->header_accum_pos = 0;
-    state->rep_offset_1 = ZSTD_REP_OFFSET_1_INIT;
-    state->rep_offset_2 = ZSTD_REP_OFFSET_2_INIT;
-    state->rep_offset_3 = ZSTD_REP_OFFSET_3_INIT;
+    return zstd_decoder_update(decoder, input, output);
   }
 
   return GCOMP_OK;
