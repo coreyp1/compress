@@ -71,6 +71,7 @@
 //
 
 #define MF_MIN_MATCH 3           ///< Minimum match length
+#define MF_HASH_READ_SIZE 4      ///< Bytes read by hash function (must be >= 4)
 #define MF_HASH_LOG_DEFAULT 17   ///< Default hash table log (128K entries)
 #define MF_HASH_LOG_MIN 12       ///< Minimum hash table log
 #define MF_HASH_LOG_MAX 20       ///< Maximum hash table log
@@ -266,7 +267,8 @@ static inline size_t zstd_mf_count_match(
  */
 static bool zstd_mf_find_match(zstd_match_finder_t * mf, const uint8_t * data,
     size_t pos, size_t data_size, zstd_match_t * match_out) {
-  if (pos + MF_MIN_MATCH > data_size) {
+  // Need at least MF_HASH_READ_SIZE bytes for hash function
+  if (pos + MF_HASH_READ_SIZE > data_size) {
     return false;
   }
 
@@ -351,7 +353,8 @@ static bool zstd_mf_find_match(zstd_match_finder_t * mf, const uint8_t * data,
  */
 static void zstd_mf_insert(zstd_match_finder_t * mf, const uint8_t * data,
     size_t pos, size_t data_size) {
-  if (pos + MF_MIN_MATCH > data_size) {
+  // Need at least MF_HASH_READ_SIZE bytes for hash function
+  if (pos + MF_HASH_READ_SIZE > data_size) {
     return;
   }
 
@@ -476,8 +479,8 @@ gcomp_status_t zstd_mf_generate_sequences(zstd_match_finder_t * mf,
       // Advance position
       // Insert intermediate positions into hash table for better chaining
       size_t match_end = pos + match.length;
-      for (size_t i = pos + 1; i < match_end && i + MF_MIN_MATCH <= data_size;
-           i++) {
+      for (size_t i = pos + 1;
+           i < match_end && i + MF_HASH_READ_SIZE <= data_size; i++) {
         zstd_mf_insert(mf, data, i, data_size);
       }
 

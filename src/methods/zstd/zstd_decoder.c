@@ -539,6 +539,47 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
           &state->content_hash, state->output_buffer, decompressed_len);
     }
 
+    // Update window buffer with decoded output (for cross-block match refs)
+    // The window buffer is circular - we copy new data and update position
+    if (decompressed_len > 0 && state->window_buffer) {
+      if (decompressed_len >= state->window_capacity) {
+        // New data is larger than window - just copy the last window_capacity
+        // bytes
+        memcpy(state->window_buffer,
+            state->output_buffer + decompressed_len - state->window_capacity,
+            state->window_capacity);
+        state->window_pos = 0;
+        state->window_size = state->window_capacity;
+      }
+      else {
+        // Copy new data to window buffer, wrapping if needed
+        size_t first_chunk =
+            state->window_capacity - state->window_pos; // Space until wrap
+        if (first_chunk >= decompressed_len) {
+          // No wrap needed
+          memcpy(state->window_buffer + state->window_pos, state->output_buffer,
+              decompressed_len);
+          state->window_pos += decompressed_len;
+          if (state->window_pos >= state->window_capacity) {
+            state->window_pos = 0;
+          }
+        }
+        else {
+          // Copy in two parts (wrap around)
+          memcpy(state->window_buffer + state->window_pos, state->output_buffer,
+              first_chunk);
+          memcpy(state->window_buffer, state->output_buffer + first_chunk,
+              decompressed_len - first_chunk);
+          state->window_pos = decompressed_len - first_chunk;
+        }
+        // Update window_size (capped at capacity)
+        state->window_size += decompressed_len;
+        if (state->window_size > state->window_capacity) {
+          state->window_size = state->window_capacity;
+        }
+      }
+    }
+
     // Check output limits
     state->total_output_bytes += decompressed_len;
     if (state->total_output_bytes > state->max_output_bytes) {

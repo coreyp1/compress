@@ -693,8 +693,14 @@ static gcomp_status_t zstd_sequences_execute(zstd_decoder_state_t * state,
     out_pos += literal_length;
     lit_pos += literal_length;
 
-    // Copy match
-    if (actual_offset == 0 || actual_offset > out_pos) {
+    // Copy match - may reference window buffer (history from previous blocks)
+    // or current block's output
+    //
+    // Total available history = window_size + out_pos
+    // - window_size bytes from window_buffer (previous blocks)
+    // - out_pos bytes from dst (current block)
+    size_t total_history = state->window_size + out_pos;
+    if (actual_offset == 0 || actual_offset > total_history) {
       return GCOMP_ERR_CORRUPT;
     }
     if (out_pos + match_length > dst_capacity) {
@@ -702,9 +708,32 @@ static gcomp_status_t zstd_sequences_execute(zstd_decoder_state_t * state,
     }
 
     // Byte-by-byte copy for overlapping matches
-    size_t match_src = out_pos - actual_offset;
+    // If offset <= out_pos, copy from current block's output
+    // If offset > out_pos, part or all comes from window buffer
     for (uint32_t j = 0; j < match_length; j++) {
-      dst[out_pos++] = dst[match_src++];
+      uint8_t byte;
+      if (actual_offset <= out_pos) {
+        // Source is within current block's output
+        byte = dst[out_pos - actual_offset];
+      }
+      else {
+        // Source is in window buffer (circular)
+        // Position in window = window_size - (actual_offset - out_pos)
+        size_t win_offset = actual_offset - out_pos;
+        if (win_offset > state->window_size) {
+          return GCOMP_ERR_CORRUPT;
+        }
+        size_t win_idx;
+        if (state->window_pos >= win_offset) {
+          win_idx = state->window_pos - win_offset;
+        }
+        else {
+          // Wrap around in circular buffer
+          win_idx = state->window_capacity - (win_offset - state->window_pos);
+        }
+        byte = state->window_buffer[win_idx];
+      }
+      dst[out_pos++] = byte;
     }
   }
 
