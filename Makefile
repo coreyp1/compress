@@ -340,6 +340,7 @@ $(APP_DIR)/fuzz/%$(EXE_EXTENSION): fuzz/%.c $(APP_DIR)/$(AFL_STATIC_TARGET)
 .PHONY: fuzz-build fuzz-corpus fuzz-decoder fuzz-encoder fuzz-roundtrip fuzz-help
 .PHONY: fuzz-gzip-decoder fuzz-gzip-encoder fuzz-gzip-roundtrip
 .PHONY: fuzz-lz4-decoder fuzz-lz4-encoder fuzz-lz4-roundtrip
+.PHONY: fuzz-zstd-decoder fuzz-zstd-encoder fuzz-zstd-roundtrip
 # Sanitizer commands
 .PHONY: test-asan test-asan-quiet test-ubsan sanitizer-help
 
@@ -457,6 +458,11 @@ fuzz-help: ## Show fuzzing help and instructions
 	@printf "    make fuzz-lz4-decoder   - Run LZ4 decoder fuzzer\n"
 	@printf "    make fuzz-lz4-encoder   - Run LZ4 encoder fuzzer\n"
 	@printf "    make fuzz-lz4-roundtrip - Run LZ4 roundtrip fuzzer\n"
+	@printf "\n"
+	@printf "  Zstd fuzzers:\n"
+	@printf "    make fuzz-zstd-decoder  - Run Zstd decoder fuzzer\n"
+	@printf "    make fuzz-zstd-encoder  - Run Zstd encoder fuzzer\n"
+	@printf "    make fuzz-zstd-roundtrip- Run Zstd roundtrip fuzzer\n"
 	@printf "\n"
 	@printf "Workflow:\n"
 	@printf "  1. make fuzz-corpus        # Generate seed inputs\n"
@@ -642,6 +648,51 @@ fuzz-lz4-roundtrip: $(APP_DIR)/fuzz/fuzz_lz4_roundtrip$(EXE_EXTENSION)
 		printf 'Hello' > fuzz/corpus/lz4_roundtrip/hello.bin; \
 	fi
 	$(AFL_ENV) afl-fuzz -i fuzz/corpus/lz4_roundtrip -o fuzz/findings/lz4_roundtrip -- $(APP_DIR)/fuzz/fuzz_lz4_roundtrip$(EXE_EXTENSION)
+
+fuzz-zstd-decoder: ## Run Zstd decoder fuzzer (Ctrl+C to stop)
+fuzz-zstd-decoder: $(APP_DIR)/fuzz/fuzz_zstd_decoder$(EXE_EXTENSION)
+	@printf "\033[0;32m\n"
+	@printf "#######################################\n"
+	@printf "### Running Zstd Decoder Fuzzer     ###\n"
+	@printf "#######################################\n"
+	@printf "\033[0m\n"
+	@mkdir -p fuzz/findings/zstd_decoder
+	@if [ ! -d fuzz/corpus/zstd_decoder ] || [ -z "$$(ls -A fuzz/corpus/zstd_decoder 2>/dev/null)" ]; then \
+		printf "\033[0;33mWarning: No seed corpus found. Creating minimal seed...\033[0m\n"; \
+		mkdir -p fuzz/corpus/zstd_decoder; \
+		printf '\x28\xb5\x2f\xfd\x00\x00\x01\x00\x00' > fuzz/corpus/zstd_decoder/empty.zst; \
+	fi
+	$(AFL_ENV) afl-fuzz -i fuzz/corpus/zstd_decoder -o fuzz/findings/zstd_decoder -- $(APP_DIR)/fuzz/fuzz_zstd_decoder$(EXE_EXTENSION)
+
+fuzz-zstd-encoder: ## Run Zstd encoder fuzzer (Ctrl+C to stop)
+fuzz-zstd-encoder: $(APP_DIR)/fuzz/fuzz_zstd_encoder$(EXE_EXTENSION)
+	@printf "\033[0;32m\n"
+	@printf "#######################################\n"
+	@printf "### Running Zstd Encoder Fuzzer     ###\n"
+	@printf "#######################################\n"
+	@printf "\033[0m\n"
+	@mkdir -p fuzz/findings/zstd_encoder
+	@if [ ! -d fuzz/corpus/zstd_encoder ] || [ -z "$$(ls -A fuzz/corpus/zstd_encoder 2>/dev/null)" ]; then \
+		printf "\033[0;33mWarning: No seed corpus found. Creating minimal seed...\033[0m\n"; \
+		mkdir -p fuzz/corpus/zstd_encoder; \
+		printf 'Hello' > fuzz/corpus/zstd_encoder/hello.bin; \
+	fi
+	$(AFL_ENV) afl-fuzz -i fuzz/corpus/zstd_encoder -o fuzz/findings/zstd_encoder -- $(APP_DIR)/fuzz/fuzz_zstd_encoder$(EXE_EXTENSION)
+
+fuzz-zstd-roundtrip: ## Run Zstd roundtrip fuzzer (Ctrl+C to stop)
+fuzz-zstd-roundtrip: $(APP_DIR)/fuzz/fuzz_zstd_roundtrip$(EXE_EXTENSION)
+	@printf "\033[0;32m\n"
+	@printf "#######################################\n"
+	@printf "### Running Zstd Roundtrip Fuzzer   ###\n"
+	@printf "#######################################\n"
+	@printf "\033[0m\n"
+	@mkdir -p fuzz/findings/zstd_roundtrip
+	@if [ ! -d fuzz/corpus/zstd_roundtrip ] || [ -z "$$(ls -A fuzz/corpus/zstd_roundtrip 2>/dev/null)" ]; then \
+		printf "\033[0;33mWarning: No seed corpus found. Creating minimal seed...\033[0m\n"; \
+		mkdir -p fuzz/corpus/zstd_roundtrip; \
+		printf 'Hello' > fuzz/corpus/zstd_roundtrip/hello.bin; \
+	fi
+	$(AFL_ENV) afl-fuzz -i fuzz/corpus/zstd_roundtrip -o fuzz/findings/zstd_roundtrip -- $(APP_DIR)/fuzz/fuzz_zstd_roundtrip$(EXE_EXTENSION)
 
 test: ## Make and run the Unit tests
 test: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES)

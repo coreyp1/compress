@@ -305,7 +305,8 @@ static bool zstd_mf_find_match(zstd_match_finder_t * mf, const uint8_t * data,
     }
 
     // Quick check: compare first and last bytes before full comparison
-    if (data[chain_pos] == data[pos] &&
+    // Ensure we don't read past the end of the buffer
+    if (pos + best_len < data_size && data[chain_pos] == data[pos] &&
         data[chain_pos + best_len] == data[pos + best_len]) {
       // Count matching bytes
       size_t match_len =
