@@ -1,27 +1,67 @@
 /**
  * @file zstd_huf.c
  *
- * Huffman decoder for the Ghoti.io Compress library.
+ * Huffman encoder and decoder for the Ghoti.io Compress library.
  *
  * ## Algorithm Overview
  *
  * Huffman coding assigns variable-length codes to symbols based on their
- * frequency. More frequent symbols get shorter codes. Zstd uses a
- * table-based approach for fast decoding.
+ * frequency. More frequent symbols get shorter codes. This file implements
+ * both encoding (for compression) and decoding (for decompression).
  *
  * ## Zstd Huffman Specifics
  *
  * In Zstd:
  * - Huffman is used only for literals (not sequences)
- * - Tree weights are encoded using FSE
- * - Maximum number of bits is 11
- * - 4-stream mode is used for large literal sections
+ * - Tree weights are encoded as 4-bit values (direct) or FSE-compressed
+ * - Maximum code length is 11 bits
+ * - 4-stream mode is used for large literal sections (decoder only)
  *
- * ## Decoding Table
+ * ## Decoding
  *
  * The decoding table has 2^maxBits entries. Each entry contains:
- * - symbol: The decoded symbol
+ * - symbol: The decoded symbol (0-255)
  * - nb_bits: Number of bits consumed
+ *
+ * Decoding uses a reverse bit reader since Zstd Huffman streams are written
+ * backwards with a marker bit at the end.
+ *
+ * ## Encoding
+ *
+ * The encoder implements:
+ *
+ * 1. **Tree Building** (two-queue algorithm):
+ *    - Sort symbols by frequency
+ *    - Repeatedly combine two lowest-frequency nodes
+ *    - O(n log n) complexity for n symbols
+ *
+ * 2. **Code Length Limiting**:
+ *    - Zstd limits codes to 11 bits maximum
+ *    - If tree produces longer codes, redistribute bit lengths
+ *    - Ensures decodable with fixed-size lookup table
+ *
+ * 3. **Canonical Code Generation**:
+ *    - Sort symbols by (bit_length, symbol_value)
+ *    - Assign codes sequentially within each bit length
+ *    - Enables compact weight representation
+ *
+ * 4. **Weight Encoding**:
+ *    - weight = maxBits + 1 - nb_bits (0 = symbol not present)
+ *    - Direct representation: 4-bit weights packed into bytes
+ *    - Header byte < 128 indicates direct representation
+ *
+ * 5. **Bitstream Encoding**:
+ *    - Write symbols forward using their Huffman codes
+ *    - Add marker bit (1) at the end
+ *    - Reverse byte order for backward reading by decoder
+ *
+ * ## Performance Considerations
+ *
+ * - Tree building uses insertion sort (O(n²)) which is acceptable for
+ *   the maximum 256 symbols. A heap would be faster for larger alphabets.
+ * - Code length limiting uses a simple greedy approach rather than the
+ *   optimal package-merge algorithm. This may produce slightly longer
+ *   codes in rare cases but is much simpler.
  *
  * Reference:
  * https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md
@@ -519,5 +559,556 @@ gcomp_status_t zstd_huf_decode_4streams(const zstd_huf_entry_t * table,
   }
 
   *decoded_size_out = decoded1 + decoded2 + decoded3 + decoded4;
+  return GCOMP_OK;
+}
+
+//============================================================================
+// Huffman Encoding
+//============================================================================
+//
+// The Huffman encoder creates variable-length codes for literal bytes based
+// on their frequency in the input. The encoding process is:
+//
+// 1. COUNT FREQUENCIES
+//    Count occurrences of each byte value (0-255) in the literals.
+//
+// 2. BUILD HUFFMAN TREE
+//    Use the classic two-queue algorithm:
+//    - Create leaf node for each symbol with non-zero frequency
+//    - Sort leaves by frequency (ascending)
+//    - Repeatedly merge two lowest-frequency nodes into internal node
+//    - Tree depth at each leaf = code length for that symbol
+//
+// 3. LIMIT CODE LENGTHS
+//    Zstd limits Huffman codes to 11 bits maximum. If the tree produces
+//    longer codes (highly skewed distributions), redistribute bit lengths
+//    to stay within the limit while maintaining decodability.
+//
+// 4. GENERATE CANONICAL CODES
+//    Sort symbols by (bit_length, symbol_value), then assign codes
+//    sequentially. This canonical form allows compact representation
+//    via weights rather than explicit tree structure.
+//
+// 5. CALCULATE WEIGHTS
+//    Convert bit lengths to weights: weight = maxBits + 1 - nb_bits
+//    Weight 0 means symbol is not present in the data.
+//
+// 6. WRITE WEIGHTS HEADER
+//    For <= 127 symbols, use direct 4-bit representation:
+//    - Header byte = num_symbols - 1 (< 128)
+//    - Weights packed as nibbles: high nibble first
+//
+// 7. ENCODE LITERALS
+//    Write each literal's Huffman code to a forward bitstream, then
+//    add a marker bit (1) and reverse the byte order. The decoder
+//    reads backwards, using the marker to find the start position.
+//
+// Example encoding:
+//   Input:  "AAAAABBC"
+//   Freqs:  A=5, B=2, C=1
+//   Tree:   A gets 1-bit code (frequent), B and C get 2-bit codes
+//   Codes:  A=0, B=10, C=11 (canonical assignment)
+//   Bits:   0 0 0 0 0 10 10 11 [marker=1]
+//   Output: Reversed bytes with marker at end
+//
+//============================================================================
+
+//
+// Huffman Tree Node (for building)
+//
+
+typedef struct {
+  uint32_t freq;   ///< Symbol frequency
+  int16_t parent;  ///< Parent node index (-1 if root)
+  int16_t left;    ///< Left child (-1 if leaf)
+  int16_t right;   ///< Right child (-1 if leaf)
+  uint16_t symbol; ///< Symbol value (for leaves)
+  uint8_t depth;   ///< Depth in tree (= code length)
+} zstd_huf_node_t;
+
+/**
+ * @brief Build Huffman tree using standard algorithm.
+ *
+ * Creates a binary tree where more frequent symbols have shorter paths.
+ *
+ * @param freq Symbol frequencies (256 entries)
+ * @param nodes Node array (must have space for 511 nodes: 256 leaves + 255
+ * internal)
+ * @param num_symbols_out Output: number of symbols with non-zero frequency
+ * @param root_out Output: index of root node
+ * @return GCOMP_OK on success
+ */
+static gcomp_status_t zstd_huf_build_tree(const uint32_t * freq,
+    zstd_huf_node_t * nodes, unsigned * num_symbols_out, int * root_out) {
+  // Initialize leaf nodes for symbols with non-zero frequency
+  unsigned num_leaves = 0;
+  for (unsigned i = 0; i < 256; i++) {
+    if (freq[i] > 0) {
+      nodes[num_leaves].freq = freq[i];
+      nodes[num_leaves].symbol = (uint16_t)i;
+      nodes[num_leaves].parent = -1;
+      nodes[num_leaves].left = -1;
+      nodes[num_leaves].right = -1;
+      nodes[num_leaves].depth = 0;
+      num_leaves++;
+    }
+  }
+
+  if (num_leaves == 0) {
+    *num_symbols_out = 0;
+    *root_out = -1;
+    return GCOMP_OK;
+  }
+
+  if (num_leaves == 1) {
+    // Single symbol: give it depth 1
+    nodes[0].depth = 1;
+    *num_symbols_out = 1;
+    *root_out = 0;
+    return GCOMP_OK;
+  }
+
+  *num_symbols_out = num_leaves;
+
+  // Sort leaves by frequency (simple insertion sort - fine for 256 elements)
+  for (unsigned i = 1; i < num_leaves; i++) {
+    zstd_huf_node_t temp = nodes[i];
+    unsigned j = i;
+    while (j > 0 && nodes[j - 1].freq > temp.freq) {
+      nodes[j] = nodes[j - 1];
+      j--;
+    }
+    nodes[j] = temp;
+  }
+
+  // Build tree using two-queue algorithm
+  // Queue 1: sorted leaves (front at index q1_front)
+  // Queue 2: internal nodes (at indices num_leaves and beyond)
+  unsigned q1_front = 0;
+  unsigned q2_front = num_leaves;
+  unsigned q2_back = num_leaves;
+
+  // Build internal nodes
+  while ((q1_front < num_leaves ? 1 : 0) + (q2_back - q2_front) > 1) {
+    // Get first minimum node
+    int left;
+    if (q1_front < num_leaves &&
+        (q2_front >= q2_back || nodes[q1_front].freq <= nodes[q2_front].freq)) {
+      left = (int)q1_front++;
+    }
+    else {
+      left = (int)q2_front++;
+    }
+
+    // Get second minimum node
+    int right;
+    if (q1_front < num_leaves &&
+        (q2_front >= q2_back || nodes[q1_front].freq <= nodes[q2_front].freq)) {
+      right = (int)q1_front++;
+    }
+    else {
+      right = (int)q2_front++;
+    }
+
+    // Create internal node
+    nodes[q2_back].freq = nodes[left].freq + nodes[right].freq;
+    nodes[q2_back].left = (int16_t)left;
+    nodes[q2_back].right = (int16_t)right;
+    nodes[q2_back].parent = -1;
+    nodes[q2_back].symbol = 0xFFFF; // Internal node marker
+    nodes[q2_back].depth = 0;
+
+    nodes[left].parent = (int16_t)q2_back;
+    nodes[right].parent = (int16_t)q2_back;
+
+    q2_back++;
+  }
+
+  // Root is the last internal node (or the single remaining node)
+  int root;
+  if (q1_front < num_leaves) {
+    root = (int)q1_front;
+  }
+  else {
+    root = (int)q2_front;
+  }
+
+  // Calculate depths using BFS from root
+  nodes[root].depth = 0;
+
+  // Process nodes in reverse order (parents before children in q2)
+  for (int i = (int)q2_back - 1; i >= (int)num_leaves; i--) {
+    uint8_t parent_depth = nodes[i].depth;
+    if (nodes[i].left >= 0) {
+      nodes[nodes[i].left].depth = parent_depth + 1;
+    }
+    if (nodes[i].right >= 0) {
+      nodes[nodes[i].right].depth = parent_depth + 1;
+    }
+  }
+
+  *root_out = root;
+  return GCOMP_OK;
+}
+
+/**
+ * @brief Limit code lengths to maximum allowed (11 bits for zstd).
+ *
+ * Uses the package-merge algorithm concept to redistribute bit lengths.
+ *
+ * @param depths Array of code lengths for each symbol (modified in place)
+ * @param freq Original frequencies
+ * @param num_symbols Number of symbols
+ * @param max_bits Maximum allowed code length
+ */
+static void zstd_huf_limit_depths(uint8_t * depths, const uint32_t * freq,
+    unsigned num_symbols, unsigned max_bits) {
+  // Check if any depth exceeds max
+  bool need_limit = false;
+  for (unsigned i = 0; i < num_symbols; i++) {
+    if (depths[i] > max_bits) {
+      need_limit = true;
+      break;
+    }
+  }
+
+  if (!need_limit) {
+    return;
+  }
+
+  // Simple approach: cap depths and redistribute
+  // This isn't optimal but produces valid codes
+  uint32_t total = 0;
+  for (unsigned i = 0; i < num_symbols; i++) {
+    if (depths[i] > max_bits) {
+      depths[i] = (uint8_t)max_bits;
+    }
+    total += 1U << (max_bits - depths[i]);
+  }
+
+  // If total > 2^max_bits, we need to increase some depths
+  uint32_t max_total = 1U << max_bits;
+  while (total > max_total) {
+    // Find symbol with smallest depth and increase it
+    unsigned min_idx = 0;
+    uint8_t min_depth = depths[0];
+    for (unsigned i = 1; i < num_symbols; i++) {
+      if (depths[i] < min_depth) {
+        min_depth = depths[i];
+        min_idx = i;
+      }
+    }
+
+    if (min_depth >= max_bits) {
+      break; // Can't increase further
+    }
+
+    total -= 1U << (max_bits - depths[min_idx]);
+    depths[min_idx]++;
+    total += 1U << (max_bits - depths[min_idx]);
+  }
+
+  // If total < 2^max_bits, decrease some depths (make codes shorter)
+  // This redistributes unused code space
+  while (total < max_total) {
+    // Find symbol with largest depth (shortest code = biggest contribution)
+    unsigned max_idx = 0;
+    uint8_t max_depth = 0;
+    for (unsigned i = 0; i < num_symbols; i++) {
+      if (depths[i] > max_depth) {
+        max_depth = depths[i];
+        max_idx = i;
+      }
+    }
+
+    if (max_depth <= 1) {
+      break;
+    }
+
+    // Check if we can decrease this depth
+    uint32_t gain = 1U << (max_bits - max_depth + 1);
+    uint32_t loss = 1U << (max_bits - max_depth);
+    if (total - loss + gain <= max_total) {
+      total = total - loss + gain;
+      depths[max_idx]--;
+    }
+    else {
+      break;
+    }
+  }
+
+  (void)freq; // freq could be used for better redistribution
+}
+
+/**
+ * @brief Generate canonical Huffman codes from sorted symbols and depths.
+ *
+ * @param symbols Symbol array (sorted by depth, then by symbol)
+ * @param depths Depth/bit-length for each symbol
+ * @param num_symbols Number of symbols
+ * @param table Output encoding table
+ */
+static void zstd_huf_generate_codes(const uint16_t * symbols,
+    const uint8_t * depths, unsigned num_symbols,
+    zstd_huf_enc_table_t * table) {
+  if (num_symbols == 0) {
+    table->max_bits = 0;
+    table->num_symbols = 0;
+    return;
+  }
+
+  // Find max depth
+  unsigned max_depth = 0;
+  for (unsigned i = 0; i < num_symbols; i++) {
+    if (depths[i] > max_depth) {
+      max_depth = depths[i];
+    }
+  }
+  table->max_bits = max_depth;
+  table->num_symbols = num_symbols;
+
+  // Count symbols per depth
+  unsigned count[HUF_MAX_BITS + 1] = {0};
+  for (unsigned i = 0; i < num_symbols; i++) {
+    count[depths[i]]++;
+  }
+
+  // Generate starting code for each depth (canonical Huffman)
+  uint16_t next_code[HUF_MAX_BITS + 1] = {0};
+  uint16_t code = 0;
+  for (unsigned bits = 1; bits <= max_depth; bits++) {
+    code = (uint16_t)((code + count[bits - 1]) << 1);
+    next_code[bits] = code;
+  }
+
+  // Assign codes to symbols
+  // Initialize all entries as unused
+  for (unsigned i = 0; i < 256; i++) {
+    table->symbols[i].code = 0;
+    table->symbols[i].nb_bits = 0;
+  }
+
+  for (unsigned i = 0; i < num_symbols; i++) {
+    uint16_t sym = symbols[i];
+    uint8_t nbits = depths[i];
+    table->symbols[sym].code = next_code[nbits]++;
+    table->symbols[sym].nb_bits = nbits;
+  }
+
+  // Calculate weights: weight = maxBits + 1 - nb_bits (0 if unused)
+  for (unsigned i = 0; i < 256; i++) {
+    if (table->symbols[i].nb_bits > 0) {
+      table->weights[i] = (uint8_t)(max_depth + 1 - table->symbols[i].nb_bits);
+    }
+    else {
+      table->weights[i] = 0;
+    }
+  }
+}
+
+gcomp_status_t zstd_huf_build_enc_table(
+    const uint32_t * freq, zstd_huf_enc_table_t * table) {
+  if (!freq || !table) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  // Clear table
+  memset(table, 0, sizeof(*table));
+
+  // Build Huffman tree
+  zstd_huf_node_t nodes[511]; // 256 leaves + 255 internal nodes max
+  unsigned num_symbols;
+  int root;
+
+  gcomp_status_t status = zstd_huf_build_tree(freq, nodes, &num_symbols, &root);
+  if (status != GCOMP_OK) {
+    return status;
+  }
+
+  if (num_symbols == 0) {
+    table->max_bits = 0;
+    table->num_symbols = 0;
+    return GCOMP_OK;
+  }
+
+  // Extract depths and symbols from tree
+  uint16_t symbols[256];
+  uint8_t depths[256];
+
+  unsigned sym_idx = 0;
+  for (unsigned i = 0; i < num_symbols; i++) {
+    if (nodes[i].symbol < 256) { // Leaf node
+      symbols[sym_idx] = nodes[i].symbol;
+      depths[sym_idx] = nodes[i].depth;
+      sym_idx++;
+    }
+  }
+  num_symbols = sym_idx;
+
+  // Limit depths to 11 bits (zstd maximum)
+  zstd_huf_limit_depths(depths, freq, num_symbols, HUF_MAX_BITS);
+
+  // Sort symbols by (depth, symbol) for canonical code generation
+  for (unsigned i = 1; i < num_symbols; i++) {
+    uint16_t sym = symbols[i];
+    uint8_t depth = depths[i];
+    unsigned j = i;
+    while (j > 0 &&
+        (depths[j - 1] > depth ||
+            (depths[j - 1] == depth && symbols[j - 1] > sym))) {
+      symbols[j] = symbols[j - 1];
+      depths[j] = depths[j - 1];
+      j--;
+    }
+    symbols[j] = sym;
+    depths[j] = depth;
+  }
+
+  // Generate canonical codes
+  zstd_huf_generate_codes(symbols, depths, num_symbols, table);
+
+  return GCOMP_OK;
+}
+
+gcomp_status_t zstd_huf_write_weights(const zstd_huf_enc_table_t * table,
+    uint8_t * output, size_t output_cap, size_t * output_len_out) {
+  if (!table || !output || !output_len_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  // Find last non-zero weight (number of symbols - 1)
+  unsigned last_symbol = 0;
+  for (unsigned i = 0; i < 256; i++) {
+    if (table->weights[i] > 0) {
+      last_symbol = i;
+    }
+  }
+
+  // Number of symbols to write
+  unsigned num_weights = last_symbol + 1;
+
+  // Header byte: num_symbols - 1 (must be < 128 for direct representation)
+  if (num_weights == 0) {
+    // No symbols - shouldn't happen for valid data
+    if (output_cap < 1) {
+      return GCOMP_ERR_LIMIT;
+    }
+    output[0] = 0;
+    *output_len_out = 1;
+    return GCOMP_OK;
+  }
+
+  if (num_weights > 128) {
+    // Would need FSE compression for weights (>127 symbols)
+    // For now, return unsupported (very rare case)
+    return GCOMP_ERR_UNSUPPORTED;
+  }
+
+  // Calculate output size: 1 header + ceil(num_weights/2) weight bytes
+  size_t weights_size = (num_weights + 1) / 2;
+  size_t total_size = 1 + weights_size;
+
+  if (output_cap < total_size) {
+    return GCOMP_ERR_LIMIT;
+  }
+
+  // Write header: number of symbols - 1
+  output[0] = (uint8_t)(num_weights - 1);
+
+  // Write weights as 4-bit pairs (high nibble first)
+  for (unsigned i = 0; i < num_weights; i += 2) {
+    uint8_t w0 = table->weights[i];
+    uint8_t w1 = (i + 1 < num_weights) ? table->weights[i + 1] : 0;
+    output[1 + i / 2] = (uint8_t)((w0 << 4) | (w1 & 0x0F));
+  }
+
+  *output_len_out = total_size;
+  return GCOMP_OK;
+}
+
+gcomp_status_t zstd_huf_encode_1stream(const zstd_huf_enc_table_t * table,
+    const uint8_t * literals, size_t literals_size, uint8_t * output,
+    size_t output_cap, size_t * output_len_out) {
+  if (!table || !output || !output_len_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  if (literals_size == 0 || !literals) {
+    // Empty input: just write marker byte
+    if (output_cap < 1) {
+      return GCOMP_ERR_LIMIT;
+    }
+    output[0] = 0x01; // Single marker bit
+    *output_len_out = 1;
+    return GCOMP_OK;
+  }
+
+  // Huffman bitstream is written backwards with a marker bit at the end.
+  // We encode forward into a bit buffer, then reverse the byte order.
+  // The marker bit (1) marks the start of data when reading backwards.
+
+  // Estimate maximum output size (worst case: all symbols have max bits)
+  size_t max_output = (literals_size * table->max_bits + 7) / 8 + 1;
+  if (output_cap < max_output) {
+    // May not be enough, but try anyway
+  }
+
+  // Bit buffer for encoding
+  uint64_t bit_buffer = 0;
+  unsigned bits_in_buffer = 0;
+  size_t output_pos = 0;
+
+  // Encode literals forward
+  for (size_t i = 0; i < literals_size; i++) {
+    uint8_t sym = literals[i];
+    const zstd_huf_enc_entry_t * entry = &table->symbols[sym];
+
+    if (entry->nb_bits == 0) {
+      // Symbol not in table - shouldn't happen if table built from same data
+      return GCOMP_ERR_CORRUPT;
+    }
+
+    // Add code bits to buffer (MSB first)
+    bit_buffer |= (uint64_t)entry->code << bits_in_buffer;
+    bits_in_buffer += entry->nb_bits;
+
+    // Flush complete bytes
+    while (bits_in_buffer >= 8) {
+      if (output_pos >= output_cap) {
+        return GCOMP_ERR_LIMIT;
+      }
+      output[output_pos++] = (uint8_t)(bit_buffer & 0xFF);
+      bit_buffer >>= 8;
+      bits_in_buffer -= 8;
+    }
+  }
+
+  // Add marker bit (1) at the end
+  bit_buffer |= (1ULL << bits_in_buffer);
+  bits_in_buffer++;
+
+  // Flush remaining bits (pad with zeros on the high side)
+  while (bits_in_buffer > 0) {
+    if (output_pos >= output_cap) {
+      return GCOMP_ERR_LIMIT;
+    }
+    output[output_pos++] = (uint8_t)(bit_buffer & 0xFF);
+    bit_buffer >>= 8;
+    if (bits_in_buffer >= 8) {
+      bits_in_buffer -= 8;
+    }
+    else {
+      bits_in_buffer = 0;
+    }
+  }
+
+  // Reverse byte order (decoder reads backwards)
+  for (size_t i = 0; i < output_pos / 2; i++) {
+    uint8_t tmp = output[i];
+    output[i] = output[output_pos - 1 - i];
+    output[output_pos - 1 - i] = tmp;
+  }
+
+  *output_len_out = output_pos;
   return GCOMP_OK;
 }

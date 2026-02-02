@@ -121,6 +121,20 @@ static const gcomp_option_schema_t g_zstd_option_schemas[] = {
         0,                                           // max_uint
         "Decoder: support concatenated zstd frames", // help
     },
+    // zstd.dictionary - Dictionary data (v1: not supported, must be empty)
+    {
+        "zstd.dictionary",                       // key
+        GCOMP_OPT_BYTES,                         // type
+        0,                                       // has_default (optional)
+        {.bytes = {NULL, 0}},                    // default_value
+        0,                                       // has_min
+        0,                                       // has_max
+        0,                                       // min_int
+        0,                                       // max_int
+        0,                                       // min_uint
+        0,                                       // max_uint
+        "Dictionary data (not supported in v1)", // help
+    },
     // limits.max_output_bytes - Maximum decompressed output
     {
         "limits.max_output_bytes",               // key
@@ -213,6 +227,7 @@ static const char * const g_zstd_option_keys[] = {
     "zstd.window_log",
     "zstd.content_size",
     "zstd.concat",
+    "zstd.dictionary",
     "zstd.job_size",
     "threads.count",
     "limits.max_output_bytes",
@@ -280,12 +295,38 @@ static gcomp_status_t zstd_create_encoder(gcomp_registry_t * registry,
     return GCOMP_ERR_INVALID_ARG;
   }
 
-  // Validate window_log option if provided
   if (options) {
+    // Validate window_log option if provided
     uint64_t window_log_val;
     if (gcomp_options_get_uint64(options, "zstd.window_log", &window_log_val) ==
         GCOMP_OK) {
       if (!zstd_validate_window_log(window_log_val)) {
+        return GCOMP_ERR_INVALID_ARG;
+      }
+    }
+
+    // Reject dictionary option (v1: not supported)
+    const void * dict_data = NULL;
+    size_t dict_size = 0;
+    if (gcomp_options_get_bytes(
+            options, "zstd.dictionary", &dict_data, &dict_size) == GCOMP_OK) {
+      if (dict_data != NULL && dict_size > 0) {
+        gcomp_encoder_set_error(*encoder_out, GCOMP_ERR_UNSUPPORTED,
+            "zstd.dictionary is not supported in this version");
+        return GCOMP_ERR_UNSUPPORTED;
+      }
+    }
+
+    // Validate job_size option if provided (must be 0 or within bounds)
+    uint64_t job_size_val;
+    if (gcomp_options_get_uint64(options, "zstd.job_size", &job_size_val) ==
+        GCOMP_OK) {
+      if (job_size_val != 0 &&
+          (job_size_val < ZSTD_MIN_JOB_SIZE ||
+              job_size_val > ZSTD_MAX_JOB_SIZE)) {
+        gcomp_encoder_set_error(*encoder_out, GCOMP_ERR_INVALID_ARG,
+            "zstd.job_size must be 0 (auto) or between %zu and %zu bytes",
+            (size_t)ZSTD_MIN_JOB_SIZE, (size_t)ZSTD_MAX_JOB_SIZE);
         return GCOMP_ERR_INVALID_ARG;
       }
     }
@@ -306,6 +347,20 @@ static gcomp_status_t zstd_create_decoder(gcomp_registry_t * registry,
     gcomp_options_t * options, gcomp_decoder_t ** decoder_out) {
   if (!decoder_out || !*decoder_out) {
     return GCOMP_ERR_INVALID_ARG;
+  }
+
+  if (options) {
+    // Reject dictionary option (v1: not supported)
+    const void * dict_data = NULL;
+    size_t dict_size = 0;
+    if (gcomp_options_get_bytes(
+            options, "zstd.dictionary", &dict_data, &dict_size) == GCOMP_OK) {
+      if (dict_data != NULL && dict_size > 0) {
+        gcomp_decoder_set_error(*decoder_out, GCOMP_ERR_UNSUPPORTED,
+            "zstd.dictionary is not supported in this version");
+        return GCOMP_ERR_UNSUPPORTED;
+      }
+    }
   }
 
   gcomp_status_t status = zstd_decoder_init(registry, options, *decoder_out);

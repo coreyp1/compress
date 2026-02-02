@@ -292,6 +292,15 @@ static gcomp_status_t zstd_parse_frame_header(
       break;
     }
     pos += dict_id_len;
+
+    // Reject streams that require a dictionary (v1: not supported)
+    if (state->header.dict_id != 0) {
+      gcomp_decoder_set_error(decoder, GCOMP_ERR_UNSUPPORTED,
+          "zstd stream requires dictionary ID %u, but dictionaries are not "
+          "supported in this version",
+          state->header.dict_id);
+      return GCOMP_ERR_UNSUPPORTED;
+    }
   }
 
   // Parse frame content size (if present)
@@ -522,6 +531,24 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
       state->stage = ZSTD_DEC_STAGE_ERROR;
       gcomp_decoder_set_error(
           decoder, GCOMP_ERR_CORRUPT, "reserved block type");
+      return GCOMP_ERR_CORRUPT;
+    }
+
+    // Validate block size against window size (per zstd spec)
+    if (state->current_block_size > state->header.window_size) {
+      state->stage = ZSTD_DEC_STAGE_ERROR;
+      gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+          "block size %u exceeds window size %u", state->current_block_size,
+          state->header.window_size);
+      return GCOMP_ERR_CORRUPT;
+    }
+
+    // Validate block size against maximum (128 KB per spec)
+    if (state->current_block_size > ZSTD_BLOCK_SIZE_MAX) {
+      state->stage = ZSTD_DEC_STAGE_ERROR;
+      gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+          "block size %u exceeds maximum %u", state->current_block_size,
+          ZSTD_BLOCK_SIZE_MAX);
       return GCOMP_ERR_CORRUPT;
     }
 

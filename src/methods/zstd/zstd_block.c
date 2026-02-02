@@ -217,10 +217,10 @@ gcomp_status_t zstd_block_compress(zstd_encoder_state_t * state,
     if (status == GCOMP_OK && num_sequences > 0) {
       // We have sequences - try to compress
 
-      // Encode literals section (raw for now - Huffman encoding is future work)
+      // Encode literals section (with Huffman compression when beneficial)
       size_t literals_encoded_size = 0;
-      status = zstd_literals_encode_raw(state->literals_buffer, literals_size,
-          output, output_cap, &literals_encoded_size);
+      status = zstd_literals_encode_compressed(state->literals_buffer,
+          literals_size, output, output_cap, &literals_encoded_size);
 
       if (status == GCOMP_OK) {
         // Encode sequences section

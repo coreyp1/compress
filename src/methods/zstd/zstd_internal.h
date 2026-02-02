@@ -637,6 +637,115 @@ gcomp_status_t zstd_huf_read_table(const uint8_t * src, size_t src_size,
     zstd_huf_entry_t * table, size_t table_capacity, unsigned * max_bits_out,
     size_t * bytes_read_out);
 
+//
+// Internal API: Huffman Encoding
+//
+// The Huffman encoder compresses literal bytes by assigning shorter codes
+// to more frequent symbols. It is used by zstd_literals_encode_compressed()
+// when compression provides sufficient benefit over raw literals.
+//
+// Format requirements (RFC 8878):
+//   - Maximum code length: 11 bits
+//   - Weights encoded as 4-bit values (direct) or FSE-compressed
+//   - Bitstream written backwards with marker bit
+//
+// Implementation choices (tunable heuristics):
+//   - When to use Huffman vs raw (see zstd_literals.c)
+//   - Tree building algorithm (two-queue, O(n log n))
+//   - Code length limiting strategy (greedy redistribution)
+//
+// Typical usage:
+//   1. Count symbol frequencies in input literals
+//   2. Call zstd_huf_build_enc_table() to build encoding table
+//   3. Call zstd_huf_write_weights() to write table description
+//   4. Call zstd_huf_encode_1stream() to write compressed bitstream
+//
+
+/**
+ * @brief Huffman encoding table entry.
+ *
+ * Maps a symbol (byte value) to its Huffman code.
+ */
+typedef struct {
+  uint16_t code;   ///< Huffman code bits (canonical, right-aligned)
+  uint8_t nb_bits; ///< Number of bits in code (1-11, or 0 if unused)
+} zstd_huf_enc_entry_t;
+
+/**
+ * @brief Huffman encoder context.
+ *
+ * Holds the encoding table and metadata needed for Huffman compression.
+ * Built from symbol frequencies via zstd_huf_build_enc_table().
+ */
+typedef struct {
+  zstd_huf_enc_entry_t symbols[256]; ///< Encoding table: symbol -> code
+  uint8_t weights[256];              ///< Weights for each symbol (for header)
+  unsigned max_bits;                 ///< Maximum code length (1-11)
+  unsigned num_symbols;              ///< Number of symbols with non-zero weight
+} zstd_huf_enc_table_t;
+
+/**
+ * @brief Build Huffman encoding table from symbol frequencies.
+ *
+ * Builds an optimal Huffman tree from the given frequencies, limits code
+ * lengths to 11 bits (Zstd maximum), and generates canonical codes.
+ *
+ * The resulting table can be used for encoding via zstd_huf_encode_1stream()
+ * and the weights can be written via zstd_huf_write_weights().
+ *
+ * @param freq Symbol frequency array (256 entries, one per byte value).
+ *             Symbols with freq[i] == 0 are not included in the tree.
+ * @param table Output: encoding table with codes, weights, and metadata.
+ * @return GCOMP_OK on success, GCOMP_ERR_INVALID_ARG if freq or table is NULL.
+ */
+gcomp_status_t zstd_huf_build_enc_table(
+    const uint32_t * freq, zstd_huf_enc_table_t * table);
+
+/**
+ * @brief Write Huffman table description (weights) to output.
+ *
+ * Writes the Huffman tree in Zstd's weight format. Uses direct 4-bit
+ * representation (header byte < 128) where weights are packed as nibbles.
+ *
+ * Format: [header_byte][weight_pairs...]
+ *   - header_byte = num_symbols - 1 (must be < 128)
+ *   - Each byte contains two 4-bit weights: (w[i] << 4) | w[i+1]
+ *
+ * @param table Encoding table with weights (from zstd_huf_build_enc_table).
+ * @param output Output buffer.
+ * @param output_cap Output buffer capacity.
+ * @param output_len_out Output: number of bytes written.
+ * @return GCOMP_OK on success,
+ *         GCOMP_ERR_LIMIT if output buffer too small,
+ *         GCOMP_ERR_UNSUPPORTED if num_symbols > 128 (would need FSE weights).
+ */
+gcomp_status_t zstd_huf_write_weights(const zstd_huf_enc_table_t * table,
+    uint8_t * output, size_t output_cap, size_t * output_len_out);
+
+/**
+ * @brief Encode literals using Huffman coding (single stream).
+ *
+ * Encodes literal bytes as a Huffman bitstream. The stream is written
+ * forward, then a marker bit (1) is appended, and finally the bytes are
+ * reversed. This matches Zstd's backward reading convention.
+ *
+ * The decoder reads the stream backwards, finding the marker bit in the
+ * last byte to determine where data starts.
+ *
+ * @param table Encoding table (from zstd_huf_build_enc_table).
+ * @param literals Input literal bytes to encode.
+ * @param literals_size Number of literals (0 for empty stream).
+ * @param output Output buffer.
+ * @param output_cap Output buffer capacity.
+ * @param output_len_out Output: number of bytes written.
+ * @return GCOMP_OK on success,
+ *         GCOMP_ERR_LIMIT if output buffer too small,
+ *         GCOMP_ERR_CORRUPT if a literal has no code in the table.
+ */
+gcomp_status_t zstd_huf_encode_1stream(const zstd_huf_enc_table_t * table,
+    const uint8_t * literals, size_t literals_size, uint8_t * output,
+    size_t output_cap, size_t * output_len_out);
+
 /**
  * @brief Decode a single Huffman stream.
  *
@@ -772,6 +881,24 @@ gcomp_status_t zstd_mf_generate_sequences(zstd_match_finder_t * mf,
  * @return GCOMP_OK on success
  */
 gcomp_status_t zstd_literals_encode_raw(const uint8_t * literals,
+    size_t literals_size, uint8_t * output, size_t output_cap,
+    size_t * output_len_out);
+
+/**
+ * @brief Encode literals section using Huffman compression.
+ *
+ * Builds a Huffman table from symbol frequencies and encodes
+ * the literals as a compressed bitstream. Falls back to raw
+ * encoding if compression doesn't provide benefit.
+ *
+ * @param literals Literals data
+ * @param literals_size Literals size
+ * @param output Output buffer
+ * @param output_cap Output capacity
+ * @param output_len_out Output: bytes written
+ * @return GCOMP_OK on success
+ */
+gcomp_status_t zstd_literals_encode_compressed(const uint8_t * literals,
     size_t literals_size, uint8_t * output, size_t output_cap,
     size_t * output_len_out);
 

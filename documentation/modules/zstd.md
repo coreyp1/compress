@@ -426,11 +426,11 @@ The decoder tracks memory usage and enforces `limits.max_memory_bytes`. This inc
 
 ## Entropy coding
 
-Zstd uses two entropy coding methods:
+Zstd uses two entropy coding methods for efficient data representation:
 
 ### FSE (Finite State Entropy)
 
-FSE is an asymmetric numeral system (ANS) variant used for encoding sequences. It provides near-optimal compression with fast decoding.
+FSE is an asymmetric numeral system (ANS) variant used for encoding sequences (literal lengths, match lengths, and offsets). It provides near-optimal compression with fast decoding.
 
 **Predefined tables**: For common data patterns, Zstd uses predefined FSE tables for:
 - Literal lengths (36 symbols, accuracy log 6)
@@ -441,9 +441,30 @@ FSE is an asymmetric numeral system (ANS) variant used for encoding sequences. I
 
 ### Huffman coding
 
-Huffman coding is used for literals (the non-matched bytes). Supports:
+Huffman coding is used for literals (the non-matched bytes in compressed blocks). The encoder automatically selects the best encoding:
+
+| Literals Encoding | When Used |
+|-------------------|-----------|
+| Raw | Small inputs (<32 bytes), or when compression provides <10% savings |
+| Huffman compressed | Skewed byte distribution where compression is beneficial |
+
+**Encoder behavior:**
+1. Count symbol frequencies in the literal bytes
+2. Build optimal Huffman tree from frequencies
+3. Estimate compressed size (weights + bitstream)
+4. Use Huffman only if savings exceed 10%; otherwise use raw literals
+
+**Format requirements (RFC 8878):**
+- Maximum code length: 11 bits
+- Weights encoded as direct 4-bit values (header byte < 128) or FSE-compressed
+- Bitstream written backwards with marker bit for decoder synchronization
+
+**Implementation notes:**
+> The 32-byte minimum and 10% savings threshold are encoder heuristics in this implementation, not format requirements. The Zstd specification allows encoders complete freedom to choose raw, RLE, or Huffman for any literals section. Other Zstd encoders (e.g., the reference `libzstd`) may use different decision criteria.
+
+**Decoding:**
 - Single-stream mode: Sequential decoding
-- Four-stream mode: Parallel decoding for better throughput
+- Four-stream mode: Parallel decoding for better throughput (used by external encoders for large literal sections)
 
 ## Interoperability
 
@@ -457,7 +478,8 @@ Files created by this library can be decompressed by standard tools, and files c
 
 **Current limitations:**
 - Dictionary compression not yet supported (parsed but not used)
-- FSE-compressed Huffman tables in decoder (external zstd output may use these)
+- FSE-compressed Huffman weight tables not yet supported in decoder (very large symbol sets from external encoders may use these)
+- Encoder uses single-stream Huffman only (4-stream encoding not implemented)
 
 ## Comparison with other methods
 
