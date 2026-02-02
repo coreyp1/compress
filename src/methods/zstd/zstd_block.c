@@ -3,10 +3,50 @@
  *
  * Zstandard block compression/decompression for the Ghoti.io Compress library.
  *
- * This file implements block-level operations for the Zstd format:
- * - Raw block: direct copy
- * - RLE block: single byte repeated
- * - Compressed block: FSE + Huffman encoded (TODO: full implementation)
+ * ## Block Types
+ *
+ * Zstd frames consist of one or more blocks. Each block has a 3-byte header:
+ * - Bit 0: Last_Block flag (1 = this is the final block)
+ * - Bits 1-2: Block_Type (0=Raw, 1=RLE, 2=Compressed, 3=Reserved)
+ * - Bits 3-23: Block_Size (21 bits, max ~2MB)
+ *
+ * | Type | Encoding | Block_Size Meaning |
+ * |------|----------|-------------------|
+ * | Raw  | Uncompressed | Bytes to copy |
+ * | RLE  | Single byte  | Times to repeat |
+ * | Compressed | FSE+Huffman | Compressed size |
+ * | Reserved | Invalid | N/A |
+ *
+ * ## Block Selection Strategy (Encoder)
+ *
+ * The encoder chooses block type based on data characteristics:
+ *
+ * 1. **RLE Block**: If all bytes in the block are identical
+ *    - Most efficient: 1 byte of data regardless of block size
+ *    - Condition: block[0] == block[1] == ... == block[n-1]
+ *
+ * 2. **Compressed Block**: If compression is beneficial
+ *    - Contains: literals section + sequences section
+ *    - Used when compressed_size < raw_size
+ *
+ * 3. **Raw Block**: Fallback when compression doesn't help
+ *    - Direct copy of input bytes
+ *    - Used when compressed_size >= raw_size
+ *
+ * ## Compressed Block Structure
+ *
+ * ```
+ * [Literals Section]
+ *   - Header (1-5 bytes): type, sizes
+ *   - Data: raw, RLE, or Huffman-compressed literals
+ *
+ * [Sequences Section]
+ *   - Header: num_sequences, compression modes
+ *   - FSE tables (if not predefined)
+ *   - Bitstream: FSE-encoded (literal_len, offset, match_len) tuples
+ * ```
+ *
+ * Reference: RFC 8878 Section 3.1 (Blocks)
  *
  * Copyright 2026 by Corey Pennycuff
  */
@@ -163,8 +203,6 @@ gcomp_status_t zstd_block_compress(zstd_encoder_state_t * state,
   }
 
   // Try compressed block if we have a match finder and sufficient input
-  // Note: Currently only single-sequence blocks are fully supported.
-  // Multi-sequence FSE encoding is still in development.
   if (state && state->match_finder && state->seq_buffer &&
       state->literals_buffer && input_len >= MIN_COMPRESSION_SIZE) {
     // Generate sequences using match finder

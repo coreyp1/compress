@@ -5,27 +5,73 @@
  *
  * ## Algorithm Overview
  *
- * FSE is an entropy coding algorithm that achieves compression close to the
- * entropy limit. It uses a state machine where each state encodes information
- * about the next symbol and the number of bits to read.
+ * FSE (Finite State Entropy) is an asymmetric numeral system (ANS) variant
+ * that achieves near-optimal compression. It works by representing symbols
+ * as state transitions, where each state encodes:
+ * - The current symbol
+ * - Number of bits to read for the next state
+ * - Base value for computing the next state
+ *
+ * ### Decoding Process
+ *
+ * 1. Initialize state by reading `table_log` bits from the bitstream
+ * 2. Look up `table[state]` to get:
+ *    - `symbol`: The decoded symbol
+ *    - `nb_bits`: Number of bits to read for state update
+ *    - `new_state`: Base value for next state
+ * 3. Read `nb_bits` from bitstream, add to `new_state` for next state
+ * 4. Repeat until all symbols are decoded
+ *
+ * ### Encoding Process (reverse of decoding)
+ *
+ * 1. Process symbols in REVERSE order (last to first)
+ * 2. For each symbol, find state that will decode to that symbol
+ * 3. Output state update bits (difference from base)
+ * 4. Output initial states at the end (read first by decoder)
+ *
+ * ## Table Building (Critical for Interoperability)
+ *
+ * FSE tables are built from normalized frequency distributions. The building
+ * algorithm must match exactly between encoder and decoder:
+ *
+ * ### Symbol Distribution
+ *
+ * - Each symbol has a "count" (frequency) in the normalized distribution
+ * - Count of -1 means "less than 1" probability (rare symbols)
+ * - Total counts must sum to `table_size` (2^table_log)
+ *
+ * ### State Assignment (RFC 8878 Section 4.1.1)
+ *
+ * 1. **Less-than-one symbols (-1 count)**: Placed at high end of table
+ *    (states table_size-1, table_size-2, ...) in the ORDER THEY APPEAR
+ *    in the distribution. For predefined tables, this means INCREASING
+ *    symbol order: symbol 46 gets state 63, symbol 47 gets state 62, etc.
+ *
+ * 2. **Regular symbols**: Distributed using spread function:
+ *    - step = (table_size >> 1) + (table_size >> 3) + 3
+ *    - position = (position + step) & (table_size - 1)
+ *    - Skip positions already used by -1 symbols
+ *
+ * 3. **State transition computation**: For each state i with symbol s:
+ *    - Track occurrence count for symbol s
+ *    - nb_bits = table_log - floor(log2(occurrence))
+ *    - new_state = (occurrence << nb_bits) - table_size
  *
  * ## Zstd Usage
  *
- * In Zstd, FSE is used for:
- * - Huffman weight encoding (to describe Huffman trees)
- * - Literal length codes
- * - Match length codes
- * - Offset codes
+ * In Zstd, FSE is used for encoding/decoding:
+ * - Huffman weights (to describe Huffman trees)
+ * - Literal length codes (36 symbols, predefined log=6)
+ * - Match length codes (53 symbols, predefined log=6)
+ * - Match offset codes (29 symbols, predefined log=5)
  *
- * ## Table Building
+ * ## Predefined Tables
  *
- * FSE tables are built from a normalized distribution of symbol frequencies.
- * The distribution is either:
- * - Predefined (for sequences with known distributions)
- * - Encoded in the bitstream using a compact representation
+ * Zstd defines predefined FSE tables for sequences that provide good
+ * compression for typical data without needing to transmit custom tables.
+ * The predefined distributions are fixed by the specification.
  *
- * Reference:
- * https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md
+ * Reference: RFC 8878 (https://www.rfc-editor.org/rfc/rfc8878.html)
  *
  * Copyright 2026 by Corey Pennycuff
  */
@@ -229,9 +275,48 @@ static uint32_t zstd_fwd_bit_reader_read(
 /**
  * @brief Build FSE decoding table from normalized counts.
  *
- * @param norm_counts Normalized symbol counts (frequency for each symbol)
- * @param max_symbol Maximum symbol value
- * @param table_log Log2 of table size
+ * This function constructs an FSE decoding table that maps state indices to
+ * (symbol, nb_bits, new_state) tuples. The algorithm has three passes:
+ *
+ * ## Pass 1: Place "less-than-one" probability symbols
+ *
+ * Symbols with count == -1 have probability < 1/table_size. These are placed
+ * at the HIGH end of the table (states table_size-1 down) in the order they
+ * appear in the input distribution.
+ *
+ * **CRITICAL**: For predefined tables, symbols appear in increasing order,
+ * so the FIRST -1 symbol encountered gets state (table_size-1), the second
+ * gets (table_size-2), etc. This order MUST match between encoder and decoder
+ * for interoperability with external zstd implementations.
+ *
+ * Example for ML predefined table (table_size=64, symbols 46-52 have count=-1):
+ * - Symbol 46 → state 63 (first -1 encountered)
+ * - Symbol 47 → state 62
+ * - Symbol 48 → state 61
+ * - ...
+ * - Symbol 52 → state 57
+ *
+ * ## Pass 2: Spread remaining symbols
+ *
+ * Regular symbols (count > 0) are distributed using a deterministic spread
+ * function that provides good mixing:
+ * - step = (table_size/2) + (table_size/8) + 3 = table_size*5/8 + 3
+ * - For each occurrence of symbol s: table[position].symbol = s
+ * - position = (position + step) mod table_size, skipping -1 symbol positions
+ *
+ * ## Pass 3: Compute state transitions
+ *
+ * For each table entry i with symbol s (tracking occurrence number for s):
+ * - nb_bits = table_log - floor(log2(occurrence_number))
+ * - new_state = (occurrence_number << nb_bits) - table_size
+ *
+ * The decoder uses these to update state:
+ *   next_state = new_state + read_bits(nb_bits)
+ *
+ * @param norm_counts Normalized symbol counts (-1 for less-than-one
+ * probability)
+ * @param max_symbol Maximum symbol value (0 to max_symbol inclusive)
+ * @param table_log Log2 of table size (table has 2^table_log entries)
  * @param table Output table (must be at least 1 << table_log entries)
  * @return GCOMP_OK on success
  */
@@ -248,25 +333,34 @@ static gcomp_status_t zstd_fse_build_table(const int16_t * norm_counts,
   unsigned table_size = 1U << table_log;
   unsigned high_threshold = table_size - 1;
 
-  // Symbol start positions (cumulative)
+  // Symbol occurrence tracking (reused in pass 3)
   uint16_t symbol_next[FSE_MAX_SYMBOL_VALUE + 1];
 
-  // First pass: handle symbols with count == -1 (probability less than 1)
-  // These symbols are placed at the high end of the table
-  // Only set the symbol here; nb_bits and new_state are computed in third pass
-  // IMPORTANT: Iterate in REVERSE order to match zstd reference implementation
-  for (int s = (int)max_symbol; s >= 0; s--) {
+  //
+  // Pass 1: Place -1 probability symbols at high end of table
+  //
+  // RFC 8878 Section 4.1.1: "Less-than-one probability symbols are assigned
+  // a single cell, starting from the end of the table... symbols are placed
+  // in decreasing order [of table position], while the list is iterated in
+  // its given order [increasing symbol order for predefined tables]."
+  //
+  for (unsigned s = 0; s <= max_symbol; s++) {
     if (norm_counts[s] == -1) {
       table[high_threshold].symbol = (uint8_t)s;
       high_threshold--;
-      symbol_next[s] = 1; // Will be used in third pass
+      symbol_next[s] = 1; // -1 symbols have 1 occurrence for pass 3
     }
     else {
       symbol_next[s] = (uint16_t)(norm_counts[s] > 0 ? norm_counts[s] : 0);
     }
   }
 
-  // Second pass: distribute remaining symbols using spread function
+  //
+  // Pass 2: Spread regular symbols using deterministic step function
+  //
+  // The step value provides good distribution while being coprime to table_size
+  // (since table_size is a power of 2 and step is odd).
+  //
   unsigned position = 0;
   unsigned step = (table_size >> 1) + (table_size >> 3) + 3;
   unsigned mask = table_size - 1;
@@ -274,13 +368,13 @@ static gcomp_status_t zstd_fse_build_table(const int16_t * norm_counts,
   for (unsigned s = 0; s <= max_symbol; s++) {
     int count = norm_counts[s];
     if (count <= 0) {
-      continue;
+      continue; // Skip -1 and 0 count symbols
     }
 
     for (int i = 0; i < count; i++) {
       table[position].symbol = (uint8_t)s;
 
-      // Find next available position (skip high threshold positions)
+      // Advance to next position, skipping positions reserved for -1 symbols
       position = (position + step) & mask;
       while (position > high_threshold) {
         position = (position + step) & mask;
@@ -288,13 +382,25 @@ static gcomp_status_t zstd_fse_build_table(const int16_t * norm_counts,
     }
   }
 
-  // Third pass: compute new_state and nb_bits for ALL entries
-  // This includes the -1 probability symbols at the high end
+  //
+  // Pass 3: Compute nb_bits and new_state for state transitions
+  //
+  // For each state entry, we compute how many bits the decoder reads and
+  // the base value for computing the next state.
+  //
+  // Formula derivation:
+  // - occurrence: 1-based count of this symbol's appearances seen so far
+  // - high_bit: floor(log2(occurrence)) = position of highest set bit
+  // - nb_bits: bits needed = table_log - high_bit
+  // - new_state: base value = (occurrence << nb_bits) - table_size
+  //
+  // Decoder computes: next_state = new_state + bits_read
+  // This spreads states evenly across the valid range for the symbol.
+  //
   for (unsigned i = 0; i < table_size; i++) {
     uint8_t s = table[i].symbol;
     uint16_t next = symbol_next[s]++;
 
-    // highbit32 returns the position of highest set bit (0 for value 1)
     unsigned high_bit = (next > 0) ? (31 - __builtin_clz(next)) : 0;
     unsigned nb_bits = table_log - high_bit;
     unsigned new_state_base = (next << nb_bits) - table_size;
