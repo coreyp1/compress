@@ -65,10 +65,10 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
+#include "../../core/alloc_internal.h"
 #include "gzip_internal.h"
 #include <ghoti.io/compress/crc32.h>
 #include <ghoti.io/compress/errors.h>
-#include <stdlib.h>
 #include <string.h>
 
 /**
@@ -230,31 +230,34 @@ void gzip_write_trailer(uint32_t crc32, uint32_t isize, uint8_t * buf) {
  * Free dynamically allocated members of a gzip_header_info_t structure.
  *
  * This function frees the extra, name, and comment fields if they are
- * non-NULL, and resets the pointers to NULL. The structure itself is not
- * freed (it may be stack-allocated or embedded in another structure).
+ * non-NULL, using the same allocator that was used to allocate them.
+ * The structure itself is not freed (it may be stack-allocated or
+ * embedded in another structure).
  *
- * Safe to call with NULL or with already-freed members.
+ * Safe to call with NULL info or with already-freed members.
  *
- * @param info  Header info structure to clean up (may be NULL)
+ * @param info      Header info structure to clean up (may be NULL)
+ * @param allocator Allocator used for extra/name/comment (NULL = default)
  */
-void gzip_header_info_free(gzip_header_info_t * info) {
+void gzip_header_info_free(
+    gzip_header_info_t * info, const gcomp_allocator_t * allocator) {
   if (!info) {
     return;
   }
 
   if (info->extra) {
-    free(info->extra);
+    gcomp_free(allocator, info->extra);
     info->extra = NULL;
     info->extra_len = 0;
   }
 
   if (info->name) {
-    free(info->name);
+    gcomp_free(allocator, info->name);
     info->name = NULL;
   }
 
   if (info->comment) {
-    free(info->comment);
+    gcomp_free(allocator, info->comment);
     info->comment = NULL;
   }
 }

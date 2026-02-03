@@ -3,9 +3,14 @@
  *
  * Default allocator implementation for the Ghoti.io Compress library.
  *
+ * The default allocator treats overflow in calloc(nitems, size) as allocation
+ * failure: if nitems * size would overflow size_t, gcomp_stdlib_calloc returns
+ * NULL rather than calling calloc with undefined behavior.
+ *
  * Copyright 2026 by Corey Pennycuff
  */
 
+#include "safe_math.h"
 #include <ghoti.io/compress/allocator.h>
 #include <ghoti.io/compress/macros.h>
 #include <stdlib.h>
@@ -16,7 +21,11 @@ static void * gcomp_stdlib_malloc(GCOMP_MAYBE_UNUSED(void * ctx), size_t size) {
 
 static void * gcomp_stdlib_calloc(
     GCOMP_MAYBE_UNUSED(void * ctx), size_t nitems, size_t size) {
-  return calloc(nitems, size);
+  size_t total;
+  if (!gcomp_safe_mul_size(nitems, size, &total)) {
+    return NULL; // overflow: treat as allocation failure
+  }
+  return calloc(1, total);
 }
 
 static void * gcomp_stdlib_realloc(

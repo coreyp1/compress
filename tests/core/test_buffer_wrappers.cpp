@@ -57,6 +57,32 @@ TEST_F(BufferWrappersTest, EncodeBuffer_Basic) {
   ASSERT_EQ(memcmp(input, output, input_size), 0);
 }
 
+// Test gcomp_encode_buffer() - output_capacity == 0 (invalid)
+TEST_F(BufferWrappersTest, EncodeBuffer_ZeroOutputCapacity) {
+  const uint8_t input[] = {'H', 'e', 'l', 'l', 'o'};
+  uint8_t output_dummy;
+  size_t output_size = 99;
+
+  gcomp_status_t status = gcomp_encode_buffer(registry_, "passthru", nullptr,
+      input, sizeof(input), &output_dummy, 0, &output_size);
+
+  ASSERT_EQ(status, GCOMP_ERR_INVALID_ARG);
+  EXPECT_EQ(output_size, 0u); // output_size_out set to 0 on this error
+}
+
+// Test gcomp_decode_buffer() - output_capacity == 0 (invalid)
+TEST_F(BufferWrappersTest, DecodeBuffer_ZeroOutputCapacity) {
+  const uint8_t input[] = {'H', 'e', 'l', 'l', 'o'};
+  uint8_t output_dummy;
+  size_t output_size = 99;
+
+  gcomp_status_t status = gcomp_decode_buffer(registry_, "passthru", nullptr,
+      input, sizeof(input), &output_dummy, 0, &output_size);
+
+  ASSERT_EQ(status, GCOMP_ERR_INVALID_ARG);
+  EXPECT_EQ(output_size, 0u); // output_size_out set to 0 on this error
+}
+
 // Test gcomp_encode_buffer() - NULL pointer handling
 TEST_F(BufferWrappersTest, EncodeBuffer_NullPointers) {
   const uint8_t input[] = {'H', 'e', 'l', 'l', 'o'};
@@ -68,7 +94,7 @@ TEST_F(BufferWrappersTest, EncodeBuffer_NullPointers) {
       input, sizeof(input), output, sizeof(output), &output_size);
   ASSERT_EQ(status, GCOMP_ERR_INVALID_ARG);
 
-  // NULL input_data
+  // NULL input_data with input_size > 0 (invalid)
   status = gcomp_encode_buffer(registry_, "passthru", nullptr, nullptr,
       sizeof(input), output, sizeof(output), &output_size);
   ASSERT_EQ(status, GCOMP_ERR_INVALID_ARG);
@@ -84,7 +110,7 @@ TEST_F(BufferWrappersTest, EncodeBuffer_NullPointers) {
   ASSERT_EQ(status, GCOMP_ERR_INVALID_ARG);
 }
 
-// Test gcomp_encode_buffer() - empty input
+// Test gcomp_encode_buffer() - empty input (input_data NULL, input_size 0)
 TEST_F(BufferWrappersTest, EncodeBuffer_EmptyInput) {
   const uint8_t * input = nullptr;
   uint8_t output[1024];

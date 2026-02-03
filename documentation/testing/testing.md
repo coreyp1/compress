@@ -288,6 +288,7 @@ tests/
 │   ├── test_errors.cpp           # Error handling tests
 │   ├── test_job_queue.cpp        # Job queue tests
 │   ├── test_limits.cpp           # Safety limits tests
+│   ├── test_safe_math.cpp        # Safe math (overflow) unit tests
 │   ├── test_options.cpp          # Options API tests
 │   ├── test_registry.cpp         # Registry tests
 │   ├── test_schema.cpp           # Option schema introspection tests
@@ -328,6 +329,24 @@ tests/
 │       ├── test_lz4_roundtrip.cpp # Encode/decode roundtrip tests
 │       ├── test_lz4_streaming.cpp # Streaming API tests
 │       └── data/golden_vectors.h # Verified test vectors (Python lz4 v4.4.5)
+│   └── zstd/                      # Zstd method tests
+│       ├── test_zstd_allocator.cpp
+│       ├── test_zstd_concat.cpp
+│       ├── test_zstd_corruption.cpp
+│       ├── test_zstd_decoder.cpp
+│       ├── test_zstd_encoder.cpp
+│       ├── test_zstd_entropy.cpp
+│       ├── test_zstd_format.cpp
+│       ├── test_zstd_limits.cpp
+│       ├── test_zstd_options.cpp
+│       ├── test_zstd_oracle.cpp
+│       ├── test_zstd_parallel.cpp
+│       ├── test_zstd_register.cpp
+│       ├── test_zstd_reset.cpp
+│       ├── test_zstd_robustness.cpp
+│       ├── test_zstd_roundtrip.cpp
+│       ├── test_zstd_streaming.cpp
+│       └── (data/ as needed)
 └── common/
     ├── test_helpers.h            # Test utility functions
     └── test_helpers.cpp          # Test utility implementations

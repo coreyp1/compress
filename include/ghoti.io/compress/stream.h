@@ -120,6 +120,10 @@ GCOMP_API gcomp_status_t gcomp_encoder_update(
  * emits trailers (if applicable). After calling this, the encoder
  * should not be used for further updates unless reset is called.
  *
+ * Idempotent: once finish returns GCOMP_OK (stream complete), subsequent
+ * finish calls are safe and return GCOMP_OK without writing output again
+ * and without leaking or double-freeing.
+ *
  * @param encoder The encoder
  * @param output Output buffer
  * @return Status code
@@ -164,6 +168,10 @@ GCOMP_API gcomp_status_t gcomp_decoder_update(
  * Finalizes the decompression stream and validates trailers (if applicable).
  * After calling this, the decoder should not be used for further updates
  * unless reset is called.
+ *
+ * Idempotent: once finish returns GCOMP_OK (stream complete), subsequent
+ * finish calls are safe and return GCOMP_OK without writing output again
+ * and without leaking or double-freeing.
  *
  * @param decoder The decoder
  * @param output Output buffer
@@ -246,6 +254,16 @@ GCOMP_API void gcomp_encoder_destroy(gcomp_encoder_t * encoder);
  * @param decoder The decoder to destroy
  */
 GCOMP_API void gcomp_decoder_destroy(gcomp_decoder_t * decoder);
+
+/*
+ * Stream callback API — buffer size guidance
+ *
+ * gcomp_encode_stream_cb and gcomp_decode_stream_cb use an internal buffer of
+ * 64 KiB by design, balancing memory use and I/O efficiency. Callers may use
+ * 64 KiB or a multiple (e.g. 128 KiB) for their read_cb/write_cb buffers for
+ * good throughput. The internal buffer size is not configurable in the current
+ * API; any future configurability (e.g. via options) will be documented.
+ */
 
 /**
  * @brief Encode data using callback-based streaming

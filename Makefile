@@ -116,7 +116,7 @@ endif
 INCLUDE := -I include/ -I $(GEN_DIR)/ $(CUTIL_CFLAGS)
 
 # Additional include directories for tests (common helpers, method-specific data)
-TEST_INCLUDE := $(INCLUDE) -I tests/common/ -I tests/methods/deflate/
+TEST_INCLUDE := $(INCLUDE) -I src/ -I tests/common/ -I tests/methods/deflate/
 
 # Automatically collect all .c source files under the src directory.
 SOURCES := $(shell find src -type f -name '*.c')

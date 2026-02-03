@@ -7,6 +7,7 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
+#include "safe_math.h"
 #include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/registry.h>
@@ -19,6 +20,12 @@ gcomp_status_t gcomp_encode_buffer(gcomp_registry_t * registry,
     size_t output_capacity, size_t * output_size_out) {
   // Validate arguments
   if (!method_name || !output_data || !output_size_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  // output_capacity must be at least 1; zero cannot hold any output
+  if (output_capacity == 0) {
+    *output_size_out = 0;
     return GCOMP_ERR_INVALID_ARG;
   }
 
@@ -51,6 +58,7 @@ gcomp_status_t gcomp_encode_buffer(gcomp_registry_t * registry,
   size_t input_remaining = input_size;
   uint8_t * output_ptr = (uint8_t *)output_data;
   size_t output_remaining = output_capacity;
+  size_t new_total;
 
   // Process input data
   while (input_remaining > 0) {
@@ -82,7 +90,11 @@ gcomp_status_t gcomp_encode_buffer(gcomp_registry_t * registry,
     input_remaining -= input_buf.used;
     output_ptr += output_buf.used;
     output_remaining -= output_buf.used;
-    *output_size_out += output_buf.used;
+    if (!gcomp_safe_add_size(*output_size_out, output_buf.used, &new_total)) {
+      gcomp_encoder_destroy(encoder);
+      return GCOMP_ERR_LIMIT;
+    }
+    *output_size_out = new_total;
 
     // Check if output buffer is full and we still have input
     if (output_remaining == 0 && input_remaining > 0) {
@@ -109,7 +121,11 @@ gcomp_status_t gcomp_encode_buffer(gcomp_registry_t * registry,
       // Finished successfully
       output_ptr += output_buf.used;
       output_remaining -= output_buf.used;
-      *output_size_out += output_buf.used;
+      if (!gcomp_safe_add_size(*output_size_out, output_buf.used, &new_total)) {
+        gcomp_encoder_destroy(encoder);
+        return GCOMP_ERR_LIMIT;
+      }
+      *output_size_out = new_total;
       break;
     }
     else if (status == GCOMP_ERR_LIMIT) {
@@ -135,6 +151,12 @@ gcomp_status_t gcomp_decode_buffer(gcomp_registry_t * registry,
     size_t output_capacity, size_t * output_size_out) {
   // Validate arguments
   if (!method_name || !output_data || !output_size_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  // output_capacity must be at least 1; zero cannot hold any output
+  if (output_capacity == 0) {
+    *output_size_out = 0;
     return GCOMP_ERR_INVALID_ARG;
   }
 
@@ -167,6 +189,7 @@ gcomp_status_t gcomp_decode_buffer(gcomp_registry_t * registry,
   size_t input_remaining = input_size;
   uint8_t * output_ptr = (uint8_t *)output_data;
   size_t output_remaining = output_capacity;
+  size_t new_total;
 
   // Process input data
   while (input_remaining > 0) {
@@ -198,7 +221,11 @@ gcomp_status_t gcomp_decode_buffer(gcomp_registry_t * registry,
     input_remaining -= input_buf.used;
     output_ptr += output_buf.used;
     output_remaining -= output_buf.used;
-    *output_size_out += output_buf.used;
+    if (!gcomp_safe_add_size(*output_size_out, output_buf.used, &new_total)) {
+      gcomp_decoder_destroy(decoder);
+      return GCOMP_ERR_LIMIT;
+    }
+    *output_size_out = new_total;
 
     // Check if output buffer is full and we still have input
     if (output_remaining == 0 && input_remaining > 0) {
@@ -225,7 +252,11 @@ gcomp_status_t gcomp_decode_buffer(gcomp_registry_t * registry,
       // Finished successfully
       output_ptr += output_buf.used;
       output_remaining -= output_buf.used;
-      *output_size_out += output_buf.used;
+      if (!gcomp_safe_add_size(*output_size_out, output_buf.used, &new_total)) {
+        gcomp_decoder_destroy(decoder);
+        return GCOMP_ERR_LIMIT;
+      }
+      *output_size_out = new_total;
       break;
     }
     else if (status == GCOMP_ERR_LIMIT) {

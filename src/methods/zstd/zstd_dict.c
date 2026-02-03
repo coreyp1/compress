@@ -78,14 +78,14 @@ gcomp_status_t zstd_dict_parse(const uint8_t * buf, size_t buf_size,
 
   uint32_t magic = gcomp_read_le32(buf);
   if (magic != ZSTD_DICT_MAGIC) {
-    /* Raw content dictionary */
+    // Raw content dictionary
     out->content = buf;
     out->content_size = buf_size;
     out->dict_id = 0;
     return GCOMP_OK;
   }
 
-  /* Formatted dictionary */
+  // Formatted dictionary
   if (buf_size < 8) {
     return GCOMP_ERR_CORRUPT;
   }
@@ -102,8 +102,8 @@ gcomp_status_t zstd_dict_parse(const uint8_t * buf, size_t buf_size,
   out->_allocator = alloc;
   size_t pos = 8;
 
-  /* Huffman table for literals */
-  size_t huf_table_size = (size_t)1 << 11; /* max 11 bits */
+  // Huffman table for literals
+  size_t huf_table_size = (size_t)1 << 11; // max 11 bits
   out->huf_table =
       gcomp_calloc(alloc, huf_table_size, sizeof(zstd_huf_entry_t));
   if (!out->huf_table) {
@@ -121,7 +121,7 @@ gcomp_status_t zstd_dict_parse(const uint8_t * buf, size_t buf_size,
   out->huf_table_size = huf_table_size;
   pos += huf_bytes;
 
-  /* FSE table for offsets (order per RFC 8878 §5: HUF, OF, ML, LL) */
+  // FSE table for offsets (order per RFC 8878 §5: HUF, OF, ML, LL)
   if (pos >= buf_size) {
     goto cleanup_tables;
   }
@@ -150,7 +150,7 @@ gcomp_status_t zstd_dict_parse(const uint8_t * buf, size_t buf_size,
     pos += fse_bytes;
   }
 
-  /* FSE table for match lengths */
+  // FSE table for match lengths
   if (pos >= buf_size) {
     goto cleanup_tables;
   }
@@ -179,7 +179,7 @@ gcomp_status_t zstd_dict_parse(const uint8_t * buf, size_t buf_size,
     pos += fse_bytes;
   }
 
-  /* FSE table for literals lengths */
+  // FSE table for literals lengths
   if (pos >= buf_size) {
     goto cleanup_tables;
   }
@@ -208,7 +208,7 @@ gcomp_status_t zstd_dict_parse(const uint8_t * buf, size_t buf_size,
     pos += fse_bytes;
   }
 
-  /* 3 × 4-byte repeat offsets */
+  // 3 × 4-byte repeat offsets
   if (pos + 12 > buf_size) {
     goto cleanup_tables;
   }
@@ -221,7 +221,7 @@ gcomp_status_t zstd_dict_parse(const uint8_t * buf, size_t buf_size,
   out->content_size = buf_size - pos;
   out->has_entropy_tables = true;
 
-  /* Per RFC: each repeat offset must be < dictionary content size */
+  // Per RFC: each repeat offset must be < dictionary content size
   if (out->rep_offset_1 >= out->content_size ||
       out->rep_offset_2 >= out->content_size ||
       out->rep_offset_3 >= out->content_size) {

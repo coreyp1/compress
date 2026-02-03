@@ -64,12 +64,16 @@ extern "C" {
  * @param registry The registry to use (can be NULL to use default registry)
  * @param method_name The name of the compression method (e.g., "deflate")
  * @param options Configuration options (can be NULL for defaults)
- * @param input_data Pointer to input data
+ * @param input_data Pointer to input data; may be NULL only when input_size is
+ * 0
  * @param input_size Size of input data in bytes
- * @param output_data Pointer to output buffer
- * @param output_capacity Capacity of output buffer in bytes
+ * @param output_data Pointer to output buffer (must be non-NULL)
+ * @param output_capacity Capacity of output buffer in bytes; must be > 0
  * @param output_size_out Output parameter for actual number of bytes written
- * @return Status code. Returns GCOMP_ERR_LIMIT if output buffer is too small.
+ * @return Status code. GCOMP_ERR_INVALID_ARG if output_capacity is 0, or
+ *         input_data is NULL with input_size > 0; GCOMP_ERR_LIMIT if output
+ *         buffer is too small. On error when output_capacity is 0,
+ *         *output_size_out is set to 0.
  */
 GCOMP_API gcomp_status_t gcomp_encode_buffer(gcomp_registry_t * registry,
     const char * method_name, gcomp_options_t * options,
@@ -86,12 +90,16 @@ GCOMP_API gcomp_status_t gcomp_encode_buffer(gcomp_registry_t * registry,
  * @param registry The registry to use (can be NULL to use default registry)
  * @param method_name The name of the compression method (e.g., "deflate")
  * @param options Configuration options (can be NULL for defaults)
- * @param input_data Pointer to compressed input data
+ * @param input_data Pointer to compressed input data; may be NULL only when
+ *        input_size is 0
  * @param input_size Size of input data in bytes
- * @param output_data Pointer to output buffer
- * @param output_capacity Capacity of output buffer in bytes
+ * @param output_data Pointer to output buffer (must be non-NULL)
+ * @param output_capacity Capacity of output buffer in bytes; must be > 0
  * @param output_size_out Output parameter for actual number of bytes written
- * @return Status code. Returns GCOMP_ERR_LIMIT if output buffer is too small.
+ * @return Status code. GCOMP_ERR_INVALID_ARG if output_capacity is 0, or
+ *         input_data is NULL with input_size > 0; GCOMP_ERR_LIMIT if output
+ *         buffer is too small. On error when output_capacity is 0,
+ *         *output_size_out is set to 0.
  */
 GCOMP_API gcomp_status_t gcomp_decode_buffer(gcomp_registry_t * registry,
     const char * method_name, gcomp_options_t * options,

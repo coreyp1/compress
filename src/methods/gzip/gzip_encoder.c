@@ -64,7 +64,6 @@
 #include <ghoti.io/compress/stream.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdlib.h>
 #include <string.h>
 
 /**
@@ -129,7 +128,7 @@ static bool validate_latin1_string(GCOMP_MAYBE_UNUSED(const char * str)) {
 static gcomp_status_t read_encoder_options(const gcomp_options_t * options,
     gzip_header_info_t * info, uint8_t * xfl_out, int * has_explicit_xfl,
     uint8_t * header_flags_out, int * has_explicit_header_flags,
-    gcomp_memory_tracker_t * mem_tracker) {
+    gcomp_memory_tracker_t * mem_tracker, const gcomp_allocator_t * allocator) {
   gcomp_status_t status;
   uint64_t u64_val;
   int bool_val;
@@ -190,7 +189,7 @@ static gcomp_status_t read_encoder_options(const gcomp_options_t * options,
       return GCOMP_ERR_INVALID_ARG; // Invalid character encoding
     }
     size_t len = strlen(str_val);
-    info->name = (char *)malloc(len + 1);
+    info->name = (char *)gcomp_malloc(allocator, len + 1);
     if (!info->name) {
       return GCOMP_ERR_MEMORY;
     }
@@ -204,13 +203,13 @@ static gcomp_status_t read_encoder_options(const gcomp_options_t * options,
   if (status == GCOMP_OK && str_val) {
     // Validate Latin-1 encoding (RFC 1952 compliance)
     if (!validate_latin1_string(str_val)) {
-      gzip_header_info_free(info);
+      gzip_header_info_free(info, allocator);
       return GCOMP_ERR_INVALID_ARG; // Invalid character encoding
     }
     size_t len = strlen(str_val);
-    info->comment = (char *)malloc(len + 1);
+    info->comment = (char *)gcomp_malloc(allocator, len + 1);
     if (!info->comment) {
-      gzip_header_info_free(info);
+      gzip_header_info_free(info, allocator);
       return GCOMP_ERR_MEMORY;
     }
     memcpy(info->comment, str_val, len + 1);
@@ -222,9 +221,9 @@ static gcomp_status_t read_encoder_options(const gcomp_options_t * options,
   status =
       gcomp_options_get_bytes(options, "gzip.extra", &bytes_val, &bytes_len);
   if (status == GCOMP_OK && bytes_val && bytes_len > 0) {
-    info->extra = (uint8_t *)malloc(bytes_len);
+    info->extra = (uint8_t *)gcomp_malloc(allocator, bytes_len);
     if (!info->extra) {
-      gzip_header_info_free(info);
+      gzip_header_info_free(info, allocator);
       return GCOMP_ERR_MEMORY;
     }
     memcpy(info->extra, bytes_val, bytes_len);
@@ -282,7 +281,7 @@ static gcomp_status_t read_encoder_options(const gcomp_options_t * options,
       // Header fields exceed the maximum buffer size. Free any allocated
       // memory and return a limit error. The caller will receive a clear
       // indication that the combined size of name/comment/extra is too large.
-      gzip_header_info_free(info);
+      gzip_header_info_free(info, allocator);
       return GCOMP_ERR_LIMIT;
     }
   }
@@ -316,8 +315,8 @@ gcomp_status_t gzip_encoder_init(gcomp_registry_t * registry,
   int header_info_initialized = 0;
 
   // Allocate state
-  gzip_encoder_state_t * state =
-      (gzip_encoder_state_t *)gcomp_calloc(alloc, 1, sizeof(gzip_encoder_state_t));
+  gzip_encoder_state_t * state = (gzip_encoder_state_t *)gcomp_calloc(
+      alloc, 1, sizeof(gzip_encoder_state_t));
   if (!state) {
     return gcomp_encoder_set_error(
         encoder, GCOMP_ERR_MEMORY, "failed to allocate gzip encoder state");
@@ -337,9 +336,9 @@ gcomp_status_t gzip_encoder_init(gcomp_registry_t * registry,
   int has_explicit_xfl;
   uint8_t explicit_header_flags;
   int has_explicit_header_flags;
-  status = read_encoder_options(options, &state->header_info,
-      &explicit_xfl, &has_explicit_xfl, &explicit_header_flags,
-      &has_explicit_header_flags, &state->mem_tracker);
+  status = read_encoder_options(options, &state->header_info, &explicit_xfl,
+      &has_explicit_xfl, &explicit_header_flags, &has_explicit_header_flags,
+      &state->mem_tracker, alloc);
   if (status != GCOMP_OK) {
     goto cleanup;
   }
@@ -411,7 +410,7 @@ cleanup:
     gcomp_encoder_destroy(state->inner_encoder);
   }
   if (header_info_initialized) {
-    gzip_header_info_free(&state->header_info);
+    gzip_header_info_free(&state->header_info, alloc);
   }
   gcomp_free(alloc, state);
   if (error_msg) {
@@ -638,8 +637,7 @@ void gzip_encoder_destroy(gcomp_encoder_t * encoder) {
     gcomp_memory_track_free(&state->mem_tracker, state->header_info.extra_len);
   }
 
-  // Free header info (still uses free() for name/comment/extra fields)
-  gzip_header_info_free(&state->header_info);
+  gzip_header_info_free(&state->header_info, state->allocator);
 
   // Track state free
   gcomp_memory_track_free(&state->mem_tracker, sizeof(gzip_encoder_state_t));

@@ -62,7 +62,6 @@
 #include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/stream.h>
 #include <stdint.h>
-#include <stdlib.h>
 #include <string.h>
 
 //
@@ -145,7 +144,7 @@ static void reset_header_parser(gzip_decoder_state_t * state) {
     gcomp_memory_track_free(&state->mem_tracker, state->header_info.extra_len);
   }
 
-  gzip_header_info_free(&state->header_info);
+  gzip_header_info_free(&state->header_info, state->allocator);
   memset(&state->header_info, 0, sizeof(state->header_info));
 }
 
@@ -174,8 +173,8 @@ gcomp_status_t gzip_decoder_init(gcomp_registry_t * registry,
   gcomp_options_t * deflate_options = NULL;
 
   // Allocate state
-  gzip_decoder_state_t * state =
-      (gzip_decoder_state_t *)gcomp_calloc(alloc, 1, sizeof(gzip_decoder_state_t));
+  gzip_decoder_state_t * state = (gzip_decoder_state_t *)gcomp_calloc(
+      alloc, 1, sizeof(gzip_decoder_state_t));
   if (!state) {
     return gcomp_decoder_set_error(
         decoder, GCOMP_ERR_MEMORY, "failed to allocate gzip decoder state");
@@ -347,7 +346,8 @@ static gcomp_status_t parse_header_byte(
       }
 
       if (extra_len > 0) {
-        state->header_info.extra = (uint8_t *)malloc(extra_len);
+        state->header_info.extra =
+            (uint8_t *)gcomp_malloc(state->allocator, extra_len);
         if (!state->header_info.extra) {
           return gcomp_decoder_set_error(
               decoder, GCOMP_ERR_MEMORY, "failed to allocate FEXTRA buffer");
@@ -406,7 +406,8 @@ static gcomp_status_t parse_header_byte(
     state->header_accum[state->header_accum_pos++] = byte;
     if (byte == 0) {
       // Null terminator found
-      state->header_info.name = (char *)malloc(state->header_accum_pos);
+      state->header_info.name =
+          (char *)gcomp_malloc(state->allocator, state->header_accum_pos);
       if (!state->header_info.name) {
         return gcomp_decoder_set_error(
             decoder, GCOMP_ERR_MEMORY, "failed to allocate FNAME buffer");
@@ -439,7 +440,8 @@ static gcomp_status_t parse_header_byte(
     state->header_accum[state->header_accum_pos++] = byte;
     if (byte == 0) {
       // Null terminator found
-      state->header_info.comment = (char *)malloc(state->header_accum_pos);
+      state->header_info.comment =
+          (char *)gcomp_malloc(state->allocator, state->header_accum_pos);
       if (!state->header_info.comment) {
         return gcomp_decoder_set_error(
             decoder, GCOMP_ERR_MEMORY, "failed to allocate FCOMMENT buffer");
@@ -553,184 +555,186 @@ gcomp_status_t gzip_decoder_update(gcomp_decoder_t * decoder,
       output->used < output->size) {
 
     // HEADER stage: parse header bytes
-  while (state->stage == GZIP_DEC_STAGE_HEADER && input->used < input->size) {
-    uint8_t byte = input_data[input->used++];
-    state->total_input_bytes++;
+    while (state->stage == GZIP_DEC_STAGE_HEADER && input->used < input->size) {
+      uint8_t byte = input_data[input->used++];
+      state->total_input_bytes++;
 
-    status = parse_header_byte(state, byte, decoder);
-    if (status != GCOMP_OK) {
-      state->stage = GZIP_DEC_STAGE_ERROR;
-      return status;
-    }
-
-    if (state->header_stage == GZIP_HEADER_DONE) {
-      state->stage = GZIP_DEC_STAGE_BODY;
-      state->crc32 = GCOMP_CRC32_INIT;
-      state->isize = 0;
-      break;
-    }
-  }
-
-  // BODY stage: pass through deflate, tracking CRC32/ISIZE
-  uint8_t * output_data = (uint8_t *)output->data;
-  if (state->stage == GZIP_DEC_STAGE_BODY) {
-    size_t output_before = output->used;
-    size_t input_before = input->used;
-
-    gcomp_status_t deflate_status =
-        gcomp_decoder_update(state->inner_decoder, input, output);
-
-    // Track input/output bytes
-    state->total_input_bytes += (input->used - input_before);
-    size_t output_produced = output->used - output_before;
-    state->total_output_bytes += output_produced;
-
-    // Update CRC32 and ISIZE with output
-    if (output_produced > 0) {
-      state->crc32 = gcomp_crc32_update(
-          state->crc32, output_data + output_before, output_produced);
-      state->isize += (uint32_t)output_produced;
-    }
-
-    // Check for errors from deflate update
-    if (deflate_status != GCOMP_OK) {
-      state->stage = GZIP_DEC_STAGE_ERROR;
-      return gcomp_decoder_set_error(decoder, deflate_status,
-          "deflate decoder update failed: %s",
-          gcomp_decoder_get_error_detail(state->inner_decoder));
-    }
-
-    // Check output size limit (gzip-level check, in addition to deflate's)
-    if (state->max_output_bytes > 0 &&
-        state->total_output_bytes > state->max_output_bytes) {
-      state->stage = GZIP_DEC_STAGE_ERROR;
-      return gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
-          "gzip output size %llu exceeds limit %llu",
-          (unsigned long long)state->total_output_bytes,
-          (unsigned long long)state->max_output_bytes);
-    }
-
-    // Check expansion ratio limit (gzip-level check)
-    if (state->max_expansion_ratio > 0 && state->total_input_bytes > 0) {
-      status = gcomp_limits_check_expansion_ratio(state->total_input_bytes,
-          state->total_output_bytes, state->max_expansion_ratio);
+      status = parse_header_byte(state, byte, decoder);
       if (status != GCOMP_OK) {
         state->stage = GZIP_DEC_STAGE_ERROR;
-        return gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
-            "gzip expansion ratio %llu exceeds limit %llu (input=%llu, "
-            "output=%llu)",
-            (unsigned long long)(state->total_output_bytes /
-                (state->total_input_bytes > 0 ? state->total_input_bytes : 1)),
-            (unsigned long long)state->max_expansion_ratio,
-            (unsigned long long)state->total_input_bytes,
-            (unsigned long long)state->total_output_bytes);
+        return status;
+      }
+
+      if (state->header_stage == GZIP_HEADER_DONE) {
+        state->stage = GZIP_DEC_STAGE_BODY;
+        state->crc32 = GCOMP_CRC32_INIT;
+        state->isize = 0;
+        break;
       }
     }
 
-    // Check if deflate is done by trying finish
-    // This is a simplification - ideally deflate would signal stream end
-    gcomp_buffer_t empty_out = {
-        output_data + output->used, output->size - output->used, 0};
-    status = gcomp_decoder_finish(state->inner_decoder, &empty_out);
-    if (status == GCOMP_OK) {
-      // Deflate stream complete, move to trailer
-      output->used += empty_out.used;
+    // BODY stage: pass through deflate, tracking CRC32/ISIZE
+    uint8_t * output_data = (uint8_t *)output->data;
+    if (state->stage == GZIP_DEC_STAGE_BODY) {
+      size_t output_before = output->used;
+      size_t input_before = input->used;
 
-      // Update CRC32/ISIZE for any final output
-      if (empty_out.used > 0) {
-        state->crc32 = gcomp_crc32_update(state->crc32,
-            output_data + output->used - empty_out.used, empty_out.used);
-        state->isize += (uint32_t)empty_out.used;
-        state->total_output_bytes += empty_out.used;
+      gcomp_status_t deflate_status =
+          gcomp_decoder_update(state->inner_decoder, input, output);
 
-        // Check output size limit for final output
-        if (state->max_output_bytes > 0 &&
-            state->total_output_bytes > state->max_output_bytes) {
+      // Track input/output bytes
+      state->total_input_bytes += (input->used - input_before);
+      size_t output_produced = output->used - output_before;
+      state->total_output_bytes += output_produced;
+
+      // Update CRC32 and ISIZE with output
+      if (output_produced > 0) {
+        state->crc32 = gcomp_crc32_update(
+            state->crc32, output_data + output_before, output_produced);
+        state->isize += (uint32_t)output_produced;
+      }
+
+      // Check for errors from deflate update
+      if (deflate_status != GCOMP_OK) {
+        state->stage = GZIP_DEC_STAGE_ERROR;
+        return gcomp_decoder_set_error(decoder, deflate_status,
+            "deflate decoder update failed: %s",
+            gcomp_decoder_get_error_detail(state->inner_decoder));
+      }
+
+      // Check output size limit (gzip-level check, in addition to deflate's)
+      if (state->max_output_bytes > 0 &&
+          state->total_output_bytes > state->max_output_bytes) {
+        state->stage = GZIP_DEC_STAGE_ERROR;
+        return gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
+            "gzip output size %llu exceeds limit %llu",
+            (unsigned long long)state->total_output_bytes,
+            (unsigned long long)state->max_output_bytes);
+      }
+
+      // Check expansion ratio limit (gzip-level check)
+      if (state->max_expansion_ratio > 0 && state->total_input_bytes > 0) {
+        status = gcomp_limits_check_expansion_ratio(state->total_input_bytes,
+            state->total_output_bytes, state->max_expansion_ratio);
+        if (status != GCOMP_OK) {
           state->stage = GZIP_DEC_STAGE_ERROR;
           return gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
-              "gzip output size %llu exceeds limit %llu",
-              (unsigned long long)state->total_output_bytes,
-              (unsigned long long)state->max_output_bytes);
+              "gzip expansion ratio %llu exceeds limit %llu (input=%llu, "
+              "output=%llu)",
+              (unsigned long long)(state->total_output_bytes /
+                  (state->total_input_bytes > 0 ? state->total_input_bytes
+                                                : 1)),
+              (unsigned long long)state->max_expansion_ratio,
+              (unsigned long long)state->total_input_bytes,
+              (unsigned long long)state->total_output_bytes);
         }
       }
 
-      state->stage = GZIP_DEC_STAGE_TRAILER;
-      state->trailer_pos = 0;
+      // Check if deflate is done by trying finish
+      // This is a simplification - ideally deflate would signal stream end
+      gcomp_buffer_t empty_out = {
+          output_data + output->used, output->size - output->used, 0};
+      status = gcomp_decoder_finish(state->inner_decoder, &empty_out);
+      if (status == GCOMP_OK) {
+        // Deflate stream complete, move to trailer
+        output->used += empty_out.used;
 
-      // Retrieve any unconsumed bytes from deflate's bit buffer.
-      // In streaming mode, deflate may have read trailer bytes into its
-      // bit buffer before detecting end-of-stream. These bytes weren't
-      // returned to input (they were consumed in previous calls), so we
-      // need to retrieve them explicitly for trailer parsing.
-      uint32_t unconsumed = gcomp_deflate_decoder_get_unconsumed_bytes(
-          state->inner_decoder);
-      if (unconsumed > 0 && unconsumed <= GZIP_TRAILER_SIZE) {
-        gcomp_deflate_decoder_get_unconsumed_data(state->inner_decoder,
-            state->trailer_buf, unconsumed);
-        state->trailer_pos = unconsumed;
-      }
-    }
-  }
+        // Update CRC32/ISIZE for any final output
+        if (empty_out.used > 0) {
+          state->crc32 = gcomp_crc32_update(state->crc32,
+              output_data + output->used - empty_out.used, empty_out.used);
+          state->isize += (uint32_t)empty_out.used;
+          state->total_output_bytes += empty_out.used;
 
-  // TRAILER stage: accumulate and validate trailer
-  while (state->stage == GZIP_DEC_STAGE_TRAILER && input->used < input->size) {
-    state->trailer_buf[state->trailer_pos++] = input_data[input->used++];
-    state->total_input_bytes++;
-
-    if (state->trailer_pos >= GZIP_TRAILER_SIZE) {
-      // Parse trailer
-      uint32_t expected_crc = gcomp_read_le32(state->trailer_buf);
-      uint32_t expected_isize = gcomp_read_le32(state->trailer_buf + 4);
-
-      // Finalize CRC32
-      uint32_t actual_crc = gcomp_crc32_finalize(state->crc32);
-
-      // Validate CRC32
-      if (actual_crc != expected_crc) {
-        state->stage = GZIP_DEC_STAGE_ERROR;
-        return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
-            "gzip CRC32 mismatch: expected 0x%08X, computed 0x%08X",
-            expected_crc, actual_crc);
-      }
-
-      // Validate ISIZE
-      if (state->isize != expected_isize) {
-        state->stage = GZIP_DEC_STAGE_ERROR;
-        return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
-            "gzip ISIZE mismatch: expected %u, computed %u", expected_isize,
-            state->isize);
-      }
-
-      // Check for concatenated members
-      if (state->concat_enabled && input->used < input->size) {
-        // More data available, check if it's another gzip member
-        if (input->size - input->used >= 2 &&
-            input_data[input->used] == GZIP_ID1 &&
-            input_data[input->used + 1] == GZIP_ID2) {
-          // Reset for next member
-          reset_header_parser(state);
-          state->stage = GZIP_DEC_STAGE_HEADER;
-          state->crc32 = GCOMP_CRC32_INIT;
-          state->isize = 0;
-          state->trailer_pos = 0;
-
-          // Reset inner deflate decoder
-          status = gcomp_decoder_reset(state->inner_decoder);
-          if (status != GCOMP_OK) {
+          // Check output size limit for final output
+          if (state->max_output_bytes > 0 &&
+              state->total_output_bytes > state->max_output_bytes) {
             state->stage = GZIP_DEC_STAGE_ERROR;
-            return status;
+            return gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
+                "gzip output size %llu exceeds limit %llu",
+                (unsigned long long)state->total_output_bytes,
+                (unsigned long long)state->max_output_bytes);
           }
-          continue;
+        }
+
+        state->stage = GZIP_DEC_STAGE_TRAILER;
+        state->trailer_pos = 0;
+
+        // Retrieve any unconsumed bytes from deflate's bit buffer.
+        // In streaming mode, deflate may have read trailer bytes into its
+        // bit buffer before detecting end-of-stream. These bytes weren't
+        // returned to input (they were consumed in previous calls), so we
+        // need to retrieve them explicitly for trailer parsing.
+        uint32_t unconsumed =
+            gcomp_deflate_decoder_get_unconsumed_bytes(state->inner_decoder);
+        if (unconsumed > 0 && unconsumed <= GZIP_TRAILER_SIZE) {
+          gcomp_deflate_decoder_get_unconsumed_data(
+              state->inner_decoder, state->trailer_buf, unconsumed);
+          state->trailer_pos = unconsumed;
         }
       }
-      // If concat is disabled and there's extra data, we just mark as DONE.
-      // The extra input bytes remain unconsumed (input->used < input->size).
-      // This matches standard gzip behavior where trailing data is ignored.
-
-      state->stage = GZIP_DEC_STAGE_DONE;
-      break;
     }
-  }
+
+    // TRAILER stage: accumulate and validate trailer
+    while (
+        state->stage == GZIP_DEC_STAGE_TRAILER && input->used < input->size) {
+      state->trailer_buf[state->trailer_pos++] = input_data[input->used++];
+      state->total_input_bytes++;
+
+      if (state->trailer_pos >= GZIP_TRAILER_SIZE) {
+        // Parse trailer
+        uint32_t expected_crc = gcomp_read_le32(state->trailer_buf);
+        uint32_t expected_isize = gcomp_read_le32(state->trailer_buf + 4);
+
+        // Finalize CRC32
+        uint32_t actual_crc = gcomp_crc32_finalize(state->crc32);
+
+        // Validate CRC32
+        if (actual_crc != expected_crc) {
+          state->stage = GZIP_DEC_STAGE_ERROR;
+          return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+              "gzip CRC32 mismatch: expected 0x%08X, computed 0x%08X",
+              expected_crc, actual_crc);
+        }
+
+        // Validate ISIZE
+        if (state->isize != expected_isize) {
+          state->stage = GZIP_DEC_STAGE_ERROR;
+          return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+              "gzip ISIZE mismatch: expected %u, computed %u", expected_isize,
+              state->isize);
+        }
+
+        // Check for concatenated members
+        if (state->concat_enabled && input->used < input->size) {
+          // More data available, check if it's another gzip member
+          if (input->size - input->used >= 2 &&
+              input_data[input->used] == GZIP_ID1 &&
+              input_data[input->used + 1] == GZIP_ID2) {
+            // Reset for next member
+            reset_header_parser(state);
+            state->stage = GZIP_DEC_STAGE_HEADER;
+            state->crc32 = GCOMP_CRC32_INIT;
+            state->isize = 0;
+            state->trailer_pos = 0;
+
+            // Reset inner deflate decoder
+            status = gcomp_decoder_reset(state->inner_decoder);
+            if (status != GCOMP_OK) {
+              state->stage = GZIP_DEC_STAGE_ERROR;
+              return status;
+            }
+            continue;
+          }
+        }
+        // If concat is disabled and there's extra data, we just mark as DONE.
+        // The extra input bytes remain unconsumed (input->used < input->size).
+        // This matches standard gzip behavior where trailing data is ignored.
+
+        state->stage = GZIP_DEC_STAGE_DONE;
+        break;
+      }
+    }
 
   } // end outer while loop for concatenated members
 
@@ -839,8 +843,7 @@ void gzip_decoder_destroy(gcomp_decoder_t * decoder) {
     gcomp_memory_track_free(&state->mem_tracker, state->header_info.extra_len);
   }
 
-  // Free header info (still uses free() for name/comment/extra fields)
-  gzip_header_info_free(&state->header_info);
+  gzip_header_info_free(&state->header_info, state->allocator);
 
   // Track state free
   gcomp_memory_track_free(&state->mem_tracker, sizeof(gzip_decoder_state_t));

@@ -127,6 +127,7 @@
 #include "lz4_internal.h"
 
 #include "../../core/alloc_internal.h"
+#include "../../core/parallel_block.h"
 
 //
 // Constants
@@ -150,23 +151,11 @@
  */
 struct lz4_parallel_ctx_s {
   const gcomp_allocator_t * allocator;
-  gcomp_thread_pool_t * pool;
-  gcomp_job_queue_t * queue;
+  gcomp_parallel_block_ctx_t * block_ctx;
 
-  // Configuration
-  uint32_t num_threads;
-  uint32_t max_in_flight;
   uint32_t block_max_size;
   bool block_checksum;
   uint64_t max_memory_bytes;
-
-  // Mode
-  bool is_inline;
-
-  // Inline mode: completed job queue (simple linked list)
-  lz4_parallel_job_t * inline_head;
-  lz4_parallel_job_t * inline_tail;
-  uint32_t inline_count;
 };
 
 //
@@ -212,19 +201,6 @@ static gcomp_status_t lz4_parallel_process_job(void * ctx) {
   return GCOMP_OK;
 }
 
-/**
- * @brief Job completion callback.
- *
- * Marks the job as complete in the job queue.
- */
-static void lz4_parallel_job_complete(
-    void * ctx, gcomp_status_t status, void * user_data) {
-  lz4_parallel_job_t * job = (lz4_parallel_job_t *)ctx;
-  gcomp_job_queue_t * queue = (gcomp_job_queue_t *)user_data;
-
-  gcomp_job_queue_complete(queue, &job->base, status);
-}
-
 //
 // Public API
 //
@@ -245,7 +221,6 @@ gcomp_status_t lz4_parallel_create(
   uint32_t block_max_size =
       config ? config->block_max_size : LZ4_DEFAULT_BLOCK_SIZE;
 
-  // Allocate context
   lz4_parallel_ctx_t * ctx =
       gcomp_calloc(allocator, 1, sizeof(lz4_parallel_ctx_t));
   if (!ctx) {
@@ -253,66 +228,38 @@ gcomp_status_t lz4_parallel_create(
   }
 
   ctx->allocator = allocator;
-  ctx->num_threads = num_threads;
   ctx->block_max_size = block_max_size;
   ctx->block_checksum = config ? config->block_checksum : false;
   ctx->max_memory_bytes = config ? config->max_memory_bytes : 0;
 
-  // Inline mode if no threading
-  if (num_threads <= 1) {
-    ctx->is_inline = true;
-    ctx->pool = NULL;
-    ctx->queue = NULL;
-    ctx->max_in_flight = 1;
-    ctx->inline_head = NULL;
-    ctx->inline_tail = NULL;
-    ctx->inline_count = 0;
-    *ctx_out = ctx;
-    return GCOMP_OK;
-  }
-
-  ctx->is_inline = false;
-
-  // Calculate max in-flight blocks
-  uint32_t max_in_flight = config && config->max_in_flight > 0
-      ? config->max_in_flight
-      : num_threads * LZ4_PARALLEL_DEFAULT_MAX_IN_FLIGHT_MULTIPLIER;
-
-  // If memory limit is set, calculate based on per-job memory
-  if (ctx->max_memory_bytes > 0) {
-    size_t per_job_memory = block_max_size +      // Input buffer
-        (block_max_size + LZ4_BLOCK_OVERHEAD) +   // Output buffer
-        (LZ4_HASH_TABLE_SIZE * sizeof(uint32_t)); // Hash table
-    uint32_t mem_limited_jobs =
-        (uint32_t)(ctx->max_memory_bytes / per_job_memory);
-    if (mem_limited_jobs < max_in_flight) {
-      max_in_flight = mem_limited_jobs;
-    }
-    if (max_in_flight < 1) {
-      max_in_flight = 1;
+  uint32_t max_in_flight = 1;
+  if (num_threads > 1) {
+    max_in_flight = config && config->max_in_flight > 0
+        ? config->max_in_flight
+        : num_threads * LZ4_PARALLEL_DEFAULT_MAX_IN_FLIGHT_MULTIPLIER;
+    if (ctx->max_memory_bytes > 0) {
+      size_t per_job_memory = block_max_size +
+          (block_max_size + LZ4_BLOCK_OVERHEAD) +
+          (LZ4_HASH_TABLE_SIZE * sizeof(uint32_t));
+      uint32_t mem_limited_jobs =
+          (uint32_t)(ctx->max_memory_bytes / per_job_memory);
+      if (mem_limited_jobs < max_in_flight) {
+        max_in_flight = mem_limited_jobs;
+      }
+      if (max_in_flight < 1) {
+        max_in_flight = 1;
+      }
     }
   }
-  ctx->max_in_flight = max_in_flight;
 
-  // Create thread pool
-  gcomp_thread_pool_config_t pool_config = {
+  gcomp_parallel_block_config_t block_config = {
+      .allocator = allocator,
       .num_threads = num_threads,
-      .allocator = allocator,
+      .max_in_flight = max_in_flight,
   };
-  gcomp_status_t status = gcomp_thread_pool_create(&pool_config, &ctx->pool);
+  gcomp_status_t status =
+      gcomp_parallel_block_create(&block_config, &ctx->block_ctx);
   if (status != GCOMP_OK) {
-    gcomp_free(allocator, ctx);
-    return status;
-  }
-
-  // Create job queue
-  gcomp_job_queue_config_t queue_config = {
-      .capacity = max_in_flight,
-      .allocator = allocator,
-  };
-  status = gcomp_job_queue_create(&queue_config, &ctx->queue);
-  if (status != GCOMP_OK) {
-    gcomp_thread_pool_destroy(ctx->pool);
     gcomp_free(allocator, ctx);
     return status;
   }
@@ -325,16 +272,7 @@ void lz4_parallel_destroy(lz4_parallel_ctx_t * ctx) {
   if (!ctx) {
     return;
   }
-
-  if (!ctx->is_inline) {
-    // Wait for pending jobs
-    gcomp_thread_pool_wait(ctx->pool);
-
-    // Destroy in reverse order
-    gcomp_job_queue_destroy(ctx->queue);
-    gcomp_thread_pool_destroy(ctx->pool);
-  }
-
+  gcomp_parallel_block_destroy(ctx->block_ctx);
   gcomp_free(ctx->allocator, ctx);
 }
 
@@ -421,50 +359,8 @@ gcomp_status_t lz4_parallel_submit(
   if (!ctx || !job) {
     return GCOMP_ERR_INVALID_ARG;
   }
-
-  // Inline mode: compress immediately and add to result queue
-  if (ctx->is_inline) {
-    gcomp_status_t status = lz4_parallel_process_job(job);
-    job->base.status =
-        (status == GCOMP_OK) ? GCOMP_JOB_COMPLETE : GCOMP_JOB_ERROR;
-    job->base.result = status;
-
-    // Compute block checksum if enabled
-    if (ctx->block_checksum && status == GCOMP_OK) {
-      job->block_checksum =
-          gcomp_xxhash32(job->base.output, job->base.output_size, 0);
-    }
-
-    // Add to inline result queue
-    job->next_inline = NULL;
-    if (ctx->inline_tail) {
-      ctx->inline_tail->next_inline = job;
-    }
-    else {
-      ctx->inline_head = job;
-    }
-    ctx->inline_tail = job;
-    ctx->inline_count++;
-
-    return GCOMP_OK;
-  }
-
-  // Submit to job queue (assigns sequence number)
-  gcomp_status_t status = gcomp_job_queue_submit(ctx->queue, &job->base);
-  if (status != GCOMP_OK) {
-    return status;
-  }
-
-  // Submit to thread pool for execution
-  status = gcomp_thread_pool_submit(ctx->pool, lz4_parallel_process_job, job,
-      lz4_parallel_job_complete, ctx->queue);
-  if (status != GCOMP_OK) {
-    // Job is already in queue, but won't be processed
-    // This is a partial failure state - mark as error
-    gcomp_job_queue_complete(ctx->queue, &job->base, status);
-  }
-
-  return GCOMP_OK;
+  return gcomp_parallel_block_submit(ctx->block_ctx, job,
+      (gcomp_parallel_block_process_fn_t)lz4_parallel_process_job);
 }
 
 gcomp_status_t lz4_parallel_get_result(
@@ -472,101 +368,44 @@ gcomp_status_t lz4_parallel_get_result(
   if (!ctx || !job_out) {
     return GCOMP_ERR_INVALID_ARG;
   }
-
   *job_out = NULL;
-
-  // Inline mode: return from inline result queue
-  if (ctx->is_inline) {
-    if (!ctx->inline_head) {
-      return GCOMP_ERR_INVALID_ARG; // No pending jobs
-    }
-
-    // Pop from head
-    lz4_parallel_job_t * job = ctx->inline_head;
-    ctx->inline_head = job->next_inline;
-    if (!ctx->inline_head) {
-      ctx->inline_tail = NULL;
-    }
-    job->next_inline = NULL;
-    ctx->inline_count--;
-
-    *job_out = job;
-    // Propagate job error if the job failed
-    return job->base.result;
-  }
-
-  // Get next result from queue
-  gcomp_block_job_t * base_job = NULL;
+  gcomp_block_job_t * base = NULL;
   gcomp_status_t status =
-      gcomp_job_queue_get_next_result(ctx->queue, &base_job);
-  if (status != GCOMP_OK) {
+      gcomp_parallel_block_get_result(ctx->block_ctx, &base);
+  if (!base) {
     return status;
   }
-
-  // Cast back to LZ4 job (base is first member)
-  lz4_parallel_job_t * job = (lz4_parallel_job_t *)base_job;
-
-  // Compute block checksum if enabled and job succeeded
+  lz4_parallel_job_t * job = (lz4_parallel_job_t *)base;
   if (ctx->block_checksum && job->base.result == GCOMP_OK) {
     job->block_checksum =
         gcomp_xxhash32(job->base.output, job->base.output_size, 0);
   }
-
   *job_out = job;
-  // Propagate job error if the job failed
   return job->base.result;
 }
 
 bool lz4_parallel_result_ready(const lz4_parallel_ctx_t * ctx) {
-  if (!ctx) {
-    return false;
-  }
-  if (ctx->is_inline) {
-    return ctx->inline_head != NULL;
-  }
-  return gcomp_job_queue_result_ready(ctx->queue);
+  return ctx && gcomp_parallel_block_result_ready(ctx->block_ctx);
 }
 
 gcomp_status_t lz4_parallel_wait(lz4_parallel_ctx_t * ctx) {
   if (!ctx) {
     return GCOMP_ERR_INVALID_ARG;
   }
-
-  if (ctx->is_inline) {
-    return GCOMP_OK; // Nothing to wait for
-  }
-
-  return gcomp_thread_pool_wait(ctx->pool);
+  return gcomp_parallel_block_wait(ctx->block_ctx);
 }
 
 bool lz4_parallel_is_inline(const lz4_parallel_ctx_t * ctx) {
-  return !ctx || ctx->is_inline;
+  return !ctx || gcomp_parallel_block_is_inline(ctx->block_ctx);
 }
 
 uint32_t lz4_parallel_pending_count(const lz4_parallel_ctx_t * ctx) {
-  if (!ctx) {
-    return 0;
-  }
-  if (ctx->is_inline) {
-    return ctx->inline_count;
-  }
-  return gcomp_job_queue_pending_count(ctx->queue);
+  return ctx ? gcomp_parallel_block_pending_count(ctx->block_ctx) : 0;
 }
 
 gcomp_status_t lz4_parallel_reset(lz4_parallel_ctx_t * ctx) {
   if (!ctx) {
     return GCOMP_ERR_INVALID_ARG;
   }
-
-  if (ctx->is_inline) {
-    // Check that no jobs are pending
-    if (ctx->inline_count > 0) {
-      return GCOMP_ERR_INVALID_ARG;
-    }
-    ctx->inline_head = NULL;
-    ctx->inline_tail = NULL;
-    return GCOMP_OK;
-  }
-
-  return gcomp_job_queue_reset(ctx->queue);
+  return gcomp_parallel_block_reset(ctx->block_ctx);
 }

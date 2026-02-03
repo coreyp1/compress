@@ -10,6 +10,12 @@
  * regardless of the host system's native byte order. They are implemented
  * as inline functions for optimal performance.
  *
+ * **Caller contract:** No bounds checking is performed inside these helpers.
+ * The caller must ensure the buffer has at least N bytes available before
+ * calling the N-byte read/write function (e.g. 2 for gcomp_read_le16, 4 for
+ * gcomp_read_le32, 8 for gcomp_read_le64, and the corresponding write
+ * functions). Violating this contract causes out-of-bounds access.
+ *
  * Copyright 2026 by Corey Pennycuff
  */
 

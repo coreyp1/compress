@@ -320,9 +320,15 @@ void gzip_write_trailer(uint32_t crc32, uint32_t isize, uint8_t * buf);
 /**
  * @brief Free dynamically allocated fields in header_info.
  *
- * @param info Header info structure to clean up
+ * Uses the provided allocator so that the same allocator used for
+ * gcomp_malloc is used for gcomp_free (registry/plumbing consistency).
+ *
+ * @param info      Header info structure to clean up
+ * @param allocator Allocator used for extra/name/comment (may be NULL for
+ * default)
  */
-void gzip_header_info_free(gzip_header_info_t * info);
+void gzip_header_info_free(
+    gzip_header_info_t * info, const gcomp_allocator_t * allocator);
 
 /**
  * @brief Extract options to pass through to the inner deflate encoder/decoder.

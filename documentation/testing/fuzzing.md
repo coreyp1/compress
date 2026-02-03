@@ -51,6 +51,8 @@ make fuzz-roundtrip  # Fuzz encode+decode roundtrip
 # 4. Press Ctrl+C to stop fuzzing
 ```
 
+Decoder, encoder, and roundtrip fuzz harnesses exist for **deflate**, **gzip**, **LZ4**, and **zstd**. See the `fuzz/` directory for the full list of harnesses and `make help` (or the Fuzz Testing section below) for available targets.
+
 ## Available Fuzz Targets
 
 ### Decoder Fuzzer (`fuzz-decoder`)
@@ -391,6 +393,9 @@ fuzz/
 ├── fuzz_lz4_decoder.c       # LZ4 decoder fuzz harness
 ├── fuzz_lz4_encoder.c       # LZ4 encoder fuzz harness
 ├── fuzz_lz4_roundtrip.c     # LZ4 roundtrip fuzz harness
+├── fuzz_zstd_decoder.c      # Zstd decoder fuzz harness
+├── fuzz_zstd_encoder.c      # Zstd encoder fuzz harness
+├── fuzz_zstd_roundtrip.c    # Zstd roundtrip fuzz harness
 ├── generate_corpus.c        # Seed corpus generator
 ├── corpus/                  # Seed inputs (generated)
 │   ├── decoder/             # Raw deflate test inputs
@@ -401,7 +406,10 @@ fuzz/
 │   ├── gzip_roundtrip/      # Plaintext for gzip roundtrip
 │   ├── lz4_decoder/         # LZ4 frame format test inputs
 │   ├── lz4_encoder/         # Plaintext inputs for LZ4
-│   └── lz4_roundtrip/       # Plaintext for LZ4 roundtrip
+│   ├── lz4_roundtrip/       # Plaintext for LZ4 roundtrip
+│   ├── zstd_decoder/        # Zstd frame format test inputs
+│   ├── zstd_encoder/        # Plaintext inputs for zstd
+│   └── zstd_roundtrip/      # Plaintext for zstd roundtrip
 └── findings/                # AFL++ output (generated)
     ├── decoder/
     │   ├── crashes/         # Crash-inducing inputs
@@ -414,7 +422,10 @@ fuzz/
     ├── gzip_roundtrip/
     ├── lz4_decoder/
     ├── lz4_encoder/
-    └── lz4_roundtrip/
+    ├── lz4_roundtrip/
+    ├── zstd_decoder/
+    ├── zstd_encoder/
+    └── zstd_roundtrip/
 ```
 
 ## References

@@ -32,6 +32,9 @@ typedef struct gcomp_allocator_s {
 /**
  * @brief Get the default allocator (stdlib-backed).
  *
+ * The default allocator treats overflow in calloc(nitems, size) as allocation
+ * failure: if nitems * size would overflow, it returns NULL.
+ *
  * @return Pointer to a process-global allocator instance.
  */
 GCOMP_API const gcomp_allocator_t * gcomp_allocator_default(void);

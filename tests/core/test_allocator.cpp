@@ -10,7 +10,9 @@
 #include <ghoti.io/compress/registry.h>
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <cstdlib>
+#include <limits>
 
 struct CountCtx {
   size_t mallocs = 0;
@@ -62,6 +64,15 @@ TEST(Allocator, RegistryUsesProvidedAllocator) {
   // At minimum, registry allocation/free should have used the allocator.
   EXPECT_GE(ctx.callocs + ctx.mallocs, 1u);
   EXPECT_GE(ctx.frees, 1u);
+}
+
+TEST(Allocator, DefaultCallocOverflowReturnsNull) {
+  const gcomp_allocator_t * alloc = gcomp_allocator_default();
+  ASSERT_NE(alloc, nullptr);
+  // nitems * size would overflow size_t; default allocator must return NULL
+  size_t huge = std::numeric_limits<size_t>::max();
+  void * p = alloc->calloc_fn(alloc->ctx, huge, 2);
+  EXPECT_EQ(p, nullptr);
 }
 
 int main(int argc, char ** argv) {

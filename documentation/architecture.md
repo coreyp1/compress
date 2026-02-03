@@ -44,6 +44,14 @@ The library is organized into the following major components:
 │  │  │  lz4_parallel.c  │  │                  │  │  lz4_frame.c  │  │    │
 │  │  └──────────────────┘  └──────────────────┘  └───────────────┘  │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                           zstd/                                 │    │
+│  │  ┌──────────────────┐  ┌──────────────────┐  ┌───────────────┐  │    │
+│  │  │ zstd_encoder.c   │  │ zstd_decoder.c   │  │ zstd_huf.c    │  │    │
+│  │  │ zstd_parallel.c  │  │                  │  │ zstd_fse.c    │  │    │
+│  │  │                  │  │                  │  │ zstd_*.c      │  │    │
+│  │  └──────────────────┘  └──────────────────┘  └───────────────┘  │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -59,9 +67,41 @@ The library is organized into the following major components:
 | **Errors** | `errors.h` | Status codes and error handling |
 | **Method** | `method.h` | Method vtable interface |
 
+### Public API
+
+Public headers and main entry points (all under `include/ghoti.io/compress/`):
+
+| Header | Purpose |
+|--------|---------|
+| `compress.h` | Buffer-to-buffer encode/decode convenience API; version |
+| `stream.h` | Streaming encoder/decoder lifecycle, update/finish, callbacks |
+| `registry.h` | Method registry create/destroy, lookup, registration |
+| `options.h` | Configuration key/value system, schema |
+| `limits.h` | Safety limits, memory tracking, expansion ratio |
+| `errors.h` | Status codes and string conversion |
+| `allocator.h` | Memory allocation abstraction (malloc/free/calloc) |
+| `deflate.h` | Deflate-specific API (options, helpers) |
+| `gzip.h` | Gzip-specific API (options, helpers) |
+| `lz4.h` | LZ4-specific API (options, helpers) |
+| `zstd.h` | Zstd-specific API (options, helpers) |
+| `crc32.h` | CRC-32 computation (gzip) |
+| `xxhash32.h` | XXH32 hash (LZ4 content checksum) |
+| `xxhash64.h` | XXH64 hash (zstd checksum) |
+| `method.h` | Method vtable interface (for custom methods) |
+| `macros.h` | Cross-compiler macros (e.g. GCOMP_API) |
+
+Optional / build-time: `job_queue.h`, `thread_pool.h` (for parallel encode when used).
+
+### Internal-Only Headers
+
+The following are used only inside the library and are **not** part of the public API. Do not include them from application code; they may change or be removed without notice.
+
+- **Core internal:** `safe_math.h`, `endian.h`, `alloc_internal.h`, `registry_internal.h`, `stream_internal.h`, and other `*_internal.h` under `src/core/`.
+- **Method internal:** Each method has an `*_internal.h` (e.g. `deflate_internal.h`, `gzip_internal.h`, `lz4_internal.h`, `zstd_internal.h`) for shared state and helpers within that method only.
+
 ### Method Layer
 
-Each compression method (deflate, gzip, etc.) implements the `gcomp_method_t` interface:
+Each compression method (deflate, gzip, LZ4, zstd) implements the `gcomp_method_t` interface:
 
 ```c
 struct gcomp_method_s {
@@ -439,6 +479,10 @@ compress/
 │   ├── deflate.h                 # Deflate-specific API
 │   ├── gzip.h                    # Gzip-specific API
 │   ├── lz4.h                     # LZ4-specific API
+│   ├── zstd.h                    # Zstd-specific API
+│   ├── crc32.h                   # CRC-32 (gzip)
+│   ├── xxhash32.h                # XXH32 (LZ4)
+│   ├── xxhash64.h                # XXH64 (zstd)
 │   └── macros.h                  # Cross-compiler utilities
 │
 ├── src/
@@ -470,13 +514,19 @@ compress/
 │       │   ├── gzip_decoder.c    # Gzip wrapper decoder
 │       │   ├── gzip_format.c     # Header/trailer parsing
 │       │   └── gzip_register.c   # Vtable and registration
-│       └── lz4/
-│           ├── lz4_encoder.c     # LZ4 frame encoder
-│           ├── lz4_decoder.c     # LZ4 frame decoder
-│           ├── lz4_block.c       # Block compression/decompression
-│           ├── lz4_frame.c       # Frame header/trailer
-│           ├── lz4_parallel.c    # Parallel encoding support
-│           └── lz4_register.c    # Vtable and registration
+│       ├── lz4/
+│       │   ├── lz4_encoder.c     # LZ4 frame encoder
+│       │   ├── lz4_decoder.c     # LZ4 frame decoder
+│       │   ├── lz4_block.c       # Block compression/decompression
+│       │   ├── lz4_frame.c       # Frame header/trailer
+│       │   ├── lz4_parallel.c    # Parallel encoding support
+│       │   └── lz4_register.c    # Vtable and registration
+│       └── zstd/
+│           ├── zstd_encoder.c   # Zstd frame encoder
+│           ├── zstd_decoder.c   # Zstd frame decoder
+│           ├── zstd_parallel.c  # Parallel encoding support
+│           ├── zstd_*.c         # Format, FSE, Huffman, etc.
+│           └── zstd_register.c  # Vtable and registration
 │
 ├── tests/                        # Unit tests (Google Test)
 ├── examples/                     # Example programs
@@ -484,6 +534,25 @@ compress/
 ├── fuzz/                         # Fuzz testing harnesses
 └── documentation/                # Detailed documentation
 ```
+
+## Parallel Block Compression
+
+LZ4 and Zstd parallel encoders share a generic **parallel block** helper in `src/core/parallel_block.c` (internal API in `parallel_block.h`). The helper encapsulates:
+
+- **Inline vs threaded mode:** When `num_threads <= 1`, jobs run in the caller thread; otherwise a thread pool and job queue are used.
+- **Ordered results:** Jobs may complete out of order; the helper returns results in submission order via the existing `gcomp_job_queue_t` and an inline FIFO.
+- **Submit / get_result:** Methods submit an opaque job (whose first member is `gcomp_block_job_t`) and a process callback; they retrieve the next completed job in order.
+
+Method-specific logic (per-job allocation, block or frame compression, checksums) remains in `lz4_parallel.c` and `zstd_parallel.c`; the helper only manages context lifecycle, threading, and ordering.
+
+## Bit I/O and Format Differences
+
+Deflate and zstd use separate bit I/O code by design; the duplication is intentional.
+
+- **Deflate** uses LSB-first (least significant bit first) bit I/O in `src/methods/deflate/bitreader.c` and `bitwriter.c`, per RFC 1951.
+- **Zstd** uses MSB-first (most significant bit first) bit I/O in its own modules (`zstd_fse.c`, `zstd_huf.c`, `zstd_sequences.c`, etc.) per the Zstandard specification.
+
+Implementations are intentionally separate due to bit order and format-specific alignment; do not unify them.
 
 ## Related Documentation
 

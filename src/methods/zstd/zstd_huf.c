@@ -1195,7 +1195,7 @@ gcomp_status_t zstd_huf_build_enc_table(
 // FSE weight encoding: backward bit writer and helpers
 //
 
-#define HUF_FSE_WEIGHT_MAX_SYMBOL (HUF_MAX_BITS + 1) /* 0..12 */
+#define HUF_FSE_WEIGHT_MAX_SYMBOL (HUF_MAX_BITS + 1) // 0..12
 #define HUF_FSE_WEIGHT_TABLE_LOG 6
 #define HUF_FSE_WEIGHT_TABLE_SIZE (1U << HUF_FSE_WEIGHT_TABLE_LOG)
 
@@ -1311,7 +1311,7 @@ static gcomp_status_t zstd_huf_write_weights_fse(
   }
 
   // 2. Normalize to FSE norm_counts (table_log=6, sum = 64)
-  int16_t norm_counts[HUF_FSE_WEIGHT_MAX_SYMBOL + 2]; /* 0..12 + 1 */
+  int16_t norm_counts[HUF_FSE_WEIGHT_MAX_SYMBOL + 2]; // 0..12 + 1
   memset(norm_counts, 0, sizeof(norm_counts));
   unsigned table_size = HUF_FSE_WEIGHT_TABLE_SIZE;
 
@@ -1323,7 +1323,7 @@ static gcomp_status_t zstd_huf_write_weights_fse(
     // share.
     unsigned share = (counts[i] * table_size) / total_count;
     if (share == 0) {
-      norm_counts[i] = -1; /* less-than-one probability */
+      norm_counts[i] = -1; // less-than-one probability
     }
     else {
       unsigned n = 1;
@@ -1438,7 +1438,7 @@ static gcomp_status_t zstd_huf_write_weights_fse(
 
   size_t total_size = 1 + header_size + bitstream_size;
   if (total_size >= HUF_WEIGHTS_COMPRESSED) {
-    return GCOMP_ERR_LIMIT; /* FSE header byte must be < 128 */
+    return GCOMP_ERR_LIMIT; // FSE header byte must be < 128
   }
 
   // 6. Write header byte = compressed size (per RFC 8878: header_byte < 128)
