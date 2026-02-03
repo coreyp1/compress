@@ -525,7 +525,7 @@ compress/
 │           ├── zstd_encoder.c   # Zstd frame encoder
 │           ├── zstd_decoder.c   # Zstd frame decoder
 │           ├── zstd_parallel.c  # Parallel encoding support
-│           ├── zstd_*.c         # Format, FSE, Huffman, etc.
+│           ├── zstd_*.c         # Format, FSE, Huffman, sequences (decode + encode), etc.
 │           └── zstd_register.c  # Vtable and registration
 │
 ├── tests/                        # Unit tests (Google Test)
@@ -550,7 +550,7 @@ Method-specific logic (per-job allocation, block or frame compression, checksums
 Deflate and zstd use separate bit I/O code by design; the duplication is intentional.
 
 - **Deflate** uses LSB-first (least significant bit first) bit I/O in `src/methods/deflate/bitreader.c` and `bitwriter.c`, per RFC 1951.
-- **Zstd** uses MSB-first (most significant bit first) bit I/O in its own modules (`zstd_fse.c`, `zstd_huf.c`, `zstd_sequences.c`, etc.) per the Zstandard specification.
+- **Zstd** uses MSB-first (most significant bit first) bit I/O in its own modules (`zstd_fse.c`, `zstd_huf.c`, `zstd_sequences.c`, `zstd_sequences_encode.c`, etc.) per the Zstandard specification.
 
 Implementations are intentionally separate due to bit order and format-specific alignment; do not unify them.
 

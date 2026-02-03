@@ -31,7 +31,7 @@ Block type 3 (reserved) is explicitly rejected in the block/frame parsing path.
 ## Compressed blocks
 
 - **Literals section:** Raw, RLE, and Huffman-compressed formats implemented. Treeless_Compressed and repeat-mode tables are supported. Code paths: `zstd_literals.c`, `zstd_huf.c`.
-- **Sequences section:** FSE-encoded sequences with predefined and custom tables; repeat offsets and state updates. Code paths: `zstd_sequences.c`, `zstd_fse.c`.
+- **Sequences section:** FSE-encoded sequences with predefined and custom tables; repeat offsets and state updates. Code paths: `zstd_sequences.c` (decode), `zstd_sequences_encode.c` (encode), `zstd_fse.c`.
 
 Spec edge cases (e.g. empty literals, single-symbol Huffman) are handled; invalid or truncated data returns `GCOMP_ERR_CORRUPT` where appropriate.
 
