@@ -121,19 +121,34 @@ static const gcomp_option_schema_t g_zstd_option_schemas[] = {
         0,                                           // max_uint
         "Decoder: support concatenated zstd frames", // help
     },
-    // zstd.dictionary - Dictionary data (v1: not supported, must be empty)
+    // zstd.dictionary - Dictionary data (RFC 8878 §5; raw or formatted)
     {
-        "zstd.dictionary",                       // key
-        GCOMP_OPT_BYTES,                         // type
-        0,                                       // has_default (optional)
-        {.bytes = {NULL, 0}},                    // default_value
-        0,                                       // has_min
-        0,                                       // has_max
-        0,                                       // min_int
-        0,                                       // max_int
-        0,                                       // min_uint
-        0,                                       // max_uint
-        "Dictionary data (not supported in v1)", // help
+        "zstd.dictionary",    // key
+        GCOMP_OPT_BYTES,      // type
+        0,                    // has_default (optional)
+        {.bytes = {NULL, 0}}, // default_value
+        0,                    // has_min
+        0,                    // has_max
+        0,                    // min_int
+        0,                    // max_int
+        0,                    // min_uint
+        0,                    // max_uint
+        "Dictionary data (raw content or zstd --train format)", // help
+    },
+    // zstd.dictionary_id - Dictionary ID to write/validate (optional)
+    {
+        "zstd.dictionary_id", // key
+        GCOMP_OPT_UINT64,     // type
+        0,                    // has_default (optional)
+        {.ui64 = 0},          // default_value
+        0,                    // has_min
+        0,                    // has_max
+        0,                    // min_int
+        0,                    // max_int
+        0,                    // min_uint
+        0,                    // max_uint
+        "Dictionary ID (encoder: write to header; decoder: validate if "
+        "present)", // help
     },
     // limits.max_output_bytes - Maximum decompressed output
     {
@@ -228,6 +243,7 @@ static const char * const g_zstd_option_keys[] = {
     "zstd.content_size",
     "zstd.concat",
     "zstd.dictionary",
+    "zstd.dictionary_id",
     "zstd.job_size",
     "threads.count",
     "limits.max_output_bytes",
@@ -301,19 +317,9 @@ static gcomp_status_t zstd_create_encoder(gcomp_registry_t * registry,
     if (gcomp_options_get_uint64(options, "zstd.window_log", &window_log_val) ==
         GCOMP_OK) {
       if (!zstd_validate_window_log(window_log_val)) {
+        gcomp_encoder_set_error(*encoder_out, GCOMP_ERR_INVALID_ARG,
+            "zstd.window_log must be 0 (auto) or between 10 and 31");
         return GCOMP_ERR_INVALID_ARG;
-      }
-    }
-
-    // Reject dictionary option (v1: not supported)
-    const void * dict_data = NULL;
-    size_t dict_size = 0;
-    if (gcomp_options_get_bytes(
-            options, "zstd.dictionary", &dict_data, &dict_size) == GCOMP_OK) {
-      if (dict_data != NULL && dict_size > 0) {
-        gcomp_encoder_set_error(*encoder_out, GCOMP_ERR_UNSUPPORTED,
-            "zstd.dictionary is not supported in this version");
-        return GCOMP_ERR_UNSUPPORTED;
       }
     }
 
@@ -347,20 +353,6 @@ static gcomp_status_t zstd_create_decoder(gcomp_registry_t * registry,
     gcomp_options_t * options, gcomp_decoder_t ** decoder_out) {
   if (!decoder_out || !*decoder_out) {
     return GCOMP_ERR_INVALID_ARG;
-  }
-
-  if (options) {
-    // Reject dictionary option (v1: not supported)
-    const void * dict_data = NULL;
-    size_t dict_size = 0;
-    if (gcomp_options_get_bytes(
-            options, "zstd.dictionary", &dict_data, &dict_size) == GCOMP_OK) {
-      if (dict_data != NULL && dict_size > 0) {
-        gcomp_decoder_set_error(*decoder_out, GCOMP_ERR_UNSUPPORTED,
-            "zstd.dictionary is not supported in this version");
-        return GCOMP_ERR_UNSUPPORTED;
-      }
-    }
   }
 
   gcomp_status_t status = zstd_decoder_init(registry, options, *decoder_out);

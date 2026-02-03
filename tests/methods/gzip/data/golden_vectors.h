@@ -7,7 +7,7 @@
  * inputs. They serve as cross-validation to ensure our decoder produces correct
  * output.
  *
- * Generation script: see compress/tasks/compress-gzip.md
+ * Generation script and methodology are documented in the project.
  *
  * Copyright 2026 by Corey Pennycuff
  */

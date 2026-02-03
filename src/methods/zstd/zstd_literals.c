@@ -54,9 +54,12 @@
  * ## Decoder Behavior
  *
  * The decoder handles all four literal types and supports:
- * - Single-stream Huffman decoding (our encoder output)
- * - Four-stream Huffman decoding (external encoder output)
+ * - Single-stream Huffman decoding (literals section < 1024 bytes)
+ * - Four-stream Huffman decoding (literals section >= 1024 bytes; jump
+ *   table + 4 concatenated streams; encoder uses this when appropriate)
  * - Treeless mode (reuse Huffman table from previous block)
+ * - FSE-compressed Huffman weights (header_byte < 128; used when >127
+ *   symbols; encoder uses this when the weight table has >127 symbols)
  *
  * Reference:
  * https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md
@@ -158,53 +161,72 @@ static gcomp_status_t zstd_literals_parse_header(const uint8_t * src,
     // Compressed and treeless have similar header format
     switch (header->size_format) {
     case 0:
+      // Single stream: 3 bytes total, 10+10 bit sizes
+      // Per RFC 8878, size_format 0 for compressed = single stream with both
+      // sizes Parse as 24-bit little-endian: bits 0-1: type, 2-3: fmt, 4-13:
+      // regen, 14-23: comp
+      if (src_size < 3) {
+        return GCOMP_ERR_CORRUPT;
+      }
+      {
+        uint32_t val = (uint32_t)byte0 | ((uint32_t)src[1] << 8) |
+            ((uint32_t)src[2] << 16);
+        header->regenerated_size = (val >> 4) & 0x3FF; // 10 bits
+        header->compressed_size = (val >> 14) & 0x3FF; // 10 bits
+      }
+      header_size = 3;
+      header->four_streams = false;
+      break;
+
     case 1:
-      // Single stream: 1+1 or 2+2 bytes
-      if (header->size_format == 0) {
-        // 2 bytes total: 6-bit sizes (10+10 bits)
-        if (src_size < 2) {
-          return GCOMP_ERR_CORRUPT;
-        }
-        // Note: spec says this is rare/impossible for compressed literals
-        header->regenerated_size = (byte0 >> 4) | ((src[1] & 0x3F) << 4);
-        header->compressed_size = src[1] >> 6;
-        header_size = 2;
-        header->four_streams = false;
+      // 4 streams: 3 bytes total, 10+10 bit sizes
+      // Parse same as case 0 but four_streams = true
+      if (src_size < 3) {
+        return GCOMP_ERR_CORRUPT;
       }
-      else {
-        // 3 bytes total: 10+10 bit sizes
-        if (src_size < 3) {
-          return GCOMP_ERR_CORRUPT;
-        }
-        header->regenerated_size =
-            (byte0 >> 4) | ((uint32_t)(src[1] & 0x3F) << 4);
-        header->compressed_size = (src[1] >> 6) | ((uint32_t)src[2] << 2);
-        header_size = 3;
-        header->four_streams = false;
+      {
+        uint32_t val = (uint32_t)byte0 | ((uint32_t)src[1] << 8) |
+            ((uint32_t)src[2] << 16);
+        header->regenerated_size = (val >> 4) & 0x3FF; // 10 bits
+        header->compressed_size = (val >> 14) & 0x3FF; // 10 bits
       }
+      header_size = 3;
+      header->four_streams = true;
       break;
 
     case 2:
-      // 4 streams: 3 bytes, 14+14 bit sizes
+      // 4 streams: 4 bytes, 14+14 bit sizes
+      // Parse as 32-bit little-endian value:
+      // bits 0-1: type, bits 2-3: size_format, bits 4-17: regen, bits 18-31:
+      // comp
       if (src_size < 4) {
         return GCOMP_ERR_CORRUPT;
       }
-      header->regenerated_size = (byte0 >> 4) |
-          ((uint32_t)(src[1] & 0x3F) << 4) | ((uint32_t)(src[2] & 0x03) << 10);
-      header->compressed_size = (src[2] >> 2) | ((uint32_t)src[3] << 6);
+      {
+        uint32_t val = (uint32_t)byte0 | ((uint32_t)src[1] << 8) |
+            ((uint32_t)src[2] << 16) | ((uint32_t)src[3] << 24);
+        header->regenerated_size = (val >> 4) & 0x3FFF; // 14 bits
+        header->compressed_size = (val >> 18) & 0x3FFF; // 14 bits
+      }
       header_size = 4;
       header->four_streams = true;
       break;
 
     case 3:
-      // 4 streams: 4 bytes, 18+18 bit sizes
+      // 4 streams: 5 bytes, 18+18 bit sizes
+      // Parse as 40-bit little-endian value:
+      // bits 0-1: type, bits 2-3: size_format, bits 4-21: regen, bits 22-39:
+      // comp
       if (src_size < 5) {
         return GCOMP_ERR_CORRUPT;
       }
-      header->regenerated_size = (byte0 >> 4) | ((uint32_t)src[1] << 4) |
-          ((uint32_t)(src[2] & 0x03) << 12);
-      header->compressed_size =
-          (src[2] >> 2) | ((uint32_t)src[3] << 6) | ((uint32_t)src[4] << 14);
+      {
+        uint64_t val = (uint64_t)byte0 | ((uint64_t)src[1] << 8) |
+            ((uint64_t)src[2] << 16) | ((uint64_t)src[3] << 24) |
+            ((uint64_t)src[4] << 32);
+        header->regenerated_size = (val >> 4) & 0x3FFFF; // 18 bits
+        header->compressed_size = (val >> 22) & 0x3FFFF; // 18 bits
+      }
       header_size = 5;
       header->four_streams = true;
       break;
@@ -303,17 +325,37 @@ gcomp_status_t zstd_literals_decode(zstd_decoder_state_t * state,
 
       size_t decoded_size;
       if (header.four_streams) {
-        // 4-stream mode: read jump table (6 bytes)
-        if (huf_stream_size < 6) {
-          return GCOMP_ERR_CORRUPT;
-        }
+        // 4-stream mode: jump table present only if regenerated_size >= 1024
+        // Per RFC 8878: when regenerated_size < 1024, streams are equally
+        // divided
         uint32_t jump_table[3];
-        jump_table[0] = gcomp_read_le16(huf_stream);
-        jump_table[1] = gcomp_read_le16(huf_stream + 2);
-        jump_table[2] = gcomp_read_le16(huf_stream + 4);
+        const uint8_t * stream_data;
+        size_t stream_data_size;
+
+        if (header.regenerated_size >= 1024) {
+          // Jump table present (6 bytes)
+          if (huf_stream_size < 6) {
+            return GCOMP_ERR_CORRUPT;
+          }
+          jump_table[0] = gcomp_read_le16(huf_stream);
+          jump_table[1] = gcomp_read_le16(huf_stream + 2);
+          jump_table[2] = gcomp_read_le16(huf_stream + 4);
+          stream_data = huf_stream + 6;
+          stream_data_size = huf_stream_size - 6;
+        }
+        else {
+          // No jump table - streams are equally divided
+          // Segment_Size = (Compressed_Streams_Size + 3) / 4
+          uint32_t segment_size = (uint32_t)((huf_stream_size + 3) / 4);
+          jump_table[0] = segment_size;
+          jump_table[1] = segment_size * 2;
+          jump_table[2] = segment_size * 3;
+          stream_data = huf_stream;
+          stream_data_size = huf_stream_size;
+        }
 
         status = zstd_huf_decode_4streams(state->huf_table, max_bits,
-            huf_stream + 6, huf_stream_size - 6, jump_table, dst,
+            stream_data, stream_data_size, jump_table, dst,
             header.regenerated_size, &decoded_size);
       }
       else {
@@ -344,17 +386,37 @@ gcomp_status_t zstd_literals_decode(zstd_decoder_state_t * state,
       // Decode using existing Huffman table
       size_t decoded_size;
       if (header.four_streams) {
-        // 4-stream mode: read jump table (6 bytes)
-        if (literals_data_size < 6) {
-          return GCOMP_ERR_CORRUPT;
-        }
+        // 4-stream mode: jump table present only if regenerated_size >= 1024
+        // Per RFC 8878: when regenerated_size < 1024, streams are equally
+        // divided
         uint32_t jump_table[3];
-        jump_table[0] = gcomp_read_le16(literals_data);
-        jump_table[1] = gcomp_read_le16(literals_data + 2);
-        jump_table[2] = gcomp_read_le16(literals_data + 4);
+        const uint8_t * stream_data;
+        size_t stream_data_size;
+
+        if (header.regenerated_size >= 1024) {
+          // Jump table present (6 bytes)
+          if (literals_data_size < 6) {
+            return GCOMP_ERR_CORRUPT;
+          }
+          jump_table[0] = gcomp_read_le16(literals_data);
+          jump_table[1] = gcomp_read_le16(literals_data + 2);
+          jump_table[2] = gcomp_read_le16(literals_data + 4);
+          stream_data = literals_data + 6;
+          stream_data_size = header.compressed_size - 6;
+        }
+        else {
+          // No jump table - streams are equally divided
+          // Segment_Size = (Compressed_Streams_Size + 3) / 4
+          uint32_t segment_size = (uint32_t)((header.compressed_size + 3) / 4);
+          jump_table[0] = segment_size;
+          jump_table[1] = segment_size * 2;
+          jump_table[2] = segment_size * 3;
+          stream_data = literals_data;
+          stream_data_size = header.compressed_size;
+        }
 
         status = zstd_huf_decode_4streams(state->huf_table, state->huf_max_bits,
-            literals_data + 6, header.compressed_size - 6, jump_table, dst,
+            stream_data, stream_data_size, jump_table, dst,
             header.regenerated_size, &decoded_size);
       }
       else {
@@ -566,20 +628,28 @@ gcomp_status_t zstd_literals_encode_compressed(const uint8_t * literals,
         literals, literals_size, output, output_cap, output_len_out);
   }
 
-  // Encode literals as Huffman bitstream
+  // Encode literals as Huffman bitstream (1-stream or 4-stream)
+  // Per RFC 8878: use 4 streams when regenerated_size >= 1024 for faster
+  // decoding. 4-stream layout: jump table (6 bytes) + 4 concatenated streams.
   uint8_t * stream_buf = weights_buf + weights_size;
   size_t stream_cap = weights_cap - weights_size;
 
   size_t stream_size;
-  status = zstd_huf_encode_1stream(&huf_table, literals, literals_size,
-      stream_buf, stream_cap, &stream_size);
+  if (literals_size >= 1024) {
+    status = zstd_huf_encode_4streams(&huf_table, literals, literals_size,
+        stream_buf, stream_cap, &stream_size);
+  }
+  else {
+    status = zstd_huf_encode_1stream(&huf_table, literals, literals_size,
+        stream_buf, stream_cap, &stream_size);
+  }
   if (status != GCOMP_OK) {
     // Fall back to raw encoding
     return zstd_literals_encode_raw(
         literals, literals_size, output, output_cap, output_len_out);
   }
 
-  // Total compressed size = weights + stream
+  // Total compressed size = weights + stream(s)
   size_t compressed_size = weights_size + stream_size;
 
   // Check if compression is beneficial.
@@ -593,17 +663,18 @@ gcomp_status_t zstd_literals_encode_compressed(const uint8_t * literals,
   }
 
   // Write literals header for compressed type
-  // Type = 2 (compressed), single stream
-  // Header format depends on sizes
+  // Type = 2 (compressed). size_format 0 = single stream, 1/2/3 = 4 streams.
+  // Decoder uses four_streams = true only for format 1, 2, 3.
   size_t header_size;
   uint8_t header_buf[5];
+  bool use_4streams = (literals_size >= 1024);
 
   if (literals_size <= 1023 && compressed_size <= 1023) {
-    // 3-byte header: size_format = 1 (10+10 bit sizes)
-    // byte0: type(2) | size_format(2) | regen_size_lo(4)
-    // byte1: regen_size_hi(6) | comp_size_lo(2)
-    // byte2: comp_size_hi(8)
-    header_buf[0] = (uint8_t)(((literals_size & 0x0F) << 4) | (1 << 2) |
+    // 3-byte header: size_format = 0 (single stream) or 1 (4 streams)
+    // 10+10 bit sizes. Use format 0 for single stream so decoder gets
+    // four_streams = false.
+    uint8_t fmt = use_4streams ? 1 : 0;
+    header_buf[0] = (uint8_t)(((literals_size & 0x0F) << 4) | (fmt << 2) |
         LITERALS_TYPE_COMPRESSED);
     header_buf[1] = (uint8_t)(((literals_size >> 4) & 0x3F) |
         ((compressed_size & 0x03) << 6));
@@ -611,9 +682,7 @@ gcomp_status_t zstd_literals_encode_compressed(const uint8_t * literals,
     header_size = 3;
   }
   else if (literals_size <= 16383 && compressed_size <= 16383) {
-    // 4-byte header: size_format = 2 (14+14 bit sizes, 4 streams flag)
-    // We're using single stream, so this is actually format for large single
-    // stream
+    // 4-byte header: size_format = 2 (14+14 bit sizes, 4 streams)
     // byte0: type(2) | size_format(2) | regen_size_lo(4)
     // byte1: regen_size_mid(6) | regen_size_hi(2)
     // byte2: comp_size_lo(6) | regen_size_top(2)

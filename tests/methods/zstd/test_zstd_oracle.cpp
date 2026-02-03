@@ -32,6 +32,7 @@
 #define popen _popen
 #define pclose _pclose
 #else
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 #include <ghoti.io/compress/errors.h>
@@ -190,6 +191,24 @@ protected:
     return result;
   }
 
+  // Run a command (same environment as popen). Returns true if exit code is 0.
+  bool runCommand(const std::string & cmd) {
+    FILE * pipe = popen(cmd.c_str(), "r");
+    if (!pipe) {
+      return false;
+    }
+    char buffer[4096];
+    while (fread(buffer, 1, sizeof(buffer), pipe) > 0) {
+      (void)0;
+    }
+    int st = pclose(pipe);
+#ifdef _WIN32
+    return (st == 0);
+#else
+    return (WIFEXITED(st) && WEXITSTATUS(st) == 0);
+#endif
+  }
+
   // Use Python zstandard to compress data
   std::vector<uint8_t> pythonZstdCompress(
       const std::vector<uint8_t> & data, bool content_checksum = false) {
@@ -290,6 +309,252 @@ protected:
     std::stringstream cmd;
     cmd << "zstd -dc \"" << tmpfile << "\"";
 
+    std::vector<uint8_t> result = runCommandGetOutput(cmd.str());
+    unlink(tmpfile.c_str());
+    return result;
+  }
+
+  // Create a raw content dictionary (>= 8 bytes). Same bytes used by our
+  // encoder/decoder and written to a temp file for zstd CLI / Python.
+  // Returns (dict_bytes, dict_path). Caller should unlink dict_path when done.
+  std::pair<std::vector<uint8_t>, std::string> createDictionaryFromSamples() {
+    const size_t raw_dict_size = 8 * 1024;
+    std::vector<uint8_t> dict_content(raw_dict_size);
+    test_helpers_generate_random(
+        dict_content.data(), dict_content.size(), 54321u);
+    std::string dictpath = writeTempFile(dict_content, ".dict");
+    if (dictpath.empty()) {
+      return {{}, ""};
+    }
+    return {dict_content, dictpath};
+  }
+
+  // Create a formatted dictionary using zstd --train so that external encoders
+  // (zstd CLI, Python) write Dictionary_ID and our decoder can match.
+  // Returns (dict_bytes, dict_path). Path empty on failure. Caller unlinks.
+  // Requires zstd CLI. Uses --maxdict and -B so small samples suffice.
+  std::pair<std::vector<uint8_t>, std::string> createFormattedDictionary() {
+    if (!has_zstd_cli_) {
+      return {{}, ""};
+    }
+    const size_t sample_size = 4096;
+    const int num_samples = 6;
+    std::vector<std::string> paths;
+    paths.reserve(static_cast<size_t>(num_samples));
+    for (int i = 0; i < num_samples; i++) {
+      std::vector<uint8_t> sample(sample_size + i * 128);
+      test_helpers_generate_random(
+          sample.data(), sample.size(), static_cast<uint32_t>(12345 + i * 111));
+      std::string p = writeTempFile(sample, ".sample");
+      if (p.empty()) {
+        for (const auto & x : paths)
+          unlink(x.c_str());
+        return {{}, ""};
+      }
+      paths.push_back(p);
+    }
+    std::string dictpath = writeTempFile(std::vector<uint8_t>(), ".zstd");
+    if (dictpath.empty()) {
+      for (const auto & x : paths)
+        unlink(x.c_str());
+      return {{}, ""};
+    }
+    std::stringstream cmd;
+    cmd << "zstd --train --maxdict=512 -B2048";
+    for (const auto & x : paths) {
+      cmd << " \"" << x << "\"";
+    }
+    cmd << " -o \"" << dictpath << "\"";
+#ifdef _WIN32
+    cmd << " >NUL 2>&1";
+#else
+    cmd << " 2>/dev/null";
+#endif
+    bool ok = runCommand(cmd.str());
+    for (const auto & x : paths) {
+      unlink(x.c_str());
+    }
+    if (!ok) {
+      unlink(dictpath.c_str());
+      return {{}, ""};
+    }
+    std::vector<uint8_t> dict_bytes = readFile(dictpath);
+    if (dict_bytes.empty() || dict_bytes.size() < 8) {
+      unlink(dictpath.c_str());
+      return {{}, ""};
+    }
+    return {dict_bytes, dictpath};
+  }
+
+  // Compress with our library (optional dictionary)
+  std::vector<uint8_t> gcompCompressWithDict(const std::vector<uint8_t> & data,
+      const std::vector<uint8_t> * dict_data = nullptr) {
+    gcomp_options_t * opts = nullptr;
+    if (gcomp_options_create(&opts) != GCOMP_OK) {
+      return {};
+    }
+    if (dict_data && !dict_data->empty()) {
+      if (gcomp_options_set_bytes(opts, "zstd.dictionary", dict_data->data(),
+              dict_data->size()) != GCOMP_OK) {
+        gcomp_options_destroy(opts);
+        return {};
+      }
+    }
+    size_t comp_capacity = (data.size() * 12 / 10) + 1024;
+    std::vector<uint8_t> compressed(std::max(comp_capacity, size_t(1024)));
+    size_t comp_size = 0;
+    gcomp_status_t status =
+        gcomp_encode_buffer(registry_, "zstd", opts, data.data(), data.size(),
+            compressed.data(), compressed.size(), &comp_size);
+    gcomp_options_destroy(opts);
+    if (status != GCOMP_OK) {
+      return {};
+    }
+    compressed.resize(comp_size);
+    return compressed;
+  }
+
+  // Decompress with our library (optional dictionary)
+  std::vector<uint8_t> gcompDecompressWithDict(
+      const std::vector<uint8_t> & data,
+      const std::vector<uint8_t> * dict_data = nullptr,
+      size_t expected_size = 0) {
+    if (data.empty()) {
+      return {};
+    }
+    gcomp_options_t * opts = nullptr;
+    if (gcomp_options_create(&opts) != GCOMP_OK) {
+      return {};
+    }
+    if (gcomp_options_set_uint64(opts, "limits.max_expansion_ratio", 0) !=
+        GCOMP_OK) {
+      gcomp_options_destroy(opts);
+      return {};
+    }
+    if (dict_data && !dict_data->empty()) {
+      if (gcomp_options_set_bytes(opts, "zstd.dictionary", dict_data->data(),
+              dict_data->size()) != GCOMP_OK) {
+        gcomp_options_destroy(opts);
+        return {};
+      }
+    }
+    size_t decomp_capacity =
+        expected_size > 0 ? expected_size + 1024 : data.size() * 100 + 1024;
+    std::vector<uint8_t> decompressed(decomp_capacity);
+    size_t decomp_size = 0;
+    gcomp_status_t status =
+        gcomp_decode_buffer(registry_, "zstd", opts, data.data(), data.size(),
+            decompressed.data(), decompressed.size(), &decomp_size);
+    gcomp_options_destroy(opts);
+    if (status != GCOMP_OK) {
+      return {};
+    }
+    decompressed.resize(decomp_size);
+    return decompressed;
+  }
+
+  // Use zstd CLI to compress with dictionary
+  std::vector<uint8_t> zstdCliCompressWithDict(
+      const std::vector<uint8_t> & data, const std::string & dict_path) {
+    if (!has_zstd_cli_ || dict_path.empty()) {
+      return {};
+    }
+    std::string datafile = writeTempFile(data);
+    if (datafile.empty()) {
+      return {};
+    }
+    std::stringstream cmd;
+    cmd << "zstd -D \"" << dict_path << "\" -c \"" << datafile << "\"";
+    std::vector<uint8_t> result = runCommandGetOutput(cmd.str());
+    unlink(datafile.c_str());
+    return result;
+  }
+
+  // Use zstd CLI to decompress with dictionary
+  std::vector<uint8_t> zstdCliDecompressWithDict(
+      const std::vector<uint8_t> & data, const std::string & dict_path) {
+    if (!has_zstd_cli_ || data.empty() || dict_path.empty()) {
+      return {};
+    }
+    std::string tmpfile = writeTempFile(data, ".zst");
+    if (tmpfile.empty()) {
+      return {};
+    }
+    std::stringstream cmd;
+    cmd << "zstd -D \"" << dict_path << "\" -dc \"" << tmpfile << "\"";
+    std::vector<uint8_t> result = runCommandGetOutput(cmd.str());
+    unlink(tmpfile.c_str());
+    return result;
+  }
+
+  // Use Python zstandard to compress with dictionary
+  std::vector<uint8_t> pythonZstdCompressWithDict(
+      const std::vector<uint8_t> & data, const std::string & dict_path) {
+    if (!has_python_zstd_ || dict_path.empty()) {
+      return {};
+    }
+    std::string datafile = writeTempFile(data);
+    if (datafile.empty()) {
+      return {};
+    }
+    std::string escaped_data = datafile;
+    std::string escaped_dict = dict_path;
+#ifdef _WIN32
+    for (char & c : escaped_data) {
+      if (c == '\\')
+        c = '/';
+    }
+    for (char & c : escaped_dict) {
+      if (c == '\\')
+        c = '/';
+    }
+#endif
+    std::stringstream cmd;
+    cmd << getPythonCommand() << " -c \""
+        << "import zstandard,sys;"
+        << "dict_data=zstandard.ZstdCompressionDict(open('" << escaped_dict
+        << "','rb').read());"
+        << "cctx=zstandard.ZstdCompressor(level=3,dict_data=dict_data);"
+        << "data=open('" << escaped_data << "','rb').read();"
+        << "sys.stdout.buffer.write(cctx.compress(data));"
+        << "\"";
+    std::vector<uint8_t> result = runCommandGetOutput(cmd.str());
+    unlink(datafile.c_str());
+    return result;
+  }
+
+  // Use Python zstandard to decompress with dictionary
+  std::vector<uint8_t> pythonZstdDecompressWithDict(
+      const std::vector<uint8_t> & data, const std::string & dict_path) {
+    if (!has_python_zstd_ || data.empty() || dict_path.empty()) {
+      return {};
+    }
+    std::string tmpfile = writeTempFile(data, ".zst");
+    if (tmpfile.empty()) {
+      return {};
+    }
+    std::string escaped_tmp = tmpfile;
+    std::string escaped_dict = dict_path;
+#ifdef _WIN32
+    for (char & c : escaped_tmp) {
+      if (c == '\\')
+        c = '/';
+    }
+    for (char & c : escaped_dict) {
+      if (c == '\\')
+        c = '/';
+    }
+#endif
+    std::stringstream cmd;
+    cmd << getPythonCommand() << " -c \""
+        << "import zstandard,sys,io;"
+        << "dict_data=zstandard.ZstdCompressionDict(open('" << escaped_dict
+        << "','rb').read());"
+        << "dctx=zstandard.ZstdDecompressor(dict_data=dict_data);"
+        << "data=open('" << escaped_tmp << "','rb').read();"
+        << "reader=dctx.stream_reader(io.BytesIO(data));"
+        << "sys.stdout.buffer.write(reader.read());"
+        << "\"";
     std::vector<uint8_t> result = runCommandGetOutput(cmd.str());
     unlink(tmpfile.c_str());
     return result;
@@ -700,6 +965,108 @@ TEST_F(ZstdOracleTest, PythonEncoder_OurDecoder_LargeData) {
   ASSERT_EQ(decompressed.size(), original.size()) << "Size mismatch";
   ASSERT_EQ(memcmp(decompressed.data(), original.data(), original.size()), 0)
       << "Data mismatch";
+}
+
+//
+// Tests: Dictionary compression (oracle)
+//
+
+TEST_F(ZstdOracleTest, OurEncoder_ZstdCli_WithDictionary) {
+  if (!has_zstd_cli_) {
+    GTEST_SKIP() << "zstd CLI not available";
+  }
+
+  auto [dict_bytes, dict_path] = createDictionaryFromSamples();
+  if (dict_bytes.empty() || dict_path.empty()) {
+    GTEST_SKIP() << "Could not create dictionary";
+  }
+
+  std::vector<uint8_t> original = generateTextData(4 * 1024);
+  std::vector<uint8_t> compressed =
+      gcompCompressWithDict(original, &dict_bytes);
+  ASSERT_FALSE(compressed.empty()) << "Our compression with dict failed";
+
+  std::vector<uint8_t> decompressed =
+      zstdCliDecompressWithDict(compressed, dict_path);
+  ASSERT_EQ(decompressed.size(), original.size()) << "Size mismatch";
+  ASSERT_EQ(memcmp(decompressed.data(), original.data(), original.size()), 0)
+      << "Data mismatch";
+
+  unlink(dict_path.c_str());
+}
+
+TEST_F(ZstdOracleTest, ZstdCli_OurDecoder_WithDictionary) {
+  if (!has_zstd_cli_) {
+    GTEST_SKIP() << "zstd CLI not available";
+  }
+
+  auto [dict_bytes, dict_path] = createDictionaryFromSamples();
+  if (dict_bytes.empty() || dict_path.empty()) {
+    GTEST_SKIP() << "Could not create dictionary";
+  }
+
+  std::vector<uint8_t> original = generateTextData(4 * 1024);
+  std::vector<uint8_t> compressed =
+      zstdCliCompressWithDict(original, dict_path);
+  ASSERT_FALSE(compressed.empty()) << "zstd CLI compression with dict failed";
+
+  std::vector<uint8_t> decompressed =
+      gcompDecompressWithDict(compressed, &dict_bytes, original.size());
+  ASSERT_FALSE(decompressed.empty()) << "Our decoder failed to decode";
+  ASSERT_EQ(decompressed.size(), original.size()) << "Size mismatch";
+  ASSERT_EQ(memcmp(decompressed.data(), original.data(), original.size()), 0)
+      << "Data mismatch";
+
+  unlink(dict_path.c_str());
+}
+
+TEST_F(ZstdOracleTest, OurEncoder_PythonDecoder_WithDictionary) {
+  if (!has_python_zstd_) {
+    GTEST_SKIP() << "Python zstandard not available";
+  }
+
+  auto [dict_bytes, dict_path] = createDictionaryFromSamples();
+  if (dict_bytes.empty() || dict_path.empty()) {
+    GTEST_SKIP() << "Could not create dictionary";
+  }
+
+  std::vector<uint8_t> original = generateTextData(4 * 1024);
+  std::vector<uint8_t> compressed =
+      gcompCompressWithDict(original, &dict_bytes);
+  ASSERT_FALSE(compressed.empty()) << "Our compression with dict failed";
+
+  std::vector<uint8_t> decompressed =
+      pythonZstdDecompressWithDict(compressed, dict_path);
+  ASSERT_EQ(decompressed.size(), original.size()) << "Size mismatch";
+  ASSERT_EQ(memcmp(decompressed.data(), original.data(), original.size()), 0)
+      << "Data mismatch";
+
+  unlink(dict_path.c_str());
+}
+
+TEST_F(ZstdOracleTest, PythonEncoder_OurDecoder_WithDictionary) {
+  if (!has_python_zstd_) {
+    GTEST_SKIP() << "Python zstandard not available";
+  }
+
+  auto [dict_bytes, dict_path] = createDictionaryFromSamples();
+  if (dict_bytes.empty() || dict_path.empty()) {
+    GTEST_SKIP() << "Could not create dictionary";
+  }
+
+  std::vector<uint8_t> original = generateTextData(4 * 1024);
+  std::vector<uint8_t> compressed =
+      pythonZstdCompressWithDict(original, dict_path);
+  ASSERT_FALSE(compressed.empty()) << "Python compression with dict failed";
+
+  std::vector<uint8_t> decompressed =
+      gcompDecompressWithDict(compressed, &dict_bytes, original.size());
+  ASSERT_FALSE(decompressed.empty()) << "Our decoder failed to decode";
+  ASSERT_EQ(decompressed.size(), original.size()) << "Size mismatch";
+  ASSERT_EQ(memcmp(decompressed.data(), original.data(), original.size()), 0)
+      << "Data mismatch";
+
+  unlink(dict_path.c_str());
 }
 
 int main(int argc, char ** argv) {

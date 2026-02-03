@@ -96,10 +96,11 @@ Compressed blocks contain two sections:
 | `zstd.level` | int64 | 3 | Compression level (1-22). Higher = better compression, slower |
 | `zstd.checksum` | bool | false | Enable content checksum (xxHash64, low 32 bits) |
 | `zstd.window_log` | uint64 | 0 (auto) | Window log size (10-31). 0 = auto from level |
+| `zstd.dictionary` | bytes | (none) | Optional dictionary (raw content or formatted per RFC 8878 §5) |
+| `zstd.dictionary_id` | uint32 | (none) | Dictionary ID to write (encoder) or validate (decoder); used when dictionary provided |
 | `zstd.content_size` | uint64 | (none) | Content size to write in header (optional) |
-| `zstd.dictionary_id` | uint32 | (none) | Dictionary ID (parsing only, not yet used) |
 | `zstd.concat` | bool | false | Decoder: support concatenated frames |
-| `zstd.job_size` | uint64 | 0 (auto) | Encoder: job size for parallel compression (min 64KB) |
+| `zstd.job_size` | uint64 | 0 (auto) | Encoder: job size for parallel compression (64KB–16MB, 0=auto) |
 
 ### Threading options (encoder only)
 
@@ -176,6 +177,53 @@ This enables:
 - Progress reporting during decompression
 - Pre-allocation of output buffers
 - Validation that all data was received
+
+## Dictionary compression
+
+When compressing or decompressing many small files with similar structure (e.g. log lines, JSON records), a **dictionary** improves ratio by providing shared initial context. The encoder uses the dictionary as initial window history; the decoder preloads the same content so matches can be resolved.
+
+### Options
+
+| Option | Encoder | Decoder |
+|--------|---------|---------|
+| `zstd.dictionary` | bytes: raw or formatted dictionary (RFC 8878 §5) | Same: must match encoder’s dictionary |
+| `zstd.dictionary_id` | uint32: ID written in frame header (optional) | Validated against frame header when present |
+
+### Encoder usage
+
+```c
+// Build or load a dictionary (e.g. from samples)
+uint8_t *dict_bytes = ...;
+size_t dict_len = ...;
+
+gcomp_options_t *opts = NULL;
+gcomp_options_create(&opts);
+gcomp_options_set_bytes(opts, "zstd.dictionary", dict_bytes, dict_len);
+gcomp_options_set_uint32(opts, "zstd.dictionary_id", 1);  // optional
+
+gcomp_encoder_t *enc = NULL;
+gcomp_encoder_create(registry, "zstd", opts, &enc);
+// ... encode data; frame header will include dictionary ID when set ...
+```
+
+### Decoder usage
+
+```c
+gcomp_options_t *opts = NULL;
+gcomp_options_create(&opts);
+gcomp_options_set_bytes(opts, "zstd.dictionary", dict_bytes, dict_len);
+
+gcomp_decoder_t *dec = NULL;
+gcomp_decoder_create(registry, "zstd", opts, &dec);
+// ... decode; window is preloaded with dictionary content ...
+```
+
+If the frame header specifies a dictionary ID and the decoder was created without a dictionary (or with a different ID for formatted dictionaries), the decoder returns `GCOMP_ERR_UNSUPPORTED` or `GCOMP_ERR_CORRUPT` with a message indicating the required dictionary ID. Raw dictionaries (no magic) are accepted for any frame dictionary ID to support external encoders that use content-derived IDs.
+
+### Dictionary format
+
+- **Raw**: Any bytes, no magic. `dict_id` is 0; encoder can still set `zstd.dictionary_id` in the header for identification.
+- **Formatted** (RFC 8878 §5): Magic 0xEC30A437, 4-byte dictionary ID, entropy tables (Huffman, FSE), repeat offsets, then content. Encoder and decoder can use the entropy tables and repeat offsets from the dictionary for the first block.
 
 ## Parallel compression
 
@@ -454,17 +502,22 @@ Huffman coding is used for literals (the non-matched bytes in compressed blocks)
 3. Estimate compressed size (weights + bitstream)
 4. Use Huffman only if savings exceed 10%; otherwise use raw literals
 
-**Format requirements (RFC 8878):**
+**Format requirements (RFC 8878 Section 4.2.1.2):**
 - Maximum code length: 11 bits
-- Weights encoded as direct 4-bit values (header byte < 128) or FSE-compressed
+- **Weight description**: One header byte then weight data.
+  - **Header byte ≥ 128**: Direct representation. Number_Of_Symbols = header_byte − 127 (1–128 symbols). Weights follow as 4-bit values packed high nibble first.
+  - **Header byte < 128**: FSE-compressed weights. header_byte = compressed size in bytes. Followed by FSE table header and backward FSE bitstream encoding the weight sequence (used when the Huffman table has more than 127 symbols).
 - Bitstream written backwards with marker bit for decoder synchronization
+
+**Four-stream mode (RFC 8878 Section 4.2.1.4):**
+- When the literals section has **regenerated_size ≥ 1024**, the encoder uses four parallel Huffman streams: a 3×2-byte jump table (little-endian) followed by the concatenated streams. The decoder supports both single-stream and four-stream formats.
 
 **Implementation notes:**
 > The 32-byte minimum and 10% savings threshold are encoder heuristics in this implementation, not format requirements. The Zstd specification allows encoders complete freedom to choose raw, RLE, or Huffman for any literals section. Other Zstd encoders (e.g., the reference `libzstd`) may use different decision criteria.
 
 **Decoding:**
-- Single-stream mode: Sequential decoding
-- Four-stream mode: Parallel decoding for better throughput (used by external encoders for large literal sections)
+- Single-stream mode: Sequential decoding (literals section < 1024 bytes)
+- Four-stream mode: Parallel decoding with jump table (literals section ≥ 1024 bytes); encoder and decoder both support this format
 
 ## Interoperability
 
@@ -476,10 +529,8 @@ This implementation is fully compatible with:
 
 Files created by this library can be decompressed by standard tools, and files created by standard tools can be decompressed by this library.
 
-**Current limitations:**
-- Dictionary compression not yet supported (parsed but not used)
-- FSE-compressed Huffman weight tables not yet supported in decoder (very large symbol sets from external encoders may use these)
-- Encoder uses single-stream Huffman only (4-stream encoding not implemented)
+**Features not yet implemented:**
+- Dictionary compression (frame header dictionary ID field is parsed but dictionaries are not used)
 
 ## Comparison with other methods
 

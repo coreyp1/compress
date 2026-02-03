@@ -83,6 +83,7 @@ TEST_F(ZstdParallelTest, CreateInlineContext) {
       .window_log = 0,
       .max_memory_bytes = 0,
       .allocator = nullptr,
+      .mem_tracker = nullptr,
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
@@ -104,6 +105,7 @@ TEST_F(ZstdParallelTest, CreateThreadedContext) {
       .window_log = 0,
       .max_memory_bytes = 0,
       .allocator = nullptr,
+      .mem_tracker = nullptr,
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
@@ -125,6 +127,7 @@ TEST_F(ZstdParallelTest, CreateZeroThreadsIsInline) {
       .window_log = 0,
       .max_memory_bytes = 0,
       .allocator = nullptr,
+      .mem_tracker = nullptr,
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
@@ -145,6 +148,7 @@ TEST_F(ZstdParallelTest, NullCtxOutFails) {
       .window_log = 0,
       .max_memory_bytes = 0,
       .allocator = nullptr,
+      .mem_tracker = nullptr,
   };
 
   EXPECT_EQ(zstd_parallel_create(&config, nullptr), GCOMP_ERR_INVALID_ARG);
@@ -164,6 +168,7 @@ TEST_F(ZstdParallelTest, AllocAndFreeJob) {
       .window_log = 0,
       .max_memory_bytes = 0,
       .allocator = nullptr,
+      .mem_tracker = nullptr,
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
@@ -195,6 +200,7 @@ TEST_F(ZstdParallelTest, AllocJobNullJobOutFails) {
       .window_log = 0,
       .max_memory_bytes = 0,
       .allocator = nullptr,
+      .mem_tracker = nullptr,
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
@@ -219,6 +225,7 @@ TEST_F(ZstdParallelTest, InlineSubmitGetResult) {
       .window_log = 0,
       .max_memory_bytes = 0,
       .allocator = nullptr,
+      .mem_tracker = nullptr,
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
@@ -264,6 +271,7 @@ TEST_F(ZstdParallelTest, InlineMultipleJobs) {
       .window_log = 0,
       .max_memory_bytes = 0,
       .allocator = nullptr,
+      .mem_tracker = nullptr,
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
@@ -313,6 +321,7 @@ TEST_F(ZstdParallelTest, InlineWithChecksum) {
       .window_log = 0,
       .max_memory_bytes = 0,
       .allocator = nullptr,
+      .mem_tracker = nullptr,
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
@@ -353,6 +362,7 @@ TEST_F(ZstdParallelTest, ThreadedSubmitGetResult) {
       .window_log = 0,
       .max_memory_bytes = 0,
       .allocator = nullptr,
+      .mem_tracker = nullptr,
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
@@ -391,6 +401,7 @@ TEST_F(ZstdParallelTest, ThreadedMultipleJobsOrderPreserved) {
       .window_log = 0,
       .max_memory_bytes = 0,
       .allocator = nullptr,
+      .mem_tracker = nullptr,
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
@@ -447,6 +458,7 @@ TEST_F(ZstdParallelTest, ConcatenatedFramesDecodable) {
       .window_log = 0,
       .max_memory_bytes = 0,
       .allocator = nullptr,
+      .mem_tracker = nullptr,
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
@@ -514,6 +526,7 @@ TEST_F(ZstdParallelTest, MemoryLimitReducesInFlight) {
       .window_log = 0,
       .max_memory_bytes = 1024 * 1024, // 1MB limit
       .allocator = nullptr,
+      .mem_tracker = nullptr,
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
@@ -541,6 +554,7 @@ TEST_F(ZstdParallelTest, WaitInlineMode) {
       .window_log = 0,
       .max_memory_bytes = 0,
       .allocator = nullptr,
+      .mem_tracker = nullptr,
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
@@ -562,6 +576,7 @@ TEST_F(ZstdParallelTest, ResetAfterAllJobsRetrieved) {
       .window_log = 0,
       .max_memory_bytes = 0,
       .allocator = nullptr,
+      .mem_tracker = nullptr,
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
@@ -595,6 +610,7 @@ TEST_F(ZstdParallelTest, ResetWithPendingJobsFails) {
       .window_log = 0,
       .max_memory_bytes = 0,
       .allocator = nullptr,
+      .mem_tracker = nullptr,
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
@@ -631,6 +647,7 @@ TEST_F(ZstdParallelTest, EmptyInput) {
       .window_log = 0,
       .max_memory_bytes = 0,
       .allocator = nullptr,
+      .mem_tracker = nullptr,
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
@@ -664,6 +681,7 @@ TEST_F(ZstdParallelTest, RLECompressibleInput) {
       .window_log = 0,
       .max_memory_bytes = 0,
       .allocator = nullptr,
+      .mem_tracker = nullptr,
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
@@ -702,6 +720,7 @@ TEST_F(ZstdParallelTest, LargeInputMultipleBlocks) {
       .window_log = 0,
       .max_memory_bytes = 0,
       .allocator = nullptr,
+      .mem_tracker = nullptr,
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
@@ -753,6 +772,7 @@ TEST_F(ZstdParallelTest, GetResultNoPendingFails) {
       .window_log = 0,
       .max_memory_bytes = 0,
       .allocator = nullptr,
+      .mem_tracker = nullptr,
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
@@ -778,6 +798,7 @@ TEST_F(ZstdParallelTest, JobSizeAutoDefault) {
       .window_log = 0,
       .max_memory_bytes = 0,
       .allocator = nullptr,
+      .mem_tracker = nullptr,
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
@@ -799,6 +820,7 @@ TEST_F(ZstdParallelTest, JobSizeMinEnforced) {
       .window_log = 0,
       .max_memory_bytes = 0,
       .allocator = nullptr,
+      .mem_tracker = nullptr,
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
@@ -820,6 +842,7 @@ TEST_F(ZstdParallelTest, JobSizeMaxEnforced) {
       .window_log = 0,
       .max_memory_bytes = 0,
       .allocator = nullptr,
+      .mem_tracker = nullptr,
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;

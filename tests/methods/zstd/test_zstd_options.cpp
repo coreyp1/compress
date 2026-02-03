@@ -1,7 +1,7 @@
 /**
  * @file test_zstd_options.cpp
  *
- * Tests for zstd option parsing and validation (Z1.3).
+ * Tests for zstd option parsing and validation.
  *
  * Copyright 2026 by Corey Pennycuff
  */

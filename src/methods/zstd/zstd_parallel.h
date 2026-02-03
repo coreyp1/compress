@@ -37,6 +37,7 @@
 #include <ghoti.io/compress/allocator.h>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/job_queue.h>
+#include <ghoti.io/compress/limits.h>
 #include <ghoti.io/compress/thread_pool.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -81,6 +82,8 @@ typedef struct {
   uint8_t window_log;                  ///< Window log (10-31)
   uint64_t max_memory_bytes;           ///< Memory limit
   const gcomp_allocator_t * allocator; ///< Allocator (NULL = default)
+  gcomp_memory_tracker_t *
+      mem_tracker; ///< Optional: track allocations (NULL = do not track)
 } zstd_parallel_config_t;
 
 /**

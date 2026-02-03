@@ -78,6 +78,38 @@ TEST_F(ZstdEncoderTest, EncodeWithChecksum) {
   gcomp_options_destroy(opts);
 }
 
+TEST_F(ZstdEncoderTest, EncodeWithContentSizeInHeader) {
+  const char data[] = "Content size in header test.";
+  const size_t data_len = strlen(data);
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  gcomp_options_set_uint64(opts, "zstd.content_size", data_len);
+
+  gcomp_encoder_t * enc = nullptr;
+  ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", opts, &enc), GCOMP_OK);
+  std::vector<uint8_t> out(256);
+  gcomp_buffer_t in = {(void *)data, data_len, 0};
+  gcomp_buffer_t ob = {out.data(), out.size(), 0};
+  EXPECT_EQ(gcomp_encoder_update(enc, &in, &ob), GCOMP_OK);
+  EXPECT_EQ(gcomp_encoder_finish(enc, &ob), GCOMP_OK);
+  EXPECT_GT(ob.used, 0u);
+
+  // Decoder validates content size when present; roundtrip should succeed
+  gcomp_decoder_t * dec = nullptr;
+  ASSERT_EQ(gcomp_decoder_create(registry_, "zstd", nullptr, &dec), GCOMP_OK);
+  std::vector<uint8_t> decoded(4096);
+  gcomp_buffer_t din = {out.data(), ob.used, 0};
+  gcomp_buffer_t dout = {decoded.data(), decoded.size(), 0};
+  EXPECT_EQ(gcomp_decoder_update(dec, &din, &dout), GCOMP_OK);
+  EXPECT_EQ(gcomp_decoder_finish(dec, &dout), GCOMP_OK);
+  EXPECT_EQ(dout.used, data_len);
+  EXPECT_EQ(memcmp(decoded.data(), data, data_len), 0);
+
+  gcomp_decoder_destroy(dec);
+  gcomp_encoder_destroy(enc);
+  gcomp_options_destroy(opts);
+}
+
 TEST_F(ZstdEncoderTest, ResetAndReuse) {
   gcomp_encoder_t * enc = nullptr;
   ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", nullptr, &enc), GCOMP_OK);
@@ -128,6 +160,99 @@ TEST_F(ZstdEncoderTest, NullInputWithSize) {
   gcomp_buffer_t in = {nullptr, 100, 0};
   gcomp_buffer_t ob = {out.data(), out.size(), 0};
   EXPECT_EQ(gcomp_encoder_update(enc, &in, &ob), GCOMP_ERR_INVALID_ARG);
+  gcomp_encoder_destroy(enc);
+}
+
+TEST_F(ZstdEncoderTest, EncodeWithVariousLevels) {
+  const char data[] = "Encode with different compression levels.";
+  const int levels[] = {1, 3, 9, 19, 22};
+  for (int level : levels) {
+    gcomp_options_t * opts = nullptr;
+    ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+    gcomp_options_set_int64(opts, "zstd.level", level);
+    gcomp_encoder_t * enc = nullptr;
+    ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", opts, &enc), GCOMP_OK);
+    std::vector<uint8_t> out(512);
+    gcomp_buffer_t in = {(void *)data, strlen(data), 0};
+    gcomp_buffer_t ob = {out.data(), out.size(), 0};
+    EXPECT_EQ(gcomp_encoder_update(enc, &in, &ob), GCOMP_OK)
+        << "level " << level;
+    EXPECT_EQ(gcomp_encoder_finish(enc, &ob), GCOMP_OK) << "level " << level;
+    EXPECT_GT(ob.used, 0u) << "level " << level;
+    gcomp_encoder_destroy(enc);
+    gcomp_options_destroy(opts);
+  }
+}
+
+TEST_F(ZstdEncoderTest, EncodeWithVariousWindowSizes) {
+  std::vector<uint8_t> data(4096);
+  for (size_t i = 0; i < data.size(); i++)
+    data[i] = (uint8_t)(i * 17 + i / 256);
+  const unsigned window_logs[] = {16, 20};
+  for (unsigned wlog : window_logs) {
+    gcomp_options_t * opts = nullptr;
+    ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+    gcomp_options_set_uint64(opts, "zstd.window_log", wlog);
+    gcomp_encoder_t * enc = nullptr;
+    ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", opts, &enc), GCOMP_OK);
+    std::vector<uint8_t> out(data.size() + 256);
+    gcomp_buffer_t in = {data.data(), data.size(), 0};
+    gcomp_buffer_t ob = {out.data(), out.size(), 0};
+    EXPECT_EQ(gcomp_encoder_update(enc, &in, &ob), GCOMP_OK)
+        << "window_log " << wlog;
+    EXPECT_EQ(gcomp_encoder_finish(enc, &ob), GCOMP_OK)
+        << "window_log " << wlog;
+    EXPECT_GT(ob.used, 0u) << "window_log " << wlog;
+    gcomp_encoder_destroy(enc);
+    gcomp_options_destroy(opts);
+  }
+}
+
+TEST_F(ZstdEncoderTest, Encode1ByteInputChunks) {
+  const char data[] = "One byte at a time";
+  gcomp_encoder_t * enc = nullptr;
+  ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", nullptr, &enc), GCOMP_OK);
+  std::vector<uint8_t> out(strlen(data) + 256);
+  gcomp_buffer_t ob = {out.data(), out.size(), 0};
+  size_t offset = 0;
+  while (offset < strlen(data)) {
+    gcomp_buffer_t in = {(void *)(data + offset), 1, 0};
+    gcomp_status_t st = gcomp_encoder_update(enc, &in, &ob);
+    ASSERT_EQ(st, GCOMP_OK);
+    offset += in.used;
+  }
+  EXPECT_EQ(gcomp_encoder_finish(enc, &ob), GCOMP_OK);
+  EXPECT_GT(ob.used, 0u);
+  gcomp_encoder_destroy(enc);
+}
+
+TEST_F(ZstdEncoderTest, Encode1ByteOutputBuffer) {
+  const char data[] = "Test";
+  gcomp_encoder_t * enc = nullptr;
+  ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", nullptr, &enc), GCOMP_OK);
+  std::vector<uint8_t> result;
+  uint8_t one_byte[1];
+  gcomp_buffer_t in = {(void *)data, strlen(data), 0};
+
+  while (in.used < in.size) {
+    gcomp_buffer_t ob = {one_byte, 1, 0};
+    gcomp_status_t st = gcomp_encoder_update(enc, &in, &ob);
+    ASSERT_EQ(st, GCOMP_OK);
+    if (ob.used > 0)
+      result.insert(result.end(), one_byte, one_byte + ob.used);
+  }
+
+  bool done = false;
+  while (!done) {
+    gcomp_buffer_t ob = {one_byte, 1, 0};
+    gcomp_status_t st = gcomp_encoder_finish(enc, &ob);
+    ASSERT_EQ(st, GCOMP_OK);
+    if (ob.used > 0)
+      result.insert(result.end(), one_byte, one_byte + ob.used);
+    else
+      done = true;
+  }
+  EXPECT_GT(result.size(), 0u);
   gcomp_encoder_destroy(enc);
 }
 

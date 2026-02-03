@@ -329,6 +329,28 @@ TEST_F(ZstdAllocatorTest, PeakMemoryTracked) {
   EXPECT_GT(tracker_.peak_allocated, 10000);
 }
 
+TEST_F(ZstdAllocatorTest, MemoryTrackingAllocationsMatchFrees) {
+  // Verify every allocation is freed (no leaked blocks).
+  // After create/use/destroy of encoder and decoder, alloc_count should equal
+  // free_count for the zstd operations (registry may have extra allocs).
+  size_t initial_alloc = tracker_.alloc_count;
+  size_t initial_free = tracker_.free_count;
+
+  std::vector<uint8_t> input = {'M', 'e', 'm', 'o', 'r', 'y'};
+  auto compressed = compress(input.data(), input.size());
+  ASSERT_FALSE(compressed.empty());
+
+  auto decompressed = decompress(compressed.data(), compressed.size());
+  ASSERT_EQ(decompressed.size(), input.size());
+
+  // Every allocation from encoder/decoder create/use/destroy should have been
+  // freed. So the delta in allocs should equal the delta in frees.
+  size_t alloc_delta = tracker_.alloc_count - initial_alloc;
+  size_t free_delta = tracker_.free_count - initial_free;
+  EXPECT_EQ(alloc_delta, free_delta)
+      << "Allocations and frees should match (no leaked blocks)";
+}
+
 //
 // Multiple Operations Tests
 //
@@ -400,7 +422,7 @@ TEST_F(ZstdAllocatorTest, EncoderResetRetainsBuffers) {
   status = gcomp_encoder_finish(encoder, &out_buf);
   ASSERT_EQ(status, GCOMP_OK);
 
-  // Check minimal new allocations after reset (buffers retained per BP-4)
+  // Check minimal new allocations after reset (buffers retained)
   // Allow some allocations for header rebuilding, etc.
   size_t new_allocs = tracker_.alloc_count - allocs_after_first;
   EXPECT_LE(new_allocs, 2) << "Expected minimal allocations after reset";
@@ -445,7 +467,7 @@ TEST_F(ZstdAllocatorTest, DecoderResetRetainsBuffers) {
   status = gcomp_decoder_finish(decoder, &out_buf);
   ASSERT_EQ(status, GCOMP_OK);
 
-  // Check minimal new allocations after reset (buffers retained per BP-4)
+  // Check minimal new allocations after reset (buffers retained)
   size_t new_allocs = tracker_.alloc_count - allocs_after_first;
   EXPECT_LE(new_allocs, 2) << "Expected minimal allocations after reset";
 

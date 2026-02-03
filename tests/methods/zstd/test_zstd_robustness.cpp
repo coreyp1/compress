@@ -642,7 +642,7 @@ TEST_F(ZstdRobustnessTest, DecoderAlternatingUpdateAndReset) {
 }
 
 //
-// Buffer pointer validation (SAFE-1) tests
+// Buffer pointer validation tests
 //
 
 TEST_F(ZstdRobustnessTest, EncoderNullInputDataWithNonzeroSize) {

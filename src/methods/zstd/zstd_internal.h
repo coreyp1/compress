@@ -53,7 +53,8 @@ extern "C" {
 // Zstd Frame Format Constants
 //
 
-#define ZSTD_MAGIC 0xFD2FB528U               ///< Zstd frame magic number
+#define ZSTD_MAGIC 0xFD2FB528U      ///< Zstd frame magic number
+#define ZSTD_DICT_MAGIC 0xEC30A437U ///< Zstd dictionary magic (RFC 8878 §5)
 #define ZSTD_MAGIC_SKIPPABLE_MIN 0x184D2A50U ///< Skippable frame magic (min)
 #define ZSTD_MAGIC_SKIPPABLE_MAX 0x184D2A5FU ///< Skippable frame magic (max)
 #define ZSTD_HEADER_MIN_SIZE 2               ///< FHD(1) + min window/size
@@ -225,6 +226,40 @@ typedef struct {
 } zstd_sequence_t;
 
 //
+// Parsed Zstd Dictionary (RFC 8878 Section 5)
+//
+typedef struct {
+  uint32_t dict_id;
+  const uint8_t * content;
+  size_t content_size;
+  bool has_entropy_tables;
+
+  zstd_huf_entry_t * huf_table;
+  size_t huf_table_size;
+  unsigned huf_max_bits;
+
+  zstd_fse_entry_t * fse_ll_table;
+  zstd_fse_entry_t * fse_ml_table;
+  zstd_fse_entry_t * fse_of_table;
+  size_t fse_ll_size;
+  size_t fse_ml_size;
+  size_t fse_of_size;
+  unsigned fse_ll_log;
+  unsigned fse_ml_log;
+  unsigned fse_of_log;
+
+  uint32_t rep_offset_1;
+  uint32_t rep_offset_2;
+  uint32_t rep_offset_3;
+
+  const gcomp_allocator_t * _allocator;
+} zstd_dict_parsed_t;
+
+gcomp_status_t zstd_dict_parse(const uint8_t * buf, size_t buf_size,
+    const gcomp_allocator_t * alloc, zstd_dict_parsed_t * out);
+void zstd_dict_destroy(zstd_dict_parsed_t * parsed);
+
+//
 // Encoder State Structure
 //
 
@@ -280,6 +315,13 @@ typedef struct {
   uint32_t rep_offset_1;
   uint32_t rep_offset_2;
   uint32_t rep_offset_3;
+
+  // Dictionary (optional; from zstd.dictionary option)
+  uint8_t * dict_bytes;
+  size_t dict_size;
+  zstd_dict_parsed_t dict_parsed;
+  uint8_t * dict_block_buffer; ///< [dict_content][block] for match finder
+  size_t dict_block_buffer_capacity;
 
   // Memory tracking
   gcomp_memory_tracker_t mem_tracker;
@@ -394,6 +436,12 @@ typedef struct {
 
   // Options
   bool concat_enabled;
+
+  // Dictionary (optional; from zstd.dictionary option)
+  uint8_t * dict_bytes; ///< Owned copy of dictionary buffer (NULL if none)
+  size_t dict_size;     ///< Size of dict_bytes
+  zstd_dict_parsed_t
+      dict_parsed; ///< Parsed view (content points into dict_bytes)
 
   // Limit configuration
   uint64_t max_output_bytes;
@@ -599,6 +647,27 @@ gcomp_status_t zstd_fse_build_decoding_table(const uint8_t * src,
     size_t * bytes_read_out);
 
 /**
+ * @brief Write FSE table header from normalized counts (for encoding).
+ *
+ * Used by the Huffman encoder when the weight table has >127 symbols
+ * (FSE-compressed weights). Produces the same bit format that
+ * zstd_fse_read_table_header() expects.
+ */
+gcomp_status_t zstd_fse_write_table_header(uint8_t * dst, size_t dst_cap,
+    const int16_t * norm_counts, unsigned max_symbol, unsigned table_log,
+    size_t * bytes_written_out);
+
+/**
+ * @brief Build FSE decoding table from normalized counts (for encoding).
+ *
+ * Used with zstd_fse_write_table_header() when encoding Huffman weight
+ * sequences with FSE. The encoder uses the table to drive the FSE state
+ * machine in reverse order.
+ */
+gcomp_status_t zstd_fse_build_table_from_norm(const int16_t * norm_counts,
+    unsigned max_symbol, unsigned table_log, zstd_fse_entry_t * table);
+
+/**
  * @brief Build predefined literal length FSE table.
  */
 gcomp_status_t zstd_fse_build_predefined_ll_table(
@@ -704,20 +773,19 @@ gcomp_status_t zstd_huf_build_enc_table(
 /**
  * @brief Write Huffman table description (weights) to output.
  *
- * Writes the Huffman tree in Zstd's weight format. Uses direct 4-bit
- * representation (header byte < 128) where weights are packed as nibbles.
+ * Writes the Huffman tree in Zstd's weight format (RFC 8878 Section 4.2.1.2).
  *
- * Format: [header_byte][weight_pairs...]
- *   - header_byte = num_symbols - 1 (must be < 128)
- *   - Each byte contains two 4-bit weights: (w[i] << 4) | w[i+1]
+ * - Direct (1..128 symbols): header_byte = 127 + num_weights (>= 128),
+ *   then 4-bit weights packed high nibble first.
+ * - FSE-compressed (>127 symbols): header_byte = compressed size (< 128),
+ *   then FSE table header + backward FSE bitstream (see zstd_huf.c).
  *
  * @param table Encoding table with weights (from zstd_huf_build_enc_table).
  * @param output Output buffer.
  * @param output_cap Output buffer capacity.
  * @param output_len_out Output: number of bytes written.
  * @return GCOMP_OK on success,
- *         GCOMP_ERR_LIMIT if output buffer too small,
- *         GCOMP_ERR_UNSUPPORTED if num_symbols > 128 (would need FSE weights).
+ *         GCOMP_ERR_LIMIT if output buffer too small or FSE size >= 128.
  */
 gcomp_status_t zstd_huf_write_weights(const zstd_huf_enc_table_t * table,
     uint8_t * output, size_t output_cap, size_t * output_len_out);
@@ -743,6 +811,25 @@ gcomp_status_t zstd_huf_write_weights(const zstd_huf_enc_table_t * table,
  *         GCOMP_ERR_CORRUPT if a literal has no code in the table.
  */
 gcomp_status_t zstd_huf_encode_1stream(const zstd_huf_enc_table_t * table,
+    const uint8_t * literals, size_t literals_size, uint8_t * output,
+    size_t output_cap, size_t * output_len_out);
+
+/**
+ * @brief Encode literals using Huffman coding (4 streams).
+ *
+ * Used for large literal sections (>= 1024 bytes). Splits literals into
+ * 4 roughly equal segments, encodes each independently, and writes a
+ * jump table (3 × 2-byte LE offsets) followed by the 4 concatenated streams.
+ *
+ * @param table Encoding table (from zstd_huf_build_enc_table).
+ * @param literals Input literal bytes to encode.
+ * @param literals_size Number of literals.
+ * @param output Output buffer.
+ * @param output_cap Output buffer capacity.
+ * @param output_len_out Output: number of bytes written.
+ * @return GCOMP_OK on success
+ */
+gcomp_status_t zstd_huf_encode_4streams(const zstd_huf_enc_table_t * table,
     const uint8_t * literals, size_t literals_size, uint8_t * output,
     size_t output_cap, size_t * output_len_out);
 
@@ -863,10 +950,16 @@ void zstd_mf_reset(zstd_match_finder_t * mf);
 
 /**
  * @brief Generate sequences from input data.
+ *
+ * When dict_prefix_size > 0, data = [dict_content][block]; the first
+ * dict_prefix_size bytes are loaded into the hash/chain and sequences
+ * are generated only for the block part (positions
+ * dict_prefix_size..data_size).
  */
 gcomp_status_t zstd_mf_generate_sequences(zstd_match_finder_t * mf,
-    const uint8_t * data, size_t data_size, zstd_sequence_t * sequences,
-    size_t max_sequences, size_t * num_sequences_out, uint8_t * literals_out,
+    const uint8_t * data, size_t data_size, size_t dict_prefix_size,
+    zstd_sequence_t * sequences, size_t max_sequences,
+    size_t * num_sequences_out, uint8_t * literals_out,
     size_t * literals_size_out, uint32_t * rep_offset_1,
     uint32_t * rep_offset_2, uint32_t * rep_offset_3);
 

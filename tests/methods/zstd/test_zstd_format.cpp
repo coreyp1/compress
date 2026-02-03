@@ -155,25 +155,18 @@ TEST_F(ZstdFormatTest, FrameHeaderDescriptor) {
 
 TEST_F(ZstdFormatTest, SingleSegmentFlag) {
   // Test that both single segment and non-single segment frames decode
-  // correctly
+  // correctly. Whether single segment is used is an implementation detail;
+  // just verify the frame is valid either way.
   const char data[] = "Small data for segment test";
   auto compressed = compress(data, strlen(data));
   ASSERT_GE(compressed.size(), 5u);
 
-  uint8_t fhd = compressed[4];
-  bool single_segment = (fhd & 0x20) != 0;
-
-  // Whether single segment is used is an implementation detail
-  // Just verify the frame is valid either way
   gcomp_status_t status;
   auto decompressed =
       decompress(compressed.data(), compressed.size(), nullptr, &status);
   EXPECT_EQ(status, GCOMP_OK);
   ASSERT_EQ(decompressed.size(), strlen(data));
   EXPECT_EQ(memcmp(decompressed.data(), data, strlen(data)), 0);
-
-  // Log what mode was actually used for visibility
-  GTEST_LOG_(INFO) << "Single segment: " << (single_segment ? "yes" : "no");
 }
 
 TEST_F(ZstdFormatTest, ChecksumFlagEnabled) {

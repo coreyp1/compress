@@ -574,7 +574,11 @@ static gcomp_status_t zstd_sequences_execute(zstd_decoder_state_t * state,
     uint8_t ml_code = state->fse_match_table[seq_state.ml_state].symbol;
 
     // Read extra bits for offset first (important: offset extra bits read
-    // first)
+    // first). Per spec offset = 2^code + extra; code must be at most 31 to
+    // avoid undefined shift on 32-bit type.
+    if (of_code > 31) {
+      return GCOMP_ERR_CORRUPT;
+    }
     uint32_t offset;
     if (of_code > 0) {
       uint32_t extra = zstd_seq_bit_reader_read(&br, of_code);

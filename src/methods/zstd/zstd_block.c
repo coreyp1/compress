@@ -205,14 +205,29 @@ gcomp_status_t zstd_block_compress(zstd_encoder_state_t * state,
   // Try compressed block if we have a match finder and sufficient input
   if (state && state->match_finder && state->seq_buffer &&
       state->literals_buffer && input_len >= MIN_COMPRESSION_SIZE) {
-    // Generate sequences using match finder
     size_t num_sequences = 0;
     size_t literals_size = 0;
+    const uint8_t * mf_data = input;
+    size_t mf_data_size = input_len;
+    size_t dict_prefix = 0;
 
-    gcomp_status_t status = zstd_mf_generate_sequences(state->match_finder,
-        input, input_len, state->seq_buffer, state->seq_buffer_capacity,
-        &num_sequences, state->literals_buffer, &literals_size,
-        &state->rep_offset_1, &state->rep_offset_2, &state->rep_offset_3);
+    if (state->dict_parsed.content && state->dict_parsed.content_size > 0 &&
+        state->dict_block_buffer) {
+      size_t copy_len = state->dict_parsed.content_size;
+      if (copy_len + input_len <= state->dict_block_buffer_capacity) {
+        memcpy(state->dict_block_buffer, state->dict_parsed.content, copy_len);
+        memcpy(state->dict_block_buffer + copy_len, input, input_len);
+        mf_data = state->dict_block_buffer;
+        mf_data_size = copy_len + input_len;
+        dict_prefix = copy_len;
+      }
+    }
+
+    gcomp_status_t status =
+        zstd_mf_generate_sequences(state->match_finder, mf_data, mf_data_size,
+            dict_prefix, state->seq_buffer, state->seq_buffer_capacity,
+            &num_sequences, state->literals_buffer, &literals_size,
+            &state->rep_offset_1, &state->rep_offset_2, &state->rep_offset_3);
 
     if (status == GCOMP_OK && num_sequences > 0) {
       // We have sequences - try to compress

@@ -26,6 +26,7 @@
 #include <ghoti.io/compress/stream.h>
 #include <ghoti.io/compress/zstd.h>
 #include <gtest/gtest.h>
+#include <string>
 #include <vector>
 
 //
@@ -289,6 +290,23 @@ TEST_F(ZstdCorruptionTest, TruncatedDictId) {
   EXPECT_EQ(tryDecode(data, sizeof(data)), GCOMP_ERR_CORRUPT);
 }
 
+// Maximum header size (18 bytes) parses without overflow.
+// Header = magic(4) + FHD(1) + window(1) + dict_id(4) + fcs(8) = 18.
+// Use dict_id=0 so decoder does not require a dictionary.
+TEST_F(ZstdCorruptionTest, HeaderWithMaximumOptionalFieldsParsed) {
+  uint8_t data[] = {
+      0x28, 0xB5, 0x2F, 0xFD, // Magic
+      0xC3,                   // FHD: not single_segment, dict_id_flag=3,
+                              // fcs_flag=3 (no checksum/reserved/unused)
+      0x00,                   // Window: 2^10 = 1KB
+      0x00, 0x00, 0x00, 0x00, // Dict ID 0 (4 bytes LE)
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // FCS 8 bytes (0)
+      0x01, 0x00, 0x00, // Block: last, raw, size 0
+  };
+  gcomp_status_t status = tryDecode(data, sizeof(data));
+  EXPECT_EQ(status, GCOMP_OK);
+}
+
 //
 // Block Header Tests
 //
@@ -448,6 +466,75 @@ TEST_F(ZstdCorruptionTest, CorruptedCompressedBlockRandomBytes) {
   gcomp_status_t status = tryDecode(compressed.data(), compressed.size());
   // Accept either CORRUPT or OK (if corruption was in non-critical area)
   EXPECT_TRUE(status == GCOMP_ERR_CORRUPT || status == GCOMP_OK);
+}
+
+//
+// Malformed FSE / Huffman / Invalid match offset (Z7.7)
+//
+
+TEST_F(ZstdCorruptionTest, MalformedFSETables) {
+  // Data that produces a compressed block (sequences use FSE)
+  std::string data;
+  for (int i = 0; i < 200; ++i) {
+    data += "Hello world ";
+  }
+  auto compressed = compress(data.data(), data.size());
+  ASSERT_GT(compressed.size(), 25u);
+
+  // Corrupt several bytes in the block payload so FSE table/symbol decode
+  // fails. Frame header + block header is at least 10 bytes; corrupt from start
+  // of block data and a bit beyond to ensure we hit FSE or sequence data.
+  for (size_t off = 10; off < compressed.size() && off < 25; ++off) {
+    compressed[off] ^= 0xFF;
+  }
+
+  EXPECT_EQ(tryDecode(compressed.data(), compressed.size()), GCOMP_ERR_CORRUPT);
+}
+
+TEST_F(ZstdCorruptionTest, MalformedHuffmanTables) {
+  // Data that produces a block with Huffman-compressed literals (diverse,
+  // large enough for encoder to choose Huffman)
+  std::vector<uint8_t> data(2500);
+  for (size_t i = 0; i < data.size(); ++i) {
+    data[i] = static_cast<uint8_t>((i * 31 + 17) % 256);
+  }
+  auto compressed = compress(data.data(), data.size());
+  ASSERT_GT(compressed.size(), 20u);
+
+  // Corrupt start of block payload (literals section / Huffman header)
+  size_t off = 10;
+  if (off < compressed.size()) {
+    compressed[off] ^= 0xFF;
+  }
+  if (off + 1 < compressed.size()) {
+    compressed[off + 1] ^= 0xAA;
+  }
+
+  EXPECT_EQ(tryDecode(compressed.data(), compressed.size()), GCOMP_ERR_CORRUPT);
+}
+
+TEST_F(ZstdCorruptionTest, InvalidMatchOffset) {
+  // Use data that produces a compressed block with sequences (not RLE). Corrupt
+  // bytes in the sequences section so decoded offset is invalid or FSE fails.
+  std::string data;
+  for (int i = 0; i < 200; ++i) {
+    data += "Hello world ";
+  }
+  auto compressed = compress(data.data(), data.size());
+  ASSERT_GT(compressed.size(), 20u);
+
+  // Corrupt bytes near the end of block payload (sequences section); avoid
+  // corrupting content checksum (last 4 bytes if present).
+  size_t payload_end = compressed.size();
+  if (payload_end > 6) {
+    payload_end -= 5;
+  }
+  if (payload_end > 12) {
+    compressed[payload_end - 1] ^= 0xFF;
+    compressed[payload_end - 2] ^= 0xFF;
+  }
+
+  EXPECT_EQ(tryDecode(compressed.data(), compressed.size()), GCOMP_ERR_CORRUPT);
 }
 
 //

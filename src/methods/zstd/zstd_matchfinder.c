@@ -386,8 +386,9 @@ static void zstd_mf_insert(zstd_match_finder_t * mf, const uint8_t * data,
  * @return GCOMP_OK on success
  */
 gcomp_status_t zstd_mf_generate_sequences(zstd_match_finder_t * mf,
-    const uint8_t * data, size_t data_size, zstd_sequence_t * sequences,
-    size_t max_sequences, size_t * num_sequences_out, uint8_t * literals_out,
+    const uint8_t * data, size_t data_size, size_t dict_prefix_size,
+    zstd_sequence_t * sequences, size_t max_sequences,
+    size_t * num_sequences_out, uint8_t * literals_out,
     size_t * literals_size_out, uint32_t * rep_offset_1,
     uint32_t * rep_offset_2, uint32_t * rep_offset_3) {
   if (!mf || !data || !sequences || !num_sequences_out || !literals_out ||
@@ -395,15 +396,20 @@ gcomp_status_t zstd_mf_generate_sequences(zstd_match_finder_t * mf,
     return GCOMP_ERR_INVALID_ARG;
   }
 
-  // Reset match finder for this block
   zstd_mf_reset(mf);
 
-  size_t pos = 0;
-  size_t lit_start = 0;
+  if (dict_prefix_size > 0 &&
+      dict_prefix_size + MF_HASH_READ_SIZE <= data_size) {
+    for (size_t i = 0; i + MF_HASH_READ_SIZE <= dict_prefix_size; i++) {
+      zstd_mf_insert(mf, data, i, data_size);
+    }
+  }
+
+  size_t pos = dict_prefix_size;
+  size_t lit_start = dict_prefix_size;
   size_t num_seq = 0;
   size_t lit_pos = 0;
 
-  // Current repeat offsets
   uint32_t rep1 = rep_offset_1 ? *rep_offset_1 : ZSTD_REP_OFFSET_1_INIT;
   uint32_t rep2 = rep_offset_2 ? *rep_offset_2 : ZSTD_REP_OFFSET_2_INIT;
   uint32_t rep3 = rep_offset_3 ? *rep_offset_3 : ZSTD_REP_OFFSET_3_INIT;

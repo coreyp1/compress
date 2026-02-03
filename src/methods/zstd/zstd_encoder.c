@@ -250,6 +250,7 @@ static gcomp_status_t zstd_encoder_update_parallel(gcomp_encoder_t * encoder,
   // Collect any ready results
   status = zstd_encoder_collect_parallel_results(state, output);
   if (status != GCOMP_OK) {
+    gcomp_encoder_set_error(encoder, status, "parallel compression failed");
     return status;
   }
 
@@ -264,7 +265,9 @@ static gcomp_status_t zstd_encoder_update_parallel(gcomp_encoder_t * encoder,
   // Accumulate input into current job
   while (input->used < input->size) {
     if (!state->parallel_job) {
-      return GCOMP_ERR_INTERNAL; // Should always have a job
+      gcomp_encoder_set_error(
+          encoder, GCOMP_ERR_INTERNAL, "internal error: no parallel job");
+      return GCOMP_ERR_INTERNAL;
     }
 
     // How much space in current job?
@@ -289,12 +292,14 @@ static gcomp_status_t zstd_encoder_update_parallel(gcomp_encoder_t * encoder,
     if (state->parallel_job->base.input_size >= job_size) {
       status = zstd_encoder_submit_parallel_job(state);
       if (status != GCOMP_OK) {
+        gcomp_encoder_set_error(encoder, status, "parallel job submit failed");
         return status;
       }
 
       // Try to collect results and drain output
       status = zstd_encoder_collect_parallel_results(state, output);
       if (status != GCOMP_OK) {
+        gcomp_encoder_set_error(encoder, status, "parallel compression failed");
         return status;
       }
 
@@ -319,7 +324,6 @@ static gcomp_status_t zstd_encoder_update_parallel(gcomp_encoder_t * encoder,
  */
 static gcomp_status_t zstd_encoder_finish_parallel(gcomp_encoder_t * encoder,
     zstd_encoder_state_t * state, gcomp_buffer_t * output) {
-  (void)encoder;
   gcomp_status_t status;
 
   // First, drain any pending output
@@ -333,6 +337,7 @@ static gcomp_status_t zstd_encoder_finish_parallel(gcomp_encoder_t * encoder,
     if (state->parallel_job->base.input_size > 0) {
       status = zstd_parallel_submit(state->parallel_ctx, state->parallel_job);
       if (status != GCOMP_OK) {
+        gcomp_encoder_set_error(encoder, status, "parallel job submit failed");
         return status;
       }
       state->parallel_job = NULL; // Job is now owned by parallel context
@@ -348,12 +353,14 @@ static gcomp_status_t zstd_encoder_finish_parallel(gcomp_encoder_t * encoder,
   // Wait for all pending jobs and collect results
   status = zstd_parallel_wait(state->parallel_ctx);
   if (status != GCOMP_OK) {
+    gcomp_encoder_set_error(encoder, status, "parallel wait failed");
     return status;
   }
 
   // Collect all remaining results
   status = zstd_encoder_collect_parallel_results(state, output);
   if (status != GCOMP_OK) {
+    gcomp_encoder_set_error(encoder, status, "parallel compression failed");
     return status;
   }
 
@@ -392,6 +399,8 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
   // Allocate state structure
   zstd_encoder_state_t * state = gcomp_calloc(alloc, 1, sizeof(*state));
   if (!state) {
+    gcomp_encoder_set_error(
+        encoder, GCOMP_ERR_MEMORY, "failed to allocate state");
     return GCOMP_ERR_MEMORY;
   }
   state->allocator = alloc;
@@ -408,6 +417,10 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
   uint64_t max_memory = ZSTD_DEFAULT_MAX_MEMORY_BYTES;
   uint64_t num_threads = 1;
   uint64_t job_size = 0;
+  const void * dict_opt = NULL;
+  size_t dict_opt_size = 0;
+  uint64_t dict_id_opt = 0;
+  bool dict_id_opt_set = false;
 
   if (options) {
     gcomp_options_get_int64(options, "zstd.level", &level);
@@ -420,6 +433,14 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
     gcomp_options_get_uint64(options, "limits.max_memory_bytes", &max_memory);
     gcomp_options_get_uint64(options, "threads.count", &num_threads);
     gcomp_options_get_uint64(options, "zstd.job_size", &job_size);
+    if (gcomp_options_get_bytes(options, "zstd.dictionary", &dict_opt,
+            &dict_opt_size) == GCOMP_OK &&
+        dict_opt != NULL && dict_opt_size > 0) {
+      if (gcomp_options_get_uint64(
+              options, "zstd.dictionary_id", &dict_id_opt) == GCOMP_OK) {
+        dict_id_opt_set = true;
+      }
+    }
   }
 
   // Store threading options
@@ -429,6 +450,8 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
   // Validate and set compression level
   if (level < ZSTD_LEVEL_MIN || level > ZSTD_LEVEL_MAX) {
     status = GCOMP_ERR_INVALID_ARG;
+    gcomp_encoder_set_error(encoder, status,
+        "zstd.level must be between %d and %d", ZSTD_LEVEL_MIN, ZSTD_LEVEL_MAX);
     goto cleanup;
   }
   state->compression_level = (int)level;
@@ -441,6 +464,9 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
   else {
     if (window_log < ZSTD_WINDOW_LOG_MIN || window_log > ZSTD_WINDOW_LOG_MAX) {
       status = GCOMP_ERR_INVALID_ARG;
+      gcomp_encoder_set_error(encoder, status,
+          "zstd.window_log must be 0 (auto) or between %d and %d",
+          ZSTD_WINDOW_LOG_MIN, ZSTD_WINDOW_LOG_MAX);
       goto cleanup;
     }
     effective_window_log = (uint8_t)window_log;
@@ -457,10 +483,57 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
   state->checksum_enabled = (checksum != 0);
   state->max_memory_bytes = max_memory;
 
-  // Initialize repeat offsets
-  state->rep_offset_1 = ZSTD_REP_OFFSET_1_INIT;
-  state->rep_offset_2 = ZSTD_REP_OFFSET_2_INIT;
-  state->rep_offset_3 = ZSTD_REP_OFFSET_3_INIT;
+  if (dict_opt != NULL && dict_opt_size > 0) {
+    state->dict_bytes = gcomp_malloc(alloc, dict_opt_size);
+    if (!state->dict_bytes) {
+      status = GCOMP_ERR_MEMORY;
+      gcomp_encoder_set_error(encoder, status,
+          "failed to allocate %zu bytes for dictionary", dict_opt_size);
+      goto cleanup;
+    }
+    memcpy(state->dict_bytes, dict_opt, dict_opt_size);
+    state->dict_size = dict_opt_size;
+    gcomp_memory_track_alloc(&state->mem_tracker, dict_opt_size);
+    status = zstd_dict_parse(
+        state->dict_bytes, state->dict_size, alloc, &state->dict_parsed);
+    if (status != GCOMP_OK) {
+      gcomp_encoder_set_error(encoder, status, "dictionary parse failed");
+      gcomp_free(alloc, state->dict_bytes);
+      state->dict_bytes = NULL;
+      state->dict_size = 0;
+      goto cleanup;
+    }
+    state->header.dict_id =
+        dict_id_opt_set ? (uint32_t)dict_id_opt : state->dict_parsed.dict_id;
+    if (state->dict_parsed.has_entropy_tables) {
+      state->rep_offset_1 = state->dict_parsed.rep_offset_1;
+      state->rep_offset_2 = state->dict_parsed.rep_offset_2;
+      state->rep_offset_3 = state->dict_parsed.rep_offset_3;
+    }
+    else {
+      state->rep_offset_1 = ZSTD_REP_OFFSET_1_INIT;
+      state->rep_offset_2 = ZSTD_REP_OFFSET_2_INIT;
+      state->rep_offset_3 = ZSTD_REP_OFFSET_3_INIT;
+    }
+    state->dict_block_buffer_capacity =
+        state->dict_parsed.content_size + ZSTD_BLOCK_SIZE_MAX;
+    state->dict_block_buffer =
+        gcomp_malloc(alloc, state->dict_block_buffer_capacity);
+    if (!state->dict_block_buffer) {
+      status = GCOMP_ERR_MEMORY;
+      gcomp_encoder_set_error(encoder, status,
+          "failed to allocate %zu bytes for dictionary block buffer",
+          (size_t)state->dict_block_buffer_capacity);
+      goto cleanup;
+    }
+    gcomp_memory_track_alloc(
+        &state->mem_tracker, state->dict_block_buffer_capacity);
+  }
+  else {
+    state->rep_offset_1 = ZSTD_REP_OFFSET_1_INIT;
+    state->rep_offset_2 = ZSTD_REP_OFFSET_2_INIT;
+    state->rep_offset_3 = ZSTD_REP_OFFSET_3_INIT;
+  }
 
   // Initialize content hash if checksum enabled
   if (checksum) {
@@ -473,6 +546,8 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
   state->block_buffer = gcomp_calloc(alloc, 1, block_buffer_size);
   if (!state->block_buffer) {
     status = GCOMP_ERR_MEMORY;
+    gcomp_encoder_set_error(encoder, status,
+        "failed to allocate %zu bytes for block buffer", block_buffer_size);
     goto cleanup;
   }
   state->block_buffer_capacity = block_buffer_size;
@@ -484,6 +559,9 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
   state->compressed_buffer = gcomp_malloc(alloc, compressed_buffer_size);
   if (!state->compressed_buffer) {
     status = GCOMP_ERR_MEMORY;
+    gcomp_encoder_set_error(encoder, status,
+        "failed to allocate %zu bytes for compressed buffer",
+        compressed_buffer_size);
     goto cleanup;
   }
   state->compressed_buffer_capacity = compressed_buffer_size;
@@ -493,6 +571,7 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
   state->match_finder = gcomp_calloc(alloc, 1, sizeof(zstd_match_finder_t));
   if (!state->match_finder) {
     status = GCOMP_ERR_MEMORY;
+    gcomp_encoder_set_error(encoder, status, "failed to allocate match finder");
     goto cleanup;
   }
   gcomp_memory_track_alloc(&state->mem_tracker, sizeof(zstd_match_finder_t));
@@ -500,6 +579,7 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
   status = zstd_mf_init(state->match_finder, alloc, state->compression_level,
       state->header.window_size, &state->mem_tracker);
   if (status != GCOMP_OK) {
+    gcomp_encoder_set_error(encoder, status, "match finder init failed");
     goto cleanup;
   }
 
@@ -510,6 +590,9 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
       gcomp_malloc(alloc, state->seq_buffer_capacity * sizeof(zstd_sequence_t));
   if (!state->seq_buffer) {
     status = GCOMP_ERR_MEMORY;
+    gcomp_encoder_set_error(encoder, status,
+        "failed to allocate %zu bytes for sequence buffer",
+        state->seq_buffer_capacity * sizeof(zstd_sequence_t));
     goto cleanup;
   }
   gcomp_memory_track_alloc(&state->mem_tracker,
@@ -520,6 +603,9 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
   state->literals_buffer = gcomp_malloc(alloc, state->literals_buffer_capacity);
   if (!state->literals_buffer) {
     status = GCOMP_ERR_MEMORY;
+    gcomp_encoder_set_error(encoder, status,
+        "failed to allocate %zu bytes for literals buffer",
+        state->literals_buffer_capacity);
     goto cleanup;
   }
   gcomp_memory_track_alloc(
@@ -528,6 +614,9 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
   // Check memory limits
   if (state->mem_tracker.current_bytes > max_memory) {
     status = GCOMP_ERR_LIMIT;
+    gcomp_encoder_set_error(encoder, status,
+        "memory limit exceeded during encoder init (%zu bytes, limit %zu)",
+        (size_t)state->mem_tracker.current_bytes, (size_t)max_memory);
     goto cleanup;
   }
 
@@ -542,15 +631,20 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
         .window_log = effective_window_log,
         .max_memory_bytes = max_memory,
         .allocator = alloc,
+        .mem_tracker = &state->mem_tracker,
     };
     status = zstd_parallel_create(&pconfig, &state->parallel_ctx);
     if (status != GCOMP_OK) {
+      gcomp_encoder_set_error(
+          encoder, status, "parallel context creation failed");
       goto cleanup;
     }
 
     // Allocate first job for parallel mode
     status = zstd_parallel_alloc_job(state->parallel_ctx, &state->parallel_job);
     if (status != GCOMP_OK) {
+      gcomp_encoder_set_error(
+          encoder, status, "failed to allocate parallel job");
       goto cleanup;
     }
 
@@ -563,6 +657,9 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
         gcomp_malloc(alloc, state->parallel_output_buf_cap);
     if (!state->parallel_output_buf) {
       status = GCOMP_ERR_MEMORY;
+      gcomp_encoder_set_error(encoder, status,
+          "failed to allocate %zu bytes for parallel output buffer",
+          (size_t)state->parallel_output_buf_cap);
       goto cleanup;
     }
     gcomp_memory_track_alloc(
@@ -579,6 +676,7 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
     status = zstd_write_frame_header(&state->header, state->header_buf,
         sizeof(state->header_buf), &state->header_len);
     if (status != GCOMP_OK) {
+      gcomp_encoder_set_error(encoder, status, "frame header write failed");
       goto cleanup;
     }
   }
@@ -588,6 +686,16 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
 
 cleanup:
   if (state) {
+    zstd_dict_destroy(&state->dict_parsed);
+    if (state->dict_bytes) {
+      gcomp_memory_track_free(&state->mem_tracker, state->dict_size);
+      gcomp_free(alloc, state->dict_bytes);
+    }
+    if (state->dict_block_buffer) {
+      gcomp_memory_track_free(
+          &state->mem_tracker, state->dict_block_buffer_capacity);
+      gcomp_free(alloc, state->dict_block_buffer);
+    }
     if (state->block_buffer) {
       gcomp_free(alloc, state->block_buffer);
     }
@@ -631,22 +739,42 @@ void zstd_encoder_destroy(gcomp_encoder_t * encoder) {
   const gcomp_allocator_t * alloc = state->allocator;
 
   if (state->block_buffer) {
+    gcomp_memory_track_free(&state->mem_tracker, state->block_buffer_capacity);
     gcomp_free(alloc, state->block_buffer);
   }
   if (state->compressed_buffer) {
+    gcomp_memory_track_free(
+        &state->mem_tracker, state->compressed_buffer_capacity);
     gcomp_free(alloc, state->compressed_buffer);
   }
   if (state->match_finder) {
-    zstd_mf_destroy(state->match_finder, alloc, NULL);
+    zstd_mf_destroy(state->match_finder, alloc, &state->mem_tracker);
+    gcomp_memory_track_free(&state->mem_tracker, sizeof(zstd_match_finder_t));
     gcomp_free(alloc, state->match_finder);
   }
+  if (state->dict_block_buffer) {
+    gcomp_memory_track_free(
+        &state->mem_tracker, state->dict_block_buffer_capacity);
+    gcomp_free(alloc, state->dict_block_buffer);
+  }
+  zstd_dict_destroy(&state->dict_parsed);
+  if (state->dict_bytes) {
+    gcomp_memory_track_free(&state->mem_tracker, state->dict_size);
+    gcomp_free(alloc, state->dict_bytes);
+  }
   if (state->seq_buffer) {
+    gcomp_memory_track_free(&state->mem_tracker,
+        state->seq_buffer_capacity * sizeof(zstd_sequence_t));
     gcomp_free(alloc, state->seq_buffer);
   }
   if (state->literals_buffer) {
+    gcomp_memory_track_free(
+        &state->mem_tracker, state->literals_buffer_capacity);
     gcomp_free(alloc, state->literals_buffer);
   }
   if (state->parallel_output_buf) {
+    gcomp_memory_track_free(
+        &state->mem_tracker, state->parallel_output_buf_cap);
     gcomp_free(alloc, state->parallel_output_buf);
   }
   if (state->parallel_job) {
@@ -655,6 +783,7 @@ void zstd_encoder_destroy(gcomp_encoder_t * encoder) {
   if (state->parallel_ctx) {
     zstd_parallel_destroy(state->parallel_ctx);
   }
+  gcomp_memory_track_free(&state->mem_tracker, sizeof(*state));
   gcomp_free(alloc, state);
   encoder->method_state = NULL;
 }
@@ -669,7 +798,7 @@ gcomp_status_t zstd_encoder_update(gcomp_encoder_t * encoder,
     return GCOMP_ERR_INVALID_ARG;
   }
 
-  // Buffer validation (SAFE-1)
+  // Buffer validation
   if (input->size > 0 && !input->data) {
     gcomp_encoder_set_error(
         encoder, GCOMP_ERR_INVALID_ARG, "input data is NULL with size > 0");
@@ -686,6 +815,8 @@ gcomp_status_t zstd_encoder_update(gcomp_encoder_t * encoder,
   uint8_t * out_ptr = (uint8_t *)output->data;
 
   if (state->stage == ZSTD_ENC_STAGE_ERROR) {
+    gcomp_encoder_set_error(
+        encoder, GCOMP_ERR_INTERNAL, "encoder in error state");
     return GCOMP_ERR_INTERNAL;
   }
   if (state->stage == ZSTD_ENC_STAGE_DONE) {
@@ -797,7 +928,7 @@ gcomp_status_t zstd_encoder_finish(
     return GCOMP_ERR_INVALID_ARG;
   }
 
-  // Buffer validation (SAFE-1)
+  // Buffer validation
   if (output->size > 0 && !output->data) {
     gcomp_encoder_set_error(
         encoder, GCOMP_ERR_INVALID_ARG, "output data is NULL with size > 0");
@@ -808,6 +939,8 @@ gcomp_status_t zstd_encoder_finish(
   uint8_t * out_ptr = (uint8_t *)output->data;
 
   if (state->stage == ZSTD_ENC_STAGE_ERROR) {
+    gcomp_encoder_set_error(
+        encoder, GCOMP_ERR_INTERNAL, "encoder in error state");
     return GCOMP_ERR_INTERNAL;
   }
   if (state->stage == ZSTD_ENC_STAGE_DONE) {
@@ -982,14 +1115,14 @@ gcomp_status_t zstd_encoder_reset(gcomp_encoder_t * encoder) {
     // Single-threaded mode reset
     state->stage = ZSTD_ENC_STAGE_HEADER;
 
-    // Reset positions (BP-4: retain buffers)
+    // Reset positions (retain buffers)
     state->header_pos = 0;
     state->checksum_pos = 0;
     state->block_buffer_pos = 0;
     state->compressed_buffer_pos = 0;
     state->compressed_buffer_len = 0;
 
-    // Reset match finder state (clear hash tables, not free) (BP-4)
+    // Reset match finder state (clear hash tables, not free)
     if (state->match_finder) {
       zstd_mf_reset(state->match_finder);
     }

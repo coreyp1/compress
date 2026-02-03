@@ -46,13 +46,32 @@
  * ### Not Reset Between Frames
  *
  * - `total_input_bytes`, `total_output_bytes`: Accumulate for limit checking
- * - `output_buffer`, `block_buffer`: Retained for reuse (BP-4)
+ * - `output_buffer`, `block_buffer`: Retained for reuse
  * - `fse_*_table`: Overwritten by each block anyway
  *
  * ## Use Case: Parallel Encoder Output
  *
  * The parallel encoder produces concatenated frames (one per job). This decoder
  * mode enables decompression of that output without external tools.
+ *
+ * ## Dictionary Support
+ *
+ * When the user provides a dictionary via `zstd.dictionary`:
+ *
+ * - **Window preload**: After parsing the frame header (and allocating the
+ *   window buffer), the decoder copies dictionary content into the window so
+ *   that the first block can reference it. This is done both when the frame
+ *   header has Dictionary_ID_Flag set and when it does not (raw-dict frames
+ *   from external encoders that omit the flag).
+ *
+ * - **dict_id validation**: If the frame header specifies a dictionary ID and
+ *   the user provided a formatted dictionary, the decoder validates that
+ *   dict_id matches. Raw dictionaries (dict_id 0) are accepted for any frame
+ *   dict_id so external encoders that write content-derived IDs still decode.
+ *
+ * - **Entropy tables**: If the dictionary is formatted and includes entropy
+ *   tables (Huffman, FSE), the decoder uses them for the first block (repeat
+ *   mode / treeless mode). Otherwise blocks use their own inline tables.
  *
  * Copyright 2026 by Corey Pennycuff
  */
@@ -81,6 +100,8 @@ gcomp_status_t zstd_decoder_init(gcomp_registry_t * registry,
   // Allocate state structure
   zstd_decoder_state_t * state = gcomp_calloc(alloc, 1, sizeof(*state));
   if (!state) {
+    gcomp_decoder_set_error(
+        decoder, GCOMP_ERR_MEMORY, "failed to allocate decoder state");
     return GCOMP_ERR_MEMORY;
   }
   state->allocator = alloc;
@@ -95,6 +116,9 @@ gcomp_status_t zstd_decoder_init(gcomp_registry_t * registry,
   uint64_t max_memory = ZSTD_DEFAULT_MAX_MEMORY_BYTES;
   uint64_t max_expansion = ZSTD_DEFAULT_MAX_EXPANSION_RATIO;
 
+  const void * dict_opt = NULL;
+  size_t dict_opt_size = 0;
+
   if (options) {
     gcomp_options_get_bool(options, "zstd.concat", &concat);
     gcomp_options_get_uint64(options, "limits.max_output_bytes", &max_output);
@@ -102,9 +126,30 @@ gcomp_status_t zstd_decoder_init(gcomp_registry_t * registry,
     gcomp_options_get_uint64(options, "limits.max_memory_bytes", &max_memory);
     gcomp_options_get_uint64(
         options, "limits.max_expansion_ratio", &max_expansion);
+    gcomp_options_get_bytes(
+        options, "zstd.dictionary", &dict_opt, &dict_opt_size);
   }
 
   state->concat_enabled = (concat != 0);
+
+  if (dict_opt != NULL && dict_opt_size > 0) {
+    state->dict_bytes = gcomp_malloc(alloc, dict_opt_size);
+    if (!state->dict_bytes) {
+      status = GCOMP_ERR_MEMORY;
+      goto cleanup;
+    }
+    memcpy(state->dict_bytes, dict_opt, dict_opt_size);
+    state->dict_size = dict_opt_size;
+    gcomp_memory_track_alloc(&state->mem_tracker, dict_opt_size);
+    status = zstd_dict_parse(
+        state->dict_bytes, state->dict_size, alloc, &state->dict_parsed);
+    if (status != GCOMP_OK) {
+      gcomp_free(alloc, state->dict_bytes);
+      state->dict_bytes = NULL;
+      state->dict_size = 0;
+      goto cleanup;
+    }
+  }
   state->max_output_bytes = max_output;
   state->max_window_bytes = max_window;
   state->max_memory_bytes = max_memory;
@@ -154,7 +199,25 @@ gcomp_status_t zstd_decoder_init(gcomp_registry_t * registry,
   return GCOMP_OK;
 
 cleanup:
+  if (decoder && status != GCOMP_OK) {
+    const char * msg = "decoder initialization failed";
+    if (status == GCOMP_ERR_MEMORY) {
+      msg = "failed to allocate memory during decoder init";
+    }
+    else if (status == GCOMP_ERR_LIMIT) {
+      msg = "memory limit exceeded during decoder init";
+    }
+    else if (status == GCOMP_ERR_CORRUPT || status == GCOMP_ERR_UNSUPPORTED) {
+      msg = "dictionary parse failed";
+    }
+    gcomp_decoder_set_error(decoder, status, "%s", msg);
+  }
   if (state) {
+    zstd_dict_destroy(&state->dict_parsed);
+    if (state->dict_bytes) {
+      gcomp_memory_track_free(&state->mem_tracker, state->dict_size);
+      gcomp_free(alloc, state->dict_bytes);
+    }
     if (state->block_buffer) {
       gcomp_free(alloc, state->block_buffer);
     }
@@ -189,6 +252,12 @@ void zstd_decoder_destroy(gcomp_decoder_t * decoder) {
   }
   if (state->window_buffer) {
     gcomp_free(alloc, state->window_buffer);
+  }
+  zstd_dict_destroy(&state->dict_parsed);
+  if (state->dict_bytes) {
+    gcomp_memory_track_free(&state->mem_tracker, state->dict_size);
+    gcomp_free(alloc, state->dict_bytes);
+    state->dict_bytes = NULL;
   }
   if (state->fse_lit_table) {
     gcomp_free(alloc, state->fse_lit_table);
@@ -293,13 +362,23 @@ static gcomp_status_t zstd_parse_frame_header(
     }
     pos += dict_id_len;
 
-    // Reject streams that require a dictionary (v1: not supported)
     if (state->header.dict_id != 0) {
-      gcomp_decoder_set_error(decoder, GCOMP_ERR_UNSUPPORTED,
-          "zstd stream requires dictionary ID %u, but dictionaries are not "
-          "supported in this version",
-          state->header.dict_id);
-      return GCOMP_ERR_UNSUPPORTED;
+      if (!state->dict_bytes) {
+        gcomp_decoder_set_error(decoder, GCOMP_ERR_UNSUPPORTED,
+            "zstd stream requires dictionary ID %u but no dictionary provided",
+            state->header.dict_id);
+        return GCOMP_ERR_UNSUPPORTED;
+      }
+      /* Require dict_id match for formatted dictionaries. Raw dictionaries
+       * (dict_id 0) are accepted for any frame dict_id so external encoders
+       * that write a content-derived ID for raw dicts still decode. */
+      if (state->dict_parsed.dict_id != 0 &&
+          state->dict_parsed.dict_id != state->header.dict_id) {
+        gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+            "dictionary ID mismatch: frame has %u, dictionary has %u",
+            state->header.dict_id, state->dict_parsed.dict_id);
+        return GCOMP_ERR_CORRUPT;
+      }
     }
   }
 
@@ -368,6 +447,102 @@ static gcomp_status_t zstd_parse_frame_header(
   state->window_size = 0;
   state->window_pos = 0;
 
+  /* Preload window with dictionary content when the user provided a dictionary
+   * and we have parsed content. This covers both frames with Dictionary_ID_Flag
+   * set and raw-dict frames from zstd CLI/Python that omit the flag. */
+  if (state->dict_bytes && state->dict_parsed.content &&
+      state->dict_parsed.content_size > 0) {
+    size_t copy_len = state->dict_parsed.content_size;
+    if (copy_len > state->window_capacity) {
+      copy_len = state->window_capacity;
+    }
+    memcpy(state->window_buffer, state->dict_parsed.content, copy_len);
+    state->window_size = copy_len;
+    state->window_pos = copy_len;
+    if (state->window_pos >= state->window_capacity) {
+      state->window_pos = 0;
+    }
+    state->rep_offset_1 = state->dict_parsed.rep_offset_1;
+    state->rep_offset_2 = state->dict_parsed.rep_offset_2;
+    state->rep_offset_3 = state->dict_parsed.rep_offset_3;
+    if (state->dict_parsed.has_entropy_tables) {
+      /* Allocate FSE/HUF tables if not yet allocated (needed for first block
+       * Repeat/Treeless mode) */
+      static const size_t FSE_LL_SIZE = 512;
+      static const size_t FSE_ML_SIZE = 512;
+      static const size_t FSE_OF_SIZE = 256;
+      if (state->dict_parsed.fse_ll_table) {
+        if (!state->fse_lit_table) {
+          state->fse_lit_table = gcomp_malloc(
+              state->allocator, FSE_LL_SIZE * sizeof(zstd_fse_entry_t));
+          if (state->fse_lit_table) {
+            state->fse_lit_table_size = FSE_LL_SIZE;
+            gcomp_memory_track_alloc(
+                &state->mem_tracker, FSE_LL_SIZE * sizeof(zstd_fse_entry_t));
+          }
+        }
+        if (state->fse_lit_table &&
+            state->fse_lit_table_size >= state->dict_parsed.fse_ll_size) {
+          memcpy(state->fse_lit_table, state->dict_parsed.fse_ll_table,
+              state->dict_parsed.fse_ll_size * sizeof(zstd_fse_entry_t));
+          state->fse_ll_log = state->dict_parsed.fse_ll_log;
+        }
+      }
+      if (state->dict_parsed.fse_of_table) {
+        if (!state->fse_offset_table) {
+          state->fse_offset_table = gcomp_malloc(
+              state->allocator, FSE_OF_SIZE * sizeof(zstd_fse_entry_t));
+          if (state->fse_offset_table) {
+            state->fse_offset_table_size = FSE_OF_SIZE;
+            gcomp_memory_track_alloc(
+                &state->mem_tracker, FSE_OF_SIZE * sizeof(zstd_fse_entry_t));
+          }
+        }
+        if (state->fse_offset_table &&
+            state->fse_offset_table_size >= state->dict_parsed.fse_of_size) {
+          memcpy(state->fse_offset_table, state->dict_parsed.fse_of_table,
+              state->dict_parsed.fse_of_size * sizeof(zstd_fse_entry_t));
+          state->fse_of_log = state->dict_parsed.fse_of_log;
+        }
+      }
+      if (state->dict_parsed.fse_ml_table) {
+        if (!state->fse_match_table) {
+          state->fse_match_table = gcomp_malloc(
+              state->allocator, FSE_ML_SIZE * sizeof(zstd_fse_entry_t));
+          if (state->fse_match_table) {
+            state->fse_match_table_size = FSE_ML_SIZE;
+            gcomp_memory_track_alloc(
+                &state->mem_tracker, FSE_ML_SIZE * sizeof(zstd_fse_entry_t));
+          }
+        }
+        if (state->fse_match_table &&
+            state->fse_match_table_size >= state->dict_parsed.fse_ml_size) {
+          memcpy(state->fse_match_table, state->dict_parsed.fse_ml_table,
+              state->dict_parsed.fse_ml_size * sizeof(zstd_fse_entry_t));
+          state->fse_ml_log = state->dict_parsed.fse_ml_log;
+        }
+      }
+      if (state->dict_parsed.huf_table) {
+        if (!state->huf_table) {
+          state->huf_table = gcomp_malloc(
+              state->allocator, HUF_MAX_TABLE_SIZE * sizeof(zstd_huf_entry_t));
+          if (state->huf_table) {
+            state->huf_table_size = HUF_MAX_TABLE_SIZE;
+            gcomp_memory_track_alloc(&state->mem_tracker,
+                HUF_MAX_TABLE_SIZE * sizeof(zstd_huf_entry_t));
+          }
+        }
+        if (state->huf_table &&
+            state->huf_table_size >= state->dict_parsed.huf_table_size) {
+          memcpy(state->huf_table, state->dict_parsed.huf_table,
+              state->dict_parsed.huf_table_size * sizeof(zstd_huf_entry_t));
+          state->huf_max_bits = state->dict_parsed.huf_max_bits;
+          state->huf_table_valid = true;
+        }
+      }
+    }
+  }
+
   return GCOMP_OK;
 }
 
@@ -381,7 +556,7 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
     return GCOMP_ERR_INVALID_ARG;
   }
 
-  // Buffer validation (SAFE-1)
+  // Buffer validation
   if (input->size > 0 && !input->data) {
     gcomp_decoder_set_error(
         decoder, GCOMP_ERR_INVALID_ARG, "input data is NULL with size > 0");
@@ -398,6 +573,8 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
   uint8_t * out_ptr = (uint8_t *)output->data;
 
   if (state->stage == ZSTD_DEC_STAGE_ERROR) {
+    gcomp_decoder_set_error(
+        decoder, GCOMP_ERR_INTERNAL, "decoder in error state");
     return GCOMP_ERR_INTERNAL;
   }
 
@@ -405,7 +582,7 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
   // frames
   if (state->stage == ZSTD_DEC_STAGE_DONE) {
     if (state->concat_enabled && input->used < input->size) {
-      // Reset for next frame (keep buffers per BP-4)
+      // Reset for next frame (keep buffers)
       state->stage = ZSTD_DEC_STAGE_HEADER;
       state->header_stage = ZSTD_HEADER_MAGIC;
       state->header_accum_pos = 0;
@@ -475,12 +652,25 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
     uint8_t fcs_flag =
         (fhd & ZSTD_FHD_FCS_FLAG_MASK) >> ZSTD_FHD_FCS_FLAG_SHIFT;
 
+    // Safe math for header length from untrusted descriptor
     size_t expected_len = 5; // magic + FHD
     if (!single_segment) {
-      expected_len += 1; // window descriptor
+      if (!gcomp_safe_add_size(expected_len, 1, &expected_len)) {
+        state->stage = ZSTD_DEC_STAGE_ERROR;
+        gcomp_decoder_set_error(
+            decoder, GCOMP_ERR_CORRUPT, "header length overflow");
+        return GCOMP_ERR_CORRUPT;
+      }
     }
-    expected_len += zstd_dict_id_size(dict_id_flag);
-    expected_len += zstd_fcs_size(fcs_flag, single_segment);
+    if (!gcomp_safe_add_size(
+            expected_len, zstd_dict_id_size(dict_id_flag), &expected_len) ||
+        !gcomp_safe_add_size(expected_len,
+            zstd_fcs_size(fcs_flag, single_segment), &expected_len)) {
+      state->stage = ZSTD_DEC_STAGE_ERROR;
+      gcomp_decoder_set_error(
+          decoder, GCOMP_ERR_CORRUPT, "header length overflow");
+      return GCOMP_ERR_CORRUPT;
+    }
 
     state->header_expected_len = expected_len;
 
@@ -659,9 +849,29 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
       }
     }
 
-    // Check output limits
-    state->total_output_bytes += decompressed_len;
-    state->frame_output_bytes += decompressed_len;
+    // Check output limits (use safe math for accumulated sizes)
+    {
+      uint64_t new_total;
+      if (!gcomp_safe_add_u64(state->total_output_bytes,
+              (uint64_t)decompressed_len, &new_total)) {
+        state->stage = ZSTD_DEC_STAGE_ERROR;
+        gcomp_decoder_set_error(
+            decoder, GCOMP_ERR_CORRUPT, "output size overflow");
+        return GCOMP_ERR_CORRUPT;
+      }
+      state->total_output_bytes = new_total;
+    }
+    {
+      uint64_t new_frame;
+      if (!gcomp_safe_add_u64(state->frame_output_bytes,
+              (uint64_t)decompressed_len, &new_frame)) {
+        state->stage = ZSTD_DEC_STAGE_ERROR;
+        gcomp_decoder_set_error(
+            decoder, GCOMP_ERR_CORRUPT, "frame output size overflow");
+        return GCOMP_ERR_CORRUPT;
+      }
+      state->frame_output_bytes = new_frame;
+    }
     if (state->total_output_bytes > state->max_output_bytes) {
       state->stage = ZSTD_DEC_STAGE_ERROR;
       gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
@@ -671,7 +881,7 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
       return GCOMP_ERR_LIMIT;
     }
 
-    // Check expansion ratio (CORRECT-1)
+    // Check expansion ratio
     if (gcomp_limits_check_expansion_ratio(state->total_input_bytes,
             state->total_output_bytes,
             state->max_expansion_ratio) != GCOMP_OK) {
@@ -693,7 +903,7 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
 
     // Determine next stage
     if (state->current_block_last) {
-      // Validate content size if present in header (Z3.3)
+      // Validate content size if present in header
       // Use frame_output_bytes for per-frame validation (not total across
       // concat)
       if (state->header.content_size_present) {
@@ -765,10 +975,14 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
 gcomp_status_t zstd_decoder_finish(
     gcomp_decoder_t * decoder, gcomp_buffer_t * output) {
   if (!decoder || !decoder->method_state || !output) {
+    if (decoder) {
+      gcomp_decoder_set_error(
+          decoder, GCOMP_ERR_INVALID_ARG, "decoder or output is NULL");
+    }
     return GCOMP_ERR_INVALID_ARG;
   }
 
-  // Buffer validation (SAFE-1)
+  // Buffer validation
   if (output->size > 0 && !output->data) {
     gcomp_decoder_set_error(
         decoder, GCOMP_ERR_INVALID_ARG, "output data is NULL with size > 0");
@@ -779,6 +993,8 @@ gcomp_status_t zstd_decoder_finish(
   uint8_t * out_ptr = (uint8_t *)output->data;
 
   if (state->stage == ZSTD_DEC_STAGE_ERROR) {
+    gcomp_decoder_set_error(
+        decoder, GCOMP_ERR_INTERNAL, "decoder in error state");
     return GCOMP_ERR_INTERNAL;
   }
 
@@ -810,12 +1026,16 @@ gcomp_status_t zstd_decoder_finish(
 
 gcomp_status_t zstd_decoder_reset(gcomp_decoder_t * decoder) {
   if (!decoder || !decoder->method_state) {
+    if (decoder) {
+      gcomp_decoder_set_error(
+          decoder, GCOMP_ERR_INVALID_ARG, "decoder or method state is NULL");
+    }
     return GCOMP_ERR_INVALID_ARG;
   }
 
   zstd_decoder_state_t * state = decoder->method_state;
 
-  // Reset stage (BP-4: retain buffers)
+  // Reset stage (retain buffers)
   state->stage = ZSTD_DEC_STAGE_HEADER;
   state->header_stage = ZSTD_HEADER_MAGIC;
 

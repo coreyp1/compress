@@ -120,6 +120,7 @@ struct zstd_parallel_ctx_s {
   int compression_level;
   uint8_t window_log;
   uint64_t max_memory_bytes;
+  gcomp_memory_tracker_t * mem_tracker;
 
   // Mode
   bool is_inline;
@@ -332,6 +333,11 @@ gcomp_status_t zstd_parallel_create(
       config ? config->compression_level : ZSTD_LEVEL_DEFAULT;
   ctx->window_log = config ? config->window_log : 0;
   ctx->max_memory_bytes = config ? config->max_memory_bytes : 0;
+  ctx->mem_tracker = config && config->mem_tracker ? config->mem_tracker : NULL;
+
+  if (ctx->mem_tracker) {
+    gcomp_memory_track_alloc(ctx->mem_tracker, sizeof(zstd_parallel_ctx_t));
+  }
 
   // Calculate effective window log if auto
   if (ctx->window_log == 0) {
@@ -421,6 +427,9 @@ void zstd_parallel_destroy(zstd_parallel_ctx_t * ctx) {
     gcomp_thread_pool_destroy(ctx->pool);
   }
 
+  if (ctx->mem_tracker) {
+    gcomp_memory_track_free(ctx->mem_tracker, sizeof(zstd_parallel_ctx_t));
+  }
   gcomp_free(ctx->allocator, ctx);
 }
 
@@ -439,6 +448,9 @@ gcomp_status_t zstd_parallel_alloc_job(
   if (!job) {
     return GCOMP_ERR_MEMORY;
   }
+  if (ctx->mem_tracker) {
+    gcomp_memory_track_alloc(ctx->mem_tracker, sizeof(zstd_parallel_job_t));
+  }
 
   // Allocate input buffer
   uint8_t * input_buf = gcomp_malloc(ctx->allocator, ctx->job_size);
@@ -446,21 +458,34 @@ gcomp_status_t zstd_parallel_alloc_job(
     status = GCOMP_ERR_MEMORY;
     goto cleanup;
   }
+  if (ctx->mem_tracker) {
+    gcomp_memory_track_alloc(ctx->mem_tracker, (size_t)ctx->job_size);
+  }
 
   // Allocate output buffer (worst case: input size + frame overhead)
   size_t output_cap = ctx->job_size + ZSTD_FRAME_OVERHEAD +
       (ctx->job_size / ZSTD_BLOCK_SIZE_MAX + 1) * ZSTD_BLOCK_HEADER_SIZE;
   uint8_t * output_buf = gcomp_malloc(ctx->allocator, output_cap);
   if (!output_buf) {
+    if (ctx->mem_tracker) {
+      gcomp_memory_track_free(ctx->mem_tracker, (size_t)ctx->job_size);
+    }
     gcomp_free(ctx->allocator, input_buf);
     status = GCOMP_ERR_MEMORY;
     goto cleanup;
+  }
+  if (ctx->mem_tracker) {
+    gcomp_memory_track_alloc(ctx->mem_tracker, output_cap);
   }
 
   // Allocate match finder
   zstd_match_finder_t * mf =
       gcomp_calloc(ctx->allocator, 1, sizeof(zstd_match_finder_t));
   if (!mf) {
+    if (ctx->mem_tracker) {
+      gcomp_memory_track_free(ctx->mem_tracker, output_cap);
+      gcomp_memory_track_free(ctx->mem_tracker, (size_t)ctx->job_size);
+    }
     gcomp_free(ctx->allocator, output_buf);
     gcomp_free(ctx->allocator, input_buf);
     status = GCOMP_ERR_MEMORY;
@@ -468,39 +493,64 @@ gcomp_status_t zstd_parallel_alloc_job(
   }
 
   uint32_t window_size = zstd_window_log_to_size(ctx->window_log);
-  gcomp_memory_tracker_t tracker = {0};
-  status = zstd_mf_init(
-      mf, ctx->allocator, ctx->compression_level, window_size, &tracker);
+  status = zstd_mf_init(mf, ctx->allocator, ctx->compression_level, window_size,
+      ctx->mem_tracker);
   if (status != GCOMP_OK) {
+    if (ctx->mem_tracker) {
+      gcomp_memory_track_free(ctx->mem_tracker, output_cap);
+      gcomp_memory_track_free(ctx->mem_tracker, (size_t)ctx->job_size);
+    }
     gcomp_free(ctx->allocator, mf);
     gcomp_free(ctx->allocator, output_buf);
     gcomp_free(ctx->allocator, input_buf);
     goto cleanup;
   }
+  if (ctx->mem_tracker) {
+    gcomp_memory_track_alloc(ctx->mem_tracker, sizeof(zstd_match_finder_t));
+  }
 
   // Allocate sequence buffer
   size_t seq_cap = ctx->job_size / 3;
-  uint8_t * seq_buf =
-      gcomp_malloc(ctx->allocator, seq_cap * sizeof(zstd_sequence_t));
+  size_t seq_alloc_size = seq_cap * sizeof(zstd_sequence_t);
+  uint8_t * seq_buf = gcomp_malloc(ctx->allocator, seq_alloc_size);
   if (!seq_buf) {
-    zstd_mf_destroy(mf, ctx->allocator, NULL);
+    zstd_mf_destroy(mf, ctx->allocator, ctx->mem_tracker);
+    if (ctx->mem_tracker) {
+      gcomp_memory_track_free(ctx->mem_tracker, sizeof(zstd_match_finder_t));
+      gcomp_memory_track_free(ctx->mem_tracker, output_cap);
+      gcomp_memory_track_free(ctx->mem_tracker, (size_t)ctx->job_size);
+    }
     gcomp_free(ctx->allocator, mf);
     gcomp_free(ctx->allocator, output_buf);
     gcomp_free(ctx->allocator, input_buf);
     status = GCOMP_ERR_MEMORY;
     goto cleanup;
+  }
+  if (ctx->mem_tracker) {
+    gcomp_memory_track_alloc(ctx->mem_tracker, seq_alloc_size);
   }
 
   // Allocate literals buffer
   uint8_t * lit_buf = gcomp_malloc(ctx->allocator, ctx->job_size);
   if (!lit_buf) {
+    if (ctx->mem_tracker) {
+      gcomp_memory_track_free(ctx->mem_tracker, seq_alloc_size);
+    }
     gcomp_free(ctx->allocator, seq_buf);
-    zstd_mf_destroy(mf, ctx->allocator, NULL);
+    zstd_mf_destroy(mf, ctx->allocator, ctx->mem_tracker);
+    if (ctx->mem_tracker) {
+      gcomp_memory_track_free(ctx->mem_tracker, sizeof(zstd_match_finder_t));
+      gcomp_memory_track_free(ctx->mem_tracker, output_cap);
+      gcomp_memory_track_free(ctx->mem_tracker, (size_t)ctx->job_size);
+    }
     gcomp_free(ctx->allocator, mf);
     gcomp_free(ctx->allocator, output_buf);
     gcomp_free(ctx->allocator, input_buf);
     status = GCOMP_ERR_MEMORY;
     goto cleanup;
+  }
+  if (ctx->mem_tracker) {
+    gcomp_memory_track_alloc(ctx->mem_tracker, (size_t)ctx->job_size);
   }
 
   // Initialize job
@@ -525,6 +575,9 @@ gcomp_status_t zstd_parallel_alloc_job(
   return GCOMP_OK;
 
 cleanup:
+  if (ctx->mem_tracker) {
+    gcomp_memory_track_free(ctx->mem_tracker, sizeof(zstd_parallel_job_t));
+  }
   gcomp_free(ctx->allocator, job);
   return status;
 }
@@ -535,6 +588,15 @@ void zstd_parallel_free_job(
     return;
   }
 
+  if (ctx->mem_tracker) {
+    if (job->base.user_data) {
+      gcomp_memory_track_free(ctx->mem_tracker, (size_t)ctx->job_size);
+    }
+    if (job->base.output) {
+      gcomp_memory_track_free(ctx->mem_tracker, job->base.output_capacity);
+    }
+  }
+
   // Free buffers (input pointer stored in user_data)
   if (job->base.user_data) {
     gcomp_free(ctx->allocator, job->base.user_data);
@@ -543,14 +605,26 @@ void zstd_parallel_free_job(
     gcomp_free(ctx->allocator, job->base.output);
   }
   if (job->match_finder) {
-    zstd_mf_destroy(job->match_finder, ctx->allocator, NULL);
+    zstd_mf_destroy(job->match_finder, ctx->allocator, ctx->mem_tracker);
+    if (ctx->mem_tracker) {
+      gcomp_memory_track_free(ctx->mem_tracker, sizeof(zstd_match_finder_t));
+    }
     gcomp_free(ctx->allocator, job->match_finder);
   }
   if (job->seq_buffer) {
+    if (ctx->mem_tracker) {
+      gcomp_memory_track_free(ctx->mem_tracker, job->seq_buffer_capacity);
+    }
     gcomp_free(ctx->allocator, job->seq_buffer);
   }
   if (job->literals_buffer) {
+    if (ctx->mem_tracker) {
+      gcomp_memory_track_free(ctx->mem_tracker, job->literals_buffer_capacity);
+    }
     gcomp_free(ctx->allocator, job->literals_buffer);
+  }
+  if (ctx->mem_tracker) {
+    gcomp_memory_track_free(ctx->mem_tracker, sizeof(zstd_parallel_job_t));
   }
   gcomp_free(ctx->allocator, job);
 }

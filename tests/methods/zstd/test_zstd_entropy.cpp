@@ -520,6 +520,59 @@ TEST_F(ZstdEntropyTest, BlockBoundaryMatch) {
   EXPECT_EQ(memcmp(decompressed.data(), input.data(), input.size()), 0);
 }
 
+//
+// 4-Stream Huffman Encoding
+//
+// When a block has >= 1024 literals and uses Huffman compression, the encoder
+// uses 4 parallel streams (jump table + 4 concatenated streams). This test
+// verifies roundtrip with data sized to trigger 4-stream mode.
+//
+
+TEST_F(ZstdEntropyTest, FourStreamHuffmanRoundtrip) {
+  // >= 1024 literals in a block to trigger 4-stream encoding.
+  // Use low-entropy text so the block uses Huffman (not raw) literals.
+  std::vector<uint8_t> input;
+  input.reserve(1500);
+  for (size_t i = 0; i < 1500; i++) {
+    input.push_back(static_cast<uint8_t>('a' + (i % 26)));
+  }
+
+  auto compressed = compress(input.data(), input.size());
+  ASSERT_FALSE(compressed.empty()) << "Compression failed";
+
+  auto decompressed = decompress(compressed.data(), compressed.size());
+  ASSERT_EQ(decompressed.size(), input.size());
+  EXPECT_EQ(memcmp(decompressed.data(), input.data(), input.size()), 0);
+}
+
+//
+// FSE-Compressed Huffman Weights
+//
+// When the Huffman table has >127 symbols, weights are FSE-compressed
+// (header_byte < 128 = compressed size). This test verifies roundtrip with
+// input that uses 128+ distinct bytes so the literal Huffman table triggers
+// FSE weight encoding.
+//
+
+TEST_F(ZstdEntropyTest, FSECompressedWeightsRoundtrip) {
+  // Use 200 distinct bytes so Huffman table has 200 symbols (>127).
+  // Repeat each byte a few times so the block uses Huffman (not raw).
+  std::vector<uint8_t> input;
+  input.reserve(2000);
+  for (int rep = 0; rep < 10; rep++) {
+    for (int b = 0; b < 200; b++) {
+      input.push_back(static_cast<uint8_t>(b));
+    }
+  }
+
+  auto compressed = compress(input.data(), input.size());
+  ASSERT_FALSE(compressed.empty()) << "Compression failed";
+
+  auto decompressed = decompress(compressed.data(), compressed.size());
+  ASSERT_EQ(decompressed.size(), input.size());
+  EXPECT_EQ(memcmp(decompressed.data(), input.data(), input.size()), 0);
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

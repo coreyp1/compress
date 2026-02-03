@@ -1,11 +1,11 @@
 /**
  * @file test_zstd_reset.cpp
  *
- * Tests for zstd encoder and decoder reset functionality (Z4.6, Z5.6, Z7.9).
+ * Tests for zstd encoder and decoder reset functionality.
  *
  * Verifies:
  * - Reset clears all state correctly
- * - Buffers are retained (not reallocated) after reset (BP-4)
+ * - Buffers are retained (not reallocated) after reset
  * - Multiple streams can be processed without reallocation
  * - Reset after error recovers correctly
  *

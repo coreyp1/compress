@@ -50,11 +50,24 @@
  *
  * ## Options
  *
+ * Zstd-specific:
  * - `zstd.level` (int64, default 3): Compression level (1-22)
- * - `zstd.checksum` (bool, default false): Enable content checksum
+ * - `zstd.checksum` (bool, default false): Enable content checksum (xxHash64)
  * - `zstd.window_log` (uint64, default 0/auto): Window log (10-31, 0=auto)
+ * - `zstd.dictionary` (bytes, optional): Raw or formatted dictionary (RFC 8878
+ * §5)
+ * - `zstd.dictionary_id` (uint32, optional): Dictionary ID to write (encoder)
+ * or validate (decoder)
  * - `zstd.content_size` (uint64, optional): Content size for header
- * - `zstd.concat` (bool, default false): Support concatenated frames
+ * - `zstd.concat` (bool, default false): Decoder: support concatenated frames
+ * - `zstd.job_size` (uint64, default 0/auto): Encoder: job size for parallel
+ * compression (64KB–16MB)
+ *
+ * Threading (encoder):
+ * - `threads.count` (uint64, default 1): Worker threads (0 or 1 =
+ * single-threaded; >1 = parallel)
+ *
+ * Limits (shared):
  * - `limits.max_output_bytes` (uint64): Max decompressed output
  * - `limits.max_window_bytes` (uint64): Max window size
  * - `limits.max_memory_bytes` (uint64): Max memory usage

@@ -65,6 +65,22 @@
  * - Match length codes (53 symbols, predefined log=6)
  * - Match offset codes (29 symbols, predefined log=5)
  *
+ * ## FSE Encoding (for Huffman Weights)
+ *
+ * When the Huffman encoder has >127 symbols, it compresses the weight
+ * sequence with FSE. This module provides:
+ *
+ * - zstd_fse_write_table_header(): Writes the FSE table header from
+ *   normalized counts (inverse of the decoder's read). Same bit format
+ *   as read_table_header so external decoders can parse it.
+ * - zstd_fse_build_table_from_norm(): Builds the FSE decoding table from
+ *   norm_counts (used by the encoder to drive the FSE state machine when
+ *   encoding the weight sequence in reverse order).
+ *
+ * The weight FSE alphabet is small (0..12). We use table_log = 6 (64
+ * states). The encoder in zstd_huf.c encodes weights in reverse, outputs
+ * initial state, then marker bit (backward bitstream).
+ *
  * ## Predefined Tables
  *
  * Zstd defines predefined FSE tables for sequences that provide good
@@ -266,6 +282,55 @@ static uint32_t zstd_fwd_bit_reader_read(
   br->bits_available -= nb_bits;
 
   return result;
+}
+
+//
+// Forward Bit Writer (for FSE table header encoding)
+//
+
+typedef struct {
+  uint8_t * buf;
+  size_t buf_size;
+  size_t byte_pos;
+  uint64_t bit_container;
+  unsigned bits_used;
+} zstd_fwd_bit_writer_t;
+
+static void zstd_fwd_bit_writer_init(
+    zstd_fwd_bit_writer_t * bw, uint8_t * buf, size_t buf_size) {
+  bw->buf = buf;
+  bw->buf_size = buf_size;
+  bw->byte_pos = 0;
+  bw->bit_container = 0;
+  bw->bits_used = 0;
+}
+
+static gcomp_status_t zstd_fwd_bit_writer_write(
+    zstd_fwd_bit_writer_t * bw, uint32_t value, unsigned nb_bits) {
+  if (nb_bits == 0) {
+    return GCOMP_OK;
+  }
+  if (bw->bits_used + nb_bits > 64) {
+    // Flush low byte
+    if (bw->byte_pos >= bw->buf_size) {
+      return GCOMP_ERR_LIMIT;
+    }
+    bw->buf[bw->byte_pos++] = (uint8_t)(bw->bit_container & 0xFF);
+    bw->bit_container >>= 8;
+    bw->bits_used -= 8;
+  }
+  bw->bit_container |= (uint64_t)value << bw->bits_used;
+  bw->bits_used += nb_bits;
+  return GCOMP_OK;
+}
+
+static gcomp_status_t zstd_fwd_bit_writer_flush(zstd_fwd_bit_writer_t * bw) {
+  while (bw->bits_used > 0 && bw->byte_pos < bw->buf_size) {
+    bw->buf[bw->byte_pos++] = (uint8_t)(bw->bit_container & 0xFF);
+    bw->bit_container >>= 8;
+    bw->bits_used = (bw->bits_used <= 8) ? 0 : bw->bits_used - 8;
+  }
+  return (bw->bits_used == 0) ? GCOMP_OK : GCOMP_ERR_LIMIT;
 }
 
 //
@@ -546,6 +611,116 @@ gcomp_status_t zstd_fse_read_table_header(const uint8_t * src, size_t src_size,
   *bytes_read_out = br.byte_pos;
 
   return GCOMP_OK;
+}
+
+/**
+ * @brief Write FSE table header (inverse of read_table_header).
+ *
+ * Encodes norm_counts into the same bit format the decoder expects.
+ */
+gcomp_status_t zstd_fse_write_table_header(uint8_t * dst, size_t dst_cap,
+    const int16_t * norm_counts, unsigned max_symbol, unsigned table_log,
+    size_t * bytes_written_out) {
+  if (!dst || !norm_counts || !bytes_written_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  if (table_log < FSE_MIN_TABLE_LOG || table_log > FSE_MAX_ACCURACY_LOG) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  zstd_fwd_bit_writer_t bw;
+  zstd_fwd_bit_writer_init(&bw, dst, dst_cap);
+
+  // 4 bits: table_log - 5
+  gcomp_status_t status = zstd_fwd_bit_writer_write(
+      &bw, (uint32_t)(table_log - FSE_MIN_TABLE_LOG), 4);
+  if (status != GCOMP_OK) {
+    return status;
+  }
+
+  int remaining = 1 << table_log;
+  unsigned symbol = 0;
+
+  while (remaining > 0 && symbol <= max_symbol) {
+    int count = (int)norm_counts[symbol];
+    // Encode count+1 (0, 1, 2, ...) so decode gets count = (count+1)-1
+    unsigned value = (unsigned)(count + 1);
+
+    unsigned threshold = (unsigned)remaining + 1;
+    unsigned nb_bits =
+        (threshold > 1) ? (32 - __builtin_clz(threshold - 1)) : 1;
+    unsigned low_bits = nb_bits - 1;
+    unsigned small_max = (1U << nb_bits) - 1 - threshold;
+
+    if (value <= small_max) {
+      status = zstd_fwd_bit_writer_write(&bw, value, low_bits);
+    }
+    else {
+      // value in (small_max, threshold]: encode as low_bits + 1 bit
+      unsigned low_value = value + small_max - (1U << low_bits);
+      status = zstd_fwd_bit_writer_write(&bw, low_value, low_bits);
+      if (status == GCOMP_OK) {
+        status = zstd_fwd_bit_writer_write(&bw, 1, 1);
+      }
+    }
+    if (status != GCOMP_OK) {
+      return status;
+    }
+
+    if (count == -1) {
+      remaining--;
+    }
+    else if (count >= 0) {
+      remaining -= count;
+    }
+
+    symbol++;
+
+    // Repeat zeroes: same encoding as read (2 bits per run)
+    if (count == 0) {
+      unsigned run = 0;
+      while (symbol + run <= max_symbol && norm_counts[symbol + run] == 0) {
+        run++;
+      }
+      while (run > 0) {
+        unsigned chunk = (run >= 3) ? 3 : run;
+        status = zstd_fwd_bit_writer_write(&bw, (uint32_t)chunk, 2);
+        if (status != GCOMP_OK) {
+          return status;
+        }
+        if (chunk == 3) {
+          symbol += 3;
+          run -= 3;
+        }
+        else {
+          symbol += chunk;
+          run -= chunk;
+        }
+      }
+    }
+  }
+
+  if (remaining != 0) {
+    return GCOMP_ERR_CORRUPT;
+  }
+
+  status = zstd_fwd_bit_writer_flush(&bw);
+  if (status != GCOMP_OK) {
+    return status;
+  }
+  *bytes_written_out = bw.byte_pos;
+  return GCOMP_OK;
+}
+
+/**
+ * @brief Build FSE decoding table from normalized counts (for encoding use).
+ */
+gcomp_status_t zstd_fse_build_table_from_norm(const int16_t * norm_counts,
+    unsigned max_symbol, unsigned table_log, zstd_fse_entry_t * table) {
+  if (!norm_counts || !table) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  return zstd_fse_build_table(norm_counts, max_symbol, table_log, table);
 }
 
 //

@@ -3,9 +3,29 @@
  *
  * Zstandard frame format helpers for the Ghoti.io Compress library.
  *
- * This file provides functions for:
- * - Building and parsing frame headers
- * - Building and parsing block headers
+ * ## Frame Format Structure (RFC 8878)
+ *
+ * A Zstd frame consists of:
+ * 1. **Magic Number** (4 bytes): 0xFD2FB528 (little-endian)
+ * 2. **Frame Header**: Frame_Header_Descriptor (1 byte) plus optional
+ *    Window_Descriptor, Dictionary_ID, Frame_Content_Size
+ * 3. **Data Blocks**: One or more blocks, each with 3-byte header + payload
+ * 4. **Content Checksum** (optional, 4 bytes): xxHash64 of decompressed
+ *    content, low 32 bits (per spec)
+ *
+ * ## xxHash64 Usage
+ *
+ * When the frame header has Content_Checksum_Flag set, the encoder computes
+ * xxHash64 over all decompressed bytes and writes the low 32 bits at frame
+ * end. The decoder validates this checksum and returns GCOMP_ERR_CORRUPT on
+ * mismatch. See zstd_encoder.c (content_hash) and zstd_decoder.c
+ * (content_hash, content_checksum).
+ *
+ * This file provides:
+ * - Building and parsing frame headers (zstd_write_frame_header,
+ *   zstd_parse_frame_header in decoder)
+ * - Building and parsing block headers (zstd_write_block_header,
+ *   zstd_parse_block_header)
  *
  * Copyright 2026 by Corey Pennycuff
  */
@@ -38,8 +58,18 @@ gcomp_status_t zstd_write_frame_header(const zstd_frame_header_t * header,
   // Build frame header descriptor
   uint8_t fhd = 0;
 
-  // Dictionary ID flag (we don't support dictionaries yet, so always 0)
-  // fhd |= 0; // dict_id_flag = 0
+  // Dictionary ID flag (0 = none, 1 = 1 byte, 2 = 2 bytes, 3 = 4 bytes)
+  if (header->dict_id != 0) {
+    if (header->dict_id <= 0xFF) {
+      fhd |= 1;
+    }
+    else if (header->dict_id <= 0xFFFF) {
+      fhd |= 2;
+    }
+    else {
+      fhd |= 3;
+    }
+  }
 
   // Content checksum flag
   if (header->content_checksum) {
@@ -90,8 +120,21 @@ gcomp_status_t zstd_write_frame_header(const zstd_frame_header_t * header,
     buf[pos++] = wd;
   }
 
-  // Write dictionary ID (none supported yet)
-  // No bytes written
+  // Write dictionary ID (if present)
+  if (header->dict_id != 0) {
+    uint8_t did_flag = fhd & ZSTD_FHD_DICT_ID_FLAG_MASK;
+    if (did_flag == 1) {
+      buf[pos++] = (uint8_t)header->dict_id;
+    }
+    else if (did_flag == 2) {
+      gcomp_write_le16(buf + pos, (uint16_t)header->dict_id);
+      pos += 2;
+    }
+    else if (did_flag == 3) {
+      gcomp_write_le32(buf + pos, header->dict_id);
+      pos += 4;
+    }
+  }
 
   // Write frame content size (if present)
   if (header->content_size_present) {
