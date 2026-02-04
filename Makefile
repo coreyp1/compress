@@ -135,15 +135,16 @@ TEST_HELPER_OBJ := $(OBJ_DIR)/tests/common/test_helpers.o
 
 COMPRESSLIBRARY := -L $(APP_DIR) -l$(SUITE)-$(PROJECT)$(BRANCH)
 
-# Automatically discover all test source files (excluding test_helpers.cpp)
-TEST_SOURCES := $(filter-out tests/common/test_helpers.cpp, $(shell find tests -type f -name 'test*.cpp' 2>/dev/null))
+# Single shell: discover test sources and compute executable name for each (path|name per line).
+# test.cpp -> testCompress; test_foo.cpp -> testFoo. Avoids hundreds of $(call test-name) / CreateProcess.
+TEST_PAIRS := $(shell find tests -type f -name 'test*.cpp' 2>/dev/null | sort | grep -v test_helpers.cpp | while read f; do \
+	if [ "$$f" = "tests/test.cpp" ]; then echo "$$f|testCompress"; \
+	else echo "$$f|$$(basename "$$f" .cpp | sed 's/test_/test/; s/^test\([a-z]\)/test\U\1/')"; fi; done)
+TEST_SOURCES := $(foreach pair,$(TEST_PAIRS),$(word 1,$(subst |, ,$(pair))))
+TEST_NAMES := $(foreach pair,$(TEST_PAIRS),$(word 2,$(subst |, ,$(pair))))
 
-# Function to convert test source file to executable name
-# test.cpp -> testCompress, test_*.cpp -> test* (capitalized first letter, underscores removed)
-test-name = $(if $(filter tests/test.cpp,$1),testCompress,$(shell echo $(basename $(notdir $1)) | sed 's/test_/test/; s/^test\([a-z]\)/test\U\1/'))
-
-# Generate list of test executables
-TEST_EXECUTABLES := $(foreach test,$(TEST_SOURCES),$(APP_DIR)/$(call test-name,$(test))$(EXE_EXTENSION))
+# Generate list of test executables (no $(call test-name) - use precomputed TEST_NAMES)
+TEST_EXECUTABLES := $(addprefix $(APP_DIR)/,$(addsuffix $(EXE_EXTENSION),$(TEST_NAMES)))
 
 # Automatically collect all example .c files under examples directories.
 EXAMPLE_SOURCES := $(shell find examples -type f -name '*.c' 2>/dev/null)
@@ -157,18 +158,15 @@ BENCH_SOURCES := $(shell find bench -type f -name '*.c' 2>/dev/null)
 # Convert each benchmark source file path to an executable path.
 BENCHMARKS := $(patsubst bench/%.c,$(APP_DIR)/bench/%$(EXE_EXTENSION),$(BENCH_SOURCES))
 
-
 all: $(APP_DIR)/$(TARGET) $(APP_DIR)/$(STATIC_TARGET) ## Build shared + static libraries
 
 ####################################################################
 # Dependency Inclusion
 ####################################################################
 
-# Automatically include all generated dependency files.
--include $(wildcard $(OBJ_DIR)/*.d)
--include $(wildcard $(OBJ_DIR)/**/*.d)
--include $(wildcard $(OBJ_DIR)/tests/*.d)
--include $(wildcard $(APP_DIR)/test*.d)
+# Include generated dependency files (computed list; no wildcard so same set on all platforms).
+DEPFILES := $(LIBOBJECTS:.o=.d) $(TEST_HELPER_OBJ:.o=.d) $(addprefix $(APP_DIR)/,$(addsuffix .d,$(TEST_NAMES)))
+-include $(DEPFILES)
 
 
 ####################################################################
@@ -230,33 +228,26 @@ $(TEST_HELPER_OBJ): tests/common/test_helpers.cpp
 
 # Pattern rule for compiling test source files to object files
 # This allows tests to be compiled separately from linking
+# Only test_helpers is built as .o (shared by all tests). Individual test .cpp files compile directly to exe.
 $(OBJ_DIR)/tests/%.o: tests/%.cpp
 	@printf "\n### Compiling Test Object: $* ###\n"
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(TEST_INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
 
-# Pattern rule for building test executables
-# This automatically handles all test_*.cpp files
-# Tests are compiled to .o files first, then linked separately
-# This optimization allows tests to only relink (fast) when library changes but headers don't
+# Compile each test .cpp directly to executable (link test_helpers.o in same step). Fewer targets = faster make graph.
+# Args: $1 = source path, $2 = executable name (from TEST_PAIRS; no $(call test-name) in expansion).
 define test-executable-rule
-# Generate test object file path from test source path
-# e.g., tests/core/test_callback_api.cpp -> build/linux/release/objects/tests/core/test_callback_api.o
-# The object file is built by the pattern rule $(OBJ_DIR)/tests/%.o: tests/%.cpp above
-TEST_OBJ_$1 := $(OBJ_DIR)/tests/$(patsubst tests/%.cpp,%.o,$1)
-
-# Rule to link test object file into executable
-$(APP_DIR)/$(call test-name,$1)$(EXE_EXTENSION): \
-		$$(TEST_OBJ_$1) \
+$(APP_DIR)/$2$(EXE_EXTENSION): \
+		$1 \
 		$(TEST_HELPER_OBJ) \
 		| $(APP_DIR)/$(TARGET)
-	@printf "\n### Linking %s Test ###\n" "$(call test-name,$1)"
+	@printf "\n### Compiling and linking %s Test ###\n" "$2"
 	@mkdir -p $$(@D)
-	$$(CXX) $$(CXXFLAGS) -o $$@ $$(TEST_OBJ_$1) $$(TEST_HELPER_OBJ) $$(LDFLAGS) $$(TESTFLAGS) $$(COMPRESSLIBRARY)
+	$$(CXX) $$(CXXFLAGS) $$(TEST_INCLUDE) -MMD -MP -MF $$(APP_DIR)/$2.d -o $$@ $$< $$(TEST_HELPER_OBJ) $$(LDFLAGS) $$(TESTFLAGS) $$(COMPRESSLIBRARY)
 endef
 
-# Generate build rules for all test sources
-$(foreach test,$(TEST_SOURCES),$(eval $(call test-executable-rule,$(test))))
+# Generate build rules from TEST_PAIRS (one pair = source|name)
+$(foreach pair,$(TEST_PAIRS),$(eval $(call test-executable-rule,$(word 1,$(subst |, ,$(pair))),$(word 2,$(subst |, ,$(pair))))))
 
 ####################################################################
 # Examples
@@ -343,8 +334,6 @@ $(APP_DIR)/fuzz/%$(EXE_EXTENSION): fuzz/%.c $(APP_DIR)/$(AFL_STATIC_TARGET)
 .PHONY: fuzz-zstd-decoder fuzz-zstd-encoder fuzz-zstd-roundtrip
 # Sanitizer commands
 .PHONY: test-asan test-asan-quiet test-ubsan sanitizer-help
-
-
 watch: ## Watch the file directory for changes and compile the target
 	@while true; do \
 		make --no-print-directory all; \
@@ -832,7 +821,7 @@ ASAN_STATIC_TARGET := $(BASE_NAME_PREFIX)-asan.a
 
 # ASan test helper and executables
 ASAN_TEST_HELPER_OBJ := $(ASAN_OBJ_DIR)/tests/common/test_helpers.o
-ASAN_TEST_EXECUTABLES := $(foreach test,$(TEST_SOURCES),$(ASAN_APP_DIR)/$(call test-name,$(test))$(EXE_EXTENSION))
+ASAN_TEST_EXECUTABLES := $(addprefix $(ASAN_APP_DIR)/,$(addsuffix $(EXE_EXTENSION),$(TEST_NAMES)))
 
 # Compile flags for ASan builds (include UBSan for comprehensive checking)
 ASAN_CFLAGS := $(CFLAGS) $(ASAN_UBSAN_FLAGS) -DGCOMP_BUILD -DGCOMP_TEST_BUILD
@@ -874,21 +863,21 @@ $(ASAN_OBJ_DIR)/tests/%.o: tests/%.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(ASAN_CXXFLAGS) $(TEST_INCLUDE) -c $< -o $@
 
-# Pattern rule for ASan test executables
+# Pattern rule for ASan test executables. Args: $1 = source path, $2 = executable name (from TEST_PAIRS).
 define asan-test-executable-rule
 ASAN_TEST_OBJ_$1 := $(ASAN_OBJ_DIR)/tests/$(patsubst tests/%.cpp,%.o,$1)
 
-$(ASAN_APP_DIR)/$(call test-name,$1)$(EXE_EXTENSION): \
+$(ASAN_APP_DIR)/$2$(EXE_EXTENSION): \
 		$$(ASAN_TEST_OBJ_$1) \
 		$(ASAN_TEST_HELPER_OBJ) \
 		| $(ASAN_APP_DIR)/$(ASAN_TARGET)
-	@printf "\n### Linking ASan+UBSan %s Test ###\n" "$(call test-name,$1)"
+	@printf "\n### Linking ASan+UBSan %s Test ###\n" "$2"
 	@mkdir -p $$(@D)
 	$$(CXX) $$(ASAN_CXXFLAGS) -o $$@ $$(ASAN_TEST_OBJ_$1) $$(ASAN_TEST_HELPER_OBJ) $$(ASAN_LDFLAGS) $$(TESTFLAGS) $$(ASAN_COMPRESSLIBRARY)
 endef
 
-# Generate ASan build rules for all test sources
-$(foreach test,$(TEST_SOURCES),$(eval $(call asan-test-executable-rule,$(test))))
+# Generate ASan build rules from TEST_PAIRS
+$(foreach pair,$(TEST_PAIRS),$(eval $(call asan-test-executable-rule,$(word 1,$(subst |, ,$(pair))),$(word 2,$(subst |, ,$(pair))))))
 
 test-asan: ## Run all tests with AddressSanitizer + UndefinedBehaviorSanitizer (Linux only)
 test-asan: $(ASAN_APP_DIR)/$(ASAN_TARGET) $(ASAN_TEST_EXECUTABLES)

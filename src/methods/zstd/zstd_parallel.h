@@ -38,6 +38,7 @@
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/job_queue.h>
 #include <ghoti.io/compress/limits.h>
+#include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/thread_pool.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -95,7 +96,7 @@ typedef struct {
  * @param ctx_out Pointer to receive context.
  * @return GCOMP_OK on success, error code on failure.
  */
-gcomp_status_t zstd_parallel_create(
+GCOMP_INTERNAL_API gcomp_status_t zstd_parallel_create(
     const zstd_parallel_config_t * config, zstd_parallel_ctx_t ** ctx_out);
 
 /**
@@ -105,7 +106,7 @@ gcomp_status_t zstd_parallel_create(
  *
  * @param ctx Context to destroy.
  */
-void zstd_parallel_destroy(zstd_parallel_ctx_t * ctx);
+GCOMP_INTERNAL_API void zstd_parallel_destroy(zstd_parallel_ctx_t * ctx);
 
 /**
  * @brief Allocate a job structure for parallel compression.
@@ -117,7 +118,7 @@ void zstd_parallel_destroy(zstd_parallel_ctx_t * ctx);
  * @param job_out Pointer to receive allocated job.
  * @return GCOMP_OK on success, error code on failure.
  */
-gcomp_status_t zstd_parallel_alloc_job(
+GCOMP_INTERNAL_API gcomp_status_t zstd_parallel_alloc_job(
     zstd_parallel_ctx_t * ctx, zstd_parallel_job_t ** job_out);
 
 /**
@@ -126,7 +127,7 @@ gcomp_status_t zstd_parallel_alloc_job(
  * @param ctx Parallel context.
  * @param job Job to free.
  */
-void zstd_parallel_free_job(
+GCOMP_INTERNAL_API void zstd_parallel_free_job(
     zstd_parallel_ctx_t * ctx, zstd_parallel_job_t * job);
 
 /**
@@ -143,7 +144,7 @@ void zstd_parallel_free_job(
  * @param job Job to submit (input buffer must be filled).
  * @return GCOMP_OK on success, error code on failure.
  */
-gcomp_status_t zstd_parallel_submit(
+GCOMP_INTERNAL_API gcomp_status_t zstd_parallel_submit(
     zstd_parallel_ctx_t * ctx, zstd_parallel_job_t * job);
 
 /**
@@ -156,7 +157,7 @@ gcomp_status_t zstd_parallel_submit(
  * @param job_out Pointer to receive completed job.
  * @return GCOMP_OK on success, error code on failure.
  */
-gcomp_status_t zstd_parallel_get_result(
+GCOMP_INTERNAL_API gcomp_status_t zstd_parallel_get_result(
     zstd_parallel_ctx_t * ctx, zstd_parallel_job_t ** job_out);
 
 /**
@@ -165,7 +166,8 @@ gcomp_status_t zstd_parallel_get_result(
  * @param ctx Parallel context.
  * @return true if a result is ready, false otherwise.
  */
-bool zstd_parallel_result_ready(const zstd_parallel_ctx_t * ctx);
+GCOMP_INTERNAL_API bool zstd_parallel_result_ready(
+    const zstd_parallel_ctx_t * ctx);
 
 /**
  * @brief Wait for all pending jobs to complete.
@@ -173,7 +175,7 @@ bool zstd_parallel_result_ready(const zstd_parallel_ctx_t * ctx);
  * @param ctx Parallel context.
  * @return GCOMP_OK on success, or first error from any job.
  */
-gcomp_status_t zstd_parallel_wait(zstd_parallel_ctx_t * ctx);
+GCOMP_INTERNAL_API gcomp_status_t zstd_parallel_wait(zstd_parallel_ctx_t * ctx);
 
 /**
  * @brief Check if context is in inline mode.
@@ -181,7 +183,8 @@ gcomp_status_t zstd_parallel_wait(zstd_parallel_ctx_t * ctx);
  * @param ctx Parallel context.
  * @return true if inline mode (no threading), false otherwise.
  */
-bool zstd_parallel_is_inline(const zstd_parallel_ctx_t * ctx);
+GCOMP_INTERNAL_API bool zstd_parallel_is_inline(
+    const zstd_parallel_ctx_t * ctx);
 
 /**
  * @brief Get number of pending jobs.
@@ -189,7 +192,8 @@ bool zstd_parallel_is_inline(const zstd_parallel_ctx_t * ctx);
  * @param ctx Parallel context.
  * @return Number of jobs submitted but not yet retrieved.
  */
-uint32_t zstd_parallel_pending_count(const zstd_parallel_ctx_t * ctx);
+GCOMP_INTERNAL_API uint32_t zstd_parallel_pending_count(
+    const zstd_parallel_ctx_t * ctx);
 
 /**
  * @brief Reset context for reuse.
@@ -199,7 +203,8 @@ uint32_t zstd_parallel_pending_count(const zstd_parallel_ctx_t * ctx);
  * @param ctx Parallel context.
  * @return GCOMP_OK on success, error code on failure.
  */
-gcomp_status_t zstd_parallel_reset(zstd_parallel_ctx_t * ctx);
+GCOMP_INTERNAL_API gcomp_status_t zstd_parallel_reset(
+    zstd_parallel_ctx_t * ctx);
 
 /**
  * @brief Get the job size configured for this context.
@@ -207,7 +212,8 @@ gcomp_status_t zstd_parallel_reset(zstd_parallel_ctx_t * ctx);
  * @param ctx Parallel context.
  * @return Job size in bytes.
  */
-uint64_t zstd_parallel_get_job_size(const zstd_parallel_ctx_t * ctx);
+GCOMP_INTERNAL_API uint64_t zstd_parallel_get_job_size(
+    const zstd_parallel_ctx_t * ctx);
 
 #ifdef __cplusplus
 }

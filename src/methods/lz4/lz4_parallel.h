@@ -36,6 +36,7 @@
 #include <ghoti.io/compress/allocator.h>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/job_queue.h>
+#include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/thread_pool.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -86,7 +87,7 @@ typedef struct {
  * @param ctx_out Pointer to receive context.
  * @return GCOMP_OK on success, error code on failure.
  */
-gcomp_status_t lz4_parallel_create(
+GCOMP_INTERNAL_API gcomp_status_t lz4_parallel_create(
     const lz4_parallel_config_t * config, lz4_parallel_ctx_t ** ctx_out);
 
 /**
@@ -96,7 +97,7 @@ gcomp_status_t lz4_parallel_create(
  *
  * @param ctx Context to destroy.
  */
-void lz4_parallel_destroy(lz4_parallel_ctx_t * ctx);
+GCOMP_INTERNAL_API void lz4_parallel_destroy(lz4_parallel_ctx_t * ctx);
 
 /**
  * @brief Allocate a job structure for parallel compression.
@@ -108,7 +109,7 @@ void lz4_parallel_destroy(lz4_parallel_ctx_t * ctx);
  * @param job_out Pointer to receive allocated job.
  * @return GCOMP_OK on success, error code on failure.
  */
-gcomp_status_t lz4_parallel_alloc_job(
+GCOMP_INTERNAL_API gcomp_status_t lz4_parallel_alloc_job(
     lz4_parallel_ctx_t * ctx, lz4_parallel_job_t ** job_out);
 
 /**
@@ -117,7 +118,8 @@ gcomp_status_t lz4_parallel_alloc_job(
  * @param ctx Parallel context.
  * @param job Job to free.
  */
-void lz4_parallel_free_job(lz4_parallel_ctx_t * ctx, lz4_parallel_job_t * job);
+GCOMP_INTERNAL_API void lz4_parallel_free_job(
+    lz4_parallel_ctx_t * ctx, lz4_parallel_job_t * job);
 
 /**
  * @brief Submit a block for compression.
@@ -130,7 +132,7 @@ void lz4_parallel_free_job(lz4_parallel_ctx_t * ctx, lz4_parallel_job_t * job);
  * @param job Job to submit (input buffer must be filled).
  * @return GCOMP_OK on success, error code on failure.
  */
-gcomp_status_t lz4_parallel_submit(
+GCOMP_INTERNAL_API gcomp_status_t lz4_parallel_submit(
     lz4_parallel_ctx_t * ctx, lz4_parallel_job_t * job);
 
 /**
@@ -143,7 +145,7 @@ gcomp_status_t lz4_parallel_submit(
  * @param job_out Pointer to receive completed job.
  * @return GCOMP_OK on success, error code on failure.
  */
-gcomp_status_t lz4_parallel_get_result(
+GCOMP_INTERNAL_API gcomp_status_t lz4_parallel_get_result(
     lz4_parallel_ctx_t * ctx, lz4_parallel_job_t ** job_out);
 
 /**
@@ -152,7 +154,8 @@ gcomp_status_t lz4_parallel_get_result(
  * @param ctx Parallel context.
  * @return true if a result is ready, false otherwise.
  */
-bool lz4_parallel_result_ready(const lz4_parallel_ctx_t * ctx);
+GCOMP_INTERNAL_API bool lz4_parallel_result_ready(
+    const lz4_parallel_ctx_t * ctx);
 
 /**
  * @brief Wait for all pending jobs to complete.
@@ -160,7 +163,7 @@ bool lz4_parallel_result_ready(const lz4_parallel_ctx_t * ctx);
  * @param ctx Parallel context.
  * @return GCOMP_OK on success, or first error from any job.
  */
-gcomp_status_t lz4_parallel_wait(lz4_parallel_ctx_t * ctx);
+GCOMP_INTERNAL_API gcomp_status_t lz4_parallel_wait(lz4_parallel_ctx_t * ctx);
 
 /**
  * @brief Check if context is in inline mode.
@@ -168,7 +171,7 @@ gcomp_status_t lz4_parallel_wait(lz4_parallel_ctx_t * ctx);
  * @param ctx Parallel context.
  * @return true if inline mode (no threading), false otherwise.
  */
-bool lz4_parallel_is_inline(const lz4_parallel_ctx_t * ctx);
+GCOMP_INTERNAL_API bool lz4_parallel_is_inline(const lz4_parallel_ctx_t * ctx);
 
 /**
  * @brief Get number of pending jobs.
@@ -176,7 +179,8 @@ bool lz4_parallel_is_inline(const lz4_parallel_ctx_t * ctx);
  * @param ctx Parallel context.
  * @return Number of jobs submitted but not yet retrieved.
  */
-uint32_t lz4_parallel_pending_count(const lz4_parallel_ctx_t * ctx);
+GCOMP_INTERNAL_API uint32_t lz4_parallel_pending_count(
+    const lz4_parallel_ctx_t * ctx);
 
 /**
  * @brief Reset context for reuse.
@@ -186,7 +190,7 @@ uint32_t lz4_parallel_pending_count(const lz4_parallel_ctx_t * ctx);
  * @param ctx Parallel context.
  * @return GCOMP_OK on success, error code on failure.
  */
-gcomp_status_t lz4_parallel_reset(lz4_parallel_ctx_t * ctx);
+GCOMP_INTERNAL_API gcomp_status_t lz4_parallel_reset(lz4_parallel_ctx_t * ctx);
 
 #ifdef __cplusplus
 }
