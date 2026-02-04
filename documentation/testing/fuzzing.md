@@ -51,7 +51,7 @@ make fuzz-roundtrip  # Fuzz encode+decode roundtrip
 # 4. Press Ctrl+C to stop fuzzing
 ```
 
-Decoder, encoder, and roundtrip fuzz harnesses exist for **deflate**, **gzip**, **LZ4**, and **zstd**. See the `fuzz/` directory for the full list of harnesses and `make help` (or the Fuzz Testing section below) for available targets.
+Decoder, encoder, and roundtrip fuzz harnesses exist for **deflate**, **gzip**, **LZ4**, **zstd**, **rle**, and **lzw**. See the `fuzz/` directory for the full list of harnesses and `make help` (or the Fuzz Testing section below) for available targets.
 
 ## Available Fuzz Targets
 
@@ -191,6 +191,36 @@ make fuzz-lz4-roundtrip
 | Concatenation | Multiple frames can be concatenated; decoder handles with `lz4.concat` option |
 
 **Recommendation**: The roundtrip fuzzer is most effective for LZ4 because it tests the full encode/decode path. The decoder fuzzer is important for security testing with untrusted input.
+
+## RLE Fuzz Targets
+
+The RLE method has fuzz harnesses that test both profiles:
+
+- PackBits (`rle.format=packbits`)
+- TGA (`rle.format=tga`)
+
+The decoder harness runs both profiles per input to maximize coverage.
+
+```bash
+make fuzz-rle-decoder
+make fuzz-rle-encoder
+make fuzz-rle-roundtrip
+```
+
+## LZW Fuzz Targets
+
+The LZW method has fuzz harnesses that test both profiles:
+
+- GIF LZW (`lzw.format=gif`, LSB-first bit packing)
+- TIFF LZW (`lzw.format=tiff`, MSB-first bit packing)
+
+The decoder harness runs both profiles per input to maximize coverage.
+
+```bash
+make fuzz-lzw-decoder
+make fuzz-lzw-encoder
+make fuzz-lzw-roundtrip
+```
 
 ## Understanding AFL++ Output
 
@@ -393,6 +423,12 @@ fuzz/
 ├── fuzz_lz4_decoder.c       # LZ4 decoder fuzz harness
 ├── fuzz_lz4_encoder.c       # LZ4 encoder fuzz harness
 ├── fuzz_lz4_roundtrip.c     # LZ4 roundtrip fuzz harness
+├── fuzz_rle_decoder.c       # RLE decoder fuzz harness
+├── fuzz_rle_encoder.c       # RLE encoder fuzz harness
+├── fuzz_rle_roundtrip.c     # RLE roundtrip fuzz harness
+├── fuzz_lzw_decoder.c       # LZW decoder fuzz harness
+├── fuzz_lzw_encoder.c       # LZW encoder fuzz harness
+├── fuzz_lzw_roundtrip.c     # LZW roundtrip fuzz harness
 ├── fuzz_zstd_decoder.c      # Zstd decoder fuzz harness
 ├── fuzz_zstd_encoder.c      # Zstd encoder fuzz harness
 ├── fuzz_zstd_roundtrip.c    # Zstd roundtrip fuzz harness
@@ -407,6 +443,12 @@ fuzz/
 │   ├── lz4_decoder/         # LZ4 frame format test inputs
 │   ├── lz4_encoder/         # Plaintext inputs for LZ4
 │   ├── lz4_roundtrip/       # Plaintext for LZ4 roundtrip
+│   ├── rle_decoder/         # RLE encoded streams (PackBits/TGA seeds)
+│   ├── rle_encoder/         # Plaintext inputs for RLE
+│   ├── rle_roundtrip/       # Plaintext inputs for RLE roundtrip
+│   ├── lzw_decoder/         # LZW encoded streams (GIF/TIFF seeds)
+│   ├── lzw_encoder/         # Plaintext inputs for LZW
+│   ├── lzw_roundtrip/       # Plaintext inputs for LZW roundtrip
 │   ├── zstd_decoder/        # Zstd frame format test inputs
 │   ├── zstd_encoder/        # Plaintext inputs for zstd
 │   └── zstd_roundtrip/      # Plaintext for zstd roundtrip
@@ -423,6 +465,12 @@ fuzz/
     ├── lz4_decoder/
     ├── lz4_encoder/
     ├── lz4_roundtrip/
+    ├── rle_decoder/
+    ├── rle_encoder/
+    ├── rle_roundtrip/
+    ├── lzw_decoder/
+    ├── lzw_encoder/
+    ├── lzw_roundtrip/
     ├── zstd_decoder/
     ├── zstd_encoder/
     └── zstd_roundtrip/

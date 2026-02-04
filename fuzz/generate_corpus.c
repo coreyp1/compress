@@ -116,6 +116,12 @@ int main(void) {
   mkdir_p("fuzz/corpus/decoder");
   mkdir_p("fuzz/corpus/encoder");
   mkdir_p("fuzz/corpus/roundtrip");
+  mkdir_p("fuzz/corpus/rle_decoder");
+  mkdir_p("fuzz/corpus/rle_encoder");
+  mkdir_p("fuzz/corpus/rle_roundtrip");
+  mkdir_p("fuzz/corpus/lzw_decoder");
+  mkdir_p("fuzz/corpus/lzw_encoder");
+  mkdir_p("fuzz/corpus/lzw_roundtrip");
   printf("\n");
 
   // Decoder corpus: valid compressed data
@@ -181,6 +187,16 @@ int main(void) {
 
     snprintf(path, sizeof(path), "fuzz/corpus/roundtrip/sample_%zu.bin", i);
     write_file(path, (const uint8_t *)text, len);
+
+    snprintf(path, sizeof(path), "fuzz/corpus/rle_encoder/sample_%zu.bin", i);
+    write_file(path, (const uint8_t *)text, len);
+    snprintf(path, sizeof(path), "fuzz/corpus/rle_roundtrip/sample_%zu.bin", i);
+    write_file(path, (const uint8_t *)text, len);
+
+    snprintf(path, sizeof(path), "fuzz/corpus/lzw_encoder/sample_%zu.bin", i);
+    write_file(path, (const uint8_t *)text, len);
+    snprintf(path, sizeof(path), "fuzz/corpus/lzw_roundtrip/sample_%zu.bin", i);
+    write_file(path, (const uint8_t *)text, len);
   }
 
   // Generate some binary patterns
@@ -192,6 +208,14 @@ int main(void) {
   write_file(path, zeros, sizeof(zeros));
   snprintf(path, sizeof(path), "fuzz/corpus/roundtrip/zeros_256.bin");
   write_file(path, zeros, sizeof(zeros));
+  snprintf(path, sizeof(path), "fuzz/corpus/rle_encoder/zeros_256.bin");
+  write_file(path, zeros, sizeof(zeros));
+  snprintf(path, sizeof(path), "fuzz/corpus/rle_roundtrip/zeros_256.bin");
+  write_file(path, zeros, sizeof(zeros));
+  snprintf(path, sizeof(path), "fuzz/corpus/lzw_encoder/zeros_256.bin");
+  write_file(path, zeros, sizeof(zeros));
+  snprintf(path, sizeof(path), "fuzz/corpus/lzw_roundtrip/zeros_256.bin");
+  write_file(path, zeros, sizeof(zeros));
 
   // All 0xFF
   uint8_t ones[256];
@@ -199,6 +223,14 @@ int main(void) {
   snprintf(path, sizeof(path), "fuzz/corpus/encoder/ones_256.bin");
   write_file(path, ones, sizeof(ones));
   snprintf(path, sizeof(path), "fuzz/corpus/roundtrip/ones_256.bin");
+  write_file(path, ones, sizeof(ones));
+  snprintf(path, sizeof(path), "fuzz/corpus/rle_encoder/ones_256.bin");
+  write_file(path, ones, sizeof(ones));
+  snprintf(path, sizeof(path), "fuzz/corpus/rle_roundtrip/ones_256.bin");
+  write_file(path, ones, sizeof(ones));
+  snprintf(path, sizeof(path), "fuzz/corpus/lzw_encoder/ones_256.bin");
+  write_file(path, ones, sizeof(ones));
+  snprintf(path, sizeof(path), "fuzz/corpus/lzw_roundtrip/ones_256.bin");
   write_file(path, ones, sizeof(ones));
 
   // Sequential bytes 0x00-0xFF
@@ -210,6 +242,14 @@ int main(void) {
   write_file(path, sequential, sizeof(sequential));
   snprintf(path, sizeof(path), "fuzz/corpus/roundtrip/sequential_256.bin");
   write_file(path, sequential, sizeof(sequential));
+  snprintf(path, sizeof(path), "fuzz/corpus/rle_encoder/sequential_256.bin");
+  write_file(path, sequential, sizeof(sequential));
+  snprintf(path, sizeof(path), "fuzz/corpus/rle_roundtrip/sequential_256.bin");
+  write_file(path, sequential, sizeof(sequential));
+  snprintf(path, sizeof(path), "fuzz/corpus/lzw_encoder/sequential_256.bin");
+  write_file(path, sequential, sizeof(sequential));
+  snprintf(path, sizeof(path), "fuzz/corpus/lzw_roundtrip/sequential_256.bin");
+  write_file(path, sequential, sizeof(sequential));
 
   // Alternating pattern
   uint8_t alternating[256];
@@ -219,6 +259,14 @@ int main(void) {
   snprintf(path, sizeof(path), "fuzz/corpus/encoder/alternating_256.bin");
   write_file(path, alternating, sizeof(alternating));
   snprintf(path, sizeof(path), "fuzz/corpus/roundtrip/alternating_256.bin");
+  write_file(path, alternating, sizeof(alternating));
+  snprintf(path, sizeof(path), "fuzz/corpus/rle_encoder/alternating_256.bin");
+  write_file(path, alternating, sizeof(alternating));
+  snprintf(path, sizeof(path), "fuzz/corpus/rle_roundtrip/alternating_256.bin");
+  write_file(path, alternating, sizeof(alternating));
+  snprintf(path, sizeof(path), "fuzz/corpus/lzw_encoder/alternating_256.bin");
+  write_file(path, alternating, sizeof(alternating));
+  snprintf(path, sizeof(path), "fuzz/corpus/lzw_roundtrip/alternating_256.bin");
   write_file(path, alternating, sizeof(alternating));
 
   // Generate edge case sizes for encoder/roundtrip
@@ -247,9 +295,68 @@ int main(void) {
     write_file(path, buf, sz);
     snprintf(path, sizeof(path), "fuzz/corpus/roundtrip/edge_size_%zu.bin", sz);
     write_file(path, buf, sz);
+    snprintf(
+        path, sizeof(path), "fuzz/corpus/rle_encoder/edge_size_%zu.bin", sz);
+    write_file(path, buf, sz);
+    snprintf(
+        path, sizeof(path), "fuzz/corpus/rle_roundtrip/edge_size_%zu.bin", sz);
+    write_file(path, buf, sz);
+    snprintf(
+        path, sizeof(path), "fuzz/corpus/lzw_encoder/edge_size_%zu.bin", sz);
+    write_file(path, buf, sz);
+    snprintf(
+        path, sizeof(path), "fuzz/corpus/lzw_roundtrip/edge_size_%zu.bin", sz);
+    write_file(path, buf, sz);
 
     free(buf);
   }
+
+  // Decoder corpora for RLE and LZW: a few valid and malformed edge cases.
+  printf("\nGenerating RLE decoder corpus (PackBits/TGA examples)...\n");
+  // PackBits literal "ABC": control=2 (3 literal bytes).
+  uint8_t rle_packbits_abc[] = {0x02, 'A', 'B', 'C'};
+  snprintf(path, sizeof(path), "fuzz/corpus/rle_decoder/packbits_abc.bin");
+  write_file(path, rle_packbits_abc, sizeof(rle_packbits_abc));
+  // PackBits repeat 'Z' x3: control=253 (256-253=3), byte='Z'.
+  uint8_t rle_packbits_z3[] = {0xFD, 'Z'};
+  snprintf(path, sizeof(path), "fuzz/corpus/rle_decoder/packbits_z3.bin");
+  write_file(path, rle_packbits_z3, sizeof(rle_packbits_z3));
+  // PackBits no-op (128) then literal "A".
+  uint8_t rle_packbits_nop_a[] = {0x80, 0x00, 'A'};
+  snprintf(path, sizeof(path), "fuzz/corpus/rle_decoder/packbits_nop_a.bin");
+  write_file(path, rle_packbits_nop_a, sizeof(rle_packbits_nop_a));
+  // TGA raw "ABC": header=2 (count=3), then 3 bytes.
+  uint8_t rle_tga_abc[] = {0x02, 'A', 'B', 'C'};
+  snprintf(path, sizeof(path), "fuzz/corpus/rle_decoder/tga_abc.bin");
+  write_file(path, rle_tga_abc, sizeof(rle_tga_abc));
+  // TGA run 'Z' x3: header=0x82 (run, count=3), then 'Z'.
+  uint8_t rle_tga_z3[] = {0x82, 'Z'};
+  snprintf(path, sizeof(path), "fuzz/corpus/rle_decoder/tga_z3.bin");
+  write_file(path, rle_tga_z3, sizeof(rle_tga_z3));
+  // Truncated examples (should error, not crash).
+  uint8_t rle_trunc1[] = {0x02, 'A'};
+  snprintf(path, sizeof(path), "fuzz/corpus/rle_decoder/trunc_literal.bin");
+  write_file(path, rle_trunc1, sizeof(rle_trunc1));
+  uint8_t rle_trunc2[] = {0xFD}; // repeat token missing byte
+  snprintf(path, sizeof(path), "fuzz/corpus/rle_decoder/trunc_repeat.bin");
+  write_file(path, rle_trunc2, sizeof(rle_trunc2));
+
+  printf("\nGenerating LZW decoder corpus (GIF/TIFF minimal streams)...\n");
+  // Minimal GIF-profile (LSB) stream: CLEAR(256), EOI(257) with 9-bit codes.
+  uint8_t lzw_gif_clear_eoi[] = {0x00, 0x03, 0x02};
+  snprintf(path, sizeof(path), "fuzz/corpus/lzw_decoder/gif_clear_eoi.bin");
+  write_file(path, lzw_gif_clear_eoi, sizeof(lzw_gif_clear_eoi));
+  // Minimal TIFF-profile (MSB) stream: CLEAR(256), EOI(257) with 9-bit codes.
+  uint8_t lzw_tiff_clear_eoi[] = {0x80, 0x40, 0x40};
+  snprintf(path, sizeof(path), "fuzz/corpus/lzw_decoder/tiff_clear_eoi.bin");
+  write_file(path, lzw_tiff_clear_eoi, sizeof(lzw_tiff_clear_eoi));
+  // Truncated bitstreams.
+  uint8_t lzw_trunc1[] = {0x00};
+  snprintf(path, sizeof(path), "fuzz/corpus/lzw_decoder/trunc_1.bin");
+  write_file(path, lzw_trunc1, sizeof(lzw_trunc1));
+  uint8_t lzw_trunc2[] = {0x80, 0x40};
+  snprintf(path, sizeof(path), "fuzz/corpus/lzw_decoder/trunc_2.bin");
+  write_file(path, lzw_trunc2, sizeof(lzw_trunc2));
 
   // Generate gzip corpus with various header combinations
   printf("\nGenerating gzip corpus directory...\n");
@@ -267,19 +374,19 @@ int main(void) {
   write_file(path, gzip_empty, sizeof(gzip_empty));
 
   // Gzip with FNAME flag set (0x08)
-  uint8_t gzip_fname[] = {0x1f, 0x8b, 0x08, 0x08, // magic + CM + FLG=FNAME
-      0x00, 0x00, 0x00, 0x00, // MTIME
-      0x00, 0xff, // XFL, OS
-      't', 'e', 's', 't', '.', 't', 'x', 't', 0x00, // FNAME
-      0x01, 0x00, 0x00, 0xff, 0xff, // deflate empty
+  uint8_t gzip_fname[] = {0x1f, 0x8b, 0x08, 0x08,      // magic + CM + FLG=FNAME
+      0x00, 0x00, 0x00, 0x00,                          // MTIME
+      0x00, 0xff,                                      // XFL, OS
+      't', 'e', 's', 't', '.', 't', 'x', 't', 0x00,    // FNAME
+      0x01, 0x00, 0x00, 0xff, 0xff,                    // deflate empty
       0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; // CRC+ISIZE
   snprintf(path, sizeof(path), "fuzz/corpus/gzip_decoder/with_fname.gz");
   write_file(path, gzip_fname, sizeof(gzip_fname));
 
   // Gzip with FCOMMENT flag set (0x10)
   uint8_t gzip_fcomment[] = {0x1f, 0x8b, 0x08, 0x10, // FLG=FCOMMENT
-      0x00, 0x00, 0x00, 0x00, 0x00, 0xff, // MTIME, XFL, OS
-      'H', 'e', 'l', 'l', 'o', 0x00, // FCOMMENT
+      0x00, 0x00, 0x00, 0x00, 0x00, 0xff,            // MTIME, XFL, OS
+      'H', 'e', 'l', 'l', 'o', 0x00,                 // FCOMMENT
       0x01, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
       0x00};
   snprintf(path, sizeof(path), "fuzz/corpus/gzip_decoder/with_fcomment.gz");
@@ -287,8 +394,8 @@ int main(void) {
 
   // Gzip with FEXTRA flag set (0x04)
   uint8_t gzip_fextra[] = {0x1f, 0x8b, 0x08, 0x04, // FLG=FEXTRA
-      0x00, 0x00, 0x00, 0x00, 0x00, 0xff, // MTIME, XFL, OS
-      0x04, 0x00, // XLEN=4
+      0x00, 0x00, 0x00, 0x00, 0x00, 0xff,          // MTIME, XFL, OS
+      0x04, 0x00,                                  // XLEN=4
       'E', 'X', 0x02, 0x00, // Extra data (SI1, SI2, LEN=2, data)
       0x01, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
       0x00};
@@ -296,9 +403,8 @@ int main(void) {
   write_file(path, gzip_fextra, sizeof(gzip_fextra));
 
   // Gzip with FHCRC flag set (0x02) - need to compute actual CRC16
-  uint8_t gzip_fhcrc[] = {
-      0x1f, 0x8b, 0x08, 0x02, // FLG=FHCRC
-      0x00, 0x00, 0x00, 0x00, 0x00, 0xff, // MTIME, XFL, OS
+  uint8_t gzip_fhcrc[] = {0x1f, 0x8b, 0x08, 0x02, // FLG=FHCRC
+      0x00, 0x00, 0x00, 0x00, 0x00, 0xff,         // MTIME, XFL, OS
       0x17, 0xc9, // FHCRC (CRC16 of header bytes 0-9)
       0x01, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
       0x00};
@@ -314,11 +420,11 @@ int main(void) {
 
   // Gzip with all flags (FTEXT|FHCRC|FEXTRA|FNAME|FCOMMENT = 0x1F)
   uint8_t gzip_all_flags[] = {0x1f, 0x8b, 0x08, 0x1f, // All flags
-      0x00, 0x00, 0x00, 0x00, 0x00, 0xff, // MTIME, XFL, OS
-      0x04, 0x00, 'E', 'X', 0x02, 0x00, // FEXTRA
-      'f', 'i', 'l', 'e', 0x00, // FNAME
-      'c', 'o', 'm', 'm', 'e', 'n', 't', 0x00, // FCOMMENT
-      0x87, 0x56, // FHCRC (pre-computed)
+      0x00, 0x00, 0x00, 0x00, 0x00, 0xff,             // MTIME, XFL, OS
+      0x04, 0x00, 'E', 'X', 0x02, 0x00,               // FEXTRA
+      'f', 'i', 'l', 'e', 0x00,                       // FNAME
+      'c', 'o', 'm', 'm', 'e', 'n', 't', 0x00,        // FCOMMENT
+      0x87, 0x56,                                     // FHCRC (pre-computed)
       0x01, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
       0x00};
   snprintf(path, sizeof(path), "fuzz/corpus/gzip_decoder/all_flags.gz");
@@ -381,6 +487,12 @@ int main(void) {
   printf("  Decoder:      fuzz/corpus/decoder/\n");
   printf("  Encoder:      fuzz/corpus/encoder/\n");
   printf("  Roundtrip:    fuzz/corpus/roundtrip/\n");
+  printf("  RLE Decoder:  fuzz/corpus/rle_decoder/\n");
+  printf("  RLE Encoder:  fuzz/corpus/rle_encoder/\n");
+  printf("  RLE Roundtrip:fuzz/corpus/rle_roundtrip/\n");
+  printf("  LZW Decoder:  fuzz/corpus/lzw_decoder/\n");
+  printf("  LZW Encoder:  fuzz/corpus/lzw_encoder/\n");
+  printf("  LZW Roundtrip:fuzz/corpus/lzw_roundtrip/\n");
   printf("  Gzip Decoder: fuzz/corpus/gzip_decoder/\n");
   printf("  Gzip Encoder: fuzz/corpus/gzip_encoder/\n");
   printf("\n");
