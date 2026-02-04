@@ -35,15 +35,14 @@ extern "C" {
  */
 typedef struct lzw_core_decoder_s {
   const gcomp_allocator_t * allocator;
-  uint16_t *
-      prefix_code; /**< Prefix code for each table entry [0..capacity-1] */
-  uint8_t * append_char; /**< Append byte for each table entry */
-  uint8_t * stack;       /**< Decode stack (reverse output); length capacity */
-  uint32_t capacity;     /**< Max codes (e.g. 4096) */
-  uint32_t next_code;    /**< Next code to assign */
-  uint32_t prev_code;    /**< Previous code decoded (for KwKwK) */
-  uint8_t prev_first_byte; /**< First byte of previous string (for KwKwK) */
-  int has_prev;            /**< 1 if prev_code is valid */
+  uint16_t * prefix_code; ///< Prefix code for each table entry [0..capacity-1].
+  uint8_t * append_char;  ///< Append byte for each table entry.
+  uint8_t * stack;        ///< Decode stack (reverse output); length capacity.
+  uint32_t capacity;      ///< Max codes (e.g. 4096).
+  uint32_t next_code;     ///< Next code to assign.
+  uint32_t prev_code;     ///< Previous code decoded (for KwKwK).
+  uint8_t prev_first_byte; ///< First byte of previous string (for KwKwK).
+  int has_prev;            ///< 1 if prev_code is valid.
 } lzw_core_decoder_t;
 
 /**

@@ -41,16 +41,30 @@ See [Auto-Registration](../auto-registration.md) for details.
 | `lzw.format` | string | `"gif"` | Profile: `"gif"` (LSB) or `"tiff"` (MSB) |
 | `lzw.lit_width` | uint64 | (format default) | Literal width in bits. If unset: 8 for `"gif"`, 9 for `"tiff"` |
 | `lzw.max_code_bits` | uint64 | 12 | Maximum code width in bits (max 12 → 4096 entries) |
+| `lzw.encoder_lookup` | string | `"hash"` | Encoder dictionary lookup: `"linear"` (O(n) scan) or `"hash"` (O(1), faster). Decoder is unchanged. |
 
 ### Core limit options
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `limits.max_output_bytes` | uint64 | 0 (unlimited) | Maximum decompressed output (decoder) |
-| `limits.max_memory_bytes` | uint64 | 0 (unlimited) | Maximum working memory |
+| `limits.max_memory_bytes` | uint64 | 0 (unlimited) | Maximum working memory (encoder and decoder) |
 | `limits.max_expansion_ratio` | uint64 | 0 (unlimited) | Maximum output/input ratio; decompression bomb protection (decoder) |
 
-Limits are enforced by the decoder; exceeding any limit returns `GCOMP_ERR_LIMIT`. Unknown option keys yield `GCOMP_ERR_INVALID_ARG` at create time (schema policy: `GCOMP_UNKNOWN_KEY_ERROR`).
+Limits are enforced by the method; exceeding any limit returns `GCOMP_ERR_LIMIT`. Unknown option keys yield `GCOMP_ERR_INVALID_ARG` at create time (schema policy: `GCOMP_UNKNOWN_KEY_ERROR`).
+
+### Memory limit enforcement
+
+`limits.max_memory_bytes` is enforced at **init** (encoder and decoder creation). All dynamic allocations are tracked and checked after allocation; if total usage would exceed the limit, create fails with `GCOMP_ERR_LIMIT` and a detail string that includes current and maximum bytes.
+
+**What is counted:** Encoder and decoder state structures, the dictionary tables (`prefix_code`, `append_char`), and (decoder only) the decode stack and the pending output buffer. All sizes scale with `lzw.max_code_bits`.
+
+**Baseline (approximate) for default `lzw.max_code_bits=12` (capacity 4096):**
+
+- **Encoder:** state + 4096×2 bytes (prefix_code) + 4096×1 byte (append_char) ≈ 12.5 KB.
+- **Decoder:** state + 4096 bytes (pending buffer) + 4096×2 (prefix_code) + 4096×1 (append_char) + 4096×1 (stack) ≈ 20.5 KB.
+
+With smaller `lzw.max_code_bits` (e.g. 9 → capacity 512), baseline is proportionally smaller. Setting `limits.max_memory_bytes` below the required baseline causes create to fail with `GCOMP_ERR_LIMIT`.
 
 ## Format profiles
 
@@ -91,7 +105,7 @@ Code packing is bit-level. The encoder/decoder may retain partial-byte state bet
 | Code | Meaning |
 |------|---------|
 | `GCOMP_ERR_INVALID_ARG` | NULL registry/encoder/decoder; NULL buffer pointer with size > 0; unknown or invalid option |
-| `GCOMP_ERR_LIMIT` | Output would exceed `max_output_bytes`; expansion ratio would exceed `max_expansion_ratio`; output buffer too small |
+| `GCOMP_ERR_LIMIT` | Output would exceed `max_output_bytes`; expansion ratio would exceed `max_expansion_ratio`; memory would exceed `max_memory_bytes` at init; output buffer too small |
 | `GCOMP_ERR_CORRUPT` | Truncated stream, invalid code sequence, missing EOI, etc. |
 | `GCOMP_ERR_MEMORY` | Failed to allocate encoder/decoder state |
 

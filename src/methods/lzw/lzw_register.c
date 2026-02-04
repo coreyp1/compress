@@ -41,6 +41,7 @@
 //
 
 static const char LZW_DEFAULT_FORMAT[] = "gif";
+static const char LZW_DEFAULT_ENCODER_LOOKUP[] = "hash";
 
 static const gcomp_option_schema_t g_lzw_option_schemas[] = {
     {
@@ -81,6 +82,19 @@ static const gcomp_option_schema_t g_lzw_option_schemas[] = {
         0,                   // min_uint
         0,                   // max_uint
         "Maximum code width in bits (e.g. 12 for 4096 entries)",
+    },
+    {
+        "lzw.encoder_lookup",                // key
+        GCOMP_OPT_STRING,                    // type
+        1,                                   // has_default
+        {.str = LZW_DEFAULT_ENCODER_LOOKUP}, // default_value
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        "Encoder lookup mode: linear or hash (hash is faster)",
     },
     {
         "limits.max_output_bytes",
@@ -127,6 +141,7 @@ static const char * const g_lzw_option_keys[] = {
     "lzw.format",
     "lzw.lit_width",
     "lzw.max_code_bits",
+    "lzw.encoder_lookup",
     "limits.max_output_bytes",
     "limits.max_memory_bytes",
     "limits.max_expansion_ratio",

@@ -196,6 +196,33 @@ TEST_F(LzwDecoderTest, LimitMaxOutputBytes) {
   EXPECT_EQ(s, GCOMP_ERR_LIMIT);
 }
 
+TEST_F(LzwDecoderTest, LimitMaxMemoryBytesBelowBaselineFails) {
+  gcomp_options_t * opts = nullptr;
+  gcomp_options_create(&opts);
+  gcomp_options_set_string(opts, "lzw.format", "gif");
+  gcomp_options_set_uint64(opts, "limits.max_memory_bytes", 1000);
+
+  gcomp_decoder_t * dec = nullptr;
+  gcomp_status_t s = gcomp_decoder_create(reg_, "lzw", opts, &dec);
+  EXPECT_EQ(s, GCOMP_ERR_LIMIT);
+  EXPECT_EQ(dec, nullptr);
+  gcomp_options_destroy(opts);
+}
+
+TEST_F(LzwDecoderTest, LimitMaxMemoryBytesSufficientSucceeds) {
+  gcomp_options_t * opts = nullptr;
+  gcomp_options_create(&opts);
+  gcomp_options_set_string(opts, "lzw.format", "gif");
+  gcomp_options_set_uint64(opts, "limits.max_memory_bytes", 256 * 1024);
+
+  gcomp_decoder_t * dec = nullptr;
+  gcomp_status_t s = gcomp_decoder_create(reg_, "lzw", opts, &dec);
+  ASSERT_EQ(s, GCOMP_OK);
+  ASSERT_NE(dec, nullptr);
+  gcomp_decoder_destroy(dec);
+  gcomp_options_destroy(opts);
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

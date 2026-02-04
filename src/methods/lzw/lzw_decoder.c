@@ -30,6 +30,7 @@
 
 #include "../../core/alloc_internal.h"
 #include "../../core/registry_internal.h"
+#include "../../core/strutil_internal.h"
 #include "lzw_internal.h"
 #include <ghoti.io/compress/limits.h>
 #include <string.h>
@@ -38,22 +39,6 @@
 #define LZW_LIT_WIDTH_GIF 8
 #define LZW_LIT_WIDTH_TIFF 9
 #define LZW_MAX_CODE_BITS_DEFAULT 12
-
-static void copy_format(char * dst, size_t dst_size, const char * src) {
-  if (!dst || dst_size == 0) {
-    return;
-  }
-  if (!src) {
-    dst[0] = '\0';
-    return;
-  }
-  size_t len = strlen(src);
-  if (len >= dst_size) {
-    len = dst_size - 1;
-  }
-  memcpy(dst, src, len);
-  dst[len] = '\0';
-}
 
 gcomp_status_t lzw_decoder_init(gcomp_registry_t * registry,
     gcomp_options_t * options, gcomp_decoder_t * decoder) {
@@ -80,10 +65,10 @@ gcomp_status_t lzw_decoder_init(gcomp_registry_t * registry,
       gcomp_options_get_string(options, "lzw.format", &format_str) ==
           GCOMP_OK &&
       format_str) {
-    copy_format(state->format, sizeof(state->format), format_str);
+    gcomp_copy_cstr(state->format, sizeof(state->format), format_str);
   }
   else {
-    copy_format(state->format, sizeof(state->format), LZW_FORMAT_DEFAULT);
+    gcomp_copy_cstr(state->format, sizeof(state->format), LZW_FORMAT_DEFAULT);
   }
 
   state->profile_id = lzw_profile_from_string(state->format);
@@ -134,22 +119,71 @@ gcomp_status_t lzw_decoder_init(gcomp_registry_t * registry,
   state->clear_code = lzw_profile_clear_code(state->profile_id, lit);
   state->eoi_code = lzw_profile_eoi_code(state->profile_id, lit);
   state->current_bits = lzw_profile_initial_code_bits(state->profile_id, lit);
-  state->pending_buf = (uint8_t *)gcomp_malloc(alloc, LZW_DECODER_PENDING_MAX);
+
+  unsigned max_bits = (unsigned)state->max_code_bits;
+  if (max_bits == 0 || max_bits > LZW_CORE_MAX_CODE_BITS) {
+    gcomp_free(alloc, state);
+    return gcomp_decoder_set_error(decoder, GCOMP_ERR_INVALID_ARG,
+        "LZW decoder max_code_bits must be 1..%u", LZW_CORE_MAX_CODE_BITS);
+  }
+  state->pending_cap = (size_t)(1u << max_bits);
+
+  state->mem_tracker.current_bytes = 0;
+  gcomp_memory_track_alloc(&state->mem_tracker, sizeof(lzw_decoder_state_t));
+
+  state->pending_buf = (uint8_t *)gcomp_malloc(alloc, state->pending_cap);
   if (!state->pending_buf) {
+    gcomp_memory_track_free(&state->mem_tracker, sizeof(lzw_decoder_state_t));
     gcomp_free(alloc, state);
     return gcomp_decoder_set_error(decoder, GCOMP_ERR_MEMORY,
         "LZW decoder pending buffer allocation failed");
   }
+  gcomp_memory_track_alloc(&state->mem_tracker, state->pending_cap);
   state->pending_off = 0;
   state->pending_len = 0;
   state->done = 0;
 
-  gcomp_status_t s = lzw_core_decoder_init(&state->core, alloc,
-      (unsigned)state->max_code_bits, state->clear_code, state->eoi_code);
+  gcomp_status_t s = lzw_core_decoder_init(
+      &state->core, alloc, max_bits, state->clear_code, state->eoi_code);
   if (s != GCOMP_OK) {
+    gcomp_memory_track_free(&state->mem_tracker, state->pending_cap);
+    gcomp_memory_track_free(&state->mem_tracker, sizeof(lzw_decoder_state_t));
     gcomp_free(alloc, state->pending_buf);
     gcomp_free(alloc, state);
     return gcomp_decoder_set_error(decoder, s, "LZW decoder core init failed");
+  }
+
+  {
+    uint32_t cap = state->core.capacity;
+    size_t prefix_bytes = (size_t)cap * sizeof(uint16_t);
+    size_t append_bytes = (size_t)cap * sizeof(uint8_t);
+    size_t stack_bytes = (size_t)cap * sizeof(uint8_t);
+    gcomp_memory_track_alloc(&state->mem_tracker, prefix_bytes);
+    gcomp_memory_track_alloc(&state->mem_tracker, append_bytes);
+    gcomp_memory_track_alloc(&state->mem_tracker, stack_bytes);
+  }
+
+  if (state->max_memory_bytes != 0) {
+    gcomp_status_t lim =
+        gcomp_memory_check_limit(&state->mem_tracker, state->max_memory_bytes);
+    if (lim != GCOMP_OK) {
+      uint32_t cap = state->core.capacity;
+      size_t stack_bytes = (size_t)cap * sizeof(uint8_t);
+      size_t append_bytes = (size_t)cap * sizeof(uint8_t);
+      size_t prefix_bytes = (size_t)cap * sizeof(uint16_t);
+      gcomp_memory_track_free(&state->mem_tracker, stack_bytes);
+      gcomp_memory_track_free(&state->mem_tracker, append_bytes);
+      gcomp_memory_track_free(&state->mem_tracker, prefix_bytes);
+      lzw_core_decoder_destroy(&state->core);
+      gcomp_memory_track_free(&state->mem_tracker, state->pending_cap);
+      gcomp_memory_track_free(&state->mem_tracker, sizeof(lzw_decoder_state_t));
+      gcomp_free(alloc, state->pending_buf);
+      gcomp_free(alloc, state);
+      return gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
+          "LZW decoder memory usage %llu exceeds limit %llu",
+          (unsigned long long)state->mem_tracker.current_bytes,
+          (unsigned long long)state->max_memory_bytes);
+    }
   }
 
   lzw_bitreader_init(
@@ -165,11 +199,17 @@ void lzw_decoder_destroy(gcomp_decoder_t * decoder) {
   }
 
   lzw_decoder_state_t * state = (lzw_decoder_state_t *)decoder->method_state;
+  uint32_t cap = state->core.capacity;
+  gcomp_memory_track_free(&state->mem_tracker, (size_t)cap * sizeof(uint8_t));
+  gcomp_memory_track_free(&state->mem_tracker, (size_t)cap * sizeof(uint8_t));
+  gcomp_memory_track_free(&state->mem_tracker, (size_t)cap * sizeof(uint16_t));
   lzw_core_decoder_destroy(&state->core);
   if (state->pending_buf) {
+    gcomp_memory_track_free(&state->mem_tracker, state->pending_cap);
     gcomp_free(state->allocator, state->pending_buf);
     state->pending_buf = NULL;
   }
+  gcomp_memory_track_free(&state->mem_tracker, sizeof(lzw_decoder_state_t));
   const gcomp_allocator_t * alloc = state->allocator;
   gcomp_free(alloc, state);
   decoder->method_state = NULL;
@@ -286,8 +326,8 @@ gcomp_status_t lzw_decoder_update(gcomp_decoder_t * decoder,
     }
 
     size_t dec_len = 0;
-    s = lzw_core_decoder_decode(&state->core, code, state->pending_buf,
-        LZW_DECODER_PENDING_MAX, &dec_len);
+    s = lzw_core_decoder_decode(
+        &state->core, code, state->pending_buf, state->pending_cap, &dec_len);
     if (s == GCOMP_ERR_CORRUPT) {
       input->used += state->reader.byte_pos;
       state->total_input_bytes += (uint64_t)state->reader.byte_pos;

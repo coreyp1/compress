@@ -61,8 +61,8 @@
  * | Buffer | Size | Purpose |
  * |--------|------|---------|
  * | block_buffer | block_size | Collect uncompressed input |
- * | compressed_buffer | block_size + overhead | Hold compressed block for output |
- * | hash_table | 64K entries (256KB) | Match finding for LZ77 |
+ * | compressed_buffer | block_size + overhead | Hold compressed block for
+ * output | | hash_table | 64K entries (256KB) | Match finding for LZ77 |
  *
  * Total memory is checked against `limits.max_memory_bytes` after allocation.
  *
@@ -188,8 +188,8 @@ gcomp_status_t lz4_encoder_init(gcomp_registry_t * registry,
   lz4_encoder_state_t * state = NULL;
 
   // Allocate state
-  state =
-      (lz4_encoder_state_t *)gcomp_calloc(alloc, 1, sizeof(lz4_encoder_state_t));
+  state = (lz4_encoder_state_t *)gcomp_calloc(
+      alloc, 1, sizeof(lz4_encoder_state_t));
   if (!state) {
     return gcomp_encoder_set_error(
         encoder, GCOMP_ERR_MEMORY, "failed to allocate lz4 encoder state");
@@ -207,7 +207,8 @@ gcomp_status_t lz4_encoder_init(gcomp_registry_t * registry,
 
   // Allocate block buffer
   state->block_buffer_size = state->header.block_max_size;
-  state->block_buffer = (uint8_t *)gcomp_malloc(alloc, state->block_buffer_size);
+  state->block_buffer =
+      (uint8_t *)gcomp_malloc(alloc, state->block_buffer_size);
   if (!state->block_buffer) {
     status = gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
         "failed to allocate lz4 block buffer (%zu bytes)",
@@ -234,8 +235,8 @@ gcomp_status_t lz4_encoder_init(gcomp_registry_t * registry,
 
   // Allocate hash table for compression (64KB entries)
   state->hash_table_size = 65536;
-  state->hash_table =
-      (uint32_t *)gcomp_malloc(alloc, state->hash_table_size * sizeof(uint32_t));
+  state->hash_table = (uint32_t *)gcomp_malloc(
+      alloc, state->hash_table_size * sizeof(uint32_t));
   if (!state->hash_table) {
     status = gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
         "failed to allocate lz4 hash table (%zu bytes)",
@@ -372,6 +373,23 @@ gcomp_status_t lz4_encoder_update(gcomp_encoder_t * encoder,
 
   // Process input data
   if (state->stage == LZ4_ENC_STAGE_BLOCKS) {
+    // If we have a partially-emitted block from a previous call, flush it
+    if (state->compressed_buffer_len > 0) {
+      while (state->compressed_buffer_pos < state->compressed_buffer_len &&
+          output->used < output->size) {
+        ((uint8_t *)output->data)[output->used++] =
+            state->compressed_buffer[state->compressed_buffer_pos++];
+      }
+      if (state->compressed_buffer_pos < state->compressed_buffer_len) {
+        // Still have pending block bytes; caller should provide more space
+        return GCOMP_OK;
+      }
+
+      // Finished emitting this block
+      state->compressed_buffer_len = 0;
+      state->compressed_buffer_pos = 0;
+    }
+
     while (input->used < input->size) {
       // Buffer input data
       size_t available = input->size - input->used;
@@ -418,36 +436,37 @@ gcomp_status_t lz4_encoder_update(gcomp_encoder_t * encoder,
         if (state->header.block_checksum) {
           uint32_t checksum =
               gcomp_xxhash32(state->compressed_buffer + 4, compressed_len, 0);
-          gcomp_write_le32(state->compressed_buffer + total_block_len, checksum);
+          gcomp_write_le32(
+              state->compressed_buffer + total_block_len, checksum);
           total_block_len += 4;
         }
 
-        // Output compressed block
-        size_t block_pos = 0;
-        while (block_pos < total_block_len && output->used < output->size) {
-          ((uint8_t *)output->data)[output->used++] =
-              state->compressed_buffer[block_pos++];
-        }
+        // Stage compressed block for incremental output
+        state->compressed_buffer_len = total_block_len;
+        state->compressed_buffer_pos = 0;
 
-        // If we couldn't output the whole block, we need to buffer it
-        // For simplicity, require output buffer to be large enough
-        if (block_pos < total_block_len) {
-          // TODO: Handle partial block output
-          state->stage = LZ4_ENC_STAGE_ERROR;
-          return gcomp_encoder_set_error(encoder, GCOMP_ERR_LIMIT,
-              "lz4 output buffer too small for block (%zu of %zu bytes "
-              "written)",
-              block_pos, total_block_len);
-        }
-
-        // Reset block buffer
+        // Reset block buffer and hash table state now that the block is built
         state->block_buffer_pos = 0;
-
-        // Clear hash table for independent blocks
         if (state->header.block_independence) {
           memset(
               state->hash_table, 0, state->hash_table_size * sizeof(uint32_t));
         }
+
+        // Emit as much of the staged block as fits
+        while (state->compressed_buffer_pos < state->compressed_buffer_len &&
+            output->used < output->size) {
+          ((uint8_t *)output->data)[output->used++] =
+              state->compressed_buffer[state->compressed_buffer_pos++];
+        }
+
+        if (state->compressed_buffer_pos < state->compressed_buffer_len) {
+          // Output buffer filled mid-block; caller should resume later
+          return GCOMP_OK;
+        }
+
+        // Finished emitting this block; clear staging for the next one
+        state->compressed_buffer_len = 0;
+        state->compressed_buffer_pos = 0;
       }
     }
   }

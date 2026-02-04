@@ -37,7 +37,9 @@
 
 #include "../../core/alloc_internal.h"
 #include "../../core/registry_internal.h"
+#include "../../core/strutil_internal.h"
 #include "lzw_internal.h"
+#include <ghoti.io/compress/limits.h>
 #include <limits.h>
 #include <string.h>
 
@@ -46,22 +48,6 @@
 #define LZW_LIT_WIDTH_TIFF 9
 #define LZW_MAX_CODE_BITS_DEFAULT 12
 #define LZW_NO_PREFIX UINT32_MAX
-
-static void copy_format(char * dst, size_t dst_size, const char * src) {
-  if (!dst || dst_size == 0) {
-    return;
-  }
-  if (!src) {
-    dst[0] = '\0';
-    return;
-  }
-  size_t len = strlen(src);
-  if (len >= dst_size) {
-    len = dst_size - 1;
-  }
-  memcpy(dst, src, len);
-  dst[len] = '\0';
-}
 
 gcomp_status_t lzw_encoder_init(gcomp_registry_t * registry,
     gcomp_options_t * options, gcomp_encoder_t * encoder) {
@@ -88,10 +74,10 @@ gcomp_status_t lzw_encoder_init(gcomp_registry_t * registry,
       gcomp_options_get_string(options, "lzw.format", &format_str) ==
           GCOMP_OK &&
       format_str) {
-    copy_format(state->format, sizeof(state->format), format_str);
+    gcomp_copy_cstr(state->format, sizeof(state->format), format_str);
   }
   else {
-    copy_format(state->format, sizeof(state->format), LZW_FORMAT_DEFAULT);
+    gcomp_copy_cstr(state->format, sizeof(state->format), LZW_FORMAT_DEFAULT);
   }
 
   state->profile_id = lzw_profile_from_string(state->format);
@@ -122,6 +108,18 @@ gcomp_status_t lzw_encoder_init(gcomp_registry_t * registry,
     state->max_code_bits = LZW_MAX_CODE_BITS_DEFAULT;
   }
 
+  state->use_hash = 0;
+  state->hash_table = NULL;
+  state->hash_table_bytes = 0;
+  if (options) {
+    const char * lookup_str = NULL;
+    if (gcomp_options_get_string(options, "lzw.encoder_lookup", &lookup_str) ==
+            GCOMP_OK &&
+        lookup_str && strcmp(lookup_str, "hash") == 0) {
+      state->use_hash = 1;
+    }
+  }
+
   if (options) {
     u64 = 0;
     if (gcomp_options_get_uint64(options, "limits.max_output_bytes", &u64) ==
@@ -147,11 +145,82 @@ gcomp_status_t lzw_encoder_init(gcomp_registry_t * registry,
   state->pending_bits = 0;
   state->header_emitted = 0;
 
+  state->mem_tracker.current_bytes = 0;
+  gcomp_memory_track_alloc(&state->mem_tracker, sizeof(lzw_encoder_state_t));
+
   gcomp_status_t s = lzw_core_encoder_init(&state->core, alloc,
       (unsigned)state->max_code_bits, state->clear_code, state->eoi_code);
   if (s != GCOMP_OK) {
+    gcomp_memory_track_free(&state->mem_tracker, sizeof(lzw_encoder_state_t));
     gcomp_free(alloc, state);
     return gcomp_encoder_set_error(encoder, s, "LZW encoder core init failed");
+  }
+
+  {
+    uint32_t cap = state->core.capacity;
+    size_t prefix_bytes = (size_t)cap * sizeof(uint16_t);
+    size_t append_bytes = (size_t)cap * sizeof(uint8_t);
+    gcomp_memory_track_alloc(&state->mem_tracker, prefix_bytes);
+    gcomp_memory_track_alloc(&state->mem_tracker, append_bytes);
+  }
+
+  if (state->max_memory_bytes != 0) {
+    gcomp_status_t lim =
+        gcomp_memory_check_limit(&state->mem_tracker, state->max_memory_bytes);
+    if (lim != GCOMP_OK) {
+      uint32_t cap = state->core.capacity;
+      gcomp_memory_track_free(
+          &state->mem_tracker, (size_t)cap * sizeof(uint16_t));
+      gcomp_memory_track_free(
+          &state->mem_tracker, (size_t)cap * sizeof(uint8_t));
+      lzw_core_encoder_destroy(&state->core);
+      gcomp_memory_track_free(&state->mem_tracker, sizeof(lzw_encoder_state_t));
+      gcomp_free(alloc, state);
+      return gcomp_encoder_set_error(encoder, GCOMP_ERR_LIMIT,
+          "LZW encoder memory usage %llu exceeds limit %llu",
+          (unsigned long long)state->mem_tracker.current_bytes,
+          (unsigned long long)state->max_memory_bytes);
+    }
+  }
+
+  if (state->use_hash) {
+    gcomp_status_t hash_status =
+        lzw_encoder_hash_init(&state->hash_table, alloc, state->core.capacity,
+            &state->mem_tracker, &state->hash_table_bytes);
+    if (hash_status != GCOMP_OK) {
+      uint32_t cap = state->core.capacity;
+      gcomp_memory_track_free(
+          &state->mem_tracker, (size_t)cap * sizeof(uint16_t));
+      gcomp_memory_track_free(
+          &state->mem_tracker, (size_t)cap * sizeof(uint8_t));
+      lzw_core_encoder_destroy(&state->core);
+      gcomp_memory_track_free(&state->mem_tracker, sizeof(lzw_encoder_state_t));
+      gcomp_free(alloc, state);
+      return gcomp_encoder_set_error(
+          encoder, hash_status, "LZW encoder hash table init failed");
+    }
+    if (state->max_memory_bytes != 0) {
+      gcomp_status_t lim = gcomp_memory_check_limit(
+          &state->mem_tracker, state->max_memory_bytes);
+      if (lim != GCOMP_OK) {
+        lzw_encoder_hash_destroy(&state->hash_table, alloc, &state->mem_tracker,
+            state->hash_table_bytes);
+        state->hash_table_bytes = 0;
+        uint32_t cap = state->core.capacity;
+        gcomp_memory_track_free(
+            &state->mem_tracker, (size_t)cap * sizeof(uint16_t));
+        gcomp_memory_track_free(
+            &state->mem_tracker, (size_t)cap * sizeof(uint8_t));
+        lzw_core_encoder_destroy(&state->core);
+        gcomp_memory_track_free(
+            &state->mem_tracker, sizeof(lzw_encoder_state_t));
+        gcomp_free(alloc, state);
+        return gcomp_encoder_set_error(encoder, GCOMP_ERR_LIMIT,
+            "LZW encoder memory usage %llu exceeds limit %llu",
+            (unsigned long long)state->mem_tracker.current_bytes,
+            (unsigned long long)state->max_memory_bytes);
+      }
+    }
   }
 
   lzw_bitwriter_init(
@@ -167,7 +236,16 @@ void lzw_encoder_destroy(gcomp_encoder_t * encoder) {
   }
 
   lzw_encoder_state_t * state = (lzw_encoder_state_t *)encoder->method_state;
+  if (state->hash_table) {
+    lzw_encoder_hash_destroy(&state->hash_table, state->allocator,
+        &state->mem_tracker, state->hash_table_bytes);
+    state->hash_table_bytes = 0;
+  }
+  uint32_t cap = state->core.capacity;
+  gcomp_memory_track_free(&state->mem_tracker, (size_t)cap * sizeof(uint16_t));
+  gcomp_memory_track_free(&state->mem_tracker, (size_t)cap * sizeof(uint8_t));
   lzw_core_encoder_destroy(&state->core);
+  gcomp_memory_track_free(&state->mem_tracker, sizeof(lzw_encoder_state_t));
   const gcomp_allocator_t * alloc = state->allocator;
   gcomp_free(alloc, state);
   encoder->method_state = NULL;
@@ -249,7 +327,13 @@ gcomp_status_t lzw_encoder_update(gcomp_encoder_t * encoder,
       continue;
     }
 
-    found = lzw_core_encoder_find(&state->core, prefix, byte, &code_out);
+    if (state->use_hash && state->hash_table) {
+      found = lzw_encoder_hash_find(
+          state->hash_table, &state->core, prefix, byte, &code_out);
+    }
+    else {
+      found = lzw_core_encoder_find(&state->core, prefix, byte, &code_out);
+    }
     if (found) {
       state->prefix_code = code_out;
       input->used++;
@@ -268,11 +352,17 @@ gcomp_status_t lzw_encoder_update(gcomp_encoder_t * encoder,
         return s;
       }
       lzw_core_encoder_reset(&state->core, state->clear_code, state->eoi_code);
+      if (state->hash_table) {
+        lzw_encoder_hash_reset(state->hash_table);
+      }
       state->current_bits = lzw_profile_initial_code_bits(
           state->profile_id, (unsigned)state->lit_width);
     }
     else {
-      lzw_core_encoder_add(&state->core, prefix, byte);
+      uint32_t new_code = lzw_core_encoder_add(&state->core, prefix, byte);
+      if (state->hash_table && new_code != 0) {
+        lzw_encoder_hash_insert(state->hash_table, prefix, byte, new_code);
+      }
       if (lzw_profile_should_increment_bits(
               state->profile_id, state->core.next_code, state->current_bits)) {
         if (state->current_bits < (unsigned)state->max_code_bits) {
@@ -354,6 +444,9 @@ gcomp_status_t lzw_encoder_reset(gcomp_encoder_t * encoder) {
 
   lzw_encoder_state_t * state = (lzw_encoder_state_t *)encoder->method_state;
   lzw_core_encoder_reset(&state->core, state->clear_code, state->eoi_code);
+  if (state->hash_table) {
+    lzw_encoder_hash_reset(state->hash_table);
+  }
   state->current_bits = lzw_profile_initial_code_bits(
       state->profile_id, (unsigned)state->lit_width);
   state->prefix_code = LZW_NO_PREFIX;

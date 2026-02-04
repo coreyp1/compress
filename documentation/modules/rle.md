@@ -142,6 +142,7 @@ Encoder and decoder support `gcomp_encoder_reset()` and `gcomp_decoder_reset()`.
 
 - For untrusted encoded input, set `limits.max_output_bytes` and `limits.max_expansion_ratio` to avoid decompression bombs.
 - Buffer pointer validation: `update()` and `finish()` return `GCOMP_ERR_INVALID_ARG` if `input->data` or `output->data` is NULL when the corresponding size is greater than zero.
+- **Memory limit:** The option `limits.max_memory_bytes` is accepted (schema) but has no effect: RLE uses only fixed-size encoder/decoder state with no dynamic buffers. No memory is counted or enforced.
 
 ## See also
 

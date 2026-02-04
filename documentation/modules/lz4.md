@@ -111,6 +111,10 @@ The block size affects compression ratio, memory usage, and parallelism:
 
 **Note:** Memory usage includes the block buffer plus hash table for the encoder, and block buffer plus output buffer for the decoder.
 
+### Streaming and incremental output
+
+Encoder output is **incremental** even at block boundaries. When a block is compressed and the caller’s output buffer is too small to hold the entire block, the encoder buffers the remainder and returns `GCOMP_OK`; the next `update()` (or `finish()`) call will emit the buffered bytes before consuming more input. Callers may use arbitrarily small output buffers (e.g. 1–8 bytes) and still stream-encode correctly by repeatedly calling `update()` until input is consumed, then `finish()` until completion.
+
 ## Checksums
 
 ### Block checksum

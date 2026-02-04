@@ -854,6 +854,72 @@ TEST_F(Lz4StreamingTest, StreamingSingleByte) {
   EXPECT_EQ(decompressed[0], single);
 }
 
+//
+// Encoder: small output buffer at block emission boundary
+//
+
+TEST_F(Lz4StreamingTest, EncoderSmallOutputAtBlockBoundary) {
+  // Configure a small block size so that blocks are frequent.
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  ASSERT_EQ(gcomp_options_set_uint64(opts, "lz4.block_size", 65536), GCOMP_OK);
+
+  // Create encoder.
+  gcomp_encoder_t * encoder = nullptr;
+  gcomp_status_t status =
+      gcomp_encoder_create(registry_, "lz4", opts, &encoder);
+  ASSERT_EQ(status, GCOMP_OK);
+
+  // Input slightly larger than one block to ensure we hit a block boundary.
+  std::vector<uint8_t> original(65536 + 100);
+  test_helpers_generate_random(original.data(), original.size(), 424242);
+
+  gcomp_buffer_t in_buf = {original.data(), original.size(), 0};
+
+  // Use a very small output buffer to force partial block emission.
+  uint8_t out_chunk[7];
+  std::vector<uint8_t> compressed;
+
+  // Stream through update() until all input is consumed.
+  while (in_buf.used < in_buf.size) {
+    gcomp_buffer_t out_buf = {out_chunk, sizeof(out_chunk), 0};
+    status = gcomp_encoder_update(encoder, &in_buf, &out_buf);
+    ASSERT_EQ(status, GCOMP_OK);
+    compressed.insert(compressed.end(), out_chunk,
+        out_chunk + static_cast<ptrdiff_t>(out_buf.used));
+  }
+
+  // Drain finish() with the same tiny output buffer.
+  bool finished = false;
+  size_t previous_size = 0;
+  for (int i = 0; i < 100 && !finished; i++) {
+    gcomp_buffer_t out_buf = {out_chunk, sizeof(out_chunk), 0};
+    status = gcomp_encoder_finish(encoder, &out_buf);
+    ASSERT_EQ(status, GCOMP_OK);
+    compressed.insert(compressed.end(), out_chunk,
+        out_chunk + static_cast<ptrdiff_t>(out_buf.used));
+
+    // Two consecutive finish calls that produce no new output indicate
+    // completion.
+    if (out_buf.used == 0 && compressed.size() == previous_size) {
+      finished = true;
+    }
+    previous_size = compressed.size();
+  }
+  ASSERT_TRUE(finished) << "Encoder did not finish within iteration limit";
+
+  gcomp_encoder_destroy(encoder);
+  gcomp_options_destroy(opts);
+
+  // Verify by decoding with chunked input.
+  gcomp_status_t dec_status;
+  auto decompressed = decompressChunked(
+      compressed.data(), compressed.size(), 1024, nullptr, &dec_status);
+  ASSERT_EQ(dec_status, GCOMP_OK);
+  ASSERT_EQ(decompressed.size(), original.size());
+  EXPECT_EQ(memcmp(decompressed.data(), original.data(), original.size()), 0);
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

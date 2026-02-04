@@ -15,28 +15,13 @@
 
 #include "../../core/alloc_internal.h"
 #include "../../core/registry_internal.h"
+#include "../../core/strutil_internal.h"
 #include "rle_internal.h"
 #include "rle_profile.h"
 #include <ghoti.io/compress/limits.h>
 #include <string.h>
 
 #define RLE_FORMAT_DEFAULT RLE_FORMAT_PACKBITS
-
-static void copy_format(char * dst, size_t dst_size, const char * src) {
-  if (!dst || dst_size == 0) {
-    return;
-  }
-  if (!src) {
-    dst[0] = '\0';
-    return;
-  }
-  size_t len = strlen(src);
-  if (len >= dst_size) {
-    len = dst_size - 1;
-  }
-  memcpy(dst, src, len);
-  dst[len] = '\0';
-}
 
 gcomp_status_t rle_decoder_init(gcomp_registry_t * registry,
     gcomp_options_t * options, gcomp_decoder_t * decoder) {
@@ -63,10 +48,10 @@ gcomp_status_t rle_decoder_init(gcomp_registry_t * registry,
       gcomp_options_get_string(options, "rle.format", &format_str) ==
           GCOMP_OK &&
       format_str) {
-    copy_format(state->format, sizeof(state->format), format_str);
+    gcomp_copy_cstr(state->format, sizeof(state->format), format_str);
   }
   else {
-    copy_format(state->format, sizeof(state->format), RLE_FORMAT_DEFAULT);
+    gcomp_copy_cstr(state->format, sizeof(state->format), RLE_FORMAT_DEFAULT);
   }
 
   if (options) {

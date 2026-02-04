@@ -46,8 +46,10 @@
 #include "../../core/stream_internal.h"
 #include "lzw_bitio.h"
 #include "lzw_core.h"
+#include "lzw_hash.h"
 #include "lzw_profile.h"
 #include <ghoti.io/compress/errors.h>
+#include <ghoti.io/compress/limits.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
 #include <ghoti.io/compress/stream.h>
@@ -65,9 +67,6 @@ extern "C" {
 #define LZW_FORMAT_GIF "gif"
 #define LZW_FORMAT_TIFF "tiff"
 
-/** Maximum decoded bytes from a single code (table size). */
-#define LZW_DECODER_PENDING_MAX 4096u
-
 //
 // Encoder state (LW2: core, bit writer, profile, current string, pending write)
 //
@@ -80,6 +79,8 @@ typedef struct {
   uint64_t max_output_bytes;
   uint64_t max_memory_bytes;
   uint64_t max_expansion_ratio;
+
+  gcomp_memory_tracker_t mem_tracker;
 
   lzw_core_encoder_t core;
   lzw_bitwriter_t writer;
@@ -95,6 +96,12 @@ typedef struct {
   unsigned pending_bits;
   /** 1 after we've emitted CLEAR at start */
   int header_emitted;
+  /** Encoder lookup: 1 = hash, 0 = linear */
+  int use_hash;
+  /** Hash table for (prefix, byte) → code; NULL if use_hash is 0 */
+  lzw_encoder_hash_t * hash_table;
+  /** Bytes tracked for hash_table (for destroy and limit) */
+  size_t hash_table_bytes;
 } lzw_encoder_state_t;
 
 //
@@ -112,6 +119,8 @@ typedef struct {
   uint64_t total_input_bytes;
   uint64_t total_output_bytes;
 
+  gcomp_memory_tracker_t mem_tracker;
+
   lzw_core_decoder_t core;
   lzw_bitreader_t reader;
   lzw_profile_id_t profile_id;
@@ -120,6 +129,7 @@ typedef struct {
   unsigned current_bits;
   /** Pending decoded bytes not yet copied to output */
   uint8_t * pending_buf;
+  size_t pending_cap; ///< Capacity of pending_buf (1u << max_code_bits)
   size_t pending_off;
   size_t pending_len;
   /** 1 when EOI seen or stream ended */

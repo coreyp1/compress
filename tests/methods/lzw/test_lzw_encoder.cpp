@@ -129,6 +129,120 @@ TEST_F(LzwEncoderTest, InvalidArgNullOutputData) {
   gcomp_options_destroy(opts);
 }
 
+TEST_F(LzwEncoderTest, LimitMaxMemoryBytesBelowBaselineFails) {
+  gcomp_options_t * opts = nullptr;
+  gcomp_options_create(&opts);
+  gcomp_options_set_string(opts, "lzw.format", "gif");
+  gcomp_options_set_uint64(opts, "limits.max_memory_bytes", 1000);
+
+  gcomp_encoder_t * enc = nullptr;
+  gcomp_status_t s = gcomp_encoder_create(reg_, "lzw", opts, &enc);
+  EXPECT_EQ(s, GCOMP_ERR_LIMIT);
+  EXPECT_EQ(enc, nullptr);
+  gcomp_options_destroy(opts);
+}
+
+TEST_F(LzwEncoderTest, LimitMaxMemoryBytesSufficientSucceeds) {
+  gcomp_options_t * opts = nullptr;
+  gcomp_options_create(&opts);
+  gcomp_options_set_string(opts, "lzw.format", "gif");
+  gcomp_options_set_uint64(opts, "limits.max_memory_bytes", 256 * 1024);
+
+  gcomp_encoder_t * enc = nullptr;
+  gcomp_status_t s = gcomp_encoder_create(reg_, "lzw", opts, &enc);
+  ASSERT_EQ(s, GCOMP_OK);
+  ASSERT_NE(enc, nullptr);
+  gcomp_encoder_destroy(enc);
+  gcomp_options_destroy(opts);
+}
+
+// Encode with given encoder_lookup mode; return encoded size (buffer in
+// encoded_out).
+static size_t encode_with_lookup(gcomp_registry_t * reg, const char * lookup,
+    const uint8_t * input, size_t input_len,
+    std::vector<uint8_t> * encoded_out) {
+  gcomp_options_t * opts = nullptr;
+  gcomp_options_create(&opts);
+  gcomp_options_set_string(opts, "lzw.format", "gif");
+  gcomp_options_set_string(opts, "lzw.encoder_lookup", lookup);
+
+  gcomp_encoder_t * enc = nullptr;
+  gcomp_status_t s = gcomp_encoder_create(reg, "lzw", opts, &enc);
+  if (s != GCOMP_OK || enc == nullptr) {
+    gcomp_options_destroy(opts);
+    return 0;
+  }
+
+  encoded_out->resize(input_len * 2 + 128);
+  gcomp_buffer_t in_buf = {const_cast<uint8_t *>(input), input_len, 0};
+  gcomp_buffer_t out_buf = {encoded_out->data(), encoded_out->size(), 0};
+
+  s = gcomp_encoder_update(enc, &in_buf, &out_buf);
+  if (s != GCOMP_OK) {
+    gcomp_encoder_destroy(enc);
+    gcomp_options_destroy(opts);
+    return 0;
+  }
+  s = gcomp_encoder_finish(enc, &out_buf);
+  gcomp_encoder_destroy(enc);
+  gcomp_options_destroy(opts);
+  return (s == GCOMP_OK) ? out_buf.used : 0;
+}
+
+TEST_F(LzwEncoderTest, EncoderLookupLinearVsHashEquivalence) {
+  const uint8_t data[] = "hello";
+  const size_t len = sizeof(data) - 1;
+
+  std::vector<uint8_t> encoded_linear, encoded_hash;
+  size_t len_linear =
+      encode_with_lookup(reg_, "linear", data, len, &encoded_linear);
+  size_t len_hash = encode_with_lookup(reg_, "hash", data, len, &encoded_hash);
+
+  ASSERT_GT(len_linear, 0u) << "linear encode failed";
+  ASSERT_GT(len_hash, 0u) << "hash encode failed";
+
+  gcomp_options_t * opts = nullptr;
+  gcomp_options_create(&opts);
+  gcomp_options_set_string(opts, "lzw.format", "gif");
+
+  std::vector<uint8_t> decoded_linear(len + 64), decoded_hash(len + 64);
+  gcomp_buffer_t dec_out_linear = {
+      decoded_linear.data(), decoded_linear.size(), 0};
+  gcomp_buffer_t dec_out_hash = {decoded_hash.data(), decoded_hash.size(), 0};
+
+  gcomp_decoder_t * dec = nullptr;
+  gcomp_status_t s = gcomp_decoder_create(reg_, "lzw", opts, &dec);
+  ASSERT_EQ(s, GCOMP_OK);
+  gcomp_buffer_t enc_in = {encoded_linear.data(), len_linear, 0};
+  s = gcomp_decoder_update(dec, &enc_in, &dec_out_linear);
+  ASSERT_EQ(s, GCOMP_OK);
+  s = gcomp_decoder_finish(dec, &dec_out_linear);
+  ASSERT_EQ(s, GCOMP_OK);
+  gcomp_decoder_destroy(dec);
+
+  dec = nullptr;
+  s = gcomp_decoder_create(reg_, "lzw", opts, &dec);
+  ASSERT_EQ(s, GCOMP_OK);
+  enc_in.data = encoded_hash.data();
+  enc_in.size = len_hash;
+  enc_in.used = 0;
+  s = gcomp_decoder_update(dec, &enc_in, &dec_out_hash);
+  ASSERT_EQ(s, GCOMP_OK);
+  s = gcomp_decoder_finish(dec, &dec_out_hash);
+  ASSERT_EQ(s, GCOMP_OK);
+  gcomp_decoder_destroy(dec);
+  gcomp_options_destroy(opts);
+
+  EXPECT_EQ(dec_out_linear.used, len);
+  EXPECT_EQ(dec_out_hash.used, len);
+  EXPECT_TRUE(test_helpers_buffers_equal(
+      data, len, decoded_linear.data(), dec_out_linear.used));
+  EXPECT_TRUE(test_helpers_buffers_equal(
+      data, len, decoded_hash.data(), dec_out_hash.used));
+  EXPECT_TRUE(test_helpers_buffers_equal(decoded_linear.data(),
+      dec_out_linear.used, decoded_hash.data(), dec_out_hash.used));
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
