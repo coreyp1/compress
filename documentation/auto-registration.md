@@ -79,6 +79,11 @@ The following methods are auto-registered by default:
 | Method | Header | Registration Function |
 |--------|--------|----------------------|
 | `deflate` | `<ghoti.io/compress/deflate.h>` | `gcomp_method_deflate_register()` |
+| `gzip` | `<ghoti.io/compress/gzip.h>` | `gcomp_method_gzip_register()` |
+| `lz4` | `<ghoti.io/compress/lz4.h>` | `gcomp_method_lz4_register()` |
+| `lzw` | `<ghoti.io/compress/lzw.h>` | `gcomp_method_lzw_register()` |
+| `rle` | `<ghoti.io/compress/rle.h>` | `gcomp_method_rle_register()` |
+| `zstd` | `<ghoti.io/compress/zstd.h>` | `gcomp_method_zstd_register()` |
 
 ## Custom Registries
 

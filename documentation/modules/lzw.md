@@ -57,12 +57,12 @@ Limits are enforced by the method; exceeding any limit returns `GCOMP_ERR_LIMIT`
 
 `limits.max_memory_bytes` is enforced at **init** (encoder and decoder creation). All dynamic allocations are tracked and checked after allocation; if total usage would exceed the limit, create fails with `GCOMP_ERR_LIMIT` and a detail string that includes current and maximum bytes.
 
-**What is counted:** Encoder and decoder state structures, the dictionary tables (`prefix_code`, `append_char`), and (decoder only) the decode stack and the pending output buffer. All sizes scale with `lzw.max_code_bits`.
+**What is counted:** Encoder and decoder state structures, the dictionary tables (`prefix_code`, `append_char`), and (decoder only) the decode stack and the pending output buffer. When `lzw.encoder_lookup=hash`, the encoder also allocates a hash table (size proportional to capacity). All sizes scale with `lzw.max_code_bits`.
 
 **Baseline (approximate) for default `lzw.max_code_bits=12` (capacity 4096):**
 
-- **Encoder:** state + 4096×2 bytes (prefix_code) + 4096×1 byte (append_char) ≈ 12.5 KB.
-- **Decoder:** state + 4096 bytes (pending buffer) + 4096×2 (prefix_code) + 4096×1 (append_char) + 4096×1 (stack) ≈ 20.5 KB.
+- **Encoder:** state + 4096×2 bytes (prefix_code) + 4096×1 byte (append_char) ≈ 12.5 KB; with `encoder_lookup=hash` add the hash table (proportional to capacity).
+- **Decoder:** state + pending buffer (capacity = 2^max_code_bits) + 4096×2 (prefix_code) + 4096×1 (append_char) + 4096×1 (stack) ≈ 20.5 KB for default 12-bit capacity.
 
 With smaller `lzw.max_code_bits` (e.g. 9 → capacity 512), baseline is proportionally smaller. Setting `limits.max_memory_bytes` below the required baseline causes create to fail with `GCOMP_ERR_LIMIT`.
 

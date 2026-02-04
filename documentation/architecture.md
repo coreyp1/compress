@@ -59,6 +59,13 @@ The library is organized into the following major components:
 │  │  │  rle_register.c  │  │  rle_core.c      │  │ rle_internal  │  │    │
 │  │  └──────────────────┘  └──────────────────┘  └───────────────┘  │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                            lzw/                                 │    │
+│  │  ┌──────────────────┐  ┌──────────────────┐  ┌───────────────┐  │    │
+│  │  │  lzw_encoder.c   │  │  lzw_decoder.c   │  │ lzw_core.c    │  │    │
+│  │  │  lzw_hash.c      │  │  lzw_bitio.c     │  │ lzw_register.c│  │    │
+│  │  └──────────────────┘  └──────────────────┘  └───────────────┘  │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -90,6 +97,7 @@ Public headers and main entry points (all under `include/ghoti.io/compress/`):
 | `deflate.h` | Deflate-specific API (options, helpers) |
 | `gzip.h` | Gzip-specific API (options, helpers) |
 | `lz4.h` | LZ4-specific API (options, helpers) |
+| `lzw.h` | LZW-specific API (registration, format options) |
 | `zstd.h` | Zstd-specific API (options, helpers) |
 | `rle.h` | RLE-specific API (registration, format options) |
 | `crc32.h` | CRC-32 computation (gzip) |
@@ -105,11 +113,11 @@ Optional / build-time: `job_queue.h`, `thread_pool.h` (for parallel encode when 
 The following are used only inside the library and are **not** part of the public API. Do not include them from application code; they may change or be removed without notice.
 
 - **Core internal:** `safe_math.h`, `endian.h`, `alloc_internal.h`, `registry_internal.h`, `stream_internal.h`, and other `*_internal.h` under `src/core/`.
-- **Method internal:** Each method has an `*_internal.h` (e.g. `deflate_internal.h`, `gzip_internal.h`, `lz4_internal.h`, `zstd_internal.h`, `rle_internal.h`) for shared state and helpers within that method only.
+- **Method internal:** Each method has an `*_internal.h` (e.g. `deflate_internal.h`, `gzip_internal.h`, `lz4_internal.h`, `zstd_internal.h`, `rle_internal.h`, `lzw_internal.h`) for shared state and helpers within that method only. Some methods also use internal-only modules (e.g. `lzw_hash.h` / `lzw_hash.c`).
 
 ### Method Layer
 
-Each compression method (deflate, gzip, LZ4, zstd) implements the `gcomp_method_t` interface:
+Each compression method (deflate, gzip, LZ4, LZW, RLE, zstd) implements the `gcomp_method_t` interface:
 
 ```c
 struct gcomp_method_s {
@@ -487,6 +495,7 @@ compress/
 │   ├── deflate.h                 # Deflate-specific API
 │   ├── gzip.h                    # Gzip-specific API
 │   ├── lz4.h                     # LZ4-specific API
+│   ├── lzw.h                     # LZW-specific API
 │   ├── zstd.h                    # Zstd-specific API
 │   ├── rle.h                     # RLE-specific API
 │   ├── crc32.h                   # CRC-32 (gzip)

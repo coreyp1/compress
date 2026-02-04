@@ -6,7 +6,7 @@ Cross-platform C library implementing streaming compression with no external dep
 
 The `compress` library provides:
 - Streaming compression and decompression for files, memory buffers, and pipes/sockets
-- Support for multiple compression methods (deflate, gzip, lz4, zstd); zstd and LZ4 support parallel encoding when configured
+- Support for multiple compression methods (deflate, gzip, lz4, lzw, rle, zstd); zstd and LZ4 support parallel encoding when configured
 - Global default registry and explicit registries for compression methods
 - Key/value option system for rich configuration
 - Intelligent safety defaults with overridable resource limits
@@ -32,6 +32,21 @@ make test
 ```bash
 make test-valgrind
 ```
+
+### Benchmarks
+
+Micro-benchmarks for throughput and behavior are built with:
+
+```bash
+make bench
+```
+
+Run them (set `LD_LIBRARY_PATH` to the build `apps` directory first):
+
+- **bench_deflate** – Deflate encode/decode throughput by data type and level; scaling check.
+- **bench_lzw** – LZW encoder lookup modes (linear vs hash); reports encode throughput.
+
+See `make bench` output for the exact run commands for your platform.
 
 ### Fuzz Testing
 

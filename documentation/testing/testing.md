@@ -313,22 +313,34 @@ tests/
 │   ├── gzip/                     # Gzip method tests
 │   │   ├── test_gzip_*.cpp       # (various gzip tests)
 │   │   └── data/golden_vectors.h
-│   └── lz4/                      # LZ4 method tests
-│       ├── test_lz4_concat.cpp   # Concatenated frame tests
-│       ├── test_lz4_corruption.cpp # Corruption handling tests
-│       ├── test_lz4_decoder.cpp  # Decoder tests
-│       ├── test_lz4_encoder.cpp  # Encoder tests
-│       ├── test_lz4_format.cpp   # Frame format tests
-│       ├── test_lz4_limits.cpp   # Limit enforcement tests
-│       ├── test_lz4_options.cpp  # Option handling tests
-│       ├── test_lz4_oracle.cpp   # Cross-tool validation (Python lz4, CLI)
-│       ├── test_lz4_parallel.cpp # Parallel compression tests
-│       ├── test_lz4_register.cpp # Registration tests
-│       ├── test_lz4_reset.cpp    # Encoder/decoder reset tests
-│       ├── test_lz4_robustness.cpp # Robustness tests
-│       ├── test_lz4_roundtrip.cpp # Encode/decode roundtrip tests
-│       ├── test_lz4_streaming.cpp # Streaming API tests
-│       └── data/golden_vectors.h # Verified test vectors (Python lz4 v4.4.5)
+│   ├── lzw/                      # LZW method tests
+│   │   ├── test_lzw_core.cpp
+│   │   ├── test_lzw_decoder.cpp
+│   │   ├── test_lzw_encoder.cpp
+│   │   ├── test_lzw_register.cpp
+│   │   └── test_lzw_roundtrip.cpp
+│   ├── lz4/                      # LZ4 method tests
+│   │   ├── test_lz4_concat.cpp   # Concatenated frame tests
+│   │   ├── test_lz4_corruption.cpp # Corruption handling tests
+│   │   ├── test_lz4_decoder.cpp  # Decoder tests
+│   │   ├── test_lz4_encoder.cpp  # Encoder tests
+│   │   ├── test_lz4_format.cpp   # Frame format tests
+│   │   ├── test_lz4_limits.cpp   # Limit enforcement tests
+│   │   ├── test_lz4_options.cpp  # Option handling tests
+│   │   ├── test_lz4_oracle.cpp   # Cross-tool validation (Python lz4, CLI)
+│   │   ├── test_lz4_parallel.cpp # Parallel compression tests
+│   │   ├── test_lz4_register.cpp # Registration tests
+│   │   ├── test_lz4_reset.cpp    # Encoder/decoder reset tests
+│   │   ├── test_lz4_robustness.cpp # Robustness tests
+│   │   ├── test_lz4_roundtrip.cpp # Encode/decode roundtrip tests
+│   │   ├── test_lz4_streaming.cpp # Streaming API tests
+│   │   └── data/golden_vectors.h # Verified test vectors (Python lz4 v4.4.5)
+│   ├── rle/                      # RLE method tests
+│   │   ├── test_rle_core.cpp
+│   │   ├── test_rle_decoder.cpp
+│   │   ├── test_rle_encoder.cpp
+│   │   ├── test_rle_register.cpp
+│   │   └── test_rle_roundtrip.cpp
 │   └── zstd/                      # Zstd method tests
 │       ├── test_zstd_allocator.cpp
 │       ├── test_zstd_concat.cpp

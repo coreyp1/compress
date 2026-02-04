@@ -32,8 +32,8 @@ typedef struct lzw_encoder_hash_s lzw_encoder_hash_t;
  * @param allocator     Allocator for the table.
  * @param capacity      Max codes (2^max_code_bits).
  * @param mem_tracker   If non-NULL, track allocation here.
- * @param bytes_tracked  Output: bytes to pass to gcomp_memory_track_alloc
- * (optional).
+ * @param bytes_tracked  Output: bytes to pass to gcomp_memory_track_alloc.
+ *                      May be NULL to omit tracking.
  * @return GCOMP_OK on success.
  */
 gcomp_status_t lzw_encoder_hash_init(lzw_encoder_hash_t ** out,

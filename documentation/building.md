@@ -71,6 +71,15 @@ sudo make install
 | `make docs` | Generate HTML documentation |
 | `make docs-pdf` | Generate PDF documentation |
 
+### Benchmark Targets
+
+| Target | Description |
+|--------|-------------|
+| `make bench` | Build all benchmarks (deflate, LZW, etc.) |
+| `make bench-deflate` | Build and run the deflate benchmark |
+
+After `make bench`, run benchmarks from the build `apps` directory with `LD_LIBRARY_PATH` set (e.g. `LD_LIBRARY_PATH=./build/linux/release/apps ./build/linux/release/apps/bench/bench_deflate` or `bench_lzw`). The `make bench` output prints the exact commands for your platform.
+
 ### Fuzzing Targets
 
 | Target | Description |
@@ -127,6 +136,7 @@ compress/
 │           ├── apps/           # Executables and libraries
 │           │   ├── libghoti.io-compress-dev.so
 │           │   ├── libghoti.io-compress-dev.a
+│           │   ├── bench/      # Benchmark executables (bench_deflate, bench_lzw)
 │           │   └── test*       # Test executables
 │           ├── objects/        # Compiled object files
 │           └── generated/      # Auto-generated files

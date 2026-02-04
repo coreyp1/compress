@@ -17,7 +17,7 @@ extern "C" {
 #endif
 
 /**
- * Copy a C string into a fixed-size buffer with safe truncation.
+ * @brief Copy a C string into a fixed-size buffer with safe truncation.
  *
  * - If dst_size is 0, returns without writing.
  * - If src is NULL, writes a single '\0' to dst (if dst_size > 0).

@@ -6,7 +6,9 @@
  * Stream interpretation is profile-driven. Reference profiles: gif (GIF 89a,
  * LSB) and tiff (TIFF 6.0, MSB). Use option lzw.format to select; default
  * is "gif". Options lzw.lit_width and lzw.max_code_bits control code widths.
- * Shared limit options apply (limits.max_output_bytes, limits.max_memory_bytes,
+ * Option lzw.encoder_lookup selects encoder dictionary lookup: "linear" (O(n)
+ * scan) or "hash" (O(1), default). Shared limit options apply
+ * (limits.max_output_bytes, limits.max_memory_bytes,
  * limits.max_expansion_ratio).
  *
  * Copyright 2026 by Corey Pennycuff

@@ -17,7 +17,7 @@ All limits default to sensible values and can be customized via options.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `limits.max_output_bytes` | uint64 | 512 MiB | Maximum decompressed output size |
-| `limits.max_memory_bytes` | uint64 | 256 MiB | Maximum working memory for decoder |
+| `limits.max_memory_bytes` | uint64 | 256 MiB | Maximum working memory (encoder and decoder where the method tracks allocations) |
 | `limits.max_expansion_ratio` | uint64 | 1000 | Maximum output/input byte ratio |
 | `limits.max_window_bytes` | uint64 | method-specific | Maximum LZ77 window size |
 
