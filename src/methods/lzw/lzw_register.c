@@ -7,6 +7,21 @@
  * - Option schema: lzw.format, lzw.lit_width, lzw.max_code_bits, limits.*
  * - Public registration and auto-registration (GCOMP_AUTOREG_METHOD)
  *
+ * SCHEMA / OPTIONS
+ * ================
+ *
+ * Public options are exposed through the registry schema so callers can:
+ * - discover available keys (introspection)
+ * - validate user-provided options at create time
+ * - reject unknown keys (policy: GCOMP_UNKNOWN_KEY_ERROR)
+ *
+ * LZW is profile-driven: `lzw.format` selects the on-the-wire variant:
+ * - `"gif"`  : LSB-first bit packing and GIF code-width growth rule
+ * - `"tiff"` : MSB-first bit packing and TIFF code-width growth rule
+ *
+ * The library does not define a container or embed the format identifier in
+ * the stream. Callers must supply matching options on encode and decode.
+ *
  * Copyright 2026 by Corey Pennycuff
  */
 

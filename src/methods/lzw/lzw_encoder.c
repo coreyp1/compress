@@ -5,6 +5,33 @@
  * encoding; emits codes via profile bit I/O; respects CLEAR/EOI and
  * code-width growth rules.
  *
+ * DESIGN NOTES
+ * ============
+ *
+ * This encoder is *profile-driven* and intentionally does not implement a
+ * container. The caller must choose the same `lzw.format` on encode and decode.
+ *
+ * - **Dictionary model:** Classic LZW with a base dictionary of 0..255 literal
+ *   codes, followed by newly learned sequences.
+ * - **CLEAR / EOI:** The encoder emits CLEAR at the beginning of a stream and
+ *   EOI on finish. CLEAR is also emitted when the dictionary becomes full (at
+ *   `2^max_code_bits` entries).
+ * - **Code widths:** Start at 9 bits and grow up to `lzw.max_code_bits`
+ *   (default 12). When the width increments is dictated by the profile:
+ *   GIF and TIFF increment at different table thresholds.
+ * - **Streaming + bit packing:** `update()` and `finish()` are allowed to be
+ *   called with arbitrarily sized output buffers. The bit writer may retain a
+ *   partially filled byte between calls; `lzw_bitwriter_set_buffer()` switches
+ *   the output window without clearing pending bits.
+ *
+ * PERF NOTE
+ * =========
+ *
+ * The current dictionary lookup uses a linear search (sufficient for unit
+ * tests and correctness). If performance becomes an issue, replace
+ * `lzw_core_encoder_find()` with a hashed lookup structure while keeping the
+ * core prefix/append table layout intact.
+ *
  * Copyright 2026 by Corey Pennycuff
  */
 

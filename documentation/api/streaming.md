@@ -22,6 +22,22 @@ typedef struct {
 
 The `used` field is updated by `update()` calls to track how many bytes were consumed (input) or produced (output).
 
+## Bit-level methods and chunking
+
+Some methods pack data internally at the **bit** level (not byte-aligned on the wire). Examples include:
+
+- **Deflate** (`"deflate"`) — LSB-first bitstream per RFC 1951
+- **LZW** (`"lzw"`) — profile-driven LSB (GIF) or MSB (TIFF) bitstream
+
+Practical implications:
+
+- Your `gcomp_buffer_t` objects are always **byte buffers**, and `used` is
+  always **byte counts**.
+- Encoders/decoders for bit-level methods may retain **partial-byte state**
+  internally between calls; this is normal.
+- For reliable streaming, call `*_finish()` to complete the stream (flush any
+  pending bits / emit end markers) before treating output as complete.
+
 ## Encoder Lifecycle
 
 ### Creation

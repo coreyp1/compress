@@ -4,6 +4,23 @@
  * LZW bit I/O: LSB-first (GIF) and MSB-first (TIFF), variable width 9 to 12
  * bits.
  *
+ * STREAMING NOTES
+ * ===============
+ *
+ * Encoder/decoder `update()` calls may be given output/input buffers of any
+ * size. To support that:
+ *
+ * - `lzw_bitwriter_set_buffer()` swaps the output window but preserves pending
+ *   bits (`bit_buffer`/`bit_count`) so partial bytes can continue into the next
+ *   window.
+ * - `lzw_bitreader_set_buffer()` swaps the input window but preserves pending
+ *   bits so the reader can resume mid-byte across calls.
+ *
+ * Writer LIMIT behavior:
+ * - `lzw_bitwriter_write_bits()` is allowed to fail with `GCOMP_ERR_LIMIT` when
+ *   the output window is full. When it does, it rolls back `bit_buffer` and
+ *   `bit_count` so the caller can retry with a fresh output buffer.
+ *
  * Copyright 2026 by Corey Pennycuff
  */
 

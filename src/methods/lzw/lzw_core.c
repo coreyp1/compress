@@ -4,6 +4,39 @@
  * LZW core implementation: dictionary build/lookup, decode stack,
  * KwKwK case, reset behavior. Uses safe math for size calculations.
  *
+ * CORE RESPONSIBILITIES
+ * =====================
+ *
+ * This file is intentionally *container-agnostic* and *profile-agnostic*.
+ * It implements the algorithmic mechanics that are shared by GIF/TIFF variants:
+ *
+ * - Dictionary storage using parallel arrays:
+ *   - `prefix_code[code]` : previous code in the string (or sentinel)
+ *   - `append_char[code]`: final byte appended to the prefix
+ * - Decoder reconstruction using a reverse stack (walk prefixes then reverse)
+ * - KwKwK handling (code equals next unassigned code)
+ *
+ * The profile layer controls:
+ * - bit packing order (LSB vs MSB)
+ * - when code widths increase
+ * - when CLEAR/EOI appear in the bitstream
+ *
+ * INVARIANTS / LAYOUT
+ * ===================
+ *
+ * - Codes 0..255 are always literal bytes (single-character strings).
+ * - CLEAR and EOI codes are handled by the caller; do not pass them to
+ *   `lzw_core_decoder_decode()`.
+ * - `next_code` is the next available dictionary entry (first is EOI+1).
+ * - `prefix_code[code] == LZW_SENTINEL` means “no prefix” (literal root).
+ *
+ * PERFORMANCE NOTE
+ * ================
+ *
+ * Encoder lookup is currently O(n) via a linear scan of the table. This is
+ * acceptable for correctness and test workloads. For production throughput,
+ * replace `lzw_core_encoder_find()` with a hash table (prefix, byte) → code.
+ *
  * Copyright 2026 by Corey Pennycuff
  */
 

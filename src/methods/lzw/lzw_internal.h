@@ -11,6 +11,32 @@
  * dictionary (prefix_code, append_char), decode stack, and KwKwK handling.
  * Encoder/decoder use profile for bit packing and code semantics.
  *
+ * STREAMING CONTRACT (WHAT PERSISTS BETWEEN update() CALLS)
+ * --------------------------------------------------------
+ *
+ * LZW packs variable-width codes at the bit level. That means calls may end
+ * mid-byte. To support arbitrary chunking without corrupting the stream, the
+ * method state retains:
+ *
+ * - **Encoder (`lzw_encoder_state_t`)**
+ *   - `writer.bit_buffer` / `writer.bit_count`: pending (not yet byte-flushed)
+ *     bits that must carry into the next output window.
+ *   - `prefix_code`: the current “in-progress” string code (the last code is
+ *     emitted during `finish()`).
+ *   - `core` and `current_bits`: dictionary and current code width.
+ *
+ * - **Decoder (`lzw_decoder_state_t`)**
+ *   - `reader.bit_buffer` / `reader.bit_count`: pending bits from the last
+ *     partially consumed byte; required to resume decoding at the correct bit
+ *     offset when more input arrives.
+ *   - `pending_buf`/`pending_off`/`pending_len`: decoded bytes that could not
+ *     be copied to the caller’s output buffer yet (output backpressure).
+ *   - `core` and `current_bits`: dictionary and current code width.
+ *
+ * In other words: `input->used`/`output->used` progress is **byte-oriented**,
+ * but LZW’s internal progress is **bit-oriented** and is tracked by the
+ * bitreader/bitwriter state in the method.
+ *
  * Copyright 2026 by Corey Pennycuff
  */
 

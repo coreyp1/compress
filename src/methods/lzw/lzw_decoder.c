@@ -5,6 +5,26 @@
  * uses LZW core for dictionary and output; enforces output and expansion
  * limits.
  *
+ * DESIGN NOTES
+ * ============
+ *
+ * This decoder is designed for incremental streaming:
+ *
+ * - **Bit-level streaming:** LZW codes are packed densely. A read may end with
+ *   a partially consumed byte; `lzw_bitreader_set_buffer()` advances the input
+ *   window while preserving the reader's `bit_buffer`/`bit_count` so the next
+ *   `update()` continues at the correct bit offset.
+ *
+ * - **Output backpressure:** A single LZW code can expand to a long string
+ *   (up to the dictionary capacity). To avoid consuming input bits that cannot
+ *   be written to the caller's output buffer, the decoder always decodes into a
+ *   fixed pending buffer (`pending_buf`) and then copies as much as possible to
+ *   the user's output. Remaining bytes stay pending for the next call.
+ *
+ * - **EOI requirement:** `finish()` requires that the stream ended with an EOI
+ *   code; otherwise it reports `GCOMP_ERR_CORRUPT`. This library does not
+ *   define a container, so EOI is the method-level end-of-stream marker.
+ *
  * Copyright 2026 by Corey Pennycuff
  */
 

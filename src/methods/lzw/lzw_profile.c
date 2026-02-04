@@ -3,6 +3,21 @@
  *
  * LZW profile: GIF and TIFF (bit order, CLEAR/EOI, code-size increment rules).
  *
+ * RATIONALE
+ * =========
+ *
+ * LZW has multiple deployed on-the-wire variants. For this library the profile
+ * determines:
+ *
+ * - Bit packing order (LSB for GIF, MSB for TIFF)
+ * - When code width increases as the table grows (GIF vs TIFF rule)
+ *
+ * Note: the public options include `lzw.lit_width` for compatibility and future
+ * extension. For the reference profiles implemented here, CLEAR/EOI are fixed
+ * to 256/257 and the starting code width is 9 bits, which matches common GIF
+ * and TIFF LZW streams. `lzw.lit_width` primarily affects defaults and schema
+ * validation at the method layer.
+ *
  * Copyright 2026 by Corey Pennycuff
  */
 

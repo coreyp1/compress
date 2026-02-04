@@ -567,6 +567,7 @@ Deflate and zstd use separate bit I/O code by design; the duplication is intenti
 
 - **Deflate** uses LSB-first (least significant bit first) bit I/O in `src/methods/deflate/bitreader.c` and `bitwriter.c`, per RFC 1951.
 - **Zstd** uses MSB-first (most significant bit first) bit I/O in its own modules (`zstd_fse.c`, `zstd_huf.c`, `zstd_sequences.c`, `zstd_sequences_encode.c`, etc.) per the Zstandard specification.
+- **LZW** uses LSB-first (GIF) or MSB-first (TIFF) bit I/O in `src/methods/lzw/lzw_bitio.c`. The choice is profile-driven and affects on-the-wire representation.
 
 Implementations are intentionally separate due to bit order and format-specific alignment; do not unify them.
 
@@ -576,6 +577,7 @@ Implementations are intentionally separate due to bit order and format-specific 
 - [Deflate Module](modules/deflate.md) - Deflate-specific options and usage
 - [Gzip Module](modules/gzip.md) - Gzip-specific options and usage
 - [LZ4 Module](modules/lz4.md) - LZ4-specific options and usage
+- [LZW Module](modules/lzw.md) - LZW (GIF/TIFF) options and usage
 - [RLE Module](modules/rle.md) - RLE (PackBits/TGA) options and usage
 - [Auto-Registration](auto-registration.md) - How methods are automatically registered
 - [Wrapper Methods](wrapper-methods.md) - Implementing wrapper methods (gzip, etc.)
