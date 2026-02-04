@@ -2,7 +2,12 @@
  * @file rle_core.h
  *
  * RLE core primitives: literal span and repeat span emission with
- * output bounds checking. Used by profile-driven encoder/decoder.
+ * output bounds checking.
+ *
+ * The core is format-agnostic: it only writes raw bytes (literal or repeated)
+ * and enforces max_output_bytes and buffer size using safe math. Token
+ * parsing and grammar (PackBits vs TGA) live in rle_profile; the decoder
+ * profile calls these primitives after interpreting each token.
  *
  * Copyright 2026 by Corey Pennycuff
  */

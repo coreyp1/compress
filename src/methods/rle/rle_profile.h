@@ -1,8 +1,10 @@
 /**
  * @file rle_profile.h
  *
- * RLE profile interface: token parsing, span classification,
- * stream termination. Profiles map tokens to rle_core primitives.
+ * RLE profile interface: token parsing, span classification, stream
+ * termination. Decode path: profiles parse tokens and call rle_core
+ * (rle_emit_literal, rle_emit_repeat). Encode path: profiles write
+ * control and data bytes directly. Profile id is selected by rle.format.
  *
  * Copyright 2026 by Corey Pennycuff
  */

@@ -4,6 +4,16 @@
  * Internal declarations for the RLE (Run-Length Encoding) method.
  * Shared between encoder, decoder, core, and profile.
  *
+ * DESIGN
+ * ------
+ * RLE is profile-driven: the same core (literal/repeat emission and output
+ * bounds) is used by different token grammars (PackBits, TGA). Encoder state
+ * holds a pending literal buffer and optional run (run_byte, run_len); the
+ * profile turns input bytes into tokens and flushes on finish(). Decoder state
+ * holds a partial-token phase so we can suspend and resume across update()
+ * calls when input runs out mid-token (e.g. after a control byte but before
+ * all literal bytes or the run byte).
+ *
  * Copyright 2026 by Corey Pennycuff
  */
 
@@ -48,7 +58,9 @@ typedef struct {
 } rle_encoder_state_t;
 
 //
-// Decoder partial-token state (mid-stream)
+// Decoder partial-token state (mid-stream).
+// Phases allow streaming: we can stop after consuming a control byte and
+// resume in the next update() to read the following literal bytes or run byte.
 //
 
 typedef enum {

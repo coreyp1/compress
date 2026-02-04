@@ -3,13 +3,13 @@
  *
  * RLE (Run-Length Encoding) method for the Ghoti.io Compress library.
  *
- * Supports profile-driven stream interpretation. Reference profiles:
- * - packbits (TIFF / Apple MacPaint)
- * - tga (Truevision Targa)
+ * Stream interpretation is profile-driven. Reference profiles: packbits
+ * (TIFF / Apple MacPaint) and tga (Truevision Targa). Use option
+ * rle.format to select; default is "packbits". Shared limit options
+ * apply (limits.max_output_bytes, limits.max_memory_bytes,
+ * limits.max_expansion_ratio).
  *
- * Option: rle.format ("packbits" | "tga"), default "packbits".
- * Shared limits: limits.max_output_bytes, limits.max_memory_bytes,
- * limits.max_expansion_ratio.
+ * See documentation/modules/rle.md for full API and options.
  *
  * Copyright 2026 by Corey Pennycuff
  */

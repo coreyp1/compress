@@ -4,8 +4,10 @@
  * RLE method registration for the Ghoti.io Compress library.
  *
  * - Method descriptor with vtable hooks for encoder/decoder
- * - Option schema (rle.format, limits.*)
- * - Public registration and auto-registration
+ * - Option schema: rle.format (string), limits.max_output_bytes,
+ *   limits.max_memory_bytes, limits.max_expansion_ratio. Unknown keys
+ *   cause GCOMP_UNKNOWN_KEY_ERROR at create time.
+ * - Public registration and auto-registration (GCOMP_AUTOREG_METHOD)
  *
  * Copyright 2026 by Corey Pennycuff
  */

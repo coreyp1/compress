@@ -52,6 +52,13 @@ The library is organized into the following major components:
 │  │  │                  │  │                  │  │ zstd_*.c      │  │    │
 │  │  └──────────────────┘  └──────────────────┘  └───────────────┘  │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                            rle/                                 │    │
+│  │  ┌──────────────────┐  ┌──────────────────┐  ┌───────────────┐  │    │
+│  │  │  rle_encoder.c   │  │  rle_decoder.c   │  │ rle_profile.c │  │    │
+│  │  │  rle_register.c  │  │  rle_core.c      │  │ rle_internal  │  │    │
+│  │  └──────────────────┘  └──────────────────┘  └───────────────┘  │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -84,6 +91,7 @@ Public headers and main entry points (all under `include/ghoti.io/compress/`):
 | `gzip.h` | Gzip-specific API (options, helpers) |
 | `lz4.h` | LZ4-specific API (options, helpers) |
 | `zstd.h` | Zstd-specific API (options, helpers) |
+| `rle.h` | RLE-specific API (registration, format options) |
 | `crc32.h` | CRC-32 computation (gzip) |
 | `xxhash32.h` | XXH32 hash (LZ4 content checksum) |
 | `xxhash64.h` | XXH64 hash (zstd checksum) |
@@ -97,7 +105,7 @@ Optional / build-time: `job_queue.h`, `thread_pool.h` (for parallel encode when 
 The following are used only inside the library and are **not** part of the public API. Do not include them from application code; they may change or be removed without notice.
 
 - **Core internal:** `safe_math.h`, `endian.h`, `alloc_internal.h`, `registry_internal.h`, `stream_internal.h`, and other `*_internal.h` under `src/core/`.
-- **Method internal:** Each method has an `*_internal.h` (e.g. `deflate_internal.h`, `gzip_internal.h`, `lz4_internal.h`, `zstd_internal.h`) for shared state and helpers within that method only.
+- **Method internal:** Each method has an `*_internal.h` (e.g. `deflate_internal.h`, `gzip_internal.h`, `lz4_internal.h`, `zstd_internal.h`, `rle_internal.h`) for shared state and helpers within that method only.
 
 ### Method Layer
 
@@ -480,6 +488,7 @@ compress/
 │   ├── gzip.h                    # Gzip-specific API
 │   ├── lz4.h                     # LZ4-specific API
 │   ├── zstd.h                    # Zstd-specific API
+│   ├── rle.h                     # RLE-specific API
 │   ├── crc32.h                   # CRC-32 (gzip)
 │   ├── xxhash32.h                # XXH32 (LZ4)
 │   ├── xxhash64.h                # XXH64 (zstd)
@@ -521,12 +530,19 @@ compress/
 │       │   ├── lz4_frame.c       # Frame header/trailer
 │       │   ├── lz4_parallel.c    # Parallel encoding support
 │       │   └── lz4_register.c    # Vtable and registration
+│       ├── rle/
+│       │   ├── rle_encoder.c     # RLE encoder (profile-driven)
+│       │   ├── rle_decoder.c     # RLE decoder (profile-driven)
+│       │   ├── rle_core.c        # Literal/repeat emission, bounds
+│       │   ├── rle_profile.c     # PackBits and TGA token grammars
+│       │   ├── rle_internal.h    # Shared state and phases
+│       │   └── rle_register.c    # Vtable and registration
 │       └── zstd/
-│           ├── zstd_encoder.c   # Zstd frame encoder
-│           ├── zstd_decoder.c   # Zstd frame decoder
-│           ├── zstd_parallel.c  # Parallel encoding support
-│           ├── zstd_*.c         # Format, FSE, Huffman, sequences (decode + encode), etc.
-│           └── zstd_register.c  # Vtable and registration
+│           ├── zstd_encoder.c    # Zstd frame encoder
+│           ├── zstd_decoder.c    # Zstd frame decoder
+│           ├── zstd_parallel.c   # Parallel encoding support
+│           ├── zstd_*.c          # Format, FSE, Huffman, sequences (decode + encode), etc.
+│           └── zstd_register.c   # Vtable and registration
 │
 ├── tests/                        # Unit tests (Google Test)
 ├── examples/                     # Example programs
@@ -560,6 +576,7 @@ Implementations are intentionally separate due to bit order and format-specific 
 - [Deflate Module](modules/deflate.md) - Deflate-specific options and usage
 - [Gzip Module](modules/gzip.md) - Gzip-specific options and usage
 - [LZ4 Module](modules/lz4.md) - LZ4-specific options and usage
+- [RLE Module](modules/rle.md) - RLE (PackBits/TGA) options and usage
 - [Auto-Registration](auto-registration.md) - How methods are automatically registered
 - [Wrapper Methods](wrapper-methods.md) - Implementing wrapper methods (gzip, etc.)
 - [Testing](testing/testing.md) - Testing infrastructure

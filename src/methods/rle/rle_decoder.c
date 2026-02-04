@@ -1,8 +1,14 @@
 /**
  * @file rle_decoder.c
  *
- * RLE decoder: streaming update/finish/reset. Profile-driven;
- * core logic in rle_core and rle_profile.
+ * RLE decoder: streaming update/finish/reset.
+ *
+ * Data flow: Encoded input is passed to the selected profile
+ * (rle_profile_decode). The profile parses control/header bytes and literal/run
+ * payloads, and calls rle_core (rle_emit_literal, rle_emit_repeat) to write
+ * decompressed bytes with bounds and expansion-ratio checks. Finish is a no-op
+ * for RLE (no end-of-stream token). Reset clears partial-token state and totals
+ * for reuse.
  *
  * Copyright 2026 by Corey Pennycuff
  */

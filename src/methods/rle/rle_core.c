@@ -3,6 +3,10 @@
  *
  * RLE core: literal and repeat span emission with output bounds.
  *
+ * All size arithmetic uses gcomp_safe_add_size to avoid overflow from
+ * untrusted or option-derived lengths; overflow returns GCOMP_ERR_CORRUPT.
+ * Writing past output_size or max_output_bytes returns GCOMP_ERR_LIMIT.
+ *
  * Copyright 2026 by Corey Pennycuff
  */
 

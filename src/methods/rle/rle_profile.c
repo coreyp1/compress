@@ -3,6 +3,20 @@
  *
  * RLE profile: PackBits and TGA decode/encode.
  *
+ * Two reference profiles are implemented; they differ only in token grammar:
+ *
+ * - PackBits (TIFF / Apple): One-byte control. 0..127 = (n+1) literal bytes;
+ *   128 = no-op; 129..255 = (256-n) copies of next byte. Max literal 128,
+ *   max run 128 (we use 127 for run to avoid emitting 128 = no-op).
+ *
+ * - TGA (Truevision Targa): One-byte header. Bit7=0: raw, (header&0x7F)+1
+ *   literal bytes. Bit7=1: run, (header&0x7F)+1 copies of next byte.
+ *   Count 1..128 for both.
+ *
+ * Profiles map tokens to rle_core: decode calls rle_emit_literal /
+ * rle_emit_repeat; encode writes control and data bytes directly. Decoder path
+ * also calls gcomp_limits_check_output and gcomp_limits_check_expansion_ratio.
+ *
  * Copyright 2026 by Corey Pennycuff
  */
 
