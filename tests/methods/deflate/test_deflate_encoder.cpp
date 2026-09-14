@@ -241,6 +241,48 @@ TEST_F(DeflateEncoderTest, RoundTrip_LargeInput) {
   EXPECT_EQ(memcmp(decompressed.data(), input.data(), input.size()), 0);
 }
 
+TEST_F(DeflateEncoderTest, RoundTrip_PastWindowWrap_CompressibleData) {
+  // Regression: the match finder measured hash-entry staleness against the
+  // encoding position instead of the window fill position, so the newest
+  // `lookahead` bytes of "history" had already been overwritten by future
+  // data.  Matches against that stale region emitted distances that decode
+  // to the wrong bytes.
+  //
+  // Triggering it needs BOTH of these, which is why the pre-existing 64KB
+  // random-data round trip never caught it:
+  //   * more than one window (32KB) of input, so the buffer wraps twice, and
+  //   * data compressible enough to actually produce long-distance matches.
+  //     Pseudo-random bytes expand rather than match, and never exercise the
+  //     match finder at all.
+  const char * words[] = {"alpha", "beta", "gamma", "delta", "epsilon", "zeta",
+      "eta", "theta", "iota", "kappa", "lambda", "mu", "nu", "xi", "omicron"};
+  std::vector<uint8_t> input;
+  input.reserve(300000);
+  unsigned seed = 9876;
+  while (input.size() < 300000) {
+    seed = seed * 1103515245u + 12345u;
+    const char * w = words[(seed >> 16) % (sizeof(words) / sizeof(*words))];
+    while (*w) {
+      input.push_back((uint8_t)*w++);
+    }
+    input.push_back((uint8_t)' ');
+  }
+
+  std::vector<uint8_t> compressed;
+  ASSERT_EQ(encode_data(input.data(), input.size(), compressed), GCOMP_OK);
+
+  gcomp_encoder_destroy(encoder_);
+  encoder_ = nullptr;
+
+  std::vector<uint8_t> decompressed;
+  ASSERT_EQ(decode_data(compressed.data(), compressed.size(), decompressed,
+                input.size()),
+      GCOMP_OK);
+
+  ASSERT_EQ(decompressed.size(), input.size());
+  EXPECT_EQ(memcmp(decompressed.data(), input.data(), input.size()), 0);
+}
+
 //
 // Level 0 (stored) tests
 //

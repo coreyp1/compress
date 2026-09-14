@@ -554,7 +554,23 @@ static deflate_match_t deflate_find_match(gcomp_deflate_encoder_state_t * st,
     }
 
     size_t stream_dist = stream_pos - match_stream_pos;
-    if (stream_dist > st->window_size || stream_dist > DEFLATE_MAX_DISTANCE) {
+
+    // Staleness must be measured against total_in, not stream_pos.  The
+    // window is filled ahead of the encoding position, so window[idx] holds
+    // the most recent byte written there - the largest position <= total_in-1
+    // congruent to idx.  hash_pos[idx] still names the byte that *was* there
+    // when the entry was inserted.  The two agree only while
+    // total_in - hash_pos[idx] <= window_size; beyond that the refill has
+    // already overwritten those bytes with lookahead data.
+    //
+    // Using stream_pos here left a blind spot exactly `lookahead` bytes wide:
+    // entries whose data had been overwritten still passed, and the buf_dist
+    // check below could not catch them (buf_dist is stream_dist modulo
+    // window_size, so it agrees for any distance under one window).  The
+    // encoder then matched against future data and emitted a distance that
+    // decodes to the wrong bytes.
+    if (stream_dist > DEFLATE_MAX_DISTANCE ||
+        st->total_in - match_stream_pos > st->window_size) {
       // Entry has been overwritten or is too far back - skip
       cur = st->hash_prev[cur];
       chain_count++;
