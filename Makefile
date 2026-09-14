@@ -86,9 +86,17 @@ CFLAGS := -pedantic-errors -Wall -Wextra -Werror -Wno-error=unused-function -Wfa
 # GCOMP_BUILD enables DLL export on Windows (checked by GCOMP_API macro)
 # GCOMP_TEST_BUILD enables export of internal functions for testing (checked by GCOMP_INTERNAL_API macro)
 LIB_CFLAGS := $(CFLAGS) -DGCOMP_BUILD -DGCOMP_TEST_BUILD
-# Link cutil library for threading support
+# Link cutil library for threading support. Prefer pkg-config; fall back to a
+# sibling checkout so the suite builds from a fresh clone without installing
+# cutil system-wide first.
 CUTIL_CFLAGS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --cflags ghoti.io-cutil-dev 2>/dev/null)
 CUTIL_LIBS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --libs ghoti.io-cutil-dev 2>/dev/null)
+# cutil's build tree has no release/debug component, only the OS directory.
+CUTIL_SIBLING_DIR := ../cutil/build/$(firstword $(subst /, ,$(BUILD)))
+ifeq ($(strip $(CUTIL_CFLAGS)),)
+CUTIL_CFLAGS := -I../cutil/include -I$(CUTIL_SIBLING_DIR)/include
+CUTIL_LIBS := -L$(CUTIL_SIBLING_DIR)/apps -lghoti.io-cutil-dev
+endif
 LDFLAGS := -L /usr/lib -lstdc++ -lm $(CUTIL_LIBS) -lpthread
 BUILD_DIR := ./build/$(BUILD)
 OBJ_DIR := $(BUILD_DIR)/objects
@@ -423,7 +431,7 @@ bench-deflate: $(APP_DIR)/$(TARGET) $(APP_DIR)/bench/bench_deflate$(EXE_EXTENSIO
 	@printf "### Running Deflate Benchmark ###\n"
 	@printf "############################\n"
 	@printf "\033[0m\n"
-	@LD_LIBRARY_PATH="$(APP_DIR)" $(APP_DIR)/bench/bench_deflate$(EXE_EXTENSION)
+	@LD_LIBRARY_PATH="$(TEST_LD_PATH)" $(APP_DIR)/bench/bench_deflate$(EXE_EXTENSION)
 
 fuzz-help: ## Show fuzzing help and instructions
 	@printf "\033[0;36m"
@@ -794,6 +802,9 @@ fuzz-zstd-roundtrip: $(APP_DIR)/fuzz/fuzz_zstd_roundtrip$(EXE_EXTENSION)
 	fi
 	$(AFL_ENV) afl-fuzz -i fuzz/corpus/zstd_roundtrip -o fuzz/findings/zstd_roundtrip -- $(APP_DIR)/fuzz/fuzz_zstd_roundtrip$(EXE_EXTENSION)
 
+# So tests can load the compress library and its cutil dependency.
+TEST_LD_PATH := $(APP_DIR):$(CUTIL_SIBLING_DIR)/apps
+
 test: ## Make and run the Unit tests
 test: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES)
 	@for test_exe in $(TEST_EXECUTABLES); do \
@@ -803,7 +814,7 @@ test: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES)
 		printf "### Running %s tests ###\n" "$$test_name"; \
 		printf "############################"; \
 		printf "\033[0m\n\n"; \
-		LD_LIBRARY_PATH="$(APP_DIR)" $$test_exe --gtest_brief=1; \
+		LD_LIBRARY_PATH="$(TEST_LD_PATH)" $$test_exe --gtest_brief=1; \
 	done
 
 test-quiet: ## Run tests with minimal output (one line per test suite)
@@ -813,7 +824,7 @@ test-quiet: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES)
 	printf "\033[1;36m%-30s %8s %10s %s\033[0m\n" "------------------------------" "--------" "----------" "------"; \
 	for test_exe in $(TEST_EXECUTABLES); do \
 		test_name=$$(basename $$test_exe $(EXE_EXTENSION)); \
-		output=$$(LD_LIBRARY_PATH="$(APP_DIR)" $$test_exe --gtest_brief=1 2>&1); \
+		output=$$(LD_LIBRARY_PATH="$(TEST_LD_PATH)" $$test_exe --gtest_brief=1 2>&1); \
 		exit_code=$$?; \
 		num_tests=$$(echo "$$output" | grep -oP '\[\s*=+\s*\]\s*\K\d+(?=\s+tests?)' | head -1); \
 		time_ms=$$(echo "$$output" | grep -oP '\(\K\d+(?=\s*ms\s*total\))' | head -1); \
@@ -852,7 +863,7 @@ ifeq ($(OS_NAME), Linux)
 		printf "### Running %s tests under Valgrind ###\n" "$$test_name"; \
 		printf "############################"; \
 		printf "\033[0m\n\n"; \
-		LD_LIBRARY_PATH="$(APP_DIR)" valgrind $(VALGRIND_FLAGS) $$test_exe --gtest_brief=1; \
+		LD_LIBRARY_PATH="$(TEST_LD_PATH)" valgrind $(VALGRIND_FLAGS) $$test_exe --gtest_brief=1; \
 	done
 else
 	@printf "\033[0;31m\n"
@@ -869,7 +880,7 @@ ifeq ($(OS_NAME), Linux)
 	printf "\033[1;35m%-30s %8s %10s %s\033[0m\n" "------------------------------" "--------" "----------" "------"; \
 	for test_exe in $(TEST_EXECUTABLES); do \
 		test_name=$$(basename $$test_exe $(EXE_EXTENSION)); \
-		output=$$(LD_LIBRARY_PATH="$(APP_DIR)" valgrind $(VALGRIND_FLAGS) $$test_exe --gtest_brief=1 2>&1); \
+		output=$$(LD_LIBRARY_PATH="$(TEST_LD_PATH)" valgrind $(VALGRIND_FLAGS) $$test_exe --gtest_brief=1 2>&1); \
 		exit_code=$$?; \
 		num_tests=$$(echo "$$output" | grep -oP '\[\s*=+\s*\]\s*\K\d+(?=\s+tests?)' | head -1); \
 		time_ms=$$(echo "$$output" | grep -oP '\(\K\d+(?=\s*ms\s*total\))' | head -1); \

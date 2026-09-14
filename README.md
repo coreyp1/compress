@@ -13,7 +13,12 @@ The `compress` library provides:
 
 ## Dependencies
 
-- No external dependencies (self-contained implementation)
+- `cutil` - Ghoti.io core utilities, for the thread/mutex/semaphore
+  abstractions used by the thread pool and job queue
+  (`src/core/thread_pool.c`, `src/core/job_queue.c`)
+
+No third-party dependencies: every compression method is implemented from
+scratch against libc.
 
 ## Building
 
