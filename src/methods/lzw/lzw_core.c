@@ -216,8 +216,15 @@ gcomp_status_t lzw_core_decoder_decode(lzw_core_decoder_t * core, uint32_t code,
     output_data[used++] = core->prev_first_byte;
   }
 
-  // Add new table entry: (prev_code, first_byte)
-  if (core->next_code < core->capacity) {
+  // Add new table entry: (prev_code, first_byte).
+  //
+  // Only once a previous code exists.  The first code after a clear (and at
+  // the start of the stream) is emitted verbatim and adds nothing: there is
+  // no preceding string to extend.  Adding an entry there used prev_code 0
+  // as the prefix and produced a bogus table slot, which shifted every later
+  // entry down by one relative to the encoder's table - so any stream long
+  // enough to reference a dictionary entry decoded to the wrong bytes.
+  if (core->has_prev && core->next_code < core->capacity) {
     core->prefix_code[core->next_code] = (uint16_t)(core->prev_code & 0xFFFFu);
     core->append_char[core->next_code] = first_byte;
     core->next_code++;

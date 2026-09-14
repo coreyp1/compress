@@ -363,8 +363,16 @@ gcomp_status_t lzw_encoder_update(gcomp_encoder_t * encoder,
       if (state->hash_table && new_code != 0) {
         lzw_encoder_hash_insert(state->hash_table, prefix, byte, new_code);
       }
-      if (lzw_profile_should_increment_bits(
-              state->profile_id, state->core.next_code, state->current_bits)) {
+      // should_increment_bits() asks whether the highest code that must still
+      // be representable fits in current_bits.  For an encoder that is
+      // next_code - 1: the largest code it can ever emit is the last slot it
+      // assigned, never next_code itself.  Passing next_code widened every
+      // code one entry too early, which no conforming decoder expects - such
+      // a stream is unreadable by other GIF/TIFF implementations even though
+      // this library's own decoder, widening on the same schedule, agreed
+      // with it.
+      if (lzw_profile_should_increment_bits(state->profile_id,
+              state->core.next_code - 1u, state->current_bits)) {
         if (state->current_bits < (unsigned)state->max_code_bits) {
           state->current_bits++;
         }

@@ -366,6 +366,10 @@ gcomp_status_t lzw_decoder_update(gcomp_decoder_t * decoder,
       }
     }
 
+    // should_increment_bits() asks whether the highest code that must still
+    // be representable fits in current_bits.  For a decoder that is
+    // next_code itself: the very next code may be next_code (the KwKwK
+    // case), so it must be readable at the current width.
     if (lzw_profile_should_increment_bits(
             state->profile_id, state->core.next_code, state->current_bits)) {
       if (state->current_bits < (unsigned)state->max_code_bits) {

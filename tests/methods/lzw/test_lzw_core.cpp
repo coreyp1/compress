@@ -95,8 +95,9 @@ TEST_F(LzwCoreTest, DecoderDecodeSequenceThenNormalCode) {
   EXPECT_EQ(used, 2u);
   EXPECT_EQ(out[1], 0x42);
 
-  /* Code 259 was added as (65, 0x42) = "AB". */
-  s = lzw_core_decoder_decode(&dec, 259, out, sizeof(out), &used);
+  /* The first code after a reset adds nothing, so decoding 65 then 66 creates
+   * exactly one entry: code 258 = (65, 0x42) = "AB". */
+  s = lzw_core_decoder_decode(&dec, 258, out, sizeof(out), &used);
   ASSERT_EQ(s, GCOMP_OK);
   EXPECT_EQ(used, 4u);
   EXPECT_EQ(out[2], 0x41);
@@ -120,9 +121,9 @@ TEST_F(LzwCoreTest, DecoderDecodeKwKwK) {
   s = lzw_core_decoder_decode(&dec, 66, out, sizeof(out), &used);
   ASSERT_EQ(s, GCOMP_OK);
   EXPECT_EQ(used, 2u);
-  /* After 65,66 next_code is 260. Decode 260 (KwKwK): prev="B", first_byte='B',
-   * output "BB". */
-  s = lzw_core_decoder_decode(&dec, 260, out, sizeof(out), &used);
+  /* After 65,66 next_code is 259 (the first code adds no entry). Decode 259
+   * (KwKwK): prev="B", first_byte='B', output "BB". */
+  s = lzw_core_decoder_decode(&dec, 259, out, sizeof(out), &used);
   ASSERT_EQ(s, GCOMP_OK);
   EXPECT_EQ(used, 4u);
   EXPECT_EQ(out[2], 0x42);

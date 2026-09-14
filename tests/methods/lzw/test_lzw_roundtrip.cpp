@@ -188,6 +188,59 @@ TEST_F(LzwRoundtripTest, TiffEncodeDecodeRoundtripRepeated) {
   lzw_roundtrip_one(registry_, "tiff", data, sizeof(data) - 1);
 }
 
+static std::vector<uint8_t> lzw_text_like(size_t target) {
+  // Repetitive, word-shaped data: long enough to reuse dictionary entries,
+  // grow the code width past 9 bits, and fill/clear the table.
+  const char * words[] = {"alpha", "beta", "gamma", "delta", "epsilon", "zeta",
+      "eta", "theta", "iota", "kappa", "lambda", "mu", "nu", "xi", "omicron"};
+  std::vector<uint8_t> v;
+  v.reserve(target + 16);
+  unsigned seed = 4242;
+  while (v.size() < target) {
+    seed = seed * 1103515245u + 12345u;
+    const char * w = words[(seed >> 16) % (sizeof(words) / sizeof(*words))];
+    while (*w) {
+      v.push_back((uint8_t)*w++);
+    }
+    v.push_back((uint8_t)' ');
+  }
+  v.resize(target);
+  return v;
+}
+
+// Regression: the decoder added a table entry for the first code after a
+// reset, when there is no previous string to extend.  That bogus entry
+// shifted every later entry down by one relative to the encoder's table, so
+// any stream long enough to *reference* an entry decoded to the wrong bytes.
+//
+// The pre-existing round trips above use at most 11 bytes, which is short
+// enough that every code is a literal and the table is only ever written,
+// never read - so they passed throughout.
+TEST_F(LzwRoundtripTest, GifRoundtripUsesDictionaryEntries) {
+  const uint8_t data[] = "ABCDEFGHIJKAB"; /* 13 bytes: first entry reuse */
+  lzw_roundtrip_one(registry_, "gif", data, sizeof(data) - 1);
+}
+
+TEST_F(LzwRoundtripTest, TiffRoundtripUsesDictionaryEntries) {
+  const uint8_t data[] = "ABCDEFGHIJKAB";
+  lzw_roundtrip_one(registry_, "tiff", data, sizeof(data) - 1);
+}
+
+// Regression: the encoder widened codes one entry too early (it asked whether
+// next_code fit in the current width, rather than the largest code it could
+// actually emit, next_code - 1).  Streams past the first width boundary were
+// then unreadable by conforming decoders.  Needs enough input to cross 9->10
+// bits, which the 11-byte cases never did.
+TEST_F(LzwRoundtripTest, GifRoundtripAcrossCodeWidthGrowth) {
+  std::vector<uint8_t> data = lzw_text_like(80000);
+  lzw_roundtrip_one(registry_, "gif", data.data(), data.size());
+}
+
+TEST_F(LzwRoundtripTest, TiffRoundtripAcrossCodeWidthGrowth) {
+  std::vector<uint8_t> data = lzw_text_like(80000);
+  lzw_roundtrip_one(registry_, "tiff", data.data(), data.size());
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
