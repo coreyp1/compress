@@ -94,6 +94,19 @@ typedef struct {
   /** Code we tried to write but hit LIMIT; retry next update (0 = none) */
   uint32_t pending_code;
   unsigned pending_bits;
+  /**
+   * Output staged by update() before it is handed to the caller.
+   *
+   * Codes used to be written straight into the caller's buffer. When one did
+   * not fit, the encoder bailed out mid-step - before adding the new
+   * dictionary entry and advancing the prefix - so the next call re-emitted
+   * the same code and desynchronised the stream. Staging here lets a batch
+   * stop cleanly on a step boundary instead.
+   */
+  uint8_t * stage_buf;    ///< Staging buffer for update() output.
+  size_t stage_size;      ///< Allocated size of stage_buf.
+  size_t stage_used;      ///< Bytes rendered into stage_buf.
+  size_t stage_copied;    ///< Bytes of stage_buf already delivered.
   /** 1 after we've emitted CLEAR at start */
   int header_emitted;
   /** Encoder lookup: 1 = hash, 0 = linear */

@@ -241,6 +241,11 @@ void lzw_encoder_destroy(gcomp_encoder_t * encoder) {
         &state->mem_tracker, state->hash_table_bytes);
     state->hash_table_bytes = 0;
   }
+  if (state->stage_buf) {
+    gcomp_free(state->allocator, state->stage_buf);
+    state->stage_buf = NULL;
+    state->stage_size = 0;
+  }
   uint32_t cap = state->core.capacity;
   gcomp_memory_track_free(&state->mem_tracker, (size_t)cap * sizeof(uint16_t));
   gcomp_memory_track_free(&state->mem_tracker, (size_t)cap * sizeof(uint8_t));
@@ -251,56 +256,64 @@ void lzw_encoder_destroy(gcomp_encoder_t * encoder) {
   encoder->method_state = NULL;
 }
 
-/** Emit one code; on LIMIT set pending and return GCOMP_ERR_LIMIT. */
+/**
+ * Emit one code.
+ *
+ * On GCOMP_ERR_LIMIT the code is stashed in pending_code/pending_bits and the
+ * bit writer rolls itself back, so the next update() call replays it into a
+ * fresh output window. That makes a full output buffer an ordinary pause
+ * rather than an error, so no encoder error is recorded here.
+ */
 static gcomp_status_t emit_code(
     lzw_encoder_state_t * state, gcomp_encoder_t * encoder, uint32_t code) {
+  (void)encoder;
   gcomp_status_t s =
       lzw_bitwriter_write_bits(&state->writer, code, state->current_bits);
   if (s == GCOMP_ERR_LIMIT) {
     state->pending_code = code;
     state->pending_bits = state->current_bits;
-    return gcomp_encoder_set_error(
-        encoder, GCOMP_ERR_LIMIT, "LZW encoder output buffer full");
   }
   return s;
 }
 
-gcomp_status_t lzw_encoder_update(gcomp_encoder_t * encoder,
-    gcomp_buffer_t * input, gcomp_buffer_t * output) {
-  if (!encoder || !encoder->method_state) {
-    return GCOMP_ERR_INVALID_ARG;
-  }
+#define LZW_STAGE_SIZE 8192u
+/* Headroom kept free so a single input step - which emits at most a code plus
+ * a CLEAR - always fits without the bit writer hitting its limit mid-step. */
+#define LZW_STAGE_HEADROOM 16u
 
-  if (input->size > 0 && input->data == NULL) {
-    return gcomp_encoder_set_error(
-        encoder, GCOMP_ERR_INVALID_ARG, "input->data is NULL but size > 0");
-  }
-  if (output->size > 0 && output->data == NULL) {
-    return gcomp_encoder_set_error(
-        encoder, GCOMP_ERR_INVALID_ARG, "output->data is NULL but size > 0");
-  }
-
-  lzw_encoder_state_t * state = (lzw_encoder_state_t *)encoder->method_state;
-  gcomp_status_t s;
-  size_t output_avail = output->size - output->used;
-  if (output_avail == 0) {
-    return GCOMP_OK;
-  }
-
-  uint8_t * out_base = (uint8_t *)output->data + output->used;
-  lzw_bitwriter_set_buffer(&state->writer, out_base, output_avail);
-
-  /* Retry pending code from previous LIMIT */
-  if (state->pending_bits != 0) {
-    s = lzw_bitwriter_write_bits(
-        &state->writer, state->pending_code, state->pending_bits);
-    if (s == GCOMP_ERR_LIMIT) {
-      return gcomp_encoder_set_error(
-          encoder, GCOMP_ERR_LIMIT, "LZW encoder output buffer full");
+/** Copy staged output to the caller, as far as it will fit. */
+static int lzw_drain_stage(lzw_encoder_state_t * state, gcomp_buffer_t * output) {
+  size_t avail = state->stage_used - state->stage_copied;
+  if (avail) {
+    size_t space = output->size - output->used;
+    size_t n = (avail < space) ? avail : space;
+    if (n) {
+      memcpy((uint8_t *)output->data + output->used,
+          state->stage_buf + state->stage_copied, n);
+      output->used += n;
+      state->stage_copied += n;
     }
-    state->pending_code = 0;
-    state->pending_bits = 0;
   }
+  if (state->stage_copied >= state->stage_used) {
+    state->stage_used = 0;
+    state->stage_copied = 0;
+    return 1;
+  }
+  return 0;
+}
+
+/**
+ * @brief Encode one batch of input into the staging buffer.
+ *
+ * Stops on a step boundary once the staging buffer is within
+ * LZW_STAGE_HEADROOM of full, so a code is never half-emitted and the
+ * dictionary and prefix always advance together with the bytes that describe
+ * them.
+ */
+static gcomp_status_t lzw_encode_batch(
+    lzw_encoder_state_t * state, gcomp_encoder_t * encoder, gcomp_buffer_t * input) {
+  gcomp_status_t s;
+  lzw_bitwriter_set_buffer(&state->writer, state->stage_buf, state->stage_size);
 
   /* Emit CLEAR at start of stream */
   if (!state->header_emitted) {
@@ -311,11 +324,15 @@ gcomp_status_t lzw_encoder_update(gcomp_encoder_t * encoder,
     state->header_emitted = 1;
   }
 
-  const uint8_t * in_ptr = (const uint8_t *)input->data + input->used;
-  size_t in_avail = input->size - input->used;
+  const uint8_t * in_ptr = (const uint8_t *)input->data;
 
-  for (size_t i = 0; i < in_avail; i++) {
-    uint8_t byte = in_ptr[i];
+  while (input->used < input->size) {
+    if (lzw_bitwriter_bytes_written(&state->writer) + LZW_STAGE_HEADROOM >
+        state->stage_size) {
+      break;
+    }
+
+    uint8_t byte = in_ptr[input->used];
     uint32_t prefix = state->prefix_code;
     uint32_t code_out = 0;
     int found = 0;
@@ -383,8 +400,56 @@ gcomp_status_t lzw_encoder_update(gcomp_encoder_t * encoder,
     input->used++;
   }
 
-  output->used += lzw_bitwriter_bytes_written(&state->writer);
+  state->stage_used = lzw_bitwriter_bytes_written(&state->writer);
   return GCOMP_OK;
+}
+
+gcomp_status_t lzw_encoder_update(gcomp_encoder_t * encoder,
+    gcomp_buffer_t * input, gcomp_buffer_t * output) {
+  if (!encoder || !encoder->method_state) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  if (input->size > 0 && input->data == NULL) {
+    return gcomp_encoder_set_error(
+        encoder, GCOMP_ERR_INVALID_ARG, "input->data is NULL but size > 0");
+  }
+  if (output->size > 0 && output->data == NULL) {
+    return gcomp_encoder_set_error(
+        encoder, GCOMP_ERR_INVALID_ARG, "output->data is NULL but size > 0");
+  }
+
+  lzw_encoder_state_t * state = (lzw_encoder_state_t *)encoder->method_state;
+
+  if (!state->stage_buf) {
+    state->stage_buf = gcomp_malloc(state->allocator, LZW_STAGE_SIZE);
+    if (!state->stage_buf) {
+      return gcomp_encoder_set_error(
+          encoder, GCOMP_ERR_MEMORY, "LZW encoder staging buffer allocation failed");
+    }
+    state->stage_size = LZW_STAGE_SIZE;
+    state->stage_used = 0;
+    state->stage_copied = 0;
+  }
+
+  for (;;) {
+    if (!lzw_drain_stage(state, output)) {
+      return GCOMP_OK;
+    }
+    if (input->used >= input->size || output->used >= output->size) {
+      return GCOMP_OK;
+    }
+
+    size_t before = input->used;
+    gcomp_status_t s = lzw_encode_batch(state, encoder, input);
+    if (s != GCOMP_OK) {
+      (void)lzw_drain_stage(state, output);
+      return s;
+    }
+    if (input->used == before && state->stage_used == 0) {
+      return GCOMP_OK;
+    }
+  }
 }
 
 gcomp_status_t lzw_encoder_finish(
@@ -398,6 +463,17 @@ gcomp_status_t lzw_encoder_finish(
   }
 
   lzw_encoder_state_t * state = (lzw_encoder_state_t *)encoder->method_state;
+
+  // Anything update() staged but could not deliver must go out first, ahead of
+  // the final code and EOI. Report GCOMP_ERR_LIMIT until it has all been
+  // handed over; gcomp_encoder_finish() reserves GCOMP_OK for a complete
+  // stream, so returning it here would silently truncate.
+  if (state->stage_buf && state->stage_used > state->stage_copied) {
+    if (!lzw_drain_stage(state, output)) {
+      return GCOMP_ERR_LIMIT;
+    }
+  }
+
   size_t output_avail = output->size - output->used;
   uint8_t * out_base = (uint8_t *)output->data + output->used;
   lzw_bitwriter_set_buffer(&state->writer, out_base, output_avail);
@@ -461,6 +537,9 @@ gcomp_status_t lzw_encoder_reset(gcomp_encoder_t * encoder) {
   state->pending_code = 0;
   state->pending_bits = 0;
   state->header_emitted = 0;
+  // Discard anything update() had staged but not yet delivered.
+  state->stage_used = 0;
+  state->stage_copied = 0;
   state->writer.bit_buffer = 0;
   state->writer.bit_count = 0;
   return GCOMP_OK;

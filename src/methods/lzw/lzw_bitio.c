@@ -142,12 +142,18 @@ static gcomp_status_t write_lsb(
   value &= mask;
   uint32_t saved_buffer = writer->bit_buffer;
   uint32_t saved_count = writer->bit_count;
+  // byte_pos is part of the rollback. A single write can flush more than one
+  // byte, so the limit may be hit after some have already landed; leaving
+  // byte_pos advanced while bit_buffer/bit_count rewind makes the retry
+  // re-emit those bytes, inserting duplicates into the stream.
+  size_t saved_pos = writer->byte_pos;
   writer->bit_buffer |= value << writer->bit_count;
   writer->bit_count += num_bits;
   while (writer->bit_count >= 8u) {
     if (writer->byte_pos >= writer->size) {
       writer->bit_buffer = saved_buffer;
       writer->bit_count = saved_count;
+      writer->byte_pos = saved_pos;
       return GCOMP_ERR_LIMIT;
     }
     writer->data[writer->byte_pos++] = (uint8_t)(writer->bit_buffer & 0xFFu);
@@ -165,12 +171,18 @@ static gcomp_status_t write_msb(
   value &= mask;
   uint32_t saved_buffer = writer->bit_buffer;
   uint32_t saved_count = writer->bit_count;
+  // byte_pos is part of the rollback. A single write can flush more than one
+  // byte, so the limit may be hit after some have already landed; leaving
+  // byte_pos advanced while bit_buffer/bit_count rewind makes the retry
+  // re-emit those bytes, inserting duplicates into the stream.
+  size_t saved_pos = writer->byte_pos;
   writer->bit_buffer = (writer->bit_buffer << num_bits) | value;
   writer->bit_count += num_bits;
   while (writer->bit_count >= 8u) {
     if (writer->byte_pos >= writer->size) {
       writer->bit_buffer = saved_buffer;
       writer->bit_count = saved_count;
+      writer->byte_pos = saved_pos;
       return GCOMP_ERR_LIMIT;
     }
     writer->data[writer->byte_pos++] =
