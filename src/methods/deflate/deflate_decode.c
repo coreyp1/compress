@@ -50,7 +50,7 @@
 
 #include "../../core/alloc_internal.h"
 #include "../../core/registry_internal.h"
-#include "../../core/safe_math.h"
+#include <cutil/safemath.h>
 #include "../../core/stream_internal.h"
 #include "deflate_internal.h"
 #include "huffman.h"
@@ -631,7 +631,7 @@ static gcomp_status_t deflate_huff_decode_symbol(
 
   // Use safe math for index calculation to prevent overflow
   size_t long_idx;
-  if (!gcomp_safe_add_size((size_t)table->long_base[idx], (size_t)low, &long_idx)) {
+  if (!gcu_safe_add_size((size_t)table->long_base[idx], (size_t)low, &long_idx)) {
     return GCOMP_ERR_CORRUPT;
   }
   if (long_idx >= table->long_table_count) {

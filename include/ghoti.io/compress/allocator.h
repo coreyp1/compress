@@ -3,12 +3,22 @@
  *
  * Allocator abstraction for the Ghoti.io Compress library.
  *
+ * This is cutil's @ref GCU_Allocator under a local name. The two were
+ * identical - same four function pointers, same context argument, same
+ * semantics - and having one definition means an allocator written for any
+ * library in the suite works with all of them, rather than needing a
+ * near-identical copy per library.
+ *
+ * Existing code needs no change: `gcomp_allocator_t` still names the type and
+ * gcomp_allocator_default() still returns the stdlib-backed instance.
+ *
  * Copyright 2026 by Corey Pennycuff
  */
 
 #ifndef GHOTI_IO_GCOMP_ALLOCATOR_H
 #define GHOTI_IO_GCOMP_ALLOCATOR_H
 
+#include <cutil/allocator.h>
 #include <ghoti.io/compress/macros.h>
 #include <stddef.h>
 
@@ -19,21 +29,22 @@ extern "C" {
 /**
  * @brief Allocator interface used by the library.
  *
- * All function pointers must be non-NULL.
+ * All function pointers must be non-NULL. Each receives the `ctx` pointer
+ * from the struct as its first argument.
+ *
+ * Two requirements beyond the C library equivalents: `calloc_fn` must treat
+ * overflow of `nitems * size` as an allocation failure and return NULL rather
+ * than allocating a truncated block, and a zero-size request should return a
+ * usable non-NULL pointer, so that NULL always means failure.
  */
-typedef struct gcomp_allocator_s {
-  void * ctx;
-  void * (*malloc_fn)(void * ctx, size_t size);
-  void * (*calloc_fn)(void * ctx, size_t nitems, size_t size);
-  void * (*realloc_fn)(void * ctx, void * ptr, size_t size);
-  void (*free_fn)(void * ctx, void * ptr);
-} gcomp_allocator_t;
+typedef GCU_Allocator gcomp_allocator_t;
 
 /**
  * @brief Get the default allocator (stdlib-backed).
  *
  * The default allocator treats overflow in calloc(nitems, size) as allocation
- * failure: if nitems * size would overflow, it returns NULL.
+ * failure: if nitems * size would overflow, it returns NULL. It never returns
+ * NULL for a zero-size request.
  *
  * @return Pointer to a process-global allocator instance.
  */

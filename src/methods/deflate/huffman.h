@@ -47,6 +47,7 @@
 #ifndef GCOMP_DEFLATE_HUFFMAN_H
 #define GCOMP_DEFLATE_HUFFMAN_H
 
+#include <ghoti.io/compress/allocator.h>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/macros.h>
 #include <stddef.h>
@@ -103,7 +104,6 @@ typedef struct gcomp_deflate_huffman_fast_entry_s {
 } gcomp_deflate_huffman_fast_entry_t;
 
 // Forward declare allocator for storage in decode table
-struct gcomp_allocator_s;
 
 /**
  * @brief Two-level Huffman decode table for fast decoding.
@@ -131,7 +131,7 @@ typedef struct gcomp_deflate_huffman_decode_table_s {
   /** Number of entries in long_table. */
   size_t long_table_count;
   /** Allocator used for long_table (stored for cleanup). */
-  const struct gcomp_allocator_s * allocator;
+  const gcomp_allocator_t * allocator;
 } gcomp_deflate_huffman_decode_table_t;
 
 /**
@@ -193,7 +193,7 @@ GCOMP_INTERNAL_API gcomp_status_t gcomp_deflate_huffman_build_codes(
  *         on failure. On failure, table state is undefined.
  */
 GCOMP_INTERNAL_API gcomp_status_t gcomp_deflate_huffman_build_decode_table(
-    const struct gcomp_allocator_s * allocator, const uint8_t * lengths,
+    const gcomp_allocator_t * allocator, const uint8_t * lengths,
     size_t num_symbols, unsigned max_bits,
     gcomp_deflate_huffman_decode_table_t * table);
 

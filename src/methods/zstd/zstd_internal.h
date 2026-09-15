@@ -33,7 +33,7 @@
 #include "../../core/alloc_internal.h"
 #include "../../core/endian.h"
 #include "../../core/registry_internal.h"
-#include "../../core/safe_math.h"
+#include <cutil/safemath.h>
 #include "../../core/stream_internal.h"
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/limits.h>

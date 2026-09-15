@@ -106,7 +106,7 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#include "../../core/safe_math.h"
+#include <cutil/safemath.h>
 #include "lz4_internal.h"
 #include <string.h>
 
@@ -336,7 +336,7 @@ gcomp_status_t lz4_block_decompress(const uint8_t * input, size_t input_len,
     if (lit_len == 15) {
       while (src < src_end) {
         uint8_t b = *src++;
-        if (!gcomp_safe_add_size(lit_len, b, &lit_len)) {
+        if (!gcu_safe_add_size(lit_len, b, &lit_len)) {
           return GCOMP_ERR_CORRUPT; // Overflow in literal length
         }
         if (b != 255) {
@@ -378,7 +378,7 @@ gcomp_status_t lz4_block_decompress(const uint8_t * input, size_t input_len,
     if ((token & 0x0F) == 15) {
       while (src < src_end) {
         uint8_t b = *src++;
-        if (!gcomp_safe_add_size(match_len, b, &match_len)) {
+        if (!gcu_safe_add_size(match_len, b, &match_len)) {
           return GCOMP_ERR_CORRUPT; // Overflow in match length
         }
         if (b != 255) {

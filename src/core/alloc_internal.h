@@ -13,7 +13,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "safe_math.h"
+#include <cutil/safemath.h>
 
 static inline const gcomp_allocator_t * gcomp_alloc_or_default(
     const gcomp_allocator_t * allocator) {
@@ -53,7 +53,7 @@ static inline char * gcomp_strdup(
     len++;
   }
   size_t alloc_size;
-  if (!gcomp_safe_add_size(len, 1, &alloc_size)) {
+  if (!gcu_safe_add_size(len, 1, &alloc_size)) {
     return NULL; // len + 1 would overflow (e.g. len == SIZE_MAX)
   }
   char * out = gcomp_malloc(allocator, alloc_size);

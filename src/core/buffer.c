@@ -7,7 +7,7 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#include "safe_math.h"
+#include <cutil/safemath.h>
 #include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/registry.h>
@@ -90,7 +90,7 @@ gcomp_status_t gcomp_encode_buffer(gcomp_registry_t * registry,
     input_remaining -= input_buf.used;
     output_ptr += output_buf.used;
     output_remaining -= output_buf.used;
-    if (!gcomp_safe_add_size(*output_size_out, output_buf.used, &new_total)) {
+    if (!gcu_safe_add_size(*output_size_out, output_buf.used, &new_total)) {
       gcomp_encoder_destroy(encoder);
       return GCOMP_ERR_LIMIT;
     }
@@ -121,7 +121,7 @@ gcomp_status_t gcomp_encode_buffer(gcomp_registry_t * registry,
       // Finished successfully
       output_ptr += output_buf.used;
       output_remaining -= output_buf.used;
-      if (!gcomp_safe_add_size(*output_size_out, output_buf.used, &new_total)) {
+      if (!gcu_safe_add_size(*output_size_out, output_buf.used, &new_total)) {
         gcomp_encoder_destroy(encoder);
         return GCOMP_ERR_LIMIT;
       }
@@ -221,7 +221,7 @@ gcomp_status_t gcomp_decode_buffer(gcomp_registry_t * registry,
     input_remaining -= input_buf.used;
     output_ptr += output_buf.used;
     output_remaining -= output_buf.used;
-    if (!gcomp_safe_add_size(*output_size_out, output_buf.used, &new_total)) {
+    if (!gcu_safe_add_size(*output_size_out, output_buf.used, &new_total)) {
       gcomp_decoder_destroy(decoder);
       return GCOMP_ERR_LIMIT;
     }
@@ -252,7 +252,7 @@ gcomp_status_t gcomp_decode_buffer(gcomp_registry_t * registry,
       // Finished successfully
       output_ptr += output_buf.used;
       output_remaining -= output_buf.used;
-      if (!gcomp_safe_add_size(*output_size_out, output_buf.used, &new_total)) {
+      if (!gcu_safe_add_size(*output_size_out, output_buf.used, &new_total)) {
         gcomp_decoder_destroy(decoder);
         return GCOMP_ERR_LIMIT;
       }

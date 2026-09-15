@@ -655,16 +655,16 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
     // Safe math for header length from untrusted descriptor
     size_t expected_len = 5; // magic + FHD
     if (!single_segment) {
-      if (!gcomp_safe_add_size(expected_len, 1, &expected_len)) {
+      if (!gcu_safe_add_size(expected_len, 1, &expected_len)) {
         state->stage = ZSTD_DEC_STAGE_ERROR;
         gcomp_decoder_set_error(
             decoder, GCOMP_ERR_CORRUPT, "header length overflow");
         return GCOMP_ERR_CORRUPT;
       }
     }
-    if (!gcomp_safe_add_size(
+    if (!gcu_safe_add_size(
             expected_len, zstd_dict_id_size(dict_id_flag), &expected_len) ||
-        !gcomp_safe_add_size(expected_len,
+        !gcu_safe_add_size(expected_len,
             zstd_fcs_size(fcs_flag, single_segment), &expected_len)) {
       state->stage = ZSTD_DEC_STAGE_ERROR;
       gcomp_decoder_set_error(
@@ -852,7 +852,7 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
     // Check output limits (use safe math for accumulated sizes)
     {
       uint64_t new_total;
-      if (!gcomp_safe_add_u64(state->total_output_bytes,
+      if (!gcu_safe_add_u64(state->total_output_bytes,
               (uint64_t)decompressed_len, &new_total)) {
         state->stage = ZSTD_DEC_STAGE_ERROR;
         gcomp_decoder_set_error(
@@ -863,7 +863,7 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
     }
     {
       uint64_t new_frame;
-      if (!gcomp_safe_add_u64(state->frame_output_bytes,
+      if (!gcu_safe_add_u64(state->frame_output_bytes,
               (uint64_t)decompressed_len, &new_frame)) {
         state->stage = ZSTD_DEC_STAGE_ERROR;
         gcomp_decoder_set_error(

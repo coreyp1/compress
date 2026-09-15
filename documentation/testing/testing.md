@@ -288,7 +288,6 @@ tests/
 │   ├── test_errors.cpp           # Error handling tests
 │   ├── test_job_queue.cpp        # Job queue tests
 │   ├── test_limits.cpp           # Safety limits tests
-│   ├── test_safe_math.cpp        # Safe math (overflow) unit tests
 │   ├── test_options.cpp          # Options API tests
 │   ├── test_registry.cpp         # Registry tests
 │   ├── test_schema.cpp           # Option schema introspection tests

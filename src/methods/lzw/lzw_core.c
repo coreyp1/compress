@@ -42,7 +42,7 @@
 
 #include "lzw_core.h"
 #include "../../core/alloc_internal.h"
-#include "../../core/safe_math.h"
+#include <cutil/safemath.h>
 
 #define LZW_SENTINEL 0xFFFFu
 
@@ -63,9 +63,9 @@ gcomp_status_t lzw_core_decoder_init(lzw_core_decoder_t * core,
 
   uint32_t capacity = 1u << max_code_bits;
   size_t prefix_size, append_size, stack_size;
-  if (!gcomp_safe_mul_size((size_t)capacity, sizeof(uint16_t), &prefix_size) ||
-      !gcomp_safe_mul_size((size_t)capacity, sizeof(uint8_t), &append_size) ||
-      !gcomp_safe_mul_size((size_t)capacity, sizeof(uint8_t), &stack_size)) {
+  if (!gcu_safe_mul_size((size_t)capacity, sizeof(uint16_t), &prefix_size) ||
+      !gcu_safe_mul_size((size_t)capacity, sizeof(uint8_t), &append_size) ||
+      !gcu_safe_mul_size((size_t)capacity, sizeof(uint8_t), &stack_size)) {
     return GCOMP_ERR_CORRUPT;
   }
 
@@ -204,7 +204,7 @@ gcomp_status_t lzw_core_decoder_decode(lzw_core_decoder_t * core, uint32_t code,
 
   size_t to_write = (code == next) ? n + 1 : n;
   size_t new_used;
-  if (!gcomp_safe_add_size(used, to_write, &new_used) ||
+  if (!gcu_safe_add_size(used, to_write, &new_used) ||
       new_used > output_size) {
     return GCOMP_ERR_LIMIT;
   }
@@ -249,8 +249,8 @@ gcomp_status_t lzw_core_encoder_init(lzw_core_encoder_t * core,
 
   uint32_t capacity = 1u << max_code_bits;
   size_t prefix_size, append_size;
-  if (!gcomp_safe_mul_size((size_t)capacity, sizeof(uint16_t), &prefix_size) ||
-      !gcomp_safe_mul_size((size_t)capacity, sizeof(uint8_t), &append_size)) {
+  if (!gcu_safe_mul_size((size_t)capacity, sizeof(uint16_t), &prefix_size) ||
+      !gcu_safe_mul_size((size_t)capacity, sizeof(uint8_t), &append_size)) {
     return GCOMP_ERR_CORRUPT;
   }
 

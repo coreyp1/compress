@@ -21,7 +21,7 @@
  */
 
 #include "rle_profile.h"
-#include "../../core/safe_math.h"
+#include <cutil/safemath.h>
 #include "rle_core.h"
 #include "rle_internal.h"
 #include <ghoti.io/compress/limits.h>

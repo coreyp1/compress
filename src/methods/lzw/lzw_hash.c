@@ -8,7 +8,7 @@
 
 #include "lzw_hash.h"
 #include "../../core/alloc_internal.h"
-#include "../../core/safe_math.h"
+#include <cutil/safemath.h>
 #include <string.h>
 
 #define LZW_HASH_EMPTY_PREFIX 0xFFFFu
@@ -38,12 +38,12 @@ gcomp_status_t lzw_encoder_hash_init(lzw_encoder_hash_t ** out,
   }
 
   size_t prefix_bytes, byte_bytes, code_bytes, struct_bytes, total;
-  if (!gcomp_safe_mul_size((size_t)size, sizeof(uint16_t), &prefix_bytes) ||
-      !gcomp_safe_mul_size((size_t)size, sizeof(uint8_t), &byte_bytes) ||
-      !gcomp_safe_mul_size((size_t)size, sizeof(uint16_t), &code_bytes) ||
-      !gcomp_safe_add_size(prefix_bytes, byte_bytes, &total) ||
-      !gcomp_safe_add_size(total, code_bytes, &total) ||
-      !gcomp_safe_add_size(
+  if (!gcu_safe_mul_size((size_t)size, sizeof(uint16_t), &prefix_bytes) ||
+      !gcu_safe_mul_size((size_t)size, sizeof(uint8_t), &byte_bytes) ||
+      !gcu_safe_mul_size((size_t)size, sizeof(uint16_t), &code_bytes) ||
+      !gcu_safe_add_size(prefix_bytes, byte_bytes, &total) ||
+      !gcu_safe_add_size(total, code_bytes, &total) ||
+      !gcu_safe_add_size(
           total, sizeof(struct lzw_encoder_hash_s), &struct_bytes)) {
     return GCOMP_ERR_CORRUPT;
   }
