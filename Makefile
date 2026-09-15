@@ -79,13 +79,13 @@ endif
 
 
 CXX := g++
-CXXFLAGS := -pedantic-errors -Wall -Wextra -Werror -Wno-error=unused-function -Wfatal-errors -std=c++20 -O1 -g
+CXXFLAGS := -pedantic-errors -Wall -Wextra -Werror -Wno-error=unused-function -Wfatal-errors -std=c++20 -O1 -g $(EXTRA_CXXFLAGS)
 CC := cc
-CFLAGS := -pedantic-errors -Wall -Wextra -Werror -Wno-error=unused-function -Wfatal-errors -std=c17 -O0 -g
+CFLAGS := -pedantic-errors -Wall -Wextra -Werror -Wno-error=unused-function -Wfatal-errors -std=c17 -O0 -g $(EXTRA_CFLAGS)
 # Library-specific compile flags (export symbols on Windows, PIC on Linux)
 # GCOMP_BUILD enables DLL export on Windows (checked by GCOMP_API macro)
 # GCOMP_TEST_BUILD enables export of internal functions for testing (checked by GCOMP_INTERNAL_API macro)
-LIB_CFLAGS := $(CFLAGS) -DGCOMP_BUILD -DGCOMP_TEST_BUILD
+LIB_CFLAGS := $(CFLAGS) -DGCOMP_BUILD -DGCOMP_TEST_BUILD $(EXTRA_CFLAGS)
 # Link cutil library for threading support. Prefer pkg-config; fall back to a
 # sibling checkout so the suite builds from a fresh clone without installing
 # cutil system-wide first.
@@ -97,7 +97,7 @@ ifeq ($(strip $(CUTIL_CFLAGS)),)
 CUTIL_CFLAGS := -I../cutil/include -I$(CUTIL_SIBLING_DIR)/include
 CUTIL_LIBS := -L$(CUTIL_SIBLING_DIR)/apps -lghoti.io-cutil-dev
 endif
-LDFLAGS := -L /usr/lib -lstdc++ -lm $(CUTIL_LIBS) -lpthread
+LDFLAGS := -L /usr/lib -lstdc++ -lm $(CUTIL_LIBS) -lpthread $(EXTRA_LDFLAGS)
 BUILD_DIR := ./build/$(BUILD)
 OBJ_DIR := $(BUILD_DIR)/objects
 GEN_DIR := $(BUILD_DIR)/generated
@@ -330,7 +330,7 @@ $(APP_DIR)/fuzz/%$(EXE_EXTENSION): fuzz/%.c $(APP_DIR)/$(AFL_STATIC_TARGET)
 ####################################################################
 
 # General commands
-.PHONY: clean cloc docs docs-pdf examples bench bench-deflate
+.PHONY: clean cloc docs docs-pdf examples bench bench-deflate coverage
 # Release build commands
 .PHONY: all install test test-quiet test-valgrind test-valgrind-quiet test-watch uninstall watch
 # Debug build commands
@@ -1219,6 +1219,20 @@ docs-pdf: docs ## Generate the documentation as a pdf, at ./docs/(SUITE)-(PROJEC
 
 cloc: ## Count the lines of code used in the project
 	cloc src include tests Makefile
+
+coverage: ## Build instrumented, run the tests, and report line coverage
+# Cleans first because the object files would otherwise be reused without the
+# instrumentation, then cleans and rebuilds at the end: leaving the
+# instrumented objects behind would have a later `make` silently link them,
+# and leaving the tree cleaned would break any sibling project that links
+# this one. The cost is one extra build; coverage is not run often.
+	@$(MAKE) --no-print-directory clean > /dev/null
+	@$(MAKE) --no-print-directory test \
+		EXTRA_CFLAGS="--coverage -O0" \
+		EXTRA_LDFLAGS="--coverage" > /dev/null
+	@tools/coverage.sh $(OBJ_DIR)
+	@$(MAKE) --no-print-directory clean > /dev/null
+	@$(MAKE) --no-print-directory all > /dev/null
 
 help: ## Display this help
 	@grep -E '^[ a-zA-Z0-9_-]+:.*?## .*$$' Makefile | sort | sed 's/\([^:]*\):.*## \(.*\)/\1:\2/' | awk -F: '{printf "%-15s %s\n", $$1, $$2}' | sed "s/(SUITE)/$(SUITE)/g; s/(PROJECT)/$(PROJECT)/g; s/(BRANCH)/$(BRANCH)/g"
