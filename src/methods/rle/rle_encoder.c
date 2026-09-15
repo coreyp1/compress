@@ -84,6 +84,9 @@ void rle_encoder_destroy(gcomp_encoder_t * encoder) {
   encoder->method_state = NULL;
 }
 
+/** Length byte plus a full 128-byte PackBits literal block. */
+#define RLE_MIN_OUTPUT_SPACE 129u
+
 gcomp_status_t rle_encoder_update(gcomp_encoder_t * encoder,
     gcomp_buffer_t * input, gcomp_buffer_t * output) {
   if (!encoder || !encoder->method_state) {
@@ -109,6 +112,7 @@ gcomp_status_t rle_encoder_update(gcomp_encoder_t * encoder,
   const uint8_t * in_ptr = (const uint8_t *)input->data;
   uint8_t * out_ptr = (uint8_t *)output->data;
   size_t input_consumed = 0;
+  size_t output_used_before = output->used;
 
   gcomp_status_t s = rle_profile_encode(state, in_ptr + input->used,
       input_avail, &input_consumed, out_ptr, output->size, &output->used);
@@ -117,6 +121,19 @@ gcomp_status_t rle_encoder_update(gcomp_encoder_t * encoder,
   }
 
   input->used += input_consumed;
+
+  // A PackBits literal block is a length byte plus up to 128 bytes, so the
+  // encoder needs 129 bytes of free output to flush one. Given less, it
+  // cannot emit anything and used to return GCOMP_OK having consumed nothing
+  // and produced nothing - a caller looping until its input was consumed
+  // would spin forever with no indication why. Say so instead.
+  if (input_consumed == 0 && output->used == output_used_before &&
+      input->used < input->size) {
+    return gcomp_encoder_set_error(encoder, GCOMP_ERR_LIMIT,
+        "RLE encoder needs at least %u bytes of free output space to make "
+        "progress; %zu available",
+        (unsigned)(RLE_MIN_OUTPUT_SPACE), output->size - output_used_before);
+  }
   return GCOMP_OK;
 }
 
