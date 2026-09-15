@@ -287,14 +287,66 @@ FUZZ_SOURCES := $(shell find fuzz -maxdepth 1 -type f -name 'fuzz_*.c' 2>/dev/nu
 # Fuzz executables (built with afl-gcc)
 FUZZ_EXECUTABLES := $(patsubst fuzz/%.c,$(APP_DIR)/fuzz/%$(EXE_EXTENSION),$(FUZZ_SOURCES))
 
-# AFL compiler (can be overridden: make fuzz-build AFL_CC=afl-clang-fast)
-AFL_CC ?= afl-gcc
-AFL_CFLAGS := -O2 -g $(INCLUDE)
+# AFL compiler. AFL++ 4.x ships several front ends; afl-clang-fast gives the
+# best instrumentation and is the one that supports the sanitizers below. The
+# legacy afl-gcc wrapper still works if you have a reason to prefer it:
+#   make fuzz-build AFL_CC=afl-gcc
+AFL_CC ?= afl-clang-fast
+
+# Sanitizers in the fuzz build.
+#
+# AFL on its own only notices a bug that crashes the process. A heap overflow
+# that happens to land inside another allocation, or an out-of-bounds read that
+# returns garbage, runs to completion and is recorded as a normal execution.
+# ASan and UBSan turn both into an abort that AFL sees as a crash, which is the
+# difference between fuzzing that finds memory-safety bugs and fuzzing that
+# finds segfaults.
+#
+# The cost is roughly 2x throughput and a much larger address space. Build
+# without them with: make fuzz-build FUZZ_SAN=0
+FUZZ_SAN ?= 1
+ifeq ($(FUZZ_SAN),1)
+AFL_SAN_FLAGS := -fsanitize=address,undefined -fno-sanitize-recover=all \
+                 -fno-omit-frame-pointer
+# ASan reserves terabytes of address space for its shadow map, so AFL's per
+# execution memory cap has to come off or every run dies as a false OOM.
+AFL_MEM_LIMIT := none
+else
+AFL_SAN_FLAGS :=
+AFL_MEM_LIMIT := 200
+endif
+
+AFL_CFLAGS := -O2 -g $(AFL_SAN_FLAGS) $(INCLUDE)
+AFL_LDFLAGS := $(AFL_SAN_FLAGS)
+
+# Sanitizer runtime options for the fuzz targets.
+#
+# abort_on_error/symbolize: required by afl-fuzz, which refuses to start with
+# custom options that would let an error be reported without crashing.
+# allocator_may_return_null: a fuzzed length field asking for 100 GB is an
+# allocation failure the library is supposed to handle, not a finding. Without
+# this ASan aborts on the request itself and every such input looks like a bug.
+# detect_leaks: off because these harnesses fork per execution, so LeakSanitizer
+# would run a full scan on every input. Leaks are worth hunting separately:
+#   make fuzz-rle-decoder AFL_ENV='AFL_CRASH_EXITCODE=23' ASAN_LEAKS=1
+ASAN_LEAKS ?= 0
+AFL_SAN_ENV := ASAN_OPTIONS=abort_on_error=1:symbolize=0:allocator_may_return_null=1:detect_leaks=$(ASAN_LEAKS) \
+               UBSAN_OPTIONS=abort_on_error=1:symbolize=0
 
 # AFL environment variables for running fuzzer
 # Set AFL_SKIP_CRASHES=1 to skip core_pattern check (for WSL2/testing)
 # For proper crash detection: echo core | sudo tee /proc/sys/kernel/core_pattern
 AFL_ENV ?=
+# Stop after a fixed number of seconds instead of running until Ctrl+C, which
+# is what a scripted or CI run wants: make fuzz-rle-decoder FUZZ_TIME=300
+# Empty (the default) keeps the interactive behaviour of running until stopped.
+FUZZ_TIME ?=
+AFL_TIME_FLAG := $(if $(FUZZ_TIME),-V $(FUZZ_TIME),)
+
+# cutil is a shared library, and the harnesses call into it through the
+# allocator, so the fuzz targets need it on the library path the same way the
+# test binaries do.
+AFL_RUN_ENV = LD_LIBRARY_PATH="$(TEST_LD_PATH)" $(AFL_SAN_ENV) $(AFL_ENV)
 
 # AFL-instrumented object files and library (separate from regular build)
 AFL_OBJ_DIR := $(BUILD_DIR)/afl-objects
@@ -323,7 +375,7 @@ $(APP_DIR)/fuzz/generate_corpus$(EXE_EXTENSION): fuzz/generate_corpus.c
 $(APP_DIR)/fuzz/%$(EXE_EXTENSION): fuzz/%.c $(APP_DIR)/$(AFL_STATIC_TARGET)
 	@printf "\n### Compiling Fuzz Harness: $* ###\n"
 	@mkdir -p $(@D)
-	$(AFL_CC) $(AFL_CFLAGS) -o $@ $< $(APP_DIR)/$(AFL_STATIC_TARGET) -lm
+	$(AFL_CC) $(AFL_CFLAGS) $(AFL_LDFLAGS) -o $@ $< $(APP_DIR)/$(AFL_STATIC_TARGET) $(CUTIL_LIBS) -lm
 
 ####################################################################
 # Commands
@@ -487,8 +539,12 @@ fuzz-help: ## Show fuzzing help and instructions
 	@printf "Or skip the check (for quick testing on WSL2):\n"
 	@printf "  make fuzz-decoder AFL_ENV='AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1'\n"
 	@printf "\n"
-	@printf "For faster fuzzing (if LLVM is installed):\n"
-	@printf "  make fuzz-build AFL_CC=afl-clang-fast\n"
+	@printf "Sanitizers:\n"
+	@printf "  The fuzz build uses ASan and UBSan by default, so that a heap\n"
+	@printf "  overflow or undefined behaviour becomes a crash AFL can see\n"
+	@printf "  instead of a silently successful run.\n"
+	@printf "  Faster, less thorough:  make fuzz-build FUZZ_SAN=0\n"
+	@printf "  Hunt leaks as well:     make fuzz-<target> ASAN_LEAKS=1 AFL_ENV='AFL_CRASH_EXITCODE=23'\n"
 	@printf "\n"
 	@printf "Findings are saved to: fuzz/findings/<target>/\n"
 	@printf "  - crashes/  : Inputs that caused crashes\n"
@@ -537,7 +593,7 @@ fuzz-decoder: $(APP_DIR)/fuzz/fuzz_deflate_decoder$(EXE_EXTENSION)
 		mkdir -p fuzz/corpus/decoder; \
 		printf '\x01\x00\x00\xff\xff' > fuzz/corpus/decoder/empty.bin; \
 	fi
-	$(AFL_ENV) afl-fuzz -i fuzz/corpus/decoder -o fuzz/findings/decoder -- $(APP_DIR)/fuzz/fuzz_deflate_decoder$(EXE_EXTENSION)
+	$(AFL_RUN_ENV) afl-fuzz -m $(AFL_MEM_LIMIT) $(AFL_TIME_FLAG) -i fuzz/corpus/decoder -o fuzz/findings/decoder -- $(APP_DIR)/fuzz/fuzz_deflate_decoder$(EXE_EXTENSION)
 
 fuzz-encoder: ## Run encoder fuzzer (Ctrl+C to stop)
 fuzz-encoder: $(APP_DIR)/fuzz/fuzz_deflate_encoder$(EXE_EXTENSION)
@@ -553,7 +609,7 @@ fuzz-encoder: $(APP_DIR)/fuzz/fuzz_deflate_encoder$(EXE_EXTENSION)
 		mkdir -p fuzz/corpus/encoder; \
 		printf 'Hello' > fuzz/corpus/encoder/hello.bin; \
 	fi
-	$(AFL_ENV) afl-fuzz -i fuzz/corpus/encoder -o fuzz/findings/encoder -- $(APP_DIR)/fuzz/fuzz_deflate_encoder$(EXE_EXTENSION)
+	$(AFL_RUN_ENV) afl-fuzz -m $(AFL_MEM_LIMIT) $(AFL_TIME_FLAG) -i fuzz/corpus/encoder -o fuzz/findings/encoder -- $(APP_DIR)/fuzz/fuzz_deflate_encoder$(EXE_EXTENSION)
 
 fuzz-roundtrip: ## Run roundtrip fuzzer (Ctrl+C to stop)
 fuzz-roundtrip: $(APP_DIR)/fuzz/fuzz_roundtrip$(EXE_EXTENSION)
@@ -569,7 +625,7 @@ fuzz-roundtrip: $(APP_DIR)/fuzz/fuzz_roundtrip$(EXE_EXTENSION)
 		mkdir -p fuzz/corpus/roundtrip; \
 		printf 'Hello' > fuzz/corpus/roundtrip/hello.bin; \
 	fi
-	$(AFL_ENV) afl-fuzz -i fuzz/corpus/roundtrip -o fuzz/findings/roundtrip -- $(APP_DIR)/fuzz/fuzz_roundtrip$(EXE_EXTENSION)
+	$(AFL_RUN_ENV) afl-fuzz -m $(AFL_MEM_LIMIT) $(AFL_TIME_FLAG) -i fuzz/corpus/roundtrip -o fuzz/findings/roundtrip -- $(APP_DIR)/fuzz/fuzz_roundtrip$(EXE_EXTENSION)
 
 fuzz-gzip-decoder: ## Run gzip decoder fuzzer (Ctrl+C to stop)
 fuzz-gzip-decoder: $(APP_DIR)/fuzz/fuzz_gzip_decoder$(EXE_EXTENSION)
@@ -584,7 +640,7 @@ fuzz-gzip-decoder: $(APP_DIR)/fuzz/fuzz_gzip_decoder$(EXE_EXTENSION)
 		mkdir -p fuzz/corpus/gzip_decoder; \
 		printf '\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00' > fuzz/corpus/gzip_decoder/empty.gz; \
 	fi
-	$(AFL_ENV) afl-fuzz -i fuzz/corpus/gzip_decoder -o fuzz/findings/gzip_decoder -- $(APP_DIR)/fuzz/fuzz_gzip_decoder$(EXE_EXTENSION)
+	$(AFL_RUN_ENV) afl-fuzz -m $(AFL_MEM_LIMIT) $(AFL_TIME_FLAG) -i fuzz/corpus/gzip_decoder -o fuzz/findings/gzip_decoder -- $(APP_DIR)/fuzz/fuzz_gzip_decoder$(EXE_EXTENSION)
 
 fuzz-gzip-encoder: ## Run gzip encoder fuzzer (Ctrl+C to stop)
 fuzz-gzip-encoder: $(APP_DIR)/fuzz/fuzz_gzip_encoder$(EXE_EXTENSION)
@@ -599,7 +655,7 @@ fuzz-gzip-encoder: $(APP_DIR)/fuzz/fuzz_gzip_encoder$(EXE_EXTENSION)
 		mkdir -p fuzz/corpus/gzip_encoder; \
 		printf 'Hello' > fuzz/corpus/gzip_encoder/hello.bin; \
 	fi
-	$(AFL_ENV) afl-fuzz -i fuzz/corpus/gzip_encoder -o fuzz/findings/gzip_encoder -- $(APP_DIR)/fuzz/fuzz_gzip_encoder$(EXE_EXTENSION)
+	$(AFL_RUN_ENV) afl-fuzz -m $(AFL_MEM_LIMIT) $(AFL_TIME_FLAG) -i fuzz/corpus/gzip_encoder -o fuzz/findings/gzip_encoder -- $(APP_DIR)/fuzz/fuzz_gzip_encoder$(EXE_EXTENSION)
 
 fuzz-gzip-roundtrip: ## Run gzip roundtrip fuzzer (Ctrl+C to stop)
 fuzz-gzip-roundtrip: $(APP_DIR)/fuzz/fuzz_gzip_roundtrip$(EXE_EXTENSION)
@@ -614,7 +670,7 @@ fuzz-gzip-roundtrip: $(APP_DIR)/fuzz/fuzz_gzip_roundtrip$(EXE_EXTENSION)
 		mkdir -p fuzz/corpus/gzip_roundtrip; \
 		printf 'Hello' > fuzz/corpus/gzip_roundtrip/hello.bin; \
 	fi
-	$(AFL_ENV) afl-fuzz -i fuzz/corpus/gzip_roundtrip -o fuzz/findings/gzip_roundtrip -- $(APP_DIR)/fuzz/fuzz_gzip_roundtrip$(EXE_EXTENSION)
+	$(AFL_RUN_ENV) afl-fuzz -m $(AFL_MEM_LIMIT) $(AFL_TIME_FLAG) -i fuzz/corpus/gzip_roundtrip -o fuzz/findings/gzip_roundtrip -- $(APP_DIR)/fuzz/fuzz_gzip_roundtrip$(EXE_EXTENSION)
 
 fuzz-lz4-decoder: ## Run LZ4 decoder fuzzer (Ctrl+C to stop)
 fuzz-lz4-decoder: $(APP_DIR)/fuzz/fuzz_lz4_decoder$(EXE_EXTENSION)
@@ -629,7 +685,7 @@ fuzz-lz4-decoder: $(APP_DIR)/fuzz/fuzz_lz4_decoder$(EXE_EXTENSION)
 		mkdir -p fuzz/corpus/lz4_decoder; \
 		printf '\x04\x22\x4d\x18\x60\x70\xdf\x00\x00\x00\x00' > fuzz/corpus/lz4_decoder/empty.lz4; \
 	fi
-	$(AFL_ENV) afl-fuzz -i fuzz/corpus/lz4_decoder -o fuzz/findings/lz4_decoder -- $(APP_DIR)/fuzz/fuzz_lz4_decoder$(EXE_EXTENSION)
+	$(AFL_RUN_ENV) afl-fuzz -m $(AFL_MEM_LIMIT) $(AFL_TIME_FLAG) -i fuzz/corpus/lz4_decoder -o fuzz/findings/lz4_decoder -- $(APP_DIR)/fuzz/fuzz_lz4_decoder$(EXE_EXTENSION)
 
 fuzz-lz4-encoder: ## Run LZ4 encoder fuzzer (Ctrl+C to stop)
 fuzz-lz4-encoder: $(APP_DIR)/fuzz/fuzz_lz4_encoder$(EXE_EXTENSION)
@@ -644,7 +700,7 @@ fuzz-lz4-encoder: $(APP_DIR)/fuzz/fuzz_lz4_encoder$(EXE_EXTENSION)
 		mkdir -p fuzz/corpus/lz4_encoder; \
 		printf 'Hello' > fuzz/corpus/lz4_encoder/hello.bin; \
 	fi
-	$(AFL_ENV) afl-fuzz -i fuzz/corpus/lz4_encoder -o fuzz/findings/lz4_encoder -- $(APP_DIR)/fuzz/fuzz_lz4_encoder$(EXE_EXTENSION)
+	$(AFL_RUN_ENV) afl-fuzz -m $(AFL_MEM_LIMIT) $(AFL_TIME_FLAG) -i fuzz/corpus/lz4_encoder -o fuzz/findings/lz4_encoder -- $(APP_DIR)/fuzz/fuzz_lz4_encoder$(EXE_EXTENSION)
 
 fuzz-lz4-roundtrip: ## Run LZ4 roundtrip fuzzer (Ctrl+C to stop)
 fuzz-lz4-roundtrip: $(APP_DIR)/fuzz/fuzz_lz4_roundtrip$(EXE_EXTENSION)
@@ -659,7 +715,7 @@ fuzz-lz4-roundtrip: $(APP_DIR)/fuzz/fuzz_lz4_roundtrip$(EXE_EXTENSION)
 		mkdir -p fuzz/corpus/lz4_roundtrip; \
 		printf 'Hello' > fuzz/corpus/lz4_roundtrip/hello.bin; \
 	fi
-	$(AFL_ENV) afl-fuzz -i fuzz/corpus/lz4_roundtrip -o fuzz/findings/lz4_roundtrip -- $(APP_DIR)/fuzz/fuzz_lz4_roundtrip$(EXE_EXTENSION)
+	$(AFL_RUN_ENV) afl-fuzz -m $(AFL_MEM_LIMIT) $(AFL_TIME_FLAG) -i fuzz/corpus/lz4_roundtrip -o fuzz/findings/lz4_roundtrip -- $(APP_DIR)/fuzz/fuzz_lz4_roundtrip$(EXE_EXTENSION)
 
 fuzz-rle-decoder: ## Run RLE decoder fuzzer (Ctrl+C to stop)
 fuzz-rle-decoder: $(APP_DIR)/fuzz/fuzz_rle_decoder$(EXE_EXTENSION)
@@ -675,7 +731,7 @@ fuzz-rle-decoder: $(APP_DIR)/fuzz/fuzz_rle_decoder$(EXE_EXTENSION)
 		mkdir -p fuzz/corpus/rle_decoder; \
 		printf '\x02ABC' > fuzz/corpus/rle_decoder/abc.bin; \
 	fi
-	$(AFL_ENV) afl-fuzz -i fuzz/corpus/rle_decoder -o fuzz/findings/rle_decoder -- $(APP_DIR)/fuzz/fuzz_rle_decoder$(EXE_EXTENSION)
+	$(AFL_RUN_ENV) afl-fuzz -m $(AFL_MEM_LIMIT) $(AFL_TIME_FLAG) -i fuzz/corpus/rle_decoder -o fuzz/findings/rle_decoder -- $(APP_DIR)/fuzz/fuzz_rle_decoder$(EXE_EXTENSION)
 
 fuzz-rle-encoder: ## Run RLE encoder fuzzer (Ctrl+C to stop)
 fuzz-rle-encoder: $(APP_DIR)/fuzz/fuzz_rle_encoder$(EXE_EXTENSION)
@@ -691,7 +747,7 @@ fuzz-rle-encoder: $(APP_DIR)/fuzz/fuzz_rle_encoder$(EXE_EXTENSION)
 		mkdir -p fuzz/corpus/rle_encoder; \
 		printf 'Hello' > fuzz/corpus/rle_encoder/hello.bin; \
 	fi
-	$(AFL_ENV) afl-fuzz -i fuzz/corpus/rle_encoder -o fuzz/findings/rle_encoder -- $(APP_DIR)/fuzz/fuzz_rle_encoder$(EXE_EXTENSION)
+	$(AFL_RUN_ENV) afl-fuzz -m $(AFL_MEM_LIMIT) $(AFL_TIME_FLAG) -i fuzz/corpus/rle_encoder -o fuzz/findings/rle_encoder -- $(APP_DIR)/fuzz/fuzz_rle_encoder$(EXE_EXTENSION)
 
 fuzz-rle-roundtrip: ## Run RLE roundtrip fuzzer (Ctrl+C to stop)
 fuzz-rle-roundtrip: $(APP_DIR)/fuzz/fuzz_rle_roundtrip$(EXE_EXTENSION)
@@ -707,7 +763,7 @@ fuzz-rle-roundtrip: $(APP_DIR)/fuzz/fuzz_rle_roundtrip$(EXE_EXTENSION)
 		mkdir -p fuzz/corpus/rle_roundtrip; \
 		printf 'Hello' > fuzz/corpus/rle_roundtrip/hello.bin; \
 	fi
-	$(AFL_ENV) afl-fuzz -i fuzz/corpus/rle_roundtrip -o fuzz/findings/rle_roundtrip -- $(APP_DIR)/fuzz/fuzz_rle_roundtrip$(EXE_EXTENSION)
+	$(AFL_RUN_ENV) afl-fuzz -m $(AFL_MEM_LIMIT) $(AFL_TIME_FLAG) -i fuzz/corpus/rle_roundtrip -o fuzz/findings/rle_roundtrip -- $(APP_DIR)/fuzz/fuzz_rle_roundtrip$(EXE_EXTENSION)
 
 fuzz-lzw-decoder: ## Run LZW decoder fuzzer (Ctrl+C to stop)
 fuzz-lzw-decoder: $(APP_DIR)/fuzz/fuzz_lzw_decoder$(EXE_EXTENSION)
@@ -723,7 +779,7 @@ fuzz-lzw-decoder: $(APP_DIR)/fuzz/fuzz_lzw_decoder$(EXE_EXTENSION)
 		mkdir -p fuzz/corpus/lzw_decoder; \
 		printf '\x00\x03\x02' > fuzz/corpus/lzw_decoder/clear_eoi.bin; \
 	fi
-	$(AFL_ENV) afl-fuzz -i fuzz/corpus/lzw_decoder -o fuzz/findings/lzw_decoder -- $(APP_DIR)/fuzz/fuzz_lzw_decoder$(EXE_EXTENSION)
+	$(AFL_RUN_ENV) afl-fuzz -m $(AFL_MEM_LIMIT) $(AFL_TIME_FLAG) -i fuzz/corpus/lzw_decoder -o fuzz/findings/lzw_decoder -- $(APP_DIR)/fuzz/fuzz_lzw_decoder$(EXE_EXTENSION)
 
 fuzz-lzw-encoder: ## Run LZW encoder fuzzer (Ctrl+C to stop)
 fuzz-lzw-encoder: $(APP_DIR)/fuzz/fuzz_lzw_encoder$(EXE_EXTENSION)
@@ -739,7 +795,7 @@ fuzz-lzw-encoder: $(APP_DIR)/fuzz/fuzz_lzw_encoder$(EXE_EXTENSION)
 		mkdir -p fuzz/corpus/lzw_encoder; \
 		printf 'Hello' > fuzz/corpus/lzw_encoder/hello.bin; \
 	fi
-	$(AFL_ENV) afl-fuzz -i fuzz/corpus/lzw_encoder -o fuzz/findings/lzw_encoder -- $(APP_DIR)/fuzz/fuzz_lzw_encoder$(EXE_EXTENSION)
+	$(AFL_RUN_ENV) afl-fuzz -m $(AFL_MEM_LIMIT) $(AFL_TIME_FLAG) -i fuzz/corpus/lzw_encoder -o fuzz/findings/lzw_encoder -- $(APP_DIR)/fuzz/fuzz_lzw_encoder$(EXE_EXTENSION)
 
 fuzz-lzw-roundtrip: ## Run LZW roundtrip fuzzer (Ctrl+C to stop)
 fuzz-lzw-roundtrip: $(APP_DIR)/fuzz/fuzz_lzw_roundtrip$(EXE_EXTENSION)
@@ -755,7 +811,7 @@ fuzz-lzw-roundtrip: $(APP_DIR)/fuzz/fuzz_lzw_roundtrip$(EXE_EXTENSION)
 		mkdir -p fuzz/corpus/lzw_roundtrip; \
 		printf 'Hello' > fuzz/corpus/lzw_roundtrip/hello.bin; \
 	fi
-	$(AFL_ENV) afl-fuzz -i fuzz/corpus/lzw_roundtrip -o fuzz/findings/lzw_roundtrip -- $(APP_DIR)/fuzz/fuzz_lzw_roundtrip$(EXE_EXTENSION)
+	$(AFL_RUN_ENV) afl-fuzz -m $(AFL_MEM_LIMIT) $(AFL_TIME_FLAG) -i fuzz/corpus/lzw_roundtrip -o fuzz/findings/lzw_roundtrip -- $(APP_DIR)/fuzz/fuzz_lzw_roundtrip$(EXE_EXTENSION)
 
 fuzz-zstd-decoder: ## Run Zstd decoder fuzzer (Ctrl+C to stop)
 fuzz-zstd-decoder: $(APP_DIR)/fuzz/fuzz_zstd_decoder$(EXE_EXTENSION)
@@ -770,7 +826,7 @@ fuzz-zstd-decoder: $(APP_DIR)/fuzz/fuzz_zstd_decoder$(EXE_EXTENSION)
 		mkdir -p fuzz/corpus/zstd_decoder; \
 		printf '\x28\xb5\x2f\xfd\x00\x00\x01\x00\x00' > fuzz/corpus/zstd_decoder/empty.zst; \
 	fi
-	$(AFL_ENV) afl-fuzz -i fuzz/corpus/zstd_decoder -o fuzz/findings/zstd_decoder -- $(APP_DIR)/fuzz/fuzz_zstd_decoder$(EXE_EXTENSION)
+	$(AFL_RUN_ENV) afl-fuzz -m $(AFL_MEM_LIMIT) $(AFL_TIME_FLAG) -i fuzz/corpus/zstd_decoder -o fuzz/findings/zstd_decoder -- $(APP_DIR)/fuzz/fuzz_zstd_decoder$(EXE_EXTENSION)
 
 fuzz-zstd-encoder: ## Run Zstd encoder fuzzer (Ctrl+C to stop)
 fuzz-zstd-encoder: $(APP_DIR)/fuzz/fuzz_zstd_encoder$(EXE_EXTENSION)
@@ -785,7 +841,7 @@ fuzz-zstd-encoder: $(APP_DIR)/fuzz/fuzz_zstd_encoder$(EXE_EXTENSION)
 		mkdir -p fuzz/corpus/zstd_encoder; \
 		printf 'Hello' > fuzz/corpus/zstd_encoder/hello.bin; \
 	fi
-	$(AFL_ENV) afl-fuzz -i fuzz/corpus/zstd_encoder -o fuzz/findings/zstd_encoder -- $(APP_DIR)/fuzz/fuzz_zstd_encoder$(EXE_EXTENSION)
+	$(AFL_RUN_ENV) afl-fuzz -m $(AFL_MEM_LIMIT) $(AFL_TIME_FLAG) -i fuzz/corpus/zstd_encoder -o fuzz/findings/zstd_encoder -- $(APP_DIR)/fuzz/fuzz_zstd_encoder$(EXE_EXTENSION)
 
 fuzz-zstd-roundtrip: ## Run Zstd roundtrip fuzzer (Ctrl+C to stop)
 fuzz-zstd-roundtrip: $(APP_DIR)/fuzz/fuzz_zstd_roundtrip$(EXE_EXTENSION)
@@ -800,7 +856,7 @@ fuzz-zstd-roundtrip: $(APP_DIR)/fuzz/fuzz_zstd_roundtrip$(EXE_EXTENSION)
 		mkdir -p fuzz/corpus/zstd_roundtrip; \
 		printf 'Hello' > fuzz/corpus/zstd_roundtrip/hello.bin; \
 	fi
-	$(AFL_ENV) afl-fuzz -i fuzz/corpus/zstd_roundtrip -o fuzz/findings/zstd_roundtrip -- $(APP_DIR)/fuzz/fuzz_zstd_roundtrip$(EXE_EXTENSION)
+	$(AFL_RUN_ENV) afl-fuzz -m $(AFL_MEM_LIMIT) $(AFL_TIME_FLAG) -i fuzz/corpus/zstd_roundtrip -o fuzz/findings/zstd_roundtrip -- $(APP_DIR)/fuzz/fuzz_zstd_roundtrip$(EXE_EXTENSION)
 
 # So tests can load the compress library and its cutil dependency.
 TEST_LD_PATH := $(APP_DIR):$(CUTIL_SIBLING_DIR)/apps
