@@ -292,6 +292,20 @@ typedef struct gcomp_deflate_encoder_state_s {
   size_t finish_buf_used;   ///< Bytes written to finish_buf.
   size_t finish_buf_copied; ///< Bytes already copied to user output.
   int finish_buf_ready;     ///< Non-zero if finish output is fully rendered.
+  /**
+   * Output staged by update() before it is handed to the caller.
+   *
+   * Block flushes used to be written straight into the caller's buffer, so a
+   * flush that did not fit returned GCOMP_ERR_LIMIT *after* the input it came
+   * from had already been consumed - an unrecoverable state rather than a
+   * retryable one, which made streaming through a bounded output buffer
+   * impossible. Blocks are now rendered here first and copied out as space
+   * allows, exactly as finish() already did with finish_buf.
+   */
+  uint8_t * pending_buf;    ///< Output staged by update() before delivery.
+  size_t pending_size;      ///< Allocated size of pending_buf.
+  size_t pending_used;      ///< Bytes rendered into pending_buf.
+  size_t pending_copied;    ///< Bytes of pending_buf already delivered.
 } gcomp_deflate_encoder_state_t;
 
 //
@@ -1845,6 +1859,7 @@ void gcomp_deflate_encoder_destroy(gcomp_encoder_t * encoder) {
   const gcomp_allocator_t * alloc =
       gcomp_registry_get_allocator(encoder->registry);
 
+  gcomp_free(alloc, st->pending_buf);
   gcomp_free(alloc, st->finish_buf);
   gcomp_free(alloc, st->dist_freq);
   gcomp_free(alloc, st->lit_freq);
@@ -1923,29 +1938,85 @@ gcomp_status_t gcomp_deflate_encoder_reset(gcomp_encoder_t * encoder) {
   st->finish_buf_copied = 0;
   st->finish_buf_ready = 0;
 
+  // Discard anything update() had staged but not yet delivered.
+  if (st->pending_buf) {
+    gcomp_free(alloc, st->pending_buf);
+    st->pending_buf = NULL;
+  }
+  st->pending_size = 0;
+  st->pending_used = 0;
+  st->pending_copied = 0;
+
   // Note: We don't reset fixed_ready because the fixed Huffman tables don't
   // need to be rebuilt - they're static and can be reused.
 
   return GCOMP_OK;
 }
 
-gcomp_status_t gcomp_deflate_encoder_update(gcomp_encoder_t * encoder,
-    gcomp_buffer_t * input, gcomp_buffer_t * output) {
-  if (!encoder || !input || !output) {
-    return GCOMP_ERR_INVALID_ARG;
-  }
-  // Check data pointers if size > 0
-  if ((input->size > 0 && !input->data) ||
-      (output->size > 0 && !output->data)) {
-    return GCOMP_ERR_INVALID_ARG;
-  }
+/**
+ * @brief Worst-case byte size of a single flushed block.
+ *
+ * A Huffman block holds at most sym_buf_size symbols. Four bytes per symbol
+ * is the same conservative figure deflate_estimate_finish_size() uses (the
+ * true worst case is a length/distance pair at about 43 bits), plus the
+ * dynamic Huffman tree, the block header and end-of-block marker, byte
+ * alignment and a margin. A stored block is bounded separately by
+ * DEFLATE_MAX_STORED_BLOCK plus its header.
+ *
+ * pending_buf is sized to this, so a flush into an empty pending_buf always
+ * fits and update() can always make progress.
+ *
+ * @param st Encoder state.
+ * @return Upper bound, in bytes, on one flushed block.
+ */
+static size_t deflate_max_block_bytes(
+    const gcomp_deflate_encoder_state_t * st) {
+  size_t huffman = (st->sym_buf_size * 4u) + 512u + 8u + 1u + 64u;
+  size_t stored = (size_t)DEFLATE_MAX_STORED_BLOCK + 16u;
+  return huffman > stored ? huffman : stored;
+}
 
-  gcomp_deflate_encoder_state_t * st =
-      (gcomp_deflate_encoder_state_t *)encoder->method_state;
-  if (!st) {
-    return gcomp_encoder_set_error(
-        encoder, GCOMP_ERR_INTERNAL, "deflate encoder state is NULL");
+/**
+ * @brief Copy staged output to the caller, as far as it will fit.
+ *
+ * @param st Encoder state.
+ * @param output The caller's output buffer.
+ * @return Non-zero if everything staged has been delivered.
+ */
+static int deflate_drain_pending(
+    gcomp_deflate_encoder_state_t * st, gcomp_buffer_t * output) {
+  size_t avail = st->pending_used - st->pending_copied;
+  if (avail) {
+    size_t space = output->size - output->used;
+    size_t n = (avail < space) ? avail : space;
+    if (n) {
+      memcpy((uint8_t *)output->data + output->used,
+          st->pending_buf + st->pending_copied, n);
+      output->used += n;
+      st->pending_copied += n;
+    }
   }
+  if (st->pending_copied >= st->pending_used) {
+    st->pending_used = 0;
+    st->pending_copied = 0;
+    return 1;
+  }
+  return 0;
+}
+
+/**
+ * @brief Encode one batch of input into the staging buffer.
+ *
+ * Consumes as much of @p input as will fit in pending_buf, stopping before any
+ * flush that could overflow it. pending_buf holds at least one worst-case
+ * block and is empty on entry, so a batch always makes progress.
+ *
+ * @param st Encoder state.
+ * @param input The caller's input buffer; used is advanced by what was taken.
+ * @return Status code.
+ */
+static gcomp_status_t deflate_encode_batch(
+    gcomp_deflate_encoder_state_t * st, gcomp_buffer_t * input) {
 
   if (st->stage == DEFLATE_ENC_STAGE_DONE) {
     return GCOMP_OK;
@@ -1963,13 +2034,15 @@ gcomp_status_t gcomp_deflate_encoder_update(gcomp_encoder_t * encoder,
   // (full bytes written), bit_buffer (partial byte), bit_count (bits in
   // buffer). set_buffer() updates data/size/byte_pos but preserves
   // bit_buffer/bit_count.
-  gcomp_status_t s = gcomp_deflate_bitwriter_set_buffer(&st->bitwriter,
-      (uint8_t *)output->data + output->used, output->size - output->used);
+  gcomp_status_t s = gcomp_deflate_bitwriter_set_buffer(
+      &st->bitwriter, st->pending_buf, st->pending_size);
   if (s != GCOMP_OK) {
     return s;
   }
 
   const uint8_t * src = (const uint8_t *)input->data;
+  const size_t max_block = deflate_max_block_bytes(st);
+  int batch_full = 0;
 
   // Level 0: stored blocks (no compression)
   if (st->level == 0) {
@@ -1990,8 +2063,15 @@ gcomp_status_t gcomp_deflate_encoder_update(gcomp_encoder_t * encoder,
       if (st->block_buffer_used >= st->block_buffer_size) {
         s = deflate_flush_stored_block(st, 0);
         if (s != GCOMP_OK) {
-          output->used += gcomp_deflate_bitwriter_bytes_written(&st->bitwriter);
+          st->pending_used = gcomp_deflate_bitwriter_bytes_written(
+              &st->bitwriter);
           return s;
+        }
+        // Stop the batch if the staging buffer could not hold another block.
+        // The caller drains what is staged and calls again.
+        if (gcomp_deflate_bitwriter_bytes_written(&st->bitwriter) + max_block >
+            st->pending_size) {
+          break;
         }
       }
     }
@@ -2063,9 +2143,18 @@ gcomp_status_t gcomp_deflate_encoder_update(gcomp_encoder_t * encoder,
             s = deflate_flush_dynamic_block(st, 0);
           }
           if (s != GCOMP_OK) {
-            output->used +=
-                gcomp_deflate_bitwriter_bytes_written(&st->bitwriter);
+            st->pending_used = gcomp_deflate_bitwriter_bytes_written(
+                &st->bitwriter);
             return s;
+          }
+          // Stop the batch if the staging buffer could not hold another
+          // block. The caller drains what is staged and calls again; the
+          // window, symbol buffer and partial bits all persist in st.
+          if (gcomp_deflate_bitwriter_bytes_written(&st->bitwriter) +
+                  max_block >
+              st->pending_size) {
+            batch_full = 1;
+            break;
           }
         }
 
@@ -2168,6 +2257,10 @@ gcomp_status_t gcomp_deflate_encoder_update(gcomp_encoder_t * encoder,
         }
       }
 
+      if (batch_full) {
+        break;
+      }
+
       // If we can't make progress, break
       if (copy == 0 && st->lookahead < DEFLATE_MIN_MATCH_LENGTH &&
           !(skip_lz77 && st->lookahead > 0)) {
@@ -2176,8 +2269,71 @@ gcomp_status_t gcomp_deflate_encoder_update(gcomp_encoder_t * encoder,
     }
   }
 
-  output->used += gcomp_deflate_bitwriter_bytes_written(&st->bitwriter);
+  st->pending_used = gcomp_deflate_bitwriter_bytes_written(&st->bitwriter);
   return GCOMP_OK;
+}
+
+gcomp_status_t gcomp_deflate_encoder_update(gcomp_encoder_t * encoder,
+    gcomp_buffer_t * input, gcomp_buffer_t * output) {
+  if (!encoder || !input || !output) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  // Check data pointers if size > 0
+  if ((input->size > 0 && !input->data) ||
+      (output->size > 0 && !output->data)) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  gcomp_deflate_encoder_state_t * st =
+      (gcomp_deflate_encoder_state_t *)encoder->method_state;
+  if (!st) {
+    return gcomp_encoder_set_error(
+        encoder, GCOMP_ERR_INTERNAL, "deflate encoder state is NULL");
+  }
+
+  if (st->stage == DEFLATE_ENC_STAGE_DONE) {
+    return GCOMP_OK;
+  }
+
+  const gcomp_allocator_t * alloc =
+      gcomp_registry_get_allocator(encoder->registry);
+
+  // Rendered blocks are staged here and copied out as the caller's buffer
+  // allows, so no input is ever consumed that cannot later be delivered.
+  if (!st->pending_buf) {
+    size_t size = deflate_max_block_bytes(st);
+    st->pending_buf = (uint8_t *)gcomp_malloc(alloc, size);
+    if (!st->pending_buf) {
+      return gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
+          "failed to allocate deflate staging buffer (%zu bytes)", size);
+    }
+    st->pending_size = size;
+    st->pending_used = 0;
+    st->pending_copied = 0;
+  }
+
+  for (;;) {
+    // Hand over whatever is already staged. If it does not all fit, the
+    // caller must drain and call again; no input is taken this round.
+    if (!deflate_drain_pending(st, output)) {
+      return GCOMP_OK;
+    }
+    if (input->used >= input->size || output->used >= output->size) {
+      return GCOMP_OK;
+    }
+
+    size_t before = input->used;
+    gcomp_status_t s = deflate_encode_batch(st, input);
+    if (s != GCOMP_OK) {
+      // Deliver what the failed batch had already rendered, then report.
+      (void)deflate_drain_pending(st, output);
+      return s;
+    }
+    if (input->used == before && st->pending_used == 0) {
+      // Neither consumed nor produced: nothing more to do this call.
+      return GCOMP_OK;
+    }
+  }
 }
 
 /**
@@ -2293,6 +2449,15 @@ gcomp_status_t gcomp_deflate_encoder_finish(
 
   if (st->final_block_written) {
     return GCOMP_OK;
+  }
+
+  // Anything update() staged but could not deliver must go out first, ahead
+  // of the final block. Report GCOMP_ERR_LIMIT until it has all been handed
+  // over, the same "call me again" contract finish() already uses below.
+  if (st->pending_buf && st->pending_used > st->pending_copied) {
+    if (!deflate_drain_pending(st, output)) {
+      return GCOMP_ERR_LIMIT;
+    }
   }
 
   const gcomp_allocator_t * alloc =
