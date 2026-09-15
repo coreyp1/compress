@@ -499,7 +499,11 @@ gcomp_status_t lz4_encoder_finish(
       state->stage = LZ4_ENC_STAGE_BLOCKS;
     }
     if (output->used >= output->size && state->stage == LZ4_ENC_STAGE_HEADER) {
-      return GCOMP_OK; // Need more output space
+      // Need more output space. GCOMP_ERR_LIMIT, not GCOMP_OK:
+      // gcomp_encoder_finish() documents GCOMP_OK as meaning the stream is
+      // complete, so returning it here made a truncated stream
+      // indistinguishable from a finished one.
+      return GCOMP_ERR_LIMIT;
     }
   }
 
@@ -514,7 +518,7 @@ gcomp_status_t lz4_encoder_finish(
             state->compressed_buffer[state->compressed_buffer_pos++];
       }
       if (state->compressed_buffer_pos < state->compressed_buffer_len) {
-        return GCOMP_OK; // Need more output space
+        return GCOMP_ERR_LIMIT; // Need more output space; call finish again.
       }
       // Done with this block
       state->compressed_buffer_len = 0;
@@ -561,7 +565,7 @@ gcomp_status_t lz4_encoder_finish(
       }
 
       if (state->compressed_buffer_pos < state->compressed_buffer_len) {
-        return GCOMP_OK; // Need more output space
+        return GCOMP_ERR_LIMIT; // Need more output space; call finish again.
       }
 
       state->compressed_buffer_len = 0;
@@ -596,7 +600,7 @@ gcomp_status_t lz4_encoder_finish(
     }
     if (output->used >= output->size &&
         state->stage == LZ4_ENC_STAGE_END_MARK) {
-      return GCOMP_OK;
+      return GCOMP_ERR_LIMIT; // Need more output space; call finish again.
     }
   }
 
@@ -611,7 +615,7 @@ gcomp_status_t lz4_encoder_finish(
       state->stage = LZ4_ENC_STAGE_DONE;
     }
     if (output->used >= output->size && state->stage == LZ4_ENC_STAGE_TRAILER) {
-      return GCOMP_OK;
+      return GCOMP_ERR_LIMIT; // Need more output space; call finish again.
     }
   }
 
@@ -619,7 +623,8 @@ gcomp_status_t lz4_encoder_finish(
     return GCOMP_OK;
   }
 
-  return GCOMP_OK;
+  // Not finished: something above still has bytes to emit.
+  return GCOMP_ERR_LIMIT;
 }
 
 gcomp_status_t lz4_encoder_reset(gcomp_encoder_t * encoder) {

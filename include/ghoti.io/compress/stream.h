@@ -124,9 +124,28 @@ GCOMP_API gcomp_status_t gcomp_encoder_update(
  * finish calls are safe and return GCOMP_OK without writing output again
  * and without leaking or double-freeing.
  *
+ * ## Output buffer too small
+ *
+ * If @p output cannot hold everything that remains, finish writes what fits
+ * and returns `GCOMP_ERR_LIMIT`. Drain the buffer and call finish again;
+ * repeat until it returns `GCOMP_OK`. `GCOMP_OK` is reserved for a complete
+ * stream, so treating `GCOMP_ERR_LIMIT` as fatal - or stopping at the first
+ * call that produced no output - truncates the result.
+ *
+ * @code
+ * for (;;) {
+ *   gcomp_buffer_t out = {buf, sizeof(buf), 0};
+ *   gcomp_status_t s = gcomp_encoder_finish(encoder, &out);
+ *   write_out(buf, out.used);
+ *   if (s == GCOMP_OK) break;
+ *   if (s != GCOMP_ERR_LIMIT) return s;
+ * }
+ * @endcode
+ *
  * @param encoder The encoder
  * @param output Output buffer
- * @return Status code
+ * @return GCOMP_OK when the stream is complete, GCOMP_ERR_LIMIT when more
+ *         output space is needed, otherwise an error code
  */
 GCOMP_API gcomp_status_t gcomp_encoder_finish(
     gcomp_encoder_t * encoder, gcomp_buffer_t * output);

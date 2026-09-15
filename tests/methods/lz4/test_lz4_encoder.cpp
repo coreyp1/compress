@@ -521,20 +521,22 @@ TEST_F(Lz4EncoderTest, EncodeSmallOutputBuffer) {
     output.insert(output.end(), chunk, chunk + out_buf.used);
   }
 
-  // Finish with small output buffer - call multiple times to drain output
+  // Finish with small output buffer - call until the stream is complete.
+  // GCOMP_ERR_LIMIT means more remains and finish must be called again;
+  // GCOMP_OK means complete. The old "two calls with no output" heuristic
+  // existed only because finish could not report completion, and would have
+  // accepted a truncated stream.
   bool finished = false;
-  size_t prev_total = 0;
   for (int iterations = 0; iterations < 100 && !finished; iterations++) {
     gcomp_buffer_t out_buf = {chunk, sizeof(chunk), 0};
     status = gcomp_encoder_finish(encoder, &out_buf);
-    ASSERT_EQ(status, GCOMP_OK);
     output.insert(output.end(), chunk, chunk + out_buf.used);
-
-    // Check if done (two consecutive calls with no output means we're done)
-    if (out_buf.used == 0 && output.size() == prev_total) {
+    if (status == GCOMP_OK) {
       finished = true;
+      break;
     }
-    prev_total = output.size();
+    ASSERT_EQ(status, GCOMP_ERR_LIMIT);
+    ASSERT_GT(out_buf.used, 0u) << "finish made no progress";
   }
   ASSERT_TRUE(finished) << "Encoder did not finish within iteration limit";
 

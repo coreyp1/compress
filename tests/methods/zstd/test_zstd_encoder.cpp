@@ -242,15 +242,17 @@ TEST_F(ZstdEncoderTest, Encode1ByteOutputBuffer) {
       result.insert(result.end(), one_byte, one_byte + ob.used);
   }
 
-  bool done = false;
-  while (!done) {
+  // GCOMP_ERR_LIMIT means the remaining output did not fit and finish must be
+  // called again; GCOMP_OK means the stream is complete.
+  for (;;) {
     gcomp_buffer_t ob = {one_byte, 1, 0};
     gcomp_status_t st = gcomp_encoder_finish(enc, &ob);
-    ASSERT_EQ(st, GCOMP_OK);
     if (ob.used > 0)
       result.insert(result.end(), one_byte, one_byte + ob.used);
-    else
-      done = true;
+    if (st == GCOMP_OK)
+      break;
+    ASSERT_EQ(st, GCOMP_ERR_LIMIT);
+    ASSERT_GT(ob.used, 0u) << "finish made no progress";
   }
   EXPECT_GT(result.size(), 0u);
   gcomp_encoder_destroy(enc);

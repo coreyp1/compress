@@ -328,7 +328,10 @@ static gcomp_status_t zstd_encoder_finish_parallel(gcomp_encoder_t * encoder,
 
   // First, drain any pending output
   if (!zstd_encoder_drain_parallel_output(state, output)) {
-    return GCOMP_OK; // Need more output space
+    // GCOMP_ERR_LIMIT, not GCOMP_OK: finish() reports completion with
+    // GCOMP_OK, so returning it while output remains staged silently
+    // truncated the stream.
+    return GCOMP_ERR_LIMIT;
   }
 
   // Submit final partial job if not already done
@@ -366,13 +369,14 @@ static gcomp_status_t zstd_encoder_finish_parallel(gcomp_encoder_t * encoder,
 
   // Drain any buffered output
   if (!zstd_encoder_drain_parallel_output(state, output)) {
-    return GCOMP_OK; // Need more output space
+    return GCOMP_ERR_LIMIT; // Need more output space; call finish again.
   }
 
   // Check if there are still pending results
   if (zstd_parallel_pending_count(state->parallel_ctx) > 0) {
-    // Shouldn't happen after wait, but be defensive
-    return GCOMP_OK;
+    // Shouldn't happen after wait, but be defensive: the stream is not
+    // complete, so do not report GCOMP_OK.
+    return GCOMP_ERR_LIMIT;
   }
 
   // All done
@@ -964,7 +968,11 @@ gcomp_status_t zstd_encoder_finish(
       state->stage = ZSTD_ENC_STAGE_BLOCKS;
     }
     else {
-      return GCOMP_OK;
+      // Need more output space. GCOMP_ERR_LIMIT, not GCOMP_OK:
+      // gcomp_encoder_finish() documents GCOMP_OK as meaning the stream is
+      // complete, so returning it here made a truncated stream
+      // indistinguishable from a finished one.
+      return GCOMP_ERR_LIMIT;
     }
   }
 
@@ -977,7 +985,7 @@ gcomp_status_t zstd_encoder_finish(
           state->compressed_buffer[state->compressed_buffer_pos++];
     }
     if (state->compressed_buffer_pos < state->compressed_buffer_len) {
-      return GCOMP_OK;
+      return GCOMP_ERR_LIMIT; // Need more output space; call finish again.
     }
 
     if (!state->blocks_finished) {
@@ -1028,7 +1036,7 @@ gcomp_status_t zstd_encoder_finish(
           state->compressed_buffer[state->compressed_buffer_pos++];
     }
     if (state->compressed_buffer_pos < state->compressed_buffer_len) {
-      return GCOMP_OK;
+      return GCOMP_ERR_LIMIT; // Need more output space; call finish again.
     }
 
     // Prepare checksum if enabled
@@ -1054,8 +1062,13 @@ gcomp_status_t zstd_encoder_finish(
       state->stage = ZSTD_ENC_STAGE_DONE;
       return GCOMP_OK;
     }
+    return GCOMP_ERR_LIMIT; // Checksum partially written; call finish again.
   }
 
+  if (state->stage != ZSTD_ENC_STAGE_DONE) {
+    // Something above still has bytes to emit.
+    return GCOMP_ERR_LIMIT;
+  }
   return GCOMP_OK;
 }
 

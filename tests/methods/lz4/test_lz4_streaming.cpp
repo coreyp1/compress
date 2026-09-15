@@ -889,22 +889,23 @@ TEST_F(Lz4StreamingTest, EncoderSmallOutputAtBlockBoundary) {
         out_chunk + static_cast<ptrdiff_t>(out_buf.used));
   }
 
-  // Drain finish() with the same tiny output buffer.
+  // Drain finish() with the same tiny output buffer. GCOMP_ERR_LIMIT means
+  // more remains and finish must be called again; GCOMP_OK means the stream
+  // is complete. The old "two calls with no output" heuristic existed only
+  // because finish could not report completion, and would have accepted a
+  // truncated stream.
   bool finished = false;
-  size_t previous_size = 0;
-  for (int i = 0; i < 100 && !finished; i++) {
+  for (int i = 0; i < 1000 && !finished; i++) {
     gcomp_buffer_t out_buf = {out_chunk, sizeof(out_chunk), 0};
     status = gcomp_encoder_finish(encoder, &out_buf);
-    ASSERT_EQ(status, GCOMP_OK);
     compressed.insert(compressed.end(), out_chunk,
         out_chunk + static_cast<ptrdiff_t>(out_buf.used));
-
-    // Two consecutive finish calls that produce no new output indicate
-    // completion.
-    if (out_buf.used == 0 && compressed.size() == previous_size) {
+    if (status == GCOMP_OK) {
       finished = true;
+      break;
     }
-    previous_size = compressed.size();
+    ASSERT_EQ(status, GCOMP_ERR_LIMIT);
+    ASSERT_GT(out_buf.used, 0u) << "finish made no progress";
   }
   ASSERT_TRUE(finished) << "Encoder did not finish within iteration limit";
 
