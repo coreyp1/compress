@@ -968,6 +968,16 @@ ifeq ($(OS_NAME), Linux)
 		printf "notice; a consumer linking the .so gets an undefined reference.\n" >&2; \
 		exit 1; \
 	fi
+	@split=$$(nm -D --undefined-only $(APP_DIR)/$(TARGET) \
+		| awk '{print $$2}' | grep '^$(LIBVER_SYMBOL)_' || true); \
+	if [ -n "$$split" ]; then \
+		printf "\033[0;31m\n### Renamed but undefined - a split symbol ###\033[0m\n" >&2; \
+		printf "%s\n" "$$split" >&2; \
+		printf "\nA translation unit referenced the namespaced name while the one that\n" >&2; \
+		printf "defines it did not see the rename - usually an internal header that\n" >&2; \
+		printf "declares or defines something without including macros.h first.\n" >&2; \
+		exit 1; \
+	fi
 	@printf "\033[0;32mEvery exported symbol carries the $(LIBVER_SYMBOL)_ namespace.\033[0m\n"
 	@printf "\033[0;32mEvery public declaration carries GCOMP_API.\033[0m\n"
 else
