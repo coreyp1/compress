@@ -1378,7 +1378,11 @@ sanitizer-help: ## Show sanitizer build help
 	@printf "\n"
 
 clean: ## Remove all contents of the build directories.
-	-@rm -rvf $(BUILD_DIR)
+# The sanitizer tree is removed too. It is a sibling of the ordinary build
+# directory rather than a child, so a clean that names only the ordinary one
+# leaves instrumented objects behind - and they are the ones a stale-binary
+# mistake is hardest to notice with, because they still run.
+	-@rm -rvf $(BUILD_DIR) $(ASAN_BUILD_DIR)
 
 # Files will be as follows:
 # /usr/local/lib/(SUITE)/
