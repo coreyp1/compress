@@ -134,8 +134,8 @@ compress/
 │   └── linux/
 │       └── release/
 │           ├── apps/           # Executables and libraries
-│           │   ├── libghoti.io-compress-dev.so
-│           │   ├── libghoti.io-compress-dev.a
+│           │   ├── libghoti.io-compress-0.so
+│           │   ├── libghoti.io-compress-0.a
 │           │   ├── bench/      # Benchmark executables (bench_deflate, bench_lzw)
 │           │   └── test*       # Test executables
 │           ├── objects/        # Compiled object files

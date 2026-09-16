@@ -265,7 +265,7 @@ To reproduce a crash:
 ```bash
 # Build without AFL instrumentation for debugging
 gcc -g -O0 -o fuzz_debug fuzz/fuzz_deflate_decoder.c \
-    -I include/ build/linux/release/apps/libghoti.io-compress-dev.a -lm
+    -I include/ build/linux/release/apps/libghoti.io-compress-0.a -lm
 
 # Run under GDB
 gdb ./fuzz_debug
@@ -279,7 +279,7 @@ For better crash analysis, build with ASan:
 ```bash
 AFL_USE_ASAN=1 afl-gcc -O2 -g -fsanitize=address \
     -o fuzz_decoder_asan fuzz/fuzz_deflate_decoder.c \
-    -I include/ build/linux/release/apps/libghoti.io-compress-dev.a -lm
+    -I include/ build/linux/release/apps/libghoti.io-compress-0.a -lm
 ```
 
 ## Advanced Usage
