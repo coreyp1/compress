@@ -301,6 +301,7 @@ $(APP_DIR)/$(STATIC_TARGET): \
 		$(LIBOBJECTS)
 	@printf "\n### Archiving Compress Static Library ###\n"
 	@mkdir -p $(@D)
+	@rm -f $@
 	ar rcs $@ $^
 
 ####################################################################
@@ -441,6 +442,7 @@ $(AFL_OBJ_DIR)/%.o: src/%.c
 $(APP_DIR)/$(AFL_STATIC_TARGET): $(AFL_LIBOBJECTS)
 	@printf "\n### Archiving AFL-instrumented Static Library ###\n"
 	@mkdir -p $(@D)
+	@rm -f $@
 	ar rcs $@ $^
 
 # Corpus generator (built with regular gcc, no AFL instrumentation)
@@ -1145,6 +1147,7 @@ $(ASAN_OBJ_DIR)/%.o: src/%.c
 $(ASAN_APP_DIR)/$(ASAN_STATIC_TARGET): $(ASAN_LIBOBJECTS)
 	@printf "\n### Archiving ASan+UBSan-instrumented Static Library ###\n"
 	@mkdir -p $(@D)
+	@rm -f $@
 	ar rcs $@ $^
 
 # ASan-instrumented shared library
