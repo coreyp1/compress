@@ -988,10 +988,17 @@ TEST_LD_PATH := $(APP_DIR):$(CUTIL_SIBLING_DIR)/apps
 check-symbols: ## Fail if any exported symbol lacks the version namespace
 check-symbols: $(APP_DIR)/$(TARGET)
 ifeq ($(OS_NAME), Linux)
+# mangle_path is gcov's, not ours: a --coverage build links it into the library
+# and it is the only symbol libgcov exports whose name does not begin with an
+# underscore, so it is the only one the '^_' filter above misses. Without this
+# line `make coverage` fails here - after the instrumented build and before the
+# clean that would undo it - leaving instrumented objects that a later plain
+# `make` silently links.
 	@leaked=$$(nm -D --defined-only $(APP_DIR)/$(TARGET) \
 		| awk '$$2 ~ /^[TDBR]$$/ {print $$3}' \
 		| grep -v '^$(LIBVER_SYMBOL)_' \
-		| grep -v '^_' || true); \
+		| grep -v '^_' \
+		| grep -v '^mangle_path$$' || true); \
 	if [ -n "$$leaked" ]; then \
 		printf "\033[0;31m\n### Exported symbols missing the $(LIBVER_SYMBOL)_ namespace ###\033[0m\n" >&2; \
 		printf "%s\n" "$$leaked" >&2; \
@@ -1205,6 +1212,16 @@ ASAN_CXXFLAGS := $(CXXFLAGS) $(ASAN_UBSAN_FLAGS)
 ASAN_LDFLAGS := $(LDFLAGS) $(ASAN_UBSAN_FLAGS)
 ASAN_COMPRESSLIBRARY := -L $(ASAN_APP_DIR) -l$(SUITE)-$(PROJECT)$(BRANCH)-asan
 
+# The instrumented library is loaded through the executable's NEEDED list, and
+# the ASan runtime insists on being initialised before anything it has to
+# intercept.  Any LD_PRELOAD inherited from the environment loads ahead of it
+# and the runtime then refuses to start at all - "ASan runtime does not come
+# first in initial library list" - which aborts every test before a single one
+# runs.  Desktop sessions set LD_PRELOAD for unrelated reasons, so this is not
+# a hypothetical.  Naming the runtime here both overrides whatever was
+# inherited and puts it first, which is the remedy the runtime itself names.
+ASAN_RUNTIME := $(shell $(CC) -print-file-name=libasan.so)
+
 # Add PIC on Linux
 ifeq ($(UNAME_S), Linux)
 	ASAN_CFLAGS += -fPIC
@@ -1271,7 +1288,7 @@ ifeq ($(OS_NAME), Linux)
 		printf "### Running %s tests (ASan+UBSan) ###\n" "$$test_name"; \
 		printf "############################"; \
 		printf "\033[0m\n\n"; \
-		LD_LIBRARY_PATH="$(ASAN_APP_DIR)" ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 $$test_exe --gtest_brief=1 || exit 1; \
+		LD_LIBRARY_PATH="$(ASAN_APP_DIR)" LD_PRELOAD="$(ASAN_RUNTIME)" ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 $$test_exe --gtest_brief=1 || exit 1; \
 	done
 	@printf "\033[0;32m\n"
 	@printf "###########################################\n"
