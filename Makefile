@@ -993,8 +993,17 @@ ifeq ($(OS_NAME), Linux)
 		printf "See CONVENTIONS.md section 4.\n" >&2; \
 		exit 1; \
 	fi
-	@dupguards=$$(find include src -name '*.h' -exec sed -n '/^#ifndef/{p;q}' {} + \
-		| awk '{print $$2}' | sort | uniq -d || true); \
+	@badguards=$$(find include src -name '*.h' -exec awk 'FNR==1{d=0} !d && /^#ifndef/{print $$2; d=1}' {} + \
+		| awk '$$1 !~ /^GHOTI_IO_GCOMP_/ {print $$1}' || true); \
+	if [ -n "$$badguards" ]; then \
+		printf "\033[0;31m\n### Include guards with the wrong prefix ###\033[0m\n" >&2; \
+		printf "%s\n" "$$badguards" >&2; \
+		printf "\nGuards mirror the path: GHOTI_IO_GCOMP_<PATH>_H. A guard without the\n" >&2; \
+		printf "library token is one rename away from colliding with another library's.\n" >&2; \
+		exit 1; \
+	fi
+	@dupguards=$$(find include src -name '*.h' -exec awk 'FNR==1{d=0} !d && /^#ifndef/{print $$2; d=1}' {} + \
+		| sort | uniq -d || true); \
 	if [ -n "$$dupguards" ]; then \
 		printf "\033[0;31m\n### Headers sharing an include guard ###\033[0m\n" >&2; \
 		printf "%s\n" "$$dupguards" >&2; \
@@ -1005,7 +1014,7 @@ ifeq ($(OS_NAME), Linux)
 	@printf "\033[0;32mEvery exported symbol carries the $(LIBVER_SYMBOL)_ namespace.\033[0m\n"
 	@printf "\033[0;32mEvery public declaration carries GCOMP_API.\033[0m\n"
 	@printf "\033[0;32mEvery header includes macros.h.\033[0m\n"
-	@printf "\033[0;32mEvery include guard is unique.\033[0m\n"
+	@printf "\033[0;32mEvery include guard is unique and correctly prefixed.\033[0m\n"
 else
 	@printf "check-symbols: skipped (Linux only)\n"
 endif
