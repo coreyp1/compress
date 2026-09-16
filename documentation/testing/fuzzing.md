@@ -481,3 +481,43 @@ fuzz/
 - [AFL++ Documentation](https://github.com/AFLplusplus/AFLplusplus/tree/stable/docs)
 - [AFL++ Fuzzing Tutorial](https://github.com/AFLplusplus/AFLplusplus/blob/stable/docs/fuzzing_in_depth.md)
 - [Google Fuzzing Guide](https://github.com/google/fuzzing)
+
+## Replaying the tracked corpus
+
+`fuzz/corpus` and `fuzz/findings` are afl-fuzz's working directories. They are
+gitignored, they grow while a campaign runs, and they are not a record of
+anything: pointing afl-fuzz at a corpus directory *adds to it*, so a corpus
+that lives there cannot also be the thing that is checked in.
+
+`fuzz/regression` is the tracked one. It is small, it is never written to, and
+it is where an input that once found something goes so that it stays found.
+
+```bash
+make fuzz-replay
+```
+
+feeds every file in `fuzz/regression` to every harness and fails if any of them
+does not exit cleanly. It mutates nothing and checks afterwards that the corpus
+is byte-for-byte what it was, so it is a regression test rather than a search -
+it takes seconds, and a change that reintroduces a fixed crash is caught then
+rather than by whoever next runs a campaign.
+
+Every file goes to every harness on purpose. Each harness reads arbitrary bytes
+from stdin, so a DEFLATE stream is a perfectly good input to the Zstd decoder:
+a decoder has to reject what is not its format as safely as it rejects a
+corrupt example of it.
+
+The harnesses are built through the same `FUZZ_SAN` path afl-fuzz uses, so a
+memory error is an abort and an abort is a failure.
+
+### Adding to it
+
+When a campaign finds something, minimise it and add the minimised input:
+
+```bash
+cp fuzz/findings/<target>/default/crashes/<id> fuzz/regression/<what-it-was>.bin
+make fuzz-replay        # fails until the bug is fixed
+```
+
+The name is for whoever reads the failure, so name it after the defect rather
+than after the fuzzer's id.

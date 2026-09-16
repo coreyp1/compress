@@ -508,7 +508,7 @@ $(APP_DIR)/fuzz/%$(EXE_EXTENSION): fuzz/%.c $(APP_DIR)/$(AFL_STATIC_TARGET)
 # Debug build commands
 .PHONY: all-debug install-debug test-debug test-valgrind-debug test-watch-debug uninstall-debug watch-debug
 # Fuzz commands
-.PHONY: fuzz-build fuzz-corpus fuzz-decoder fuzz-encoder fuzz-roundtrip fuzz-help
+.PHONY: fuzz-build fuzz-corpus fuzz-replay fuzz-decoder fuzz-encoder fuzz-roundtrip fuzz-help
 .PHONY: fuzz-gzip-decoder fuzz-gzip-encoder fuzz-gzip-roundtrip
 .PHONY: fuzz-lz4-decoder fuzz-lz4-encoder fuzz-lz4-roundtrip
 .PHONY: fuzz-rle-decoder fuzz-rle-encoder fuzz-rle-roundtrip
@@ -673,6 +673,60 @@ fuzz-help: ## Show fuzzing help and instructions
 	@printf "\n"
 	@printf "Documentation: documentation/testing/fuzzing.md\n"
 	@printf "\n"
+
+fuzz-replay: ## Replay the tracked corpus through every harness (no fuzzing)
+# What this is for
+# ================
+#
+# afl-fuzz mutates and writes; this only reads. Every file in fuzz/regression
+# is fed to every harness, and any harness that does not exit cleanly fails the
+# target. That makes it a regression check rather than a search: the inputs
+# that once found something stay found, and a change that reintroduces one is
+# caught in seconds rather than on whoever next runs a campaign.
+#
+# fuzz/corpus and fuzz/findings are gitignored working directories - they are
+# afl-fuzz's, they grow, and they are not a record of anything. Running
+# afl-fuzz against a corpus directory *adds to it*, so they cannot be the thing
+# that is checked in. fuzz/regression is tracked, small, and never written to.
+#
+# Every file goes to every harness deliberately. Each one reads arbitrary bytes
+# from stdin, so a deflate stream is a perfectly good input to the zstd decoder
+# - a decoder must reject what is not its format as safely as it rejects a
+# corrupt example of it. The harnesses are built with ASan and UBSan through
+# the same FUZZ_SAN path afl-fuzz uses, so a memory error aborts.
+fuzz-replay: $(FUZZ_EXECUTABLES)
+	@printf "\033[0;36m\n"
+	@printf "###############################################\n"
+	@printf "### Replaying the tracked corpus (read-only) ###\n"
+	@printf "###############################################\n"
+	@printf "\033[0m\n"
+	@before=$$(find fuzz/regression -type f | sort | xargs cat 2>/dev/null | md5sum); \
+	files=$$(find fuzz/regression -type f | sort); \
+	nfiles=$$(printf "%s\n" "$$files" | grep -c . || true); \
+	total=0; failed=0; \
+	for exe in $(FUZZ_EXECUTABLES); do \
+		name=$$(basename $$exe); \
+		for f in $$files; do \
+			total=$$((total+1)); \
+			$(AFL_RUN_ENV) $$exe < $$f > /dev/null 2>&1; \
+			rc=$$?; \
+			if [ $$rc -ne 0 ]; then \
+				printf "\033[0;31m  %s <- %s (exit %s)\033[0m\n" "$$name" "$$f" "$$rc" >&2; \
+				failed=$$((failed+1)); \
+			fi; \
+		done; \
+		printf "  %-28s %s inputs\n" "$$name" "$$nfiles"; \
+	done; \
+	after=$$(find fuzz/regression -type f | sort | xargs cat 2>/dev/null | md5sum); \
+	if [ "$$before" != "$$after" ]; then \
+		printf "\033[0;31m\nThe corpus changed during a replay. It must not.\033[0m\n" >&2; \
+		exit 1; \
+	fi; \
+	if [ $$failed -ne 0 ]; then \
+		printf "\033[0;31m\n%d of %d replays failed.\033[0m\n" "$$failed" "$$total" >&2; \
+		exit 1; \
+	fi; \
+	printf "\033[0;32m\n%d replays, no crashes, corpus unchanged.\033[0m\n" "$$total"
 
 fuzz-build: ## Build all fuzz harnesses with AFL instrumentation
 fuzz-build: $(FUZZ_EXECUTABLES)
@@ -978,8 +1032,20 @@ fuzz-zstd-roundtrip: $(APP_DIR)/fuzz/fuzz_zstd_roundtrip$(EXE_EXTENSION)
 	fi
 	$(AFL_RUN_ENV) afl-fuzz -m $(AFL_MEM_LIMIT) $(AFL_TIME_FLAG) -i fuzz/corpus/zstd_roundtrip -o fuzz/findings/zstd_roundtrip -- $(APP_DIR)/fuzz/fuzz_zstd_roundtrip$(EXE_EXTENSION)
 
-# So tests can load the compress library and its cutil dependency.
-TEST_LD_PATH := $(APP_DIR):$(CUTIL_SIBLING_DIR)/apps
+# So tests and fuzz harnesses can load the compress library and its cutil
+# dependency.
+#
+# CUTIL_SIBLING_DIR was left behind when the sibling-checkout fallback was
+# removed in favour of resolving dependencies through pkg-config only. Being
+# undefined, it expanded to nothing and this variable named "/apps" - a
+# directory that does not exist. The test binaries never noticed: they link the
+# static archive and carry an rpath to the prefix. The fuzz harnesses link
+# cutil dynamically and do not, so every one of them failed to start:
+#
+#   error while loading shared libraries: libghoti.io-cutil-0.so.0
+#
+# which is a large part of why so little fuzzing has been done here.
+TEST_LD_PATH := $(APP_DIR):$(LIB_INSTALL_PATH)/$(SUITE)
 
 ####################################################################
 # Symbol namespace check
