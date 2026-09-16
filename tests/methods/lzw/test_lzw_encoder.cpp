@@ -156,6 +156,46 @@ TEST_F(LzwEncoderTest, LimitMaxMemoryBytesSufficientSucceeds) {
   gcomp_options_destroy(opts);
 }
 
+// The hash table is charged against limits.max_memory_bytes on top of the
+// dictionary, so there is a band of limits that the linear encoder fits inside
+// and the hash encoder does not. Nothing reached that rejection before this
+// test: the two existing limit tests sit below the dictionary baseline (which
+// is refused earlier, before the hash table is ever built) and above the whole
+// requirement. 32 KiB is inside the band - the assertions below say so rather
+// than assuming it - and reaching it is what exercises the hash table's own
+// teardown path.
+TEST_F(LzwEncoderTest, TheHashTableCountsAgainstTheMemoryLimitToo) {
+  const uint64_t limit = 32 * 1024;
+
+  // Below the band's top: the dictionary alone fits, so the baseline check
+  // passes and we get past it.
+  gcomp_options_t * linear_opts = nullptr;
+  gcomp_options_create(&linear_opts);
+  gcomp_options_set_string(linear_opts, "lzw.format", "gif");
+  gcomp_options_set_string(linear_opts, "lzw.encoder_lookup", "linear");
+  gcomp_options_set_uint64(linear_opts, "limits.max_memory_bytes", limit);
+  gcomp_encoder_t * linear_enc = nullptr;
+  ASSERT_EQ(gcomp_encoder_create(reg_, "lzw", linear_opts, &linear_enc),
+      GCOMP_OK);
+  ASSERT_NE(linear_enc, nullptr);
+  gcomp_encoder_destroy(linear_enc);
+  gcomp_options_destroy(linear_opts);
+
+  // Same limit, hash lookup: the dictionary still fits, the hash table does
+  // not, and the rejection must come from the second check rather than being
+  // silently allowed through.
+  gcomp_options_t * hash_opts = nullptr;
+  gcomp_options_create(&hash_opts);
+  gcomp_options_set_string(hash_opts, "lzw.format", "gif");
+  gcomp_options_set_string(hash_opts, "lzw.encoder_lookup", "hash");
+  gcomp_options_set_uint64(hash_opts, "limits.max_memory_bytes", limit);
+  gcomp_encoder_t * hash_enc = nullptr;
+  EXPECT_EQ(
+      gcomp_encoder_create(reg_, "lzw", hash_opts, &hash_enc), GCOMP_ERR_LIMIT);
+  EXPECT_EQ(hash_enc, nullptr);
+  gcomp_options_destroy(hash_opts);
+}
+
 // Encode with given encoder_lookup mode; return encoded size (buffer in
 // encoded_out).
 static size_t encode_with_lookup(gcomp_registry_t * reg, const char * lookup,

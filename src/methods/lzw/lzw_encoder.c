@@ -169,6 +169,11 @@ gcomp_status_t lzw_encoder_init(gcomp_registry_t * registry,
     gcomp_status_t lim =
         gcomp_memory_check_limit(&state->mem_tracker, state->max_memory_bytes);
     if (lim != GCOMP_OK) {
+      // Read out of `state` before the teardown below frees it; see the same
+      // note in lzw_decoder.c.
+      unsigned long long used =
+          (unsigned long long)state->mem_tracker.current_bytes;
+      unsigned long long limit = (unsigned long long)state->max_memory_bytes;
       uint32_t cap = state->core.capacity;
       gcomp_memory_track_free(
           &state->mem_tracker, (size_t)cap * sizeof(uint16_t));
@@ -178,9 +183,7 @@ gcomp_status_t lzw_encoder_init(gcomp_registry_t * registry,
       gcomp_memory_track_free(&state->mem_tracker, sizeof(lzw_encoder_state_t));
       gcomp_free(alloc, state);
       return gcomp_encoder_set_error(encoder, GCOMP_ERR_LIMIT,
-          "LZW encoder memory usage %llu exceeds limit %llu",
-          (unsigned long long)state->mem_tracker.current_bytes,
-          (unsigned long long)state->max_memory_bytes);
+          "LZW encoder memory usage %llu exceeds limit %llu", used, limit);
     }
   }
 
@@ -204,6 +207,11 @@ gcomp_status_t lzw_encoder_init(gcomp_registry_t * registry,
       gcomp_status_t lim = gcomp_memory_check_limit(
           &state->mem_tracker, state->max_memory_bytes);
       if (lim != GCOMP_OK) {
+        // Read out of `state` before the teardown below frees it; see the same
+        // note in lzw_decoder.c.
+        unsigned long long used =
+            (unsigned long long)state->mem_tracker.current_bytes;
+        unsigned long long limit = (unsigned long long)state->max_memory_bytes;
         lzw_encoder_hash_destroy(&state->hash_table, alloc, &state->mem_tracker,
             state->hash_table_bytes);
         state->hash_table_bytes = 0;
@@ -217,9 +225,7 @@ gcomp_status_t lzw_encoder_init(gcomp_registry_t * registry,
             &state->mem_tracker, sizeof(lzw_encoder_state_t));
         gcomp_free(alloc, state);
         return gcomp_encoder_set_error(encoder, GCOMP_ERR_LIMIT,
-            "LZW encoder memory usage %llu exceeds limit %llu",
-            (unsigned long long)state->mem_tracker.current_bytes,
-            (unsigned long long)state->max_memory_bytes);
+            "LZW encoder memory usage %llu exceeds limit %llu", used, limit);
       }
     }
   }

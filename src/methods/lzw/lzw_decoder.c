@@ -168,6 +168,13 @@ gcomp_status_t lzw_decoder_init(gcomp_registry_t * registry,
     gcomp_status_t lim =
         gcomp_memory_check_limit(&state->mem_tracker, state->max_memory_bytes);
     if (lim != GCOMP_OK) {
+      // Both numbers the message reports are read out of `state`, which the
+      // teardown below frees.  Take them first: reading them afterwards is a
+      // use-after-free, and the tracked frees would in any case have brought
+      // current_bytes back under the limit the message claims it exceeded.
+      unsigned long long used =
+          (unsigned long long)state->mem_tracker.current_bytes;
+      unsigned long long limit = (unsigned long long)state->max_memory_bytes;
       uint32_t cap = state->core.capacity;
       size_t stack_bytes = (size_t)cap * sizeof(uint8_t);
       size_t append_bytes = (size_t)cap * sizeof(uint8_t);
@@ -181,9 +188,7 @@ gcomp_status_t lzw_decoder_init(gcomp_registry_t * registry,
       gcomp_free(alloc, state->pending_buf);
       gcomp_free(alloc, state);
       return gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
-          "LZW decoder memory usage %llu exceeds limit %llu",
-          (unsigned long long)state->mem_tracker.current_bytes,
-          (unsigned long long)state->max_memory_bytes);
+          "LZW decoder memory usage %llu exceeds limit %llu", used, limit);
     }
   }
 
