@@ -19,6 +19,16 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/// @cond HIDDEN_SYMBOLS
+#define gcomp_decode_buffer GHOTIIO_COMPRESS(gcomp_decode_buffer)
+#define gcomp_encode_buffer GHOTIIO_COMPRESS(gcomp_encode_buffer)
+#define gcomp_version_major GHOTIIO_COMPRESS(gcomp_version_major)
+#define gcomp_version_minor GHOTIIO_COMPRESS(gcomp_version_minor)
+#define gcomp_version_patch GHOTIIO_COMPRESS(gcomp_version_patch)
+#define gcomp_version_string GHOTIIO_COMPRESS(gcomp_version_string)
+/// @endcond
+
+
 /**
  * @brief Library version information
  */

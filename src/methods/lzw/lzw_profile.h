@@ -11,8 +11,19 @@
 #ifndef GHOTI_IO_GCOMP_LZW_PROFILE_H
 #define GHOTI_IO_GCOMP_LZW_PROFILE_H
 
+#include <ghoti.io/compress/macros.h>
+
 #include "lzw_bitio.h"
 #include <stdint.h>
+
+/// @cond HIDDEN_SYMBOLS
+#define lzw_profile_bit_order GHOTIIO_COMPRESS(lzw_profile_bit_order)
+#define lzw_profile_clear_code GHOTIIO_COMPRESS(lzw_profile_clear_code)
+#define lzw_profile_eoi_code GHOTIIO_COMPRESS(lzw_profile_eoi_code)
+#define lzw_profile_from_string GHOTIIO_COMPRESS(lzw_profile_from_string)
+#define lzw_profile_should_increment_bits GHOTIIO_COMPRESS(lzw_profile_should_increment_bits)
+/// @endcond
+
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,17 +38,17 @@ typedef enum {
 /**
  * @brief Resolve profile from format string ("gif" or "tiff").
  */
-lzw_profile_id_t lzw_profile_from_string(const char * format);
+GCOMP_INTERNAL_API lzw_profile_id_t lzw_profile_from_string(const char * format);
 
 /**
  * @brief CLEAR code (e.g. 256).
  */
-uint32_t lzw_profile_clear_code(lzw_profile_id_t profile, unsigned lit_width);
+GCOMP_INTERNAL_API uint32_t lzw_profile_clear_code(lzw_profile_id_t profile, unsigned lit_width);
 
 /**
  * @brief EOI (end-of-information) code (e.g. 257).
  */
-uint32_t lzw_profile_eoi_code(lzw_profile_id_t profile, unsigned lit_width);
+GCOMP_INTERNAL_API uint32_t lzw_profile_eoi_code(lzw_profile_id_t profile, unsigned lit_width);
 
 /**
  * @brief Initial code width in bits for data codes (GIF: 9 after CLEAR/EOI;
@@ -49,7 +60,7 @@ unsigned lzw_profile_initial_code_bits(
 /**
  * @brief Bit order for stream (GIF = LSB, TIFF = MSB).
  */
-lzw_bitio_order_t lzw_profile_bit_order(lzw_profile_id_t profile);
+GCOMP_INTERNAL_API lzw_bitio_order_t lzw_profile_bit_order(lzw_profile_id_t profile);
 
 /**
  * @brief Whether to increment code width after adding this next_code.
@@ -57,7 +68,7 @@ lzw_bitio_order_t lzw_profile_bit_order(lzw_profile_id_t profile);
  * GIF: when next_code == 2^current_bits.
  * TIFF: when next_code == 2^current_bits - 1.
  */
-int lzw_profile_should_increment_bits(
+GCOMP_INTERNAL_API int lzw_profile_should_increment_bits(
     lzw_profile_id_t profile, uint32_t next_code, unsigned current_bits);
 
 #ifdef __cplusplus

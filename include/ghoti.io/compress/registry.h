@@ -14,6 +14,15 @@
 #include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/method.h>
 
+/// @cond HIDDEN_SYMBOLS
+#define gcomp_registry_create GHOTIIO_COMPRESS(gcomp_registry_create)
+#define gcomp_registry_default GHOTIIO_COMPRESS(gcomp_registry_default)
+#define gcomp_registry_destroy GHOTIIO_COMPRESS(gcomp_registry_destroy)
+#define gcomp_registry_find GHOTIIO_COMPRESS(gcomp_registry_find)
+#define gcomp_registry_register GHOTIIO_COMPRESS(gcomp_registry_register)
+/// @endcond
+
+
 #ifdef __cplusplus
 extern "C" {
 #endif

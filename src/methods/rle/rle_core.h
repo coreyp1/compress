@@ -19,6 +19,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/// @cond HIDDEN_SYMBOLS
+#define rle_emit_literal GHOTIIO_COMPRESS(rle_emit_literal)
+#define rle_emit_repeat GHOTIIO_COMPRESS(rle_emit_repeat)
+/// @endcond
+
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -32,7 +38,7 @@ extern "C" {
  * @param max_output_bytes Maximum allowed output (0 = unlimited)
  * @return GCOMP_OK on success, GCOMP_ERR_LIMIT if would exceed max_output_bytes
  */
-gcomp_status_t rle_emit_literal(uint8_t * output_data, size_t output_size,
+GCOMP_INTERNAL_API gcomp_status_t rle_emit_literal(uint8_t * output_data, size_t output_size,
     size_t * output_used, const uint8_t * data, size_t len,
     uint64_t max_output_bytes);
 
@@ -45,7 +51,7 @@ gcomp_status_t rle_emit_literal(uint8_t * output_data, size_t output_size,
  * @param max_output_bytes Maximum allowed output (0 = unlimited)
  * @return GCOMP_OK on success, GCOMP_ERR_LIMIT if would exceed max_output_bytes
  */
-gcomp_status_t rle_emit_repeat(uint8_t * output_data, size_t output_size,
+GCOMP_INTERNAL_API gcomp_status_t rle_emit_repeat(uint8_t * output_data, size_t output_size,
     size_t * output_used, uint8_t byte, size_t count,
     uint64_t max_output_bytes);
 

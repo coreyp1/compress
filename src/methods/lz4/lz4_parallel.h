@@ -42,6 +42,21 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/// @cond HIDDEN_SYMBOLS
+#define lz4_parallel_alloc_job GHOTIIO_COMPRESS(lz4_parallel_alloc_job)
+#define lz4_parallel_create GHOTIIO_COMPRESS(lz4_parallel_create)
+#define lz4_parallel_destroy GHOTIIO_COMPRESS(lz4_parallel_destroy)
+#define lz4_parallel_free_job GHOTIIO_COMPRESS(lz4_parallel_free_job)
+#define lz4_parallel_get_result GHOTIIO_COMPRESS(lz4_parallel_get_result)
+#define lz4_parallel_is_inline GHOTIIO_COMPRESS(lz4_parallel_is_inline)
+#define lz4_parallel_pending_count GHOTIIO_COMPRESS(lz4_parallel_pending_count)
+#define lz4_parallel_reset GHOTIIO_COMPRESS(lz4_parallel_reset)
+#define lz4_parallel_result_ready GHOTIIO_COMPRESS(lz4_parallel_result_ready)
+#define lz4_parallel_submit GHOTIIO_COMPRESS(lz4_parallel_submit)
+#define lz4_parallel_wait GHOTIIO_COMPRESS(lz4_parallel_wait)
+/// @endcond
+
+
 #ifdef __cplusplus
 extern "C" {
 #endif

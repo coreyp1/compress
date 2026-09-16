@@ -22,6 +22,11 @@
 #include <ghoti.io/compress/macros.h>
 #include <stddef.h>
 
+/// @cond HIDDEN_SYMBOLS
+#define gcomp_allocator_default GHOTIIO_COMPRESS(gcomp_allocator_default)
+/// @endcond
+
+
 #ifdef __cplusplus
 extern "C" {
 #endif

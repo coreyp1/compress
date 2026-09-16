@@ -16,6 +16,20 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/// @cond HIDDEN_SYMBOLS
+#define lzw_core_decoder_decode GHOTIIO_COMPRESS(lzw_core_decoder_decode)
+#define lzw_core_decoder_destroy GHOTIIO_COMPRESS(lzw_core_decoder_destroy)
+#define lzw_core_decoder_init GHOTIIO_COMPRESS(lzw_core_decoder_init)
+#define lzw_core_decoder_reset GHOTIIO_COMPRESS(lzw_core_decoder_reset)
+#define lzw_core_encoder_add GHOTIIO_COMPRESS(lzw_core_encoder_add)
+#define lzw_core_encoder_destroy GHOTIIO_COMPRESS(lzw_core_encoder_destroy)
+#define lzw_core_encoder_find GHOTIIO_COMPRESS(lzw_core_encoder_find)
+#define lzw_core_encoder_init GHOTIIO_COMPRESS(lzw_core_encoder_init)
+#define lzw_core_encoder_is_full GHOTIIO_COMPRESS(lzw_core_encoder_is_full)
+#define lzw_core_encoder_reset GHOTIIO_COMPRESS(lzw_core_encoder_reset)
+/// @endcond
+
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -73,7 +87,7 @@ typedef struct lzw_core_encoder_s {
  * @return GCOMP_OK on success, GCOMP_ERR_MEMORY on allocation failure,
  *         GCOMP_ERR_INVALID_ARG if max_code_bits > LZW_CORE_MAX_CODE_BITS.
  */
-gcomp_status_t lzw_core_decoder_init(lzw_core_decoder_t * core,
+GCOMP_INTERNAL_API gcomp_status_t lzw_core_decoder_init(lzw_core_decoder_t * core,
     const gcomp_allocator_t * allocator, unsigned max_code_bits,
     uint32_t clear_code, uint32_t eoi_code);
 
@@ -82,13 +96,13 @@ gcomp_status_t lzw_core_decoder_init(lzw_core_decoder_t * core,
  *
  * Retains allocated buffers. next_code set to first_sequence_code.
  */
-void lzw_core_decoder_reset(
+GCOMP_INTERNAL_API void lzw_core_decoder_reset(
     lzw_core_decoder_t * core, uint32_t clear_code, uint32_t eoi_code);
 
 /**
  * @brief Free decoder core buffers (caller frees the struct if needed).
  */
-void lzw_core_decoder_destroy(lzw_core_decoder_t * core);
+GCOMP_INTERNAL_API void lzw_core_decoder_destroy(lzw_core_decoder_t * core);
 
 /**
  * @brief Decode one code and append its string to output.
@@ -104,7 +118,7 @@ void lzw_core_decoder_destroy(lzw_core_decoder_t * core);
  * @return GCOMP_OK on success, GCOMP_ERR_CORRUPT if code > next_code,
  *         GCOMP_ERR_LIMIT if output would exceed output_size.
  */
-gcomp_status_t lzw_core_decoder_decode(lzw_core_decoder_t * core, uint32_t code,
+GCOMP_INTERNAL_API gcomp_status_t lzw_core_decoder_decode(lzw_core_decoder_t * core, uint32_t code,
     uint8_t * output_data, size_t output_size, size_t * output_used);
 
 /**
@@ -113,20 +127,20 @@ gcomp_status_t lzw_core_decoder_decode(lzw_core_decoder_t * core, uint32_t code,
  * Allocates string table. Table starts with literals only; next_code is
  * first_sequence_code (e.g. 258).
  */
-gcomp_status_t lzw_core_encoder_init(lzw_core_encoder_t * core,
+GCOMP_INTERNAL_API gcomp_status_t lzw_core_encoder_init(lzw_core_encoder_t * core,
     const gcomp_allocator_t * allocator, unsigned max_code_bits,
     uint32_t clear_code, uint32_t eoi_code);
 
 /**
  * @brief Reset encoder table to initial state.
  */
-void lzw_core_encoder_reset(
+GCOMP_INTERNAL_API void lzw_core_encoder_reset(
     lzw_core_encoder_t * core, uint32_t clear_code, uint32_t eoi_code);
 
 /**
  * @brief Free encoder core buffers.
  */
-void lzw_core_encoder_destroy(lzw_core_encoder_t * core);
+GCOMP_INTERNAL_API void lzw_core_encoder_destroy(lzw_core_encoder_t * core);
 
 /**
  * @brief Find code for (prefix_code, append_byte), or 0 if not found.
@@ -140,7 +154,7 @@ void lzw_core_encoder_destroy(lzw_core_encoder_t * core);
  * lzw_core_encoder_find(core, prefix, byte, &code_out) -> 1 if found, 0 if not;
  * code_out set when found.
  */
-int lzw_core_encoder_find(const lzw_core_encoder_t * core, uint32_t prefix,
+GCOMP_INTERNAL_API int lzw_core_encoder_find(const lzw_core_encoder_t * core, uint32_t prefix,
     uint8_t byte, uint32_t * code_out);
 
 /**
@@ -149,13 +163,13 @@ int lzw_core_encoder_find(const lzw_core_encoder_t * core, uint32_t prefix,
  * Call only when table is not full (next_code < capacity). Returns the
  * code that was assigned.
  */
-uint32_t lzw_core_encoder_add(
+GCOMP_INTERNAL_API uint32_t lzw_core_encoder_add(
     lzw_core_encoder_t * core, uint32_t prefix, uint8_t byte);
 
 /**
  * @brief Check if the encoder table is full (next_code >= capacity).
  */
-int lzw_core_encoder_is_full(const lzw_core_encoder_t * core);
+GCOMP_INTERNAL_API int lzw_core_encoder_is_full(const lzw_core_encoder_t * core);
 
 #ifdef __cplusplus
 }

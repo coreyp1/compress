@@ -15,6 +15,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/// @cond HIDDEN_SYMBOLS
+#define gcomp_method_get_all_schemas GHOTIIO_COMPRESS(gcomp_method_get_all_schemas)
+#define gcomp_method_get_option_keys GHOTIIO_COMPRESS(gcomp_method_get_option_keys)
+#define gcomp_method_get_option_schema GHOTIIO_COMPRESS(gcomp_method_get_option_schema)
+/// @endcond
+
+
 #ifdef __cplusplus
 extern "C" {
 #endif

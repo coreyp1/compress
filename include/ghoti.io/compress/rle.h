@@ -22,6 +22,11 @@
 #include <ghoti.io/compress/registry.h>
 #include <stddef.h>
 
+/// @cond HIDDEN_SYMBOLS
+#define gcomp_method_rle_register GHOTIIO_COMPRESS(gcomp_method_rle_register)
+/// @endcond
+
+
 #ifdef __cplusplus
 extern "C" {
 #endif

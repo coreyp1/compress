@@ -54,6 +54,12 @@
 
 #include <ghoti.io/compress/errors.h>
 
+/// @cond HIDDEN_SYMBOLS
+#define gcomp_decoder_set_error GHOTIIO_COMPRESS(gcomp_decoder_set_error)
+#define gcomp_encoder_set_error GHOTIIO_COMPRESS(gcomp_encoder_set_error)
+/// @endcond
+
+
 #ifdef __cplusplus
 extern "C" {
 #endif

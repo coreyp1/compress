@@ -12,6 +12,11 @@
 #ifndef GHOTI_IO_GCOMP_MACROS_H
 #define GHOTI_IO_GCOMP_MACROS_H
 
+// Every public header includes this one, and every internal header reaches it
+// through a public one, so the symbol renames below land before any
+// declaration they apply to.
+#include <ghoti.io/compress/libver.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif

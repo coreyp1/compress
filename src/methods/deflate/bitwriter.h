@@ -18,6 +18,15 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/// @cond HIDDEN_SYMBOLS
+#define gcomp_deflate_bitwriter_bytes_written GHOTIIO_COMPRESS(gcomp_deflate_bitwriter_bytes_written)
+#define gcomp_deflate_bitwriter_flush_to_byte GHOTIIO_COMPRESS(gcomp_deflate_bitwriter_flush_to_byte)
+#define gcomp_deflate_bitwriter_init GHOTIIO_COMPRESS(gcomp_deflate_bitwriter_init)
+#define gcomp_deflate_bitwriter_set_buffer GHOTIIO_COMPRESS(gcomp_deflate_bitwriter_set_buffer)
+#define gcomp_deflate_bitwriter_write_bits GHOTIIO_COMPRESS(gcomp_deflate_bitwriter_write_bits)
+/// @endcond
+
+
 #ifdef __cplusplus
 extern "C" {
 #endif

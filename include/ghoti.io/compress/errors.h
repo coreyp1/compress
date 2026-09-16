@@ -11,6 +11,11 @@
 
 #include <ghoti.io/compress/macros.h>
 
+/// @cond HIDDEN_SYMBOLS
+#define gcomp_status_to_string GHOTIIO_COMPRESS(gcomp_status_to_string)
+/// @endcond
+
+
 #ifdef __cplusplus
 extern "C" {
 #endif

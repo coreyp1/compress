@@ -14,6 +14,16 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/// @cond HIDDEN_SYMBOLS
+#define lzw_bitreader_init GHOTIIO_COMPRESS(lzw_bitreader_init)
+#define lzw_bitreader_read_bits GHOTIIO_COMPRESS(lzw_bitreader_read_bits)
+#define lzw_bitwriter_bytes_written GHOTIIO_COMPRESS(lzw_bitwriter_bytes_written)
+#define lzw_bitwriter_flush GHOTIIO_COMPRESS(lzw_bitwriter_flush)
+#define lzw_bitwriter_init GHOTIIO_COMPRESS(lzw_bitwriter_init)
+#define lzw_bitwriter_write_bits GHOTIIO_COMPRESS(lzw_bitwriter_write_bits)
+/// @endcond
+
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -52,7 +62,7 @@ typedef struct lzw_bitwriter_s {
 /**
  * @brief Initialize bit reader over input buffer.
  */
-void lzw_bitreader_init(lzw_bitreader_t * reader, const uint8_t * data,
+GCOMP_INTERNAL_API void lzw_bitreader_init(lzw_bitreader_t * reader, const uint8_t * data,
     size_t size, lzw_bitio_order_t order);
 
 /**
@@ -61,7 +71,7 @@ void lzw_bitreader_init(lzw_bitreader_t * reader, const uint8_t * data,
  * @return GCOMP_OK, GCOMP_ERR_INVALID_ARG, or GCOMP_ERR_CORRUPT if not enough
  * input.
  */
-gcomp_status_t lzw_bitreader_read_bits(
+GCOMP_INTERNAL_API gcomp_status_t lzw_bitreader_read_bits(
     lzw_bitreader_t * reader, unsigned num_bits, uint32_t * out);
 
 /**
@@ -79,7 +89,7 @@ void lzw_bitreader_set_buffer(
 /**
  * @brief Initialize bit writer over output buffer.
  */
-void lzw_bitwriter_init(lzw_bitwriter_t * writer, uint8_t * data, size_t size,
+GCOMP_INTERNAL_API void lzw_bitwriter_init(lzw_bitwriter_t * writer, uint8_t * data, size_t size,
     lzw_bitio_order_t order);
 
 /**
@@ -87,18 +97,18 @@ void lzw_bitwriter_init(lzw_bitwriter_t * writer, uint8_t * data, size_t size,
  *
  * @return GCOMP_OK or GCOMP_ERR_LIMIT if buffer full.
  */
-gcomp_status_t lzw_bitwriter_write_bits(
+GCOMP_INTERNAL_API gcomp_status_t lzw_bitwriter_write_bits(
     lzw_bitwriter_t * writer, uint32_t value, unsigned num_bits);
 
 /**
  * @brief Flush remaining bits to byte boundary (writes partial byte if any).
  */
-gcomp_status_t lzw_bitwriter_flush(lzw_bitwriter_t * writer);
+GCOMP_INTERNAL_API gcomp_status_t lzw_bitwriter_flush(lzw_bitwriter_t * writer);
 
 /**
  * @brief Number of whole bytes written (after flush, includes partial byte).
  */
-size_t lzw_bitwriter_bytes_written(const lzw_bitwriter_t * writer);
+GCOMP_INTERNAL_API size_t lzw_bitwriter_bytes_written(const lzw_bitwriter_t * writer);
 
 /**
  * @brief Set new output buffer (e.g. for streaming); resets byte_pos only.

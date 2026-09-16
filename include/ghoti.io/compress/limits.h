@@ -15,6 +15,20 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/// @cond HIDDEN_SYMBOLS
+#define gcomp_limits_check_expansion_ratio GHOTIIO_COMPRESS(gcomp_limits_check_expansion_ratio)
+#define gcomp_limits_check_memory GHOTIIO_COMPRESS(gcomp_limits_check_memory)
+#define gcomp_limits_check_output GHOTIIO_COMPRESS(gcomp_limits_check_output)
+#define gcomp_limits_read_expansion_ratio_max GHOTIIO_COMPRESS(gcomp_limits_read_expansion_ratio_max)
+#define gcomp_limits_read_memory_max GHOTIIO_COMPRESS(gcomp_limits_read_memory_max)
+#define gcomp_limits_read_output_max GHOTIIO_COMPRESS(gcomp_limits_read_output_max)
+#define gcomp_limits_read_window_max GHOTIIO_COMPRESS(gcomp_limits_read_window_max)
+#define gcomp_memory_check_limit GHOTIIO_COMPRESS(gcomp_memory_check_limit)
+#define gcomp_memory_track_alloc GHOTIIO_COMPRESS(gcomp_memory_track_alloc)
+#define gcomp_memory_track_free GHOTIIO_COMPRESS(gcomp_memory_track_free)
+/// @endcond
+
+
 #ifdef __cplusplus
 extern "C" {
 #endif

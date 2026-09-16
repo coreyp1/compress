@@ -18,6 +18,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/// @cond HIDDEN_SYMBOLS
+#define gcomp_deflate_bitreader_align_to_byte GHOTIIO_COMPRESS(gcomp_deflate_bitreader_align_to_byte)
+#define gcomp_deflate_bitreader_init GHOTIIO_COMPRESS(gcomp_deflate_bitreader_init)
+#define gcomp_deflate_bitreader_is_eof GHOTIIO_COMPRESS(gcomp_deflate_bitreader_is_eof)
+#define gcomp_deflate_bitreader_read_bits GHOTIIO_COMPRESS(gcomp_deflate_bitreader_read_bits)
+/// @endcond
+
+
 #ifdef __cplusplus
 extern "C" {
 #endif

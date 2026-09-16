@@ -53,6 +53,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/// @cond HIDDEN_SYMBOLS
+#define gcomp_deflate_huffman_build_codes GHOTIIO_COMPRESS(gcomp_deflate_huffman_build_codes)
+#define gcomp_deflate_huffman_build_decode_table GHOTIIO_COMPRESS(gcomp_deflate_huffman_build_decode_table)
+#define gcomp_deflate_huffman_decode_table_cleanup GHOTIIO_COMPRESS(gcomp_deflate_huffman_decode_table_cleanup)
+#define gcomp_deflate_huffman_validate GHOTIIO_COMPRESS(gcomp_deflate_huffman_validate)
+/// @endcond
+
+
 #ifdef __cplusplus
 extern "C" {
 #endif
