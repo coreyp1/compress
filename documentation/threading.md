@@ -6,18 +6,18 @@ This document describes how compression methods in the Ghoti.io Compress library
 
 The compress library framework does **not** include its own threading infrastructure. Instead, methods that need parallel compression should use the cross-platform threading APIs provided by `cutil`:
 
-- **`cutil/thread.h`** - Thread creation, joining, and utilities
-- **`cutil/mutex.h`** - Mutual exclusion locks
-- **`cutil/semaphore.h`** - Counting semaphores for coordination
+- **`ghoti.io/cutil/thread.h`** - Thread creation, joining, and utilities
+- **`ghoti.io/cutil/mutex.h`** - Mutual exclusion locks
+- **`ghoti.io/cutil/semaphore.h`** - Counting semaphores for coordination
 
 This design keeps the compress library focused on compression algorithms while leveraging the battle-tested threading primitives in `cutil`.
 
 ## Threading Primitives from cutil
 
-### Thread Management (`cutil/thread.h`)
+### Thread Management (`ghoti.io/cutil/thread.h`)
 
 ```c
-#include <cutil/thread.h>
+#include <ghoti.io/cutil/thread.h>
 
 // Thread handle type
 GCU_Thread thread;
@@ -45,10 +45,10 @@ void gcu_thread_sleep(unsigned long milliseconds);
 void gcu_thread_yield();
 ```
 
-### Mutexes (`cutil/mutex.h`)
+### Mutexes (`ghoti.io/cutil/mutex.h`)
 
 ```c
-#include <cutil/mutex.h>
+#include <ghoti.io/cutil/mutex.h>
 
 GCU_MUTEX_T my_mutex;
 
@@ -74,10 +74,10 @@ if (GCU_MUTEX_TRYLOCK(my_mutex) == 0) {
 GCU_MUTEX_DESTROY(my_mutex);
 ```
 
-### Semaphores (`cutil/semaphore.h`)
+### Semaphores (`ghoti.io/cutil/semaphore.h`)
 
 ```c
-#include <cutil/semaphore.h>
+#include <ghoti.io/cutil/semaphore.h>
 
 GCU_Semaphore sem;
 

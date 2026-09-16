@@ -112,7 +112,7 @@ Optional / build-time: `job_queue.h`, `thread_pool.h` (for parallel encode when 
 
 The following are used only inside the library and are **not** part of the public API. Do not include them from application code; they may change or be removed without notice.
 
-- **Core internal:** `endian.h`, `alloc_internal.h`, `registry_internal.h`, `stream_internal.h`, and other `*_internal.h` under `src/core/`. Overflow-checked size arithmetic comes from cutil (`<cutil/safemath.h>`); it used to be a local `safe_math.h` carrying the same functions.
+- **Core internal:** `endian.h`, `alloc_internal.h`, `registry_internal.h`, `stream_internal.h`, and other `*_internal.h` under `src/core/`. Overflow-checked size arithmetic comes from cutil (`<ghoti.io/cutil/safemath.h>`); it used to be a local `safe_math.h` carrying the same functions.
 - **Method internal:** Each method has an `*_internal.h` (e.g. `deflate_internal.h`, `gzip_internal.h`, `lz4_internal.h`, `zstd_internal.h`, `rle_internal.h`, `lzw_internal.h`) for shared state and helpers within that method only. Some methods also use internal-only modules (e.g. `lzw_hash.h` / `lzw_hash.c`).
 
 ### Method Layer
