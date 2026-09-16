@@ -10,8 +10,9 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
+#include <ghoti.io/compress/macros.h>
 #include "rle_core.h"
-#include <cutil/safemath.h>
+#include <ghoti.io/cutil/safemath.h>
 #include <string.h>
 
 gcomp_status_t rle_emit_literal(uint8_t * output_data, size_t output_size,

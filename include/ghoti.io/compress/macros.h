@@ -15,7 +15,9 @@
 // Every public header includes this one, and every internal header reaches it
 // through a public one, so the symbol renames below land before any
 // declaration they apply to.
-#include <ghoti.io/compress/libver.h>
+// First, so that every name below and in any header that includes this file is
+// already renamed into the version namespace.
+#include <ghoti.io/compress/namespace.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -96,6 +98,25 @@ extern "C" {
 #endif
 #else
 #define GCOMP_API GCOMP_EXTERN __attribute__((visibility("default")))
+#endif
+
+/**
+ * @brief Marks an exported *variable* as part of the public API.
+ *
+ * Same visibility as GCOMP_API, but without the `extern "C"`.  A variable
+ * declaration cannot carry a redundant linkage specification - `extern "C"
+ * extern int x;` is ill-formed in C++ - so a declaration that needs both
+ * `extern` and export uses this and sits inside the header's `extern "C"`
+ * block like every other declaration.  See CONVENTIONS.md section 4.
+ */
+#if defined(_WIN32) || defined(__CYGWIN__)
+#ifdef GCOMP_BUILD
+#define GCOMP_API_DATA __declspec(dllexport)
+#else
+#define GCOMP_API_DATA __declspec(dllimport)
+#endif
+#else
+#define GCOMP_API_DATA __attribute__((visibility("default")))
 #endif
 
 /**

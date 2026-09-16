@@ -40,8 +40,10 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#ifndef GHOTI_IO_GCOMP_LZW_INTERNAL_H
-#define GHOTI_IO_GCOMP_LZW_INTERNAL_H
+#ifndef GHOTI_IO_GCOMP_SRC_METHODS_LZW_LZW_INTERNAL_H
+#define GHOTI_IO_GCOMP_SRC_METHODS_LZW_LZW_INTERNAL_H
+
+#include <ghoti.io/compress/macros.h>
 
 #include "../../core/stream_internal.h"
 #include "lzw_bitio.h"
@@ -187,4 +189,4 @@ gcomp_status_t lzw_decoder_reset(gcomp_decoder_t * decoder);
 }
 #endif
 
-#endif // GHOTI_IO_GCOMP_LZW_INTERNAL_H
+#endif // GHOTI_IO_GCOMP_SRC_METHODS_LZW_LZW_INTERNAL_H

@@ -25,6 +25,7 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
+#include <ghoti.io/compress/macros.h>
 #include "../../autoreg/autoreg_platform.h"
 #include "../../core/stream_internal.h"
 #include "lzw_internal.h"

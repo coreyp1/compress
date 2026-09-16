@@ -48,9 +48,10 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
+#include <ghoti.io/compress/macros.h>
 #include "../../core/alloc_internal.h"
 #include "../../core/registry_internal.h"
-#include <cutil/safemath.h>
+#include <ghoti.io/cutil/safemath.h>
 #include "../../core/stream_internal.h"
 #include "deflate_internal.h"
 #include "huffman.h"

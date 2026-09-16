@@ -17,8 +17,10 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#ifndef GHOTI_IO_GCOMP_RLE_INTERNAL_H
-#define GHOTI_IO_GCOMP_RLE_INTERNAL_H
+#ifndef GHOTI_IO_GCOMP_SRC_METHODS_RLE_RLE_INTERNAL_H
+#define GHOTI_IO_GCOMP_SRC_METHODS_RLE_RLE_INTERNAL_H
+
+#include <ghoti.io/compress/macros.h>
 
 #include "../../core/stream_internal.h"
 #include <ghoti.io/compress/errors.h>
@@ -128,4 +130,4 @@ gcomp_status_t rle_decoder_reset(gcomp_decoder_t * decoder);
 }
 #endif
 
-#endif // GHOTI_IO_GCOMP_RLE_INTERNAL_H
+#endif // GHOTI_IO_GCOMP_SRC_METHODS_RLE_RLE_INTERNAL_H

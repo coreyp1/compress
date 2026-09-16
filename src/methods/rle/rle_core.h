@@ -12,17 +12,14 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#ifndef GHOTI_IO_GCOMP_RLE_CORE_H
-#define GHOTI_IO_GCOMP_RLE_CORE_H
+#ifndef GHOTI_IO_GCOMP_SRC_METHODS_RLE_RLE_CORE_H
+#define GHOTI_IO_GCOMP_SRC_METHODS_RLE_RLE_CORE_H
+
+#include <ghoti.io/compress/macros.h>
 
 #include <ghoti.io/compress/errors.h>
 #include <stddef.h>
 #include <stdint.h>
-
-/// @cond HIDDEN_SYMBOLS
-#define rle_emit_literal GHOTIIO_COMPRESS(rle_emit_literal)
-#define rle_emit_repeat GHOTIIO_COMPRESS(rle_emit_repeat)
-/// @endcond
 
 
 #ifdef __cplusplus
@@ -59,4 +56,4 @@ GCOMP_INTERNAL_API gcomp_status_t rle_emit_repeat(uint8_t * output_data, size_t 
 }
 #endif
 
-#endif // GHOTI_IO_GCOMP_RLE_CORE_H
+#endif // GHOTI_IO_GCOMP_SRC_METHODS_RLE_RLE_CORE_H

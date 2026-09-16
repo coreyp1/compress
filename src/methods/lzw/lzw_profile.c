@@ -21,6 +21,7 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
+#include <ghoti.io/compress/macros.h>
 #include "lzw_profile.h"
 #include <string.h>
 

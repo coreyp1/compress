@@ -6,9 +6,10 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
+#include <ghoti.io/compress/macros.h>
 #include "lzw_hash.h"
 #include "../../core/alloc_internal.h"
-#include <cutil/safemath.h>
+#include <ghoti.io/cutil/safemath.h>
 #include <string.h>
 
 #define LZW_HASH_EMPTY_PREFIX 0xFFFFu

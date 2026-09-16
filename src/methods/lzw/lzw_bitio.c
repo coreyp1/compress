@@ -24,6 +24,7 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
+#include <ghoti.io/compress/macros.h>
 #include "lzw_bitio.h"
 
 #define LZW_BITIO_MAX_BITS 12

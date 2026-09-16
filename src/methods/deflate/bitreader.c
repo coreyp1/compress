@@ -10,6 +10,7 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
+#include <ghoti.io/compress/macros.h>
 #include "bitreader.h"
 
 gcomp_status_t gcomp_deflate_bitreader_init(

@@ -980,8 +980,32 @@ ifeq ($(OS_NAME), Linux)
 		printf "declares or defines something without including macros.h first.\n" >&2; \
 		exit 1; \
 	fi
+	@nomacros=$$(find include src -name '*.h' \
+		! -name 'libver.h' ! -name 'libver_gen.h' ! -name 'namespace.h' ! -name 'macros.h' \
+		-exec grep -L '#include <ghoti.io/compress/macros.h>' {} + || true); \
+	if [ -n "$$nomacros" ]; then \
+		printf "\033[0;31m\n### Headers that do not include macros.h ###\033[0m\n" >&2; \
+		printf "%s\n" "$$nomacros" >&2; \
+		printf "\nEvery header must include <ghoti.io/compress/macros.h> before it declares\n" >&2; \
+		printf "anything, so that the renames in namespace.h are already in effect. A\n" >&2; \
+		printf "header that skips it can name a type before that type has been renamed,\n" >&2; \
+		printf "producing two different types under one spelling.\n" >&2; \
+		printf "See CONVENTIONS.md section 4.\n" >&2; \
+		exit 1; \
+	fi
+	@dupguards=$$(find include src -name '*.h' -exec sed -n '/^#ifndef/{p;q}' {} + \
+		| awk '{print $$2}' | sort | uniq -d || true); \
+	if [ -n "$$dupguards" ]; then \
+		printf "\033[0;31m\n### Headers sharing an include guard ###\033[0m\n" >&2; \
+		printf "%s\n" "$$dupguards" >&2; \
+		printf "\nTwo headers with one guard means whichever is included second is\n" >&2; \
+		printf "silently empty. Guards mirror the path: GHOTI_IO_GCOMP_<PATH>_H.\n" >&2; \
+		exit 1; \
+	fi
 	@printf "\033[0;32mEvery exported symbol carries the $(LIBVER_SYMBOL)_ namespace.\033[0m\n"
 	@printf "\033[0;32mEvery public declaration carries GCOMP_API.\033[0m\n"
+	@printf "\033[0;32mEvery header includes macros.h.\033[0m\n"
+	@printf "\033[0;32mEvery include guard is unique.\033[0m\n"
 else
 	@printf "check-symbols: skipped (Linux only)\n"
 endif
@@ -1330,6 +1354,10 @@ ifeq ($(OS_NAME), Windows)
 	@cp $(APP_DIR)/$(TARGET) $(BIN_INSTALL_PATH)
 endif
 	# Installing the headers.
+	# Removed first: this directory is owned entirely by this project and
+	# branch, and copying over the top of it would leave headers behind that
+	# have since been renamed or deleted.
+	@rm -rf $(INCLUDE_INSTALL_PATH)/$(SUITE)/$(PROJECT)$(BRANCH)
 	@mkdir -p $(INCLUDE_INSTALL_PATH)/$(SUITE)/$(PROJECT)$(BRANCH)
 	@if [ -d $(GEN_DIR)/ghoti.io ]; then \
 		cp -r $(GEN_DIR)/ghoti.io $(INCLUDE_INSTALL_PATH)/$(SUITE)/$(PROJECT)$(BRANCH)/ ; \

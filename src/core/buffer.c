@@ -7,7 +7,8 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#include <cutil/safemath.h>
+#include <ghoti.io/cutil/safemath.h>
+#include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/registry.h>

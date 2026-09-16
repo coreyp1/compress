@@ -14,17 +14,13 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#ifndef GHOTI_IO_COMPRESS_LZW_H
-#define GHOTI_IO_COMPRESS_LZW_H
+#ifndef GHOTI_IO_GCOMP_LZW_H
+#define GHOTI_IO_GCOMP_LZW_H
 
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/registry.h>
 #include <stddef.h>
-
-/// @cond HIDDEN_SYMBOLS
-#define gcomp_method_lzw_register GHOTIIO_COMPRESS(gcomp_method_lzw_register)
-/// @endcond
 
 
 #ifdef __cplusplus
@@ -43,4 +39,4 @@ GCOMP_API gcomp_status_t gcomp_method_lzw_register(gcomp_registry_t * registry);
 }
 #endif
 
-#endif // GHOTI_IO_COMPRESS_LZW_H
+#endif // GHOTI_IO_GCOMP_LZW_H

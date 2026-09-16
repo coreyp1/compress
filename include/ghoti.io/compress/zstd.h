@@ -83,10 +83,6 @@
 #include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/registry.h>
 
-/// @cond HIDDEN_SYMBOLS
-#define gcomp_method_zstd_register GHOTIIO_COMPRESS(gcomp_method_zstd_register)
-/// @endcond
-
 
 #ifdef __cplusplus
 extern "C" {

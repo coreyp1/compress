@@ -78,6 +78,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+#include <ghoti.io/compress/macros.h>
 #include "zstd_parallel.h"
 
 #include <stdbool.h>

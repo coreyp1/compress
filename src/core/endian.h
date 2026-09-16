@@ -19,8 +19,10 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#ifndef GHOTI_IO_GCOMP_ENDIAN_H
-#define GHOTI_IO_GCOMP_ENDIAN_H
+#ifndef GHOTI_IO_GCOMP_SRC_CORE_ENDIAN_H
+#define GHOTI_IO_GCOMP_SRC_CORE_ENDIAN_H
+
+#include <ghoti.io/compress/macros.h>
 
 #include <stdint.h>
 
@@ -107,4 +109,4 @@ static inline void gcomp_write_le64(uint8_t * buf, uint64_t val) {
 }
 #endif
 
-#endif // GHOTI_IO_GCOMP_ENDIAN_H
+#endif // GHOTI_IO_GCOMP_SRC_CORE_ENDIAN_H

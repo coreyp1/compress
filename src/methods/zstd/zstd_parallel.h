@@ -31,8 +31,8 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#ifndef GHOTI_IO_GCOMP_ZSTD_PARALLEL_H
-#define GHOTI_IO_GCOMP_ZSTD_PARALLEL_H
+#ifndef GHOTI_IO_GCOMP_SRC_METHODS_ZSTD_ZSTD_PARALLEL_H
+#define GHOTI_IO_GCOMP_SRC_METHODS_ZSTD_ZSTD_PARALLEL_H
 
 #include <ghoti.io/compress/allocator.h>
 #include <ghoti.io/compress/errors.h>
@@ -43,21 +43,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-
-/// @cond HIDDEN_SYMBOLS
-#define zstd_parallel_alloc_job GHOTIIO_COMPRESS(zstd_parallel_alloc_job)
-#define zstd_parallel_create GHOTIIO_COMPRESS(zstd_parallel_create)
-#define zstd_parallel_destroy GHOTIIO_COMPRESS(zstd_parallel_destroy)
-#define zstd_parallel_free_job GHOTIIO_COMPRESS(zstd_parallel_free_job)
-#define zstd_parallel_get_job_size GHOTIIO_COMPRESS(zstd_parallel_get_job_size)
-#define zstd_parallel_get_result GHOTIIO_COMPRESS(zstd_parallel_get_result)
-#define zstd_parallel_is_inline GHOTIIO_COMPRESS(zstd_parallel_is_inline)
-#define zstd_parallel_pending_count GHOTIIO_COMPRESS(zstd_parallel_pending_count)
-#define zstd_parallel_reset GHOTIIO_COMPRESS(zstd_parallel_reset)
-#define zstd_parallel_result_ready GHOTIIO_COMPRESS(zstd_parallel_result_ready)
-#define zstd_parallel_submit GHOTIIO_COMPRESS(zstd_parallel_submit)
-#define zstd_parallel_wait GHOTIIO_COMPRESS(zstd_parallel_wait)
-/// @endcond
 
 
 #ifdef __cplusplus
@@ -235,4 +220,4 @@ GCOMP_INTERNAL_API uint64_t zstd_parallel_get_job_size(
 }
 #endif
 
-#endif // GHOTI_IO_GCOMP_ZSTD_PARALLEL_H
+#endif // GHOTI_IO_GCOMP_SRC_METHODS_ZSTD_ZSTD_PARALLEL_H

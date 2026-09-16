@@ -77,6 +77,7 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
+#include <ghoti.io/compress/macros.h>
 #include "lz4_internal.h"
 #include <ghoti.io/compress/xxhash32.h>
 #include <string.h>

@@ -8,6 +8,7 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
+#include <ghoti.io/compress/macros.h>
 #include "huffman.h"
 #include "../../core/alloc_internal.h"
 #include <stddef.h>

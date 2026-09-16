@@ -20,13 +20,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/// @cond HIDDEN_SYMBOLS
-#define gcomp_xxhash64 GHOTIIO_COMPRESS(gcomp_xxhash64)
-#define gcomp_xxhash64_finalize GHOTIIO_COMPRESS(gcomp_xxhash64_finalize)
-#define gcomp_xxhash64_reset GHOTIIO_COMPRESS(gcomp_xxhash64_reset)
-#define gcomp_xxhash64_update GHOTIIO_COMPRESS(gcomp_xxhash64_update)
-/// @endcond
-
 
 #ifdef __cplusplus
 extern "C" {

@@ -6,8 +6,10 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#ifndef GCOMP_REGISTRY_INTERNAL_H
-#define GCOMP_REGISTRY_INTERNAL_H
+#ifndef GHOTI_IO_GCOMP_SRC_CORE_REGISTRY_INTERNAL_H
+#define GHOTI_IO_GCOMP_SRC_CORE_REGISTRY_INTERNAL_H
+
+#include <ghoti.io/compress/macros.h>
 
 #include <ghoti.io/compress/allocator.h>
 #include <ghoti.io/compress/registry.h>
@@ -16,4 +18,4 @@
 const gcomp_allocator_t * gcomp_registry_get_allocator(
     const gcomp_registry_t * registry);
 
-#endif // GCOMP_REGISTRY_INTERNAL_H
+#endif // GHOTI_IO_GCOMP_SRC_CORE_REGISTRY_INTERNAL_H

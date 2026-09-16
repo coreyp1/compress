@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/compress.h>
 
 GCOMP_API uint32_t gcomp_version_major(void) {

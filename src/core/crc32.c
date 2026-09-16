@@ -48,6 +48,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+#include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/crc32.h>
 #include <stddef.h>
 #include <stdint.h>

@@ -8,26 +8,15 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#ifndef GHOTI_IO_GCOMP_LZW_CORE_H
-#define GHOTI_IO_GCOMP_LZW_CORE_H
+#ifndef GHOTI_IO_GCOMP_SRC_METHODS_LZW_LZW_CORE_H
+#define GHOTI_IO_GCOMP_SRC_METHODS_LZW_LZW_CORE_H
+
+#include <ghoti.io/compress/macros.h>
 
 #include <ghoti.io/compress/allocator.h>
 #include <ghoti.io/compress/errors.h>
 #include <stddef.h>
 #include <stdint.h>
-
-/// @cond HIDDEN_SYMBOLS
-#define lzw_core_decoder_decode GHOTIIO_COMPRESS(lzw_core_decoder_decode)
-#define lzw_core_decoder_destroy GHOTIIO_COMPRESS(lzw_core_decoder_destroy)
-#define lzw_core_decoder_init GHOTIIO_COMPRESS(lzw_core_decoder_init)
-#define lzw_core_decoder_reset GHOTIIO_COMPRESS(lzw_core_decoder_reset)
-#define lzw_core_encoder_add GHOTIIO_COMPRESS(lzw_core_encoder_add)
-#define lzw_core_encoder_destroy GHOTIIO_COMPRESS(lzw_core_encoder_destroy)
-#define lzw_core_encoder_find GHOTIIO_COMPRESS(lzw_core_encoder_find)
-#define lzw_core_encoder_init GHOTIIO_COMPRESS(lzw_core_encoder_init)
-#define lzw_core_encoder_is_full GHOTIIO_COMPRESS(lzw_core_encoder_is_full)
-#define lzw_core_encoder_reset GHOTIIO_COMPRESS(lzw_core_encoder_reset)
-/// @endcond
 
 
 #ifdef __cplusplus
@@ -175,4 +164,4 @@ GCOMP_INTERNAL_API int lzw_core_encoder_is_full(const lzw_core_encoder_t * core)
 }
 #endif
 
-#endif // GHOTI_IO_GCOMP_LZW_CORE_H
+#endif // GHOTI_IO_GCOMP_SRC_METHODS_LZW_LZW_CORE_H

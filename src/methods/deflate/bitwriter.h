@@ -10,21 +10,13 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#ifndef GCOMP_DEFLATE_BITWRITER_H
-#define GCOMP_DEFLATE_BITWRITER_H
+#ifndef GHOTI_IO_GCOMP_SRC_METHODS_DEFLATE_BITWRITER_H
+#define GHOTI_IO_GCOMP_SRC_METHODS_DEFLATE_BITWRITER_H
 
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/macros.h>
 #include <stddef.h>
 #include <stdint.h>
-
-/// @cond HIDDEN_SYMBOLS
-#define gcomp_deflate_bitwriter_bytes_written GHOTIIO_COMPRESS(gcomp_deflate_bitwriter_bytes_written)
-#define gcomp_deflate_bitwriter_flush_to_byte GHOTIIO_COMPRESS(gcomp_deflate_bitwriter_flush_to_byte)
-#define gcomp_deflate_bitwriter_init GHOTIIO_COMPRESS(gcomp_deflate_bitwriter_init)
-#define gcomp_deflate_bitwriter_set_buffer GHOTIIO_COMPRESS(gcomp_deflate_bitwriter_set_buffer)
-#define gcomp_deflate_bitwriter_write_bits GHOTIIO_COMPRESS(gcomp_deflate_bitwriter_write_bits)
-/// @endcond
 
 
 #ifdef __cplusplus
@@ -131,4 +123,4 @@ static inline void gcomp_deflate_bitwriter_reset(
 }
 #endif
 
-#endif // GCOMP_DEFLATE_BITWRITER_H
+#endif // GHOTI_IO_GCOMP_SRC_METHODS_DEFLATE_BITWRITER_H

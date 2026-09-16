@@ -16,25 +16,6 @@
 #include <ghoti.io/compress/registry.h>
 #include <stddef.h>
 
-/// @cond HIDDEN_SYMBOLS
-#define gcomp_decoder_create GHOTIIO_COMPRESS(gcomp_decoder_create)
-#define gcomp_decoder_destroy GHOTIIO_COMPRESS(gcomp_decoder_destroy)
-#define gcomp_decoder_finish GHOTIIO_COMPRESS(gcomp_decoder_finish)
-#define gcomp_decoder_update GHOTIIO_COMPRESS(gcomp_decoder_update)
-#define gcomp_encoder_create GHOTIIO_COMPRESS(gcomp_encoder_create)
-#define gcomp_encoder_destroy GHOTIIO_COMPRESS(gcomp_encoder_destroy)
-#define gcomp_encoder_finish GHOTIIO_COMPRESS(gcomp_encoder_finish)
-#define gcomp_encoder_update GHOTIIO_COMPRESS(gcomp_encoder_update)
-#define gcomp_decode_stream_cb GHOTIIO_COMPRESS(gcomp_decode_stream_cb)
-#define gcomp_decoder_get_error GHOTIIO_COMPRESS(gcomp_decoder_get_error)
-#define gcomp_decoder_get_error_detail GHOTIIO_COMPRESS(gcomp_decoder_get_error_detail)
-#define gcomp_decoder_reset GHOTIIO_COMPRESS(gcomp_decoder_reset)
-#define gcomp_encode_stream_cb GHOTIIO_COMPRESS(gcomp_encode_stream_cb)
-#define gcomp_encoder_get_error GHOTIIO_COMPRESS(gcomp_encoder_get_error)
-#define gcomp_encoder_get_error_detail GHOTIIO_COMPRESS(gcomp_encoder_get_error_detail)
-#define gcomp_encoder_reset GHOTIIO_COMPRESS(gcomp_encoder_reset)
-/// @endcond
-
 
 #ifdef __cplusplus
 extern "C" {

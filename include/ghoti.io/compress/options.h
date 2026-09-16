@@ -15,26 +15,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/// @cond HIDDEN_SYMBOLS
-#define gcomp_options_create GHOTIIO_COMPRESS(gcomp_options_create)
-#define gcomp_options_destroy GHOTIIO_COMPRESS(gcomp_options_destroy)
-#define gcomp_options_set_bool GHOTIIO_COMPRESS(gcomp_options_set_bool)
-#define gcomp_options_set_int64 GHOTIIO_COMPRESS(gcomp_options_set_int64)
-#define gcomp_options_set_string GHOTIIO_COMPRESS(gcomp_options_set_string)
-#define gcomp_options_clone GHOTIIO_COMPRESS(gcomp_options_clone)
-#define gcomp_options_create_with_allocator GHOTIIO_COMPRESS(gcomp_options_create_with_allocator)
-#define gcomp_options_freeze GHOTIIO_COMPRESS(gcomp_options_freeze)
-#define gcomp_options_get_bool GHOTIIO_COMPRESS(gcomp_options_get_bool)
-#define gcomp_options_get_bytes GHOTIIO_COMPRESS(gcomp_options_get_bytes)
-#define gcomp_options_get_int64 GHOTIIO_COMPRESS(gcomp_options_get_int64)
-#define gcomp_options_get_string GHOTIIO_COMPRESS(gcomp_options_get_string)
-#define gcomp_options_get_uint64 GHOTIIO_COMPRESS(gcomp_options_get_uint64)
-#define gcomp_options_set_bytes GHOTIIO_COMPRESS(gcomp_options_set_bytes)
-#define gcomp_options_set_uint64 GHOTIIO_COMPRESS(gcomp_options_set_uint64)
-#define gcomp_options_validate GHOTIIO_COMPRESS(gcomp_options_validate)
-#define gcomp_options_validate_key GHOTIIO_COMPRESS(gcomp_options_validate_key)
-/// @endcond
-
 
 #ifdef __cplusplus
 extern "C" {

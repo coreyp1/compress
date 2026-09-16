@@ -53,8 +53,8 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#ifndef GHOTI_IO_GCOMP_AUTOREG_PLATFORM_H
-#define GHOTI_IO_GCOMP_AUTOREG_PLATFORM_H
+#ifndef GHOTI_IO_GCOMP_SRC_AUTOREG_AUTOREG_PLATFORM_H
+#define GHOTI_IO_GCOMP_SRC_AUTOREG_AUTOREG_PLATFORM_H
 
 #include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/registry.h>
@@ -176,4 +176,4 @@ extern "C" {
 }
 #endif
 
-#endif // GHOTI_IO_GCOMP_AUTOREG_PLATFORM_H
+#endif // GHOTI_IO_GCOMP_SRC_AUTOREG_AUTOREG_PLATFORM_H

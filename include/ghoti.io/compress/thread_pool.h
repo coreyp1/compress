@@ -21,15 +21,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/// @cond HIDDEN_SYMBOLS
-#define gcomp_thread_pool_create GHOTIIO_COMPRESS(gcomp_thread_pool_create)
-#define gcomp_thread_pool_destroy GHOTIIO_COMPRESS(gcomp_thread_pool_destroy)
-#define gcomp_thread_pool_get_num_threads GHOTIIO_COMPRESS(gcomp_thread_pool_get_num_threads)
-#define gcomp_thread_pool_is_inline GHOTIIO_COMPRESS(gcomp_thread_pool_is_inline)
-#define gcomp_thread_pool_submit GHOTIIO_COMPRESS(gcomp_thread_pool_submit)
-#define gcomp_thread_pool_wait GHOTIIO_COMPRESS(gcomp_thread_pool_wait)
-/// @endcond
-
 
 #ifdef __cplusplus
 extern "C" {

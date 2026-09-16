@@ -27,13 +27,15 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#ifndef GHOTI_IO_GCOMP_ZSTD_INTERNAL_H
-#define GHOTI_IO_GCOMP_ZSTD_INTERNAL_H
+#ifndef GHOTI_IO_GCOMP_SRC_METHODS_ZSTD_ZSTD_INTERNAL_H
+#define GHOTI_IO_GCOMP_SRC_METHODS_ZSTD_ZSTD_INTERNAL_H
+
+#include <ghoti.io/compress/macros.h>
 
 #include "../../core/alloc_internal.h"
 #include "../../core/endian.h"
 #include "../../core/registry_internal.h"
-#include <cutil/safemath.h>
+#include <ghoti.io/cutil/safemath.h>
 #include "../../core/stream_internal.h"
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/limits.h>
@@ -1029,4 +1031,4 @@ gcomp_status_t zstd_compress_block_full(zstd_encoder_state_t * state,
 }
 #endif
 
-#endif // GHOTI_IO_GCOMP_ZSTD_INTERNAL_H
+#endif // GHOTI_IO_GCOMP_SRC_METHODS_ZSTD_ZSTD_INTERNAL_H

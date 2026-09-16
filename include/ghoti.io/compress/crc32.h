@@ -16,12 +16,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/// @cond HIDDEN_SYMBOLS
-#define gcomp_crc32 GHOTIIO_COMPRESS(gcomp_crc32)
-#define gcomp_crc32_finalize GHOTIIO_COMPRESS(gcomp_crc32_finalize)
-#define gcomp_crc32_update GHOTIIO_COMPRESS(gcomp_crc32_update)
-/// @endcond
-
 
 #ifdef __cplusplus
 extern "C" {

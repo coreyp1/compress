@@ -6,14 +6,16 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#ifndef GCOMP_ALLOC_INTERNAL_H
-#define GCOMP_ALLOC_INTERNAL_H
+#ifndef GHOTI_IO_GCOMP_SRC_CORE_ALLOC_INTERNAL_H
+#define GHOTI_IO_GCOMP_SRC_CORE_ALLOC_INTERNAL_H
+
+#include <ghoti.io/compress/macros.h>
 
 #include <ghoti.io/compress/allocator.h>
 #include <stddef.h>
 #include <stdint.h>
 
-#include <cutil/safemath.h>
+#include <ghoti.io/cutil/safemath.h>
 
 static inline const gcomp_allocator_t * gcomp_alloc_or_default(
     const gcomp_allocator_t * allocator) {
@@ -66,4 +68,4 @@ static inline char * gcomp_strdup(
   return out;
 }
 
-#endif // GCOMP_ALLOC_INTERNAL_H
+#endif // GHOTI_IO_GCOMP_SRC_CORE_ALLOC_INTERNAL_H

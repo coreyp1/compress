@@ -39,18 +39,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/// @cond HIDDEN_SYMBOLS
-#define gcomp_job_queue_capacity GHOTIIO_COMPRESS(gcomp_job_queue_capacity)
-#define gcomp_job_queue_complete GHOTIIO_COMPRESS(gcomp_job_queue_complete)
-#define gcomp_job_queue_create GHOTIIO_COMPRESS(gcomp_job_queue_create)
-#define gcomp_job_queue_destroy GHOTIIO_COMPRESS(gcomp_job_queue_destroy)
-#define gcomp_job_queue_get_next_result GHOTIIO_COMPRESS(gcomp_job_queue_get_next_result)
-#define gcomp_job_queue_pending_count GHOTIIO_COMPRESS(gcomp_job_queue_pending_count)
-#define gcomp_job_queue_reset GHOTIIO_COMPRESS(gcomp_job_queue_reset)
-#define gcomp_job_queue_result_ready GHOTIIO_COMPRESS(gcomp_job_queue_result_ready)
-#define gcomp_job_queue_submit GHOTIIO_COMPRESS(gcomp_job_queue_submit)
-/// @endcond
-
 
 #ifdef __cplusplus
 extern "C" {

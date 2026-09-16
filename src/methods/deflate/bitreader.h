@@ -10,20 +10,13 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#ifndef GCOMP_DEFLATE_BITREADER_H
-#define GCOMP_DEFLATE_BITREADER_H
+#ifndef GHOTI_IO_GCOMP_SRC_METHODS_DEFLATE_BITREADER_H
+#define GHOTI_IO_GCOMP_SRC_METHODS_DEFLATE_BITREADER_H
 
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/macros.h>
 #include <stddef.h>
 #include <stdint.h>
-
-/// @cond HIDDEN_SYMBOLS
-#define gcomp_deflate_bitreader_align_to_byte GHOTIIO_COMPRESS(gcomp_deflate_bitreader_align_to_byte)
-#define gcomp_deflate_bitreader_init GHOTIIO_COMPRESS(gcomp_deflate_bitreader_init)
-#define gcomp_deflate_bitreader_is_eof GHOTIIO_COMPRESS(gcomp_deflate_bitreader_is_eof)
-#define gcomp_deflate_bitreader_read_bits GHOTIIO_COMPRESS(gcomp_deflate_bitreader_read_bits)
-/// @endcond
 
 
 #ifdef __cplusplus
@@ -97,4 +90,4 @@ GCOMP_INTERNAL_API int gcomp_deflate_bitreader_is_eof(
 }
 #endif
 
-#endif // GCOMP_DEFLATE_BITREADER_H
+#endif // GHOTI_IO_GCOMP_SRC_METHODS_DEFLATE_BITREADER_H

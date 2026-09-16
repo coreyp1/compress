@@ -28,6 +28,7 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
+#include <ghoti.io/compress/macros.h>
 #include "../../core/alloc_internal.h"
 #include "../../core/registry_internal.h"
 #include "../../core/strutil_internal.h"

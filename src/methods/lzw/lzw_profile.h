@@ -8,21 +8,13 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#ifndef GHOTI_IO_GCOMP_LZW_PROFILE_H
-#define GHOTI_IO_GCOMP_LZW_PROFILE_H
+#ifndef GHOTI_IO_GCOMP_SRC_METHODS_LZW_LZW_PROFILE_H
+#define GHOTI_IO_GCOMP_SRC_METHODS_LZW_LZW_PROFILE_H
 
 #include <ghoti.io/compress/macros.h>
 
 #include "lzw_bitio.h"
 #include <stdint.h>
-
-/// @cond HIDDEN_SYMBOLS
-#define lzw_profile_bit_order GHOTIIO_COMPRESS(lzw_profile_bit_order)
-#define lzw_profile_clear_code GHOTIIO_COMPRESS(lzw_profile_clear_code)
-#define lzw_profile_eoi_code GHOTIIO_COMPRESS(lzw_profile_eoi_code)
-#define lzw_profile_from_string GHOTIIO_COMPRESS(lzw_profile_from_string)
-#define lzw_profile_should_increment_bits GHOTIIO_COMPRESS(lzw_profile_should_increment_bits)
-/// @endcond
 
 
 #ifdef __cplusplus
@@ -75,4 +67,4 @@ GCOMP_INTERNAL_API int lzw_profile_should_increment_bits(
 }
 #endif
 
-#endif // GHOTI_IO_GCOMP_LZW_PROFILE_H
+#endif // GHOTI_IO_GCOMP_SRC_METHODS_LZW_LZW_PROFILE_H

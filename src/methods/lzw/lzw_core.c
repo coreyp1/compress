@@ -40,9 +40,10 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
+#include <ghoti.io/compress/macros.h>
 #include "lzw_core.h"
 #include "../../core/alloc_internal.h"
-#include <cutil/safemath.h>
+#include <ghoti.io/cutil/safemath.h>
 
 #define LZW_SENTINEL 0xFFFFu
 

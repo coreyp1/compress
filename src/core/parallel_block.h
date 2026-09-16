@@ -17,8 +17,10 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#ifndef GHOTI_IO_COMPRESS_PARALLEL_BLOCK_H
-#define GHOTI_IO_COMPRESS_PARALLEL_BLOCK_H
+#ifndef GHOTI_IO_GCOMP_SRC_CORE_PARALLEL_BLOCK_H
+#define GHOTI_IO_GCOMP_SRC_CORE_PARALLEL_BLOCK_H
+
+#include <ghoti.io/compress/macros.h>
 
 #include <ghoti.io/compress/allocator.h>
 #include <ghoti.io/compress/errors.h>
@@ -123,4 +125,4 @@ gcomp_status_t gcomp_parallel_block_reset(gcomp_parallel_block_ctx_t * ctx);
 }
 #endif
 
-#endif /* GHOTI_IO_COMPRESS_PARALLEL_BLOCK_H */
+#endif /* GHOTI_IO_GCOMP_SRC_CORE_PARALLEL_BLOCK_H */

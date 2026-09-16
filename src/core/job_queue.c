@@ -25,6 +25,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+#include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/job_queue.h>
 
 #include <stdbool.h>
@@ -32,8 +33,8 @@
 #include <stdint.h>
 #include <string.h>
 
-#include <cutil/mutex.h>
-#include <cutil/semaphore.h>
+#include <ghoti.io/cutil/mutex.h>
+#include <ghoti.io/cutil/semaphore.h>
 
 #include "alloc_internal.h"
 

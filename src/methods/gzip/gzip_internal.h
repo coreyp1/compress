@@ -34,8 +34,10 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#ifndef GHOTI_IO_GCOMP_GZIP_INTERNAL_H
-#define GHOTI_IO_GCOMP_GZIP_INTERNAL_H
+#ifndef GHOTI_IO_GCOMP_SRC_METHODS_GZIP_GZIP_INTERNAL_H
+#define GHOTI_IO_GCOMP_SRC_METHODS_GZIP_GZIP_INTERNAL_H
+
+#include <ghoti.io/compress/macros.h>
 
 #include "../../core/endian.h"
 #include "../../core/stream_internal.h"
@@ -347,4 +349,4 @@ gcomp_status_t gzip_extract_passthrough_options(
 }
 #endif
 
-#endif // GHOTI_IO_GCOMP_GZIP_INTERNAL_H
+#endif // GHOTI_IO_GCOMP_SRC_METHODS_GZIP_GZIP_INTERNAL_H

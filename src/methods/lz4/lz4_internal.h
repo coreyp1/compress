@@ -29,8 +29,10 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#ifndef GHOTI_IO_GCOMP_LZ4_INTERNAL_H
-#define GHOTI_IO_GCOMP_LZ4_INTERNAL_H
+#ifndef GHOTI_IO_GCOMP_SRC_METHODS_LZ4_LZ4_INTERNAL_H
+#define GHOTI_IO_GCOMP_SRC_METHODS_LZ4_LZ4_INTERNAL_H
+
+#include <ghoti.io/compress/macros.h>
 
 #include "../../core/alloc_internal.h"
 #include "../../core/endian.h"
@@ -444,4 +446,4 @@ gcomp_status_t lz4_block_decompress(const uint8_t * input, size_t input_len,
 }
 #endif
 
-#endif // GHOTI_IO_GCOMP_LZ4_INTERNAL_H
+#endif // GHOTI_IO_GCOMP_SRC_METHODS_LZ4_LZ4_INTERNAL_H

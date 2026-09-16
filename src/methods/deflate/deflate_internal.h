@@ -9,8 +9,10 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#ifndef GHOTI_IO_GCOMP_DEFLATE_INTERNAL_H
-#define GHOTI_IO_GCOMP_DEFLATE_INTERNAL_H
+#ifndef GHOTI_IO_GCOMP_SRC_METHODS_DEFLATE_DEFLATE_INTERNAL_H
+#define GHOTI_IO_GCOMP_SRC_METHODS_DEFLATE_DEFLATE_INTERNAL_H
+
+#include <ghoti.io/compress/macros.h>
 
 #include "../../core/stream_internal.h"
 #include <ghoti.io/compress/errors.h>
@@ -135,4 +137,4 @@ gcomp_status_t gcomp_deflate_encoder_finish(
 }
 #endif
 
-#endif // GHOTI_IO_GCOMP_DEFLATE_INTERNAL_H
+#endif // GHOTI_IO_GCOMP_SRC_METHODS_DEFLATE_DEFLATE_INTERNAL_H

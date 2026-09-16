@@ -9,8 +9,8 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#ifndef GHOTI_IO_GCOMP_H
-#define GHOTI_IO_GCOMP_H
+#ifndef GHOTI_IO_GCOMP_COMPRESS_H
+#define GHOTI_IO_GCOMP_COMPRESS_H
 
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/macros.h>
@@ -18,15 +18,6 @@
 #include <ghoti.io/compress/registry.h>
 #include <stddef.h>
 #include <stdint.h>
-
-/// @cond HIDDEN_SYMBOLS
-#define gcomp_decode_buffer GHOTIIO_COMPRESS(gcomp_decode_buffer)
-#define gcomp_encode_buffer GHOTIIO_COMPRESS(gcomp_encode_buffer)
-#define gcomp_version_major GHOTIIO_COMPRESS(gcomp_version_major)
-#define gcomp_version_minor GHOTIIO_COMPRESS(gcomp_version_minor)
-#define gcomp_version_patch GHOTIIO_COMPRESS(gcomp_version_patch)
-#define gcomp_version_string GHOTIIO_COMPRESS(gcomp_version_string)
-/// @endcond
 
 
 /**
@@ -120,4 +111,4 @@ GCOMP_API gcomp_status_t gcomp_decode_buffer(gcomp_registry_t * registry,
 }
 #endif
 
-#endif // GHOTI_IO_GCOMP_H
+#endif // GHOTI_IO_GCOMP_COMPRESS_H

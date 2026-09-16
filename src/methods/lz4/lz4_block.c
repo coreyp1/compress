@@ -106,7 +106,8 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#include <cutil/safemath.h>
+#include <ghoti.io/cutil/safemath.h>
+#include <ghoti.io/compress/macros.h>
 #include "lz4_internal.h"
 #include <string.h>
 

@@ -18,13 +18,9 @@
 #ifndef GHOTI_IO_GCOMP_ALLOCATOR_H
 #define GHOTI_IO_GCOMP_ALLOCATOR_H
 
-#include <cutil/allocator.h>
+#include <ghoti.io/cutil/allocator.h>
 #include <ghoti.io/compress/macros.h>
 #include <stddef.h>
-
-/// @cond HIDDEN_SYMBOLS
-#define gcomp_allocator_default GHOTIIO_COMPRESS(gcomp_allocator_default)
-/// @endcond
 
 
 #ifdef __cplusplus

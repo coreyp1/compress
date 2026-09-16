@@ -9,8 +9,10 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#ifndef GHOTI_IO_GCOMP_RLE_PROFILE_H
-#define GHOTI_IO_GCOMP_RLE_PROFILE_H
+#ifndef GHOTI_IO_GCOMP_SRC_METHODS_RLE_RLE_PROFILE_H
+#define GHOTI_IO_GCOMP_SRC_METHODS_RLE_RLE_PROFILE_H
+
+#include <ghoti.io/compress/macros.h>
 
 #include "rle_core.h"
 #include "rle_internal.h"
@@ -93,4 +95,4 @@ gcomp_status_t rle_profile_encode_finish(rle_encoder_state_t * state,
 }
 #endif
 
-#endif // GHOTI_IO_GCOMP_RLE_PROFILE_H
+#endif // GHOTI_IO_GCOMP_SRC_METHODS_RLE_RLE_PROFILE_H

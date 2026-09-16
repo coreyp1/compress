@@ -44,21 +44,14 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#ifndef GCOMP_DEFLATE_HUFFMAN_H
-#define GCOMP_DEFLATE_HUFFMAN_H
+#ifndef GHOTI_IO_GCOMP_SRC_METHODS_DEFLATE_HUFFMAN_H
+#define GHOTI_IO_GCOMP_SRC_METHODS_DEFLATE_HUFFMAN_H
 
 #include <ghoti.io/compress/allocator.h>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/macros.h>
 #include <stddef.h>
 #include <stdint.h>
-
-/// @cond HIDDEN_SYMBOLS
-#define gcomp_deflate_huffman_build_codes GHOTIIO_COMPRESS(gcomp_deflate_huffman_build_codes)
-#define gcomp_deflate_huffman_build_decode_table GHOTIIO_COMPRESS(gcomp_deflate_huffman_build_decode_table)
-#define gcomp_deflate_huffman_decode_table_cleanup GHOTIIO_COMPRESS(gcomp_deflate_huffman_decode_table_cleanup)
-#define gcomp_deflate_huffman_validate GHOTIIO_COMPRESS(gcomp_deflate_huffman_validate)
-/// @endcond
 
 
 #ifdef __cplusplus
@@ -221,4 +214,4 @@ GCOMP_INTERNAL_API void gcomp_deflate_huffman_decode_table_cleanup(
 }
 #endif
 
-#endif // GCOMP_DEFLATE_HUFFMAN_H
+#endif // GHOTI_IO_GCOMP_SRC_METHODS_DEFLATE_HUFFMAN_H

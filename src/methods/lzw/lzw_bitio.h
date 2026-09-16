@@ -7,21 +7,14 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#ifndef GHOTI_IO_GCOMP_LZW_BITIO_H
-#define GHOTI_IO_GCOMP_LZW_BITIO_H
+#ifndef GHOTI_IO_GCOMP_SRC_METHODS_LZW_LZW_BITIO_H
+#define GHOTI_IO_GCOMP_SRC_METHODS_LZW_LZW_BITIO_H
+
+#include <ghoti.io/compress/macros.h>
 
 #include <ghoti.io/compress/errors.h>
 #include <stddef.h>
 #include <stdint.h>
-
-/// @cond HIDDEN_SYMBOLS
-#define lzw_bitreader_init GHOTIIO_COMPRESS(lzw_bitreader_init)
-#define lzw_bitreader_read_bits GHOTIIO_COMPRESS(lzw_bitreader_read_bits)
-#define lzw_bitwriter_bytes_written GHOTIIO_COMPRESS(lzw_bitwriter_bytes_written)
-#define lzw_bitwriter_flush GHOTIIO_COMPRESS(lzw_bitwriter_flush)
-#define lzw_bitwriter_init GHOTIIO_COMPRESS(lzw_bitwriter_init)
-#define lzw_bitwriter_write_bits GHOTIIO_COMPRESS(lzw_bitwriter_write_bits)
-/// @endcond
 
 
 #ifdef __cplusplus
@@ -125,4 +118,4 @@ int lzw_bitwriter_has_pending_bits(const lzw_bitwriter_t * writer);
 }
 #endif
 
-#endif // GHOTI_IO_GCOMP_LZW_BITIO_H
+#endif // GHOTI_IO_GCOMP_SRC_METHODS_LZW_LZW_BITIO_H

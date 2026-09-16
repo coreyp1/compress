@@ -10,7 +10,8 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#include <cutil/allocator.h>
+#include <ghoti.io/cutil/allocator.h>
+#include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/allocator.h>
 
 const gcomp_allocator_t * gcomp_allocator_default(void) {

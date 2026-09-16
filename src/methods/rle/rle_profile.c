@@ -20,8 +20,9 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
+#include <ghoti.io/compress/macros.h>
 #include "rle_profile.h"
-#include <cutil/safemath.h>
+#include <ghoti.io/cutil/safemath.h>
 #include "rle_core.h"
 #include "rle_internal.h"
 #include <ghoti.io/compress/limits.h>

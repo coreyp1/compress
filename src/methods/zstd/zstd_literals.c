@@ -69,6 +69,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+#include <ghoti.io/compress/macros.h>
 #include "zstd_internal.h"
 #include <string.h>
 

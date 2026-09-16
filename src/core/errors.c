@@ -6,6 +6,7 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
+#include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/errors.h>
 
 const char * gcomp_status_to_string(gcomp_status_t status) {

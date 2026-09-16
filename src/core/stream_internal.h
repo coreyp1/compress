@@ -45,19 +45,16 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#ifndef GHOTI_IO_GCOMP_STREAM_INTERNAL_H
-#define GHOTI_IO_GCOMP_STREAM_INTERNAL_H
+#ifndef GHOTI_IO_GCOMP_SRC_CORE_STREAM_INTERNAL_H
+#define GHOTI_IO_GCOMP_SRC_CORE_STREAM_INTERNAL_H
+
+#include <ghoti.io/compress/macros.h>
 
 #include <ghoti.io/compress/method.h>
 #include <ghoti.io/compress/stream.h>
 #include <stddef.h>
 
 #include <ghoti.io/compress/errors.h>
-
-/// @cond HIDDEN_SYMBOLS
-#define gcomp_decoder_set_error GHOTIIO_COMPRESS(gcomp_decoder_set_error)
-#define gcomp_encoder_set_error GHOTIIO_COMPRESS(gcomp_encoder_set_error)
-/// @endcond
 
 
 #ifdef __cplusplus
@@ -213,4 +210,4 @@ GCOMP_INTERNAL_API gcomp_status_t gcomp_decoder_set_error(
 }
 #endif
 
-#endif // GHOTI_IO_GCOMP_STREAM_INTERNAL_H
+#endif // GHOTI_IO_GCOMP_SRC_CORE_STREAM_INTERNAL_H
