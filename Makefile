@@ -12,6 +12,9 @@ BASE_NAME := lib$(SUITE)-$(PROJECT)$(BRANCH).so
 BASE_NAME_PREFIX := lib$(SUITE)-$(PROJECT)$(BRANCH)
 MAJOR_VERSION := 0
 MINOR_VERSION := 0.0
+# Substituted into the .pc file; an empty Version: field makes every
+# pkg-config version constraint fail.
+VERSION := $(MAJOR_VERSION).$(MINOR_VERSION)
 SO_NAME := $(BASE_NAME).$(MAJOR_VERSION)
 STATIC_TARGET := $(BASE_NAME_PREFIX).a
 ENV_VARS :=
@@ -77,6 +80,35 @@ else
 
 endif
 
+# ---------------------------------------------------------------------------
+# Installation prefix
+#
+# Defaults to the system location chosen above. Override it to install
+# somewhere else - the suite's bootstrap installs every library into a local
+# prefix so that each build resolves its dependencies through pkg-config,
+# exactly as a consumer would, rather than through a second code path that
+# only in-tree builds exercise. See CONVENTIONS.md section 1.
+#
+#     make install PREFIX=/path/to/prefix
+# ---------------------------------------------------------------------------
+ifdef PREFIX
+INCLUDE_INSTALL_PATH := $(PREFIX)/include
+LIB_INSTALL_PATH := $(PREFIX)/lib
+BIN_INSTALL_PATH := $(PREFIX)/bin
+PKG_CONFIG_PATH := $(PREFIX)/share/pkgconfig
+ifeq ($(OS_NAME), Windows)
+PC_INCLUDE_DIR = $(shell cygpath -m $(INCLUDE_INSTALL_PATH)/$(SUITE)/$(PROJECT)$(BRANCH))
+PC_LIB_DIR = $(shell cygpath -m $(LIB_INSTALL_PATH)/$(SUITE))
+else
+PC_INCLUDE_DIR := $(INCLUDE_INSTALL_PATH)/$(SUITE)/$(PROJECT)$(BRANCH)
+PC_LIB_DIR := $(LIB_INSTALL_PATH)/$(SUITE)
+endif
+# A non-system prefix has no /etc/ld.so.conf.d, and writing to it would need
+# root anyway. Everything built here carries an rpath to the prefix instead.
+LDCONF_INSTALL_PATH :=
+endif
+
+
 
 CXX := g++
 CXXFLAGS := -pedantic-errors -Wall -Wextra -Werror -Wno-error=unused-function -Wfatal-errors -std=c++20 -O1 -g $(EXTRA_CXXFLAGS)
@@ -94,13 +126,16 @@ LIB_CFLAGS := $(CFLAGS) -fvisibility=hidden -DGCOMP_BUILD $(EXTRA_CFLAGS)
 # cutil system-wide first.
 CUTIL_CFLAGS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --cflags ghoti.io-cutil-dev 2>/dev/null)
 CUTIL_LIBS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --libs ghoti.io-cutil-dev 2>/dev/null)
-# cutil's build tree has no release/debug component, only the OS directory.
-CUTIL_SIBLING_DIR := ../cutil/build/$(firstword $(subst /, ,$(BUILD)))
 ifeq ($(strip $(CUTIL_CFLAGS)),)
-CUTIL_CFLAGS := -I../cutil/include -I$(CUTIL_SIBLING_DIR)/include
-CUTIL_LIBS := -L$(CUTIL_SIBLING_DIR)/apps -lghoti.io-cutil-dev
+$(error ghoti.io-cutil was not found by pkg-config. Run ./bootstrap.sh in the parent folder to build and install the suite into a local prefix, then pass the same PREFIX here - or point PKG_CONFIG_PATH at the directory holding its .pc file. There is deliberately no sibling-checkout fallback: a second resolution path that only in-tree builds exercise is one that silently rots.)
 endif
 LDFLAGS := -L /usr/lib -lstdc++ -lm $(CUTIL_LIBS) -lpthread $(EXTRA_LDFLAGS)
+ifdef PREFIX
+# So that a library, a test or an example finds its Ghoti.io dependencies in the
+# prefix at run time without LD_LIBRARY_PATH.
+LDFLAGS += -Wl,-rpath,$(LIB_INSTALL_PATH)/$(SUITE)
+endif
+
 # The symbol namespace token. Derived from BRANCH so that the token inside every
 # exported symbol is the same one that names the .pc file, the install directory
 # and the shared library. See CONVENTIONS.md section 4.
@@ -1272,8 +1307,8 @@ ifeq ($(OS_NAME), Linux)
 	@ln -f -s $(TARGET) $(LIB_INSTALL_PATH)/$(SUITE)/$(SO_NAME)
 	@ln -f -s $(SO_NAME) $(LIB_INSTALL_PATH)/$(SUITE)/$(BASE_NAME)
 	# Installing the ld configuration file.
-	@mkdir -p $(LDCONF_INSTALL_PATH)
-	@echo "$(LIB_INSTALL_PATH)/$(SUITE)" > $(LDCONF_INSTALL_PATH)/$(SUITE)-$(PROJECT)$(BRANCH).conf
+	@if [ -n "$(LDCONF_INSTALL_PATH)" ]; then mkdir -p $(LDCONF_INSTALL_PATH); fi
+	@if [ -n "$(LDCONF_INSTALL_PATH)" ]; then echo "$(LIB_INSTALL_PATH)/$(SUITE)" > $(LDCONF_INSTALL_PATH)/$(SUITE)-$(PROJECT)$(BRANCH).conf; fi
 endif
 ifeq ($(OS_NAME), Windows)
 # The .dll file and the .dll.a file
@@ -1298,7 +1333,7 @@ endif
 	@cat pkgconfig/$(SUITE)-$(PROJECT).pc | sed 's/(SUITE)/$(SUITE)/g; s/(PROJECT)/$(PROJECT)/g; s/(BRANCH)/$(BRANCH)/g; s/(VERSION)/$(VERSION)/g; s|(LIB)|$(LIB_INSTALL_PATH)|g; s|(INCLUDE)|$(INCLUDE_INSTALL_PATH)|g' > $(PKGCONFIG_INSTALL_PATH)/$(SUITE)-$(PROJECT)$(BRANCH).pc
 ifeq ($(OS_NAME), Linux)
 	# Running ldconfig.
-	@ldconfig >> /dev/null 2>&1
+	@if [ -n "$(LDCONF_INSTALL_PATH)" ]; then ldconfig >> /dev/null 2>&1; fi
 endif
 	@echo "Ghoti.io $(PROJECT)$(BRANCH) installed"
 
@@ -1322,7 +1357,7 @@ endif
 	@rmdir --ignore-fail-on-non-empty $(LIB_INSTALL_PATH)/$(SUITE)
 ifeq ($(OS_NAME), Linux)
 	# Running ldconfig.
-	@ldconfig >> /dev/null 2>&1
+	@if [ -n "$(LDCONF_INSTALL_PATH)" ]; then ldconfig >> /dev/null 2>&1; fi
 endif
 	@echo "Ghoti.io $(PROJECT)$(BRANCH) has been uninstalled"
 
