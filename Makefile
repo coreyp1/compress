@@ -85,7 +85,10 @@ CFLAGS := -pedantic-errors -Wall -Wextra -Werror -Wno-error=unused-function -Wfa
 # Library-specific compile flags (export symbols on Windows, PIC on Linux)
 # GCOMP_BUILD enables DLL export on Windows (checked by GCOMP_API macro)
 # GCOMP_TEST_BUILD enables export of internal functions for testing (checked by GCOMP_INTERNAL_API macro)
-LIB_CFLAGS := $(CFLAGS) -fvisibility=hidden -DGCOMP_BUILD -DGCOMP_TEST_BUILD $(EXTRA_CFLAGS)
+# No -DGCOMP_TEST_BUILD here: the shipped library exports its public API and
+# nothing else. Tests reach the internals by linking the static archive, which
+# a static link can do even for hidden symbols.
+LIB_CFLAGS := $(CFLAGS) -fvisibility=hidden -DGCOMP_BUILD $(EXTRA_CFLAGS)
 # Link cutil library for threading support. Prefer pkg-config; fall back to a
 # sibling checkout so the suite builds from a fresh clone without installing
 # cutil system-wide first.
@@ -146,7 +149,15 @@ VALGRIND_FLAGS := --leak-check=full --show-leak-kinds=definite,indirect,possible
 # Test helper object file
 TEST_HELPER_OBJ := $(OBJ_DIR)/tests/common/test_helpers.o
 
-COMPRESSLIBRARY := -L $(APP_DIR) -l$(SUITE)-$(PROJECT)$(BRANCH)
+# The static archive, not -l: a static link resolves hidden symbols, so the
+# tests can exercise internals that the shared library does not export.
+#
+# --whole-archive is required, not decorative. Each compression method registers
+# itself from a constructor (GCOMP_AUTOREG_METHOD), and a plain archive link
+# only pulls in an object file that something references by name. Nothing
+# references the registration objects, so without this the methods are silently
+# absent and every test that asks the registry for one fails.
+COMPRESSLIBRARY := -Wl,--whole-archive $(APP_DIR)/$(STATIC_TARGET) -Wl,--no-whole-archive
 
 # Single shell: discover test sources and compute executable name for each (path|name per line).
 # test.cpp -> testCompress; test_foo.cpp -> testFoo. Avoids hundreds of $(call test-name) / CreateProcess.
@@ -280,10 +291,10 @@ define test-executable-rule
 $(APP_DIR)/$2$(EXE_EXTENSION): \
 		$1 \
 		$(TEST_HELPER_OBJ) \
-		| $(APP_DIR)/$(TARGET)
+		| $(APP_DIR)/$(TARGET) $(APP_DIR)/$(STATIC_TARGET)
 	@printf "\n### Compiling and linking %s Test ###\n" "$2"
 	@mkdir -p $$(@D)
-	$$(CXX) $$(CXXFLAGS) $$(TEST_INCLUDE) -MMD -MP -MF $$(APP_DIR)/$2.d -o $$@ $$< $$(TEST_HELPER_OBJ) $$(LDFLAGS) $$(TESTFLAGS) $$(COMPRESSLIBRARY)
+	$$(CXX) $$(CXXFLAGS) $$(TEST_INCLUDE) -MMD -MP -MF $$(APP_DIR)/$2.d -o $$@ $$< $$(TEST_HELPER_OBJ) $$(COMPRESSLIBRARY) $$(LDFLAGS) $$(TESTFLAGS)
 endef
 
 # Generate build rules from TEST_PAIRS (one pair = source|name)
@@ -912,7 +923,18 @@ ifeq ($(OS_NAME), Linux)
 		printf "cannot be loaded into the same process. See CONVENTIONS.md section 4.\n" >&2; \
 		exit 1; \
 	fi
+	@unexported=$$(grep -hE '^[a-z_][A-Za-z0-9_ ]*\**[[:space:]]*\bgcomp_[a-z0-9_]+[[:space:]]*\(' \
+		include/ghoti.io/$(PROJECT)/*.h | grep -v '^typedef' || true); \
+	if [ -n "$$unexported" ]; then \
+		printf "\033[0;31m\n### Public declarations without GCOMP_API ###\033[0m\n" >&2; \
+		printf "%s\n" "$$unexported" >&2; \
+		printf "\nA public header declares these without the export macro, so they are\n" >&2; \
+		printf "hidden in the shared library. The tests link the archive and would not\n" >&2; \
+		printf "notice; a consumer linking the .so gets an undefined reference.\n" >&2; \
+		exit 1; \
+	fi
 	@printf "\033[0;32mEvery exported symbol carries the $(LIBVER_SYMBOL)_ namespace.\033[0m\n"
+	@printf "\033[0;32mEvery public declaration carries GCOMP_API.\033[0m\n"
 else
 	@printf "check-symbols: skipped (Linux only)\n"
 endif
