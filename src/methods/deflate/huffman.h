@@ -139,9 +139,12 @@ typedef struct gcomp_deflate_huffman_decode_table_s {
  * @brief Validate code lengths for a canonical Huffman tree.
  *
  * Rejects over-subscribed trees (too many codes at a given length: would
- * exceed 2^bits slots). Incomplete trees (Kraft sum < 1) are allowed per
- * RFC 1951 (e.g. one unused distance code). Code length 0 means the symbol
- * is not used.
+ * exceed 2^bits slots). Incomplete trees (Kraft sum < 1) pass: they can be
+ * built, and an encoder may legitimately emit one (RFC 1951 3.2.7's single
+ * distance code). Whether a *decoded* stream is allowed to contain one is a
+ * separate question, and a stricter one - see
+ * ::gcomp_deflate_huffman_check_complete(). Code length 0 means the symbol is
+ * not used.
  *
  * @param lengths    Code length per symbol (0 = unused). Must not be NULL.
  * @param num_symbols Number of symbols (lengths[0 .. num_symbols-1]).
@@ -151,6 +154,41 @@ typedef struct gcomp_deflate_huffman_decode_table_s {
  */
 GCOMP_INTERNAL_API gcomp_status_t gcomp_deflate_huffman_validate(
     const uint8_t * lengths, size_t num_symbols, unsigned max_bits);
+
+/**
+ * @brief Check that code lengths form a *complete* Huffman code (RFC 1951).
+ *
+ * ::gcomp_deflate_huffman_validate() asks only whether the lengths can be
+ * turned into a table at all - that is a structural question, and an encoder
+ * building its own codes never needs to ask any other. A decoder does: RFC
+ * 1951 3.2.2 constructs the code from the lengths in a way that assumes the
+ * Kraft sum is exactly 1, so a stream whose lengths leave the sum short
+ * describes bit patterns the code does not define. Such a stream is not a
+ * DEFLATE stream, and accepting it means decoding whatever those undefined
+ * patterns happen to land on and calling the result a success.
+ *
+ * RFC 1951 3.2.7 names the one exception: "If only one distance code is used,
+ * it is encoded using one bit ... Note that in this case there is an
+ * incomplete Huffman tree". @p allow_single_code admits it. Pass 0 for the
+ * code length alphabet, which has no such exception, and 1 for the
+ * literal/length and distance alphabets.
+ *
+ * An alphabet with no used symbols at all is accepted whatever @p
+ * allow_single_code says: a block that codes only literals carries an empty
+ * distance alphabet, and the absence of a code is not an incomplete one. The
+ * caller decides whether it may then read a symbol from it.
+ *
+ * @param lengths           Code length per symbol (0 = unused). Not NULL.
+ * @param num_symbols       Number of symbols (lengths[0 .. num_symbols-1]).
+ * @param max_bits          Maximum allowed code length (15 for DEFLATE).
+ * @param allow_single_code Non-zero to admit 3.2.7's one-bit single-code case.
+ * @return ::GCOMP_OK if complete (or empty, or the permitted single code),
+ *         ::GCOMP_ERR_CORRUPT if incomplete or over-subscribed,
+ *         ::GCOMP_ERR_INVALID_ARG if parameters invalid.
+ */
+GCOMP_INTERNAL_API gcomp_status_t gcomp_deflate_huffman_check_complete(
+    const uint8_t * lengths, size_t num_symbols, unsigned max_bits,
+    int allow_single_code);
 
 /**
  * @brief Build canonical code values from code lengths (RFC 1951 algorithm).

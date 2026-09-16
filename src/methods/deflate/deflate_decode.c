@@ -791,6 +791,15 @@ static gcomp_status_t deflate_dynamic_read_codelen_lengths(
     st->dyn_clen_index += 1u;
   }
 
+  // RFC 1951 3.2.7 gives the code length alphabet no incomplete-code
+  // exception - 3.2.7's exception is about the distance alphabet - so this one
+  // must be complete.
+  gcomp_status_t clen_complete = gcomp_deflate_huffman_check_complete(
+      st->dyn_clen_lengths, 19u, 7u, 0);
+  if (clen_complete != GCOMP_OK) {
+    return clen_complete;
+  }
+
   gcomp_status_t st_build = gcomp_deflate_huffman_build_decode_table(
       st->allocator, st->dyn_clen_lengths, 19u, 7u, &st->dyn_clen_table);
   if (st_build != GCOMP_OK) {
@@ -976,6 +985,27 @@ static gcomp_status_t deflate_dynamic_decode_lengths(
   // decoding a length code (257-285), and if no such codes appear in the
   // compressed data, an empty distance tree is valid. We only reject streams
   // where the lit/len tree is incomplete (missing end-of-block symbol 256).
+
+  // RFC 1951 3.2.2 constructs a code from the lengths in a way that only
+  // closes if the Kraft sum is 1, so an incomplete literal/length code
+  // describes bit patterns it does not define. Building it anyway means
+  // decoding whichever of those patterns the stream happens to contain and
+  // reporting success; the holes are caught on use, but only if the stream
+  // reaches one. zlib refuses such a stream outright ("invalid literal/lengths
+  // set") and so does this now. 3.2.7's single-code exception is allowed for
+  // both alphabets here: it is written for the distance code, and a
+  // literal/length alphabet reduced to one one-bit code is the same shape.
+  gcomp_status_t litlen_complete =
+      gcomp_deflate_huffman_check_complete(st->dyn_litlen_lengths,
+          DEFLATE_MAX_LITLEN_SYMBOLS, 15u, 1);
+  if (litlen_complete != GCOMP_OK) {
+    return litlen_complete;
+  }
+  gcomp_status_t dist_complete = gcomp_deflate_huffman_check_complete(
+      st->dyn_dist_lengths, DEFLATE_MAX_DIST_SYMBOLS, 15u, 1);
+  if (dist_complete != GCOMP_OK) {
+    return dist_complete;
+  }
 
   gcomp_status_t a = gcomp_deflate_huffman_build_decode_table(st->allocator,
       st->dyn_litlen_lengths, DEFLATE_MAX_LITLEN_SYMBOLS, 15u, &st->dyn_litlen);

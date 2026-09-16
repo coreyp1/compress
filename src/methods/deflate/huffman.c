@@ -71,7 +71,79 @@ gcomp_status_t gcomp_deflate_huffman_validate(
     }
   }
 
-  // Incomplete trees allowed in DEFLATE; only over-subscribed is rejected.
+  // Incomplete trees pass here; whether a decoded stream may contain one is a
+  // separate question - see gcomp_deflate_huffman_check_complete().
+  return GCOMP_OK;
+}
+
+//
+// Completeness (RFC 1951 Section 3.2.2)
+//
+// 3.2.2 builds the code from the lengths alone, and the construction only
+// closes if the Kraft sum is exactly 1. Track the residue the way zlib's
+// inftrees.c does: start with one code available, double the budget at each
+// length, and spend count[len] of it. A negative residue is over-subscribed
+// (already rejected above, and rejected again here so this function stands on
+// its own); a positive residue at the end means bit patterns the code does not
+// define, which is an incomplete code.
+//
+// Two residues are not errors. An alphabet with no used symbols at all is not
+// an incomplete code, it is an absent one - a block coding only literals
+// carries no distance codes - and the caller decides whether it may then read
+// a symbol from it. And 3.2.7 names the single-distance-code case explicitly:
+// "If only one distance code is used, it is encoded using one bit ... Note
+// that in this case there is an incomplete Huffman tree with only one code."
+// That is the allow_single_code exception, and it is a one-bit code: a code
+// left short at any greater length is not it.
+//
+
+gcomp_status_t gcomp_deflate_huffman_check_complete(const uint8_t * lengths,
+    size_t num_symbols, unsigned max_bits, int allow_single_code) {
+  uint32_t bl_count[GCOMP_DEFLATE_HUFFMAN_MAX_BITS + 1];
+  size_t i;
+  unsigned bits;
+  unsigned longest = 0;
+  int32_t left;
+
+  if (!lengths) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  if (max_bits == 0 || max_bits > GCOMP_DEFLATE_HUFFMAN_MAX_BITS) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  memset(bl_count, 0, sizeof(bl_count));
+  for (i = 0; i < num_symbols; i++) {
+    uint32_t len = lengths[i];
+    if (len > max_bits) {
+      return GCOMP_ERR_CORRUPT;
+    }
+    if (len > 0) {
+      bl_count[len]++;
+      if (len > longest) {
+        longest = (unsigned)len;
+      }
+    }
+  }
+
+  // No used symbols: an absent alphabet, not an incomplete one.
+  if (longest == 0) {
+    return GCOMP_OK;
+  }
+
+  left = 1;
+  for (bits = 1; bits <= max_bits; bits++) {
+    left <<= 1;
+    left -= (int32_t)bl_count[bits];
+    if (left < 0) {
+      return GCOMP_ERR_CORRUPT; // over-subscribed
+    }
+  }
+
+  if (left > 0 && !(allow_single_code && longest == 1u)) {
+    return GCOMP_ERR_CORRUPT; // incomplete
+  }
+
   return GCOMP_OK;
 }
 

@@ -100,6 +100,7 @@
 #include <ghoti.io/compress/registry.h>
 #include <ghoti.io/compress/stream.h>
 #include <gtest/gtest.h>
+#include <string>
 #include <vector>
 
 class DeflateMalformedTest : public ::testing::Test {
@@ -545,6 +546,97 @@ TEST_F(DeflateMalformedTest, Stress_RepeatedBlockHeaders) {
   gcomp_status_t status =
       decode_and_expect_error(data.data(), data.size(), false);
   EXPECT_EQ(status, GCOMP_OK) << "Many empty stored blocks should decode";
+}
+
+//
+// Huffman code completeness (RFC 1951 3.2.2, and 3.2.7's one exception)
+// =====================================================================
+//
+// 3.2.2 derives the code from the code lengths alone, and that derivation only
+// closes if the Kraft sum is exactly 1. A set of lengths that leaves it short
+// describes bit patterns the code does not define. Such a stream is not a
+// DEFLATE stream; building the table anyway means decoding whichever undefined
+// patterns happen to appear and reporting success.
+//
+// 3.2.7 names the single exception: "If only one distance code is used, it is
+// encoded using one bit ... Note that in this case there is an incomplete
+// Huffman tree with only one code."
+//
+// The four streams below were hand-built to sit either side of that line, and
+// each was checked against zlib 1.3.1 first - zlib is the authority on which a
+// conforming decoder must accept. Its verdicts are quoted with each one.
+//
+
+// Decode a complete stream in one call, returning the status and the output.
+static gcomp_status_t decode_whole(gcomp_registry_t * registry,
+    const uint8_t * data, size_t len, std::vector<uint8_t> & out) {
+  gcomp_decoder_t * dec = nullptr;
+  gcomp_status_t s = gcomp_decoder_create(registry, "deflate", nullptr, &dec);
+  if (s != GCOMP_OK) {
+    return s;
+  }
+  uint8_t buf[1024] = {};
+  gcomp_buffer_t in_buf = {data, len, 0};
+  gcomp_buffer_t out_buf = {buf, sizeof(buf), 0};
+  s = gcomp_decoder_update(dec, &in_buf, &out_buf);
+  if (s == GCOMP_OK) {
+    out.assign(buf, buf + out_buf.used);
+    gcomp_buffer_t fin = {buf, sizeof(buf), 0};
+    s = gcomp_decoder_finish(dec, &fin);
+    out.insert(out.end(), buf, buf + fin.used);
+  }
+  gcomp_decoder_destroy(dec);
+  return s;
+}
+
+// zlib: accepted, 4 bytes "AAAA".  The distance alphabet holds exactly one
+// code, of one bit - 3.2.7's incomplete tree, which must still decode.
+TEST_F(DeflateMalformedTest, ASingleOneBitDistanceCodeIsStillAccepted) {
+  const uint8_t stream[] = {0x15, 0xe0, 0xb1, 0x0d, 0x00, 0x30, 0x0c, 0xc3,
+      0x30, 0xdc, 0xa6, 0xff, 0x9f, 0x92, 0x44, 0x22};
+  std::vector<uint8_t> out;
+  EXPECT_EQ(decode_whole(registry_, stream, sizeof(stream), out), GCOMP_OK);
+  EXPECT_EQ(std::string(out.begin(), out.end()), "AAAA");
+}
+
+// zlib: accepted, 2 bytes "AA".  Every distance length is zero: the alphabet
+// is absent, not incomplete, and a block of literals never reads from it.
+TEST_F(DeflateMalformedTest, AnAbsentDistanceAlphabetIsStillAccepted) {
+  const uint8_t stream[] = {0x05, 0xe0, 0x21, 0x09, 0x00, 0x00, 0x00, 0x00,
+      0x20, 0x6c, 0xf3, 0xff, 0x29, 0x21};
+  std::vector<uint8_t> out;
+  EXPECT_EQ(decode_whole(registry_, stream, sizeof(stream), out), GCOMP_OK);
+  EXPECT_EQ(std::string(out.begin(), out.end()), "AA");
+}
+
+// zlib: rejected, "invalid literal/lengths set".  Symbol 0 at two bits and
+// symbol 256 at one leaves the Kraft sum at 3/4, and the longest code is two
+// bits, so 3.2.7's one-bit exception does not reach it.
+//
+// This is the stream that mattered: the decoder used to build the table, decode
+// the one symbol the stream does reference, and return GCOMP_OK with a byte
+// that no conforming decoder produces. The hole is detected on use, so a stream
+// that steps into it was already refused - but a stream that steps around it
+// was not.
+TEST_F(DeflateMalformedTest, AnIncompleteLiteralLengthCodeIsRefused) {
+  const uint8_t stream[] = {0x05, 0xe0, 0xb1, 0x0d, 0x00, 0x30, 0x0c, 0xc3,
+      0x30, 0xe8, 0xff, 0xab, 0xc9, 0x00};
+  std::vector<uint8_t> out;
+  EXPECT_EQ(
+      decode_whole(registry_, stream, sizeof(stream), out), GCOMP_ERR_CORRUPT);
+  EXPECT_TRUE(out.empty());
+}
+
+// zlib: rejected, "invalid code lengths set".  3.2.7's exception is written
+// about the distance alphabet; the code length alphabet has none, so an
+// incomplete one is refused whatever its longest code.
+TEST_F(DeflateMalformedTest, AnIncompleteCodeLengthAlphabetIsRefused) {
+  const uint8_t stream[] = {0x05, 0xe0, 0x81, 0x05, 0x00, 0x00, 0x00, 0x00,
+      0x20, 0xcc, 0xd6, 0xfe, 0x4b, 0x45};
+  std::vector<uint8_t> out;
+  EXPECT_EQ(
+      decode_whole(registry_, stream, sizeof(stream), out), GCOMP_ERR_CORRUPT);
+  EXPECT_TRUE(out.empty());
 }
 
 int main(int argc, char ** argv) {

@@ -233,6 +233,81 @@ TEST(DeflateHuffmanDecodeTable, TooManySymbols) {
       GCOMP_ERR_INVALID_ARG);
 }
 
+//
+// Completeness, as distinct from buildability (RFC 1951 3.2.2 / 3.2.7)
+//
+// gcomp_deflate_huffman_validate() answers "can these lengths be turned into a
+// table", which is all an encoder needs. A decoder needs the stricter question,
+// and these say where the line is.
+//
+
+TEST(DeflateHuffmanComplete, ACompleteCodePasses) {
+  // Two one-bit codes: Kraft sum exactly 1.
+  const uint8_t two[2] = {1, 1};
+  EXPECT_EQ(gcomp_deflate_huffman_check_complete(two, 2u, 15u, 0), GCOMP_OK);
+  EXPECT_EQ(gcomp_deflate_huffman_check_complete(two, 2u, 15u, 1), GCOMP_OK);
+
+  // 1 + 2 + 3 + 3: 1/2 + 1/4 + 1/8 + 1/8 = 1.
+  const uint8_t mixed[4] = {1, 2, 3, 3};
+  EXPECT_EQ(gcomp_deflate_huffman_check_complete(mixed, 4u, 15u, 0), GCOMP_OK);
+}
+
+TEST(DeflateHuffmanComplete, AnIncompleteCodeIsRejected) {
+  // 1 + 2: Kraft sum 3/4. Buildable, but not a complete code.
+  const uint8_t lengths[2] = {1, 2};
+  EXPECT_EQ(gcomp_deflate_huffman_validate(lengths, 2u, 15u), GCOMP_OK)
+      << "validate() only asks whether the table can be built";
+  EXPECT_EQ(gcomp_deflate_huffman_check_complete(lengths, 2u, 15u, 0),
+      GCOMP_ERR_CORRUPT);
+  // The longest code is two bits, so 3.2.7's one-bit exception cannot save it
+  // even where the exception is allowed.
+  EXPECT_EQ(gcomp_deflate_huffman_check_complete(lengths, 2u, 15u, 1),
+      GCOMP_ERR_CORRUPT);
+}
+
+TEST(DeflateHuffmanComplete, TheSingleOneBitCodeIsAllowedOnlyWhereTheSpecSaysSo) {
+  // RFC 1951 3.2.7: one distance code, encoded in one bit, incomplete tree.
+  const uint8_t one[1] = {1};
+  EXPECT_EQ(gcomp_deflate_huffman_check_complete(one, 1u, 15u, 1), GCOMP_OK);
+  // The code length alphabet gets no such exception.
+  EXPECT_EQ(
+      gcomp_deflate_huffman_check_complete(one, 1u, 7u, 0), GCOMP_ERR_CORRUPT);
+}
+
+TEST(DeflateHuffmanComplete, AnAlphabetWithNoSymbolsIsAbsentNotIncomplete) {
+  // Every length zero: a block of literals carries no distance codes. That is
+  // not an incomplete code, and the caller decides whether a symbol may then
+  // be read from it.
+  const uint8_t none[30] = {};
+  EXPECT_EQ(gcomp_deflate_huffman_check_complete(none, 30u, 15u, 0), GCOMP_OK);
+  EXPECT_EQ(gcomp_deflate_huffman_check_complete(none, 30u, 15u, 1), GCOMP_OK);
+}
+
+TEST(DeflateHuffmanComplete, AnOverSubscribedCodeIsRejectedHereToo) {
+  // Three one-bit codes: only two exist. Rejected by both questions, so that
+  // this one stands on its own rather than relying on its caller.
+  const uint8_t over[3] = {1, 1, 1};
+  EXPECT_EQ(gcomp_deflate_huffman_check_complete(over, 3u, 15u, 1),
+      GCOMP_ERR_CORRUPT);
+}
+
+TEST(DeflateHuffmanComplete, RejectsBadParameters) {
+  const uint8_t lengths[2] = {1, 1};
+  EXPECT_EQ(gcomp_deflate_huffman_check_complete(nullptr, 2u, 15u, 0),
+      GCOMP_ERR_INVALID_ARG);
+  EXPECT_EQ(gcomp_deflate_huffman_check_complete(lengths, 2u, 0u, 0),
+      GCOMP_ERR_INVALID_ARG);
+  EXPECT_EQ(gcomp_deflate_huffman_check_complete(lengths, 2u, 16u, 0),
+      GCOMP_ERR_INVALID_ARG);
+}
+
+// A length above max_bits is refused before any arithmetic on it.
+TEST(DeflateHuffmanComplete, ALengthBeyondMaxBitsIsRejected) {
+  const uint8_t lengths[2] = {1, 8};
+  EXPECT_EQ(
+      gcomp_deflate_huffman_check_complete(lengths, 2u, 7u, 1), GCOMP_ERR_CORRUPT);
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
