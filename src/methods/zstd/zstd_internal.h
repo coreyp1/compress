@@ -1035,17 +1035,20 @@ gcomp_status_t zstd_literals_encode_compressed(const uint8_t * literals,
     size_t literals_size, uint8_t * output, size_t output_cap,
     size_t * output_len_out);
 
+// Symbol alphabet sizes for the three sequence code types
+// (RFC 8878 3.1.1.3.2.1 and the tables in 3.1.1.3.2.2).
+#define ZSTD_SEQ_LL_CODES 36
+#define ZSTD_SEQ_ML_CODES 53
+#define ZSTD_SEQ_OF_CODES 32
+
 /**
- * @brief Encode sequences section using predefined FSE tables.
+ * @brief Encode a block's sequences section.
  *
- * @param sequences Sequence array
- * @param num_sequences Number of sequences
- * @param output Output buffer
- * @param output_cap Output capacity
- * @param output_len_out Output: bytes written
- * @return GCOMP_OK on success
+ * Chooses, per symbol type, between the predefined FSE table, an RLE table
+ * when the block uses a single symbol, and a per-block FSE table -- whichever
+ * encodes the block smallest.
  */
-gcomp_status_t zstd_sequences_encode_predefined(
+GCOMP_INTERNAL_API gcomp_status_t zstd_sequences_encode(
     const zstd_sequence_t * sequences, size_t num_sequences, uint8_t * output,
     size_t output_cap, size_t * output_len_out);
 

@@ -1357,7 +1357,7 @@ static uint16_t zstd_huf_fse_find_state_for_symbol(
 }
 
 static uint16_t zstd_huf_fse_find_encode_state(const zstd_fse_entry_t * table,
-    size_t table_size, uint8_t symbol, uint16_t next_state, uint8_t * bits_out,
+    size_t table_size, uint8_t symbol, uint16_t next_state, uint16_t * bits_out,
     uint8_t * nb_bits_out) {
   for (size_t i = 0; i < table_size; i++) {
     if (table[i].symbol != symbol) {
@@ -1367,7 +1367,7 @@ static uint16_t zstd_huf_fse_find_encode_state(const zstd_fse_entry_t * table,
     uint8_t nb_bits = table[i].nb_bits;
     uint16_t range = (uint16_t)(1U << nb_bits);
     if (next_state >= base && next_state < base + range) {
-      *bits_out = (uint8_t)(next_state - base);
+      *bits_out = (uint16_t)(next_state - base);
       *nb_bits_out = nb_bits;
       return (uint16_t)i;
     }
@@ -1477,7 +1477,8 @@ static gcomp_status_t zstd_huf_write_weights_fse(
       state[c] = zstd_huf_fse_find_state_for_symbol(fse_table, table_size, weight);
     }
     else {
-      uint8_t bits_out, nb_bits_out;
+      uint16_t bits_out;
+      uint8_t nb_bits_out;
       uint16_t prev = zstd_huf_fse_find_encode_state(
           fse_table, table_size, weight, state[c], &bits_out, &nb_bits_out);
       if (prev == 0xFFFF) {

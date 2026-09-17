@@ -51,10 +51,19 @@ protected:
     gcomp_buffer_t in_buf = {const_cast<void *>(data), len, 0};
     gcomp_buffer_t out_buf = {result.data(), result.size(), 0};
 
-    status = gcomp_encoder_update(encoder, &in_buf, &out_buf);
-    if (status != GCOMP_OK) {
-      gcomp_encoder_destroy(encoder);
-      return {};
+    // Keep feeding until the input is consumed: one update call is not
+    // required to take everything, and stopping after one silently truncated
+    // any input past the first block.
+    while (in_buf.used < in_buf.size) {
+      size_t before = in_buf.used;
+      status = gcomp_encoder_update(encoder, &in_buf, &out_buf);
+      if (status != GCOMP_OK) {
+        gcomp_encoder_destroy(encoder);
+        return {};
+      }
+      if (in_buf.used == before) {
+        break; // no progress; the output buffer is full
+      }
     }
 
     status = gcomp_encoder_finish(encoder, &out_buf);
@@ -84,12 +93,18 @@ protected:
     gcomp_buffer_t in_buf = {const_cast<void *>(data), len, 0};
     gcomp_buffer_t out_buf = {result.data(), result.size(), 0};
 
-    status = gcomp_decoder_update(decoder, &in_buf, &out_buf);
-    if (status != GCOMP_OK) {
-      if (status_out)
-        *status_out = status;
-      gcomp_decoder_destroy(decoder);
-      return {};
+    while (in_buf.used < in_buf.size) {
+      size_t before = in_buf.used;
+      status = gcomp_decoder_update(decoder, &in_buf, &out_buf);
+      if (status != GCOMP_OK) {
+        if (status_out)
+          *status_out = status;
+        gcomp_decoder_destroy(decoder);
+        return {};
+      }
+      if (in_buf.used == before) {
+        break;
+      }
     }
 
     status = gcomp_decoder_finish(decoder, &out_buf);
@@ -691,6 +706,227 @@ TEST_F(ZstdEntropyTest, LiteralsAreHuffmanCodedAtEveryAlphabetSize) {
     ASSERT_EQ(back.size(), data.size()) << "distinct=" << distinct;
     ASSERT_EQ(memcmp(back.data(), data.data(), data.size()), 0)
         << "distinct=" << distinct;
+  }
+}
+
+
+
+// The tests below feed the decoder very compressible data on purpose, which
+// trips the default expansion-ratio guard.  This is what a caller decoding
+// its own trusted output would set.
+static gcomp_options_t * makeGenerousLimits() {
+  gcomp_options_t * opts = nullptr;
+  if (gcomp_options_create(&opts) != GCOMP_OK) {
+    return nullptr;
+  }
+  gcomp_options_set_uint64(opts, "limits.max_output_bytes", 64u << 20);
+  gcomp_options_set_uint64(opts, "limits.max_expansion_ratio", 1000000);
+  gcomp_options_set_uint64(opts, "limits.max_memory_bytes", 256u << 20);
+  return opts;
+}
+
+// Which Symbol_Compression_Mode each of the three sequence symbol types used
+// (RFC 8878 3.1.1.3.2): 0 Predefined, 1 RLE, 2 FSE_Compressed, 3 Repeat.
+struct SeqModeCounts {
+  int mode[3][4] = {{0}}; // [0]=literal lengths, [1]=offsets, [2]=match lengths
+  int blocks_with_sequences = 0;
+  bool parsed = false;
+};
+
+static SeqModeCounts countSequenceModes(const std::vector<uint8_t> & f) {
+  SeqModeCounts c;
+  if (f.size() < 6 || f[0] != 0x28 || f[1] != 0xB5 || f[2] != 0x2F ||
+      f[3] != 0xFD) {
+    return c;
+  }
+  size_t p = 4;
+  uint8_t fhd = f[p++];
+  unsigned fcs_flag = fhd >> 6;
+  bool single = ((fhd >> 5) & 1) != 0;
+  unsigned did = fhd & 3;
+  if (!single) {
+    p += 1;
+  }
+  static const unsigned kDid[4] = {0, 1, 2, 4};
+  p += kDid[did];
+  p += (fcs_flag == 0) ? (single ? 1u : 0u)
+                       : (fcs_flag == 1 ? 2u : (fcs_flag == 2 ? 4u : 8u));
+
+  for (;;) {
+    if (p + 3 > f.size()) {
+      return c;
+    }
+    uint32_t h = (uint32_t)f[p] | ((uint32_t)f[p + 1] << 8) |
+        ((uint32_t)f[p + 2] << 16);
+    p += 3;
+    bool last = (h & 1) != 0;
+    unsigned type = (h >> 1) & 3;
+    size_t size = h >> 3;
+    if (type == 3) {
+      return c;
+    }
+
+    if (type == 2) {
+      if (p + size > f.size() || size < 2) {
+        return c;
+      }
+      const uint8_t * b = f.data() + p;
+      unsigned lt = b[0] & 3;
+      unsigned sf = (b[0] >> 2) & 3;
+      size_t regen, comp, hs;
+      if (lt < 2) {
+        if (sf == 1) {
+          regen = (b[0] >> 4) | ((size_t)b[1] << 4);
+          hs = 2;
+        }
+        else if (sf == 3) {
+          regen = (b[0] >> 4) | ((size_t)b[1] << 4) | ((size_t)b[2] << 12);
+          hs = 3;
+        }
+        else {
+          regen = b[0] >> 3;
+          hs = 1;
+        }
+        comp = (lt == 0) ? regen : 1;
+      }
+      else if (sf < 2) {
+        comp = (b[1] >> 6) | ((size_t)b[2] << 2);
+        hs = 3;
+      }
+      else if (sf == 2) {
+        comp = (b[2] >> 2) | ((size_t)b[3] << 6);
+        hs = 4;
+      }
+      else {
+        comp = (b[2] >> 6) | ((size_t)b[3] << 2) | ((size_t)b[4] << 10);
+        hs = 5;
+      }
+
+      size_t q = hs + comp;
+      if (q >= size) {
+        return c;
+      }
+      unsigned n0 = b[q];
+      size_t nseq;
+      if (n0 == 0) {
+        nseq = 0;
+        q += 1;
+      }
+      else if (n0 < 128) {
+        nseq = n0;
+        q += 1;
+      }
+      else if (n0 < 255) {
+        nseq = ((size_t)(n0 - 128) << 8) + b[q + 1];
+        q += 2;
+      }
+      else {
+        nseq = (size_t)b[q + 1] + ((size_t)b[q + 2] << 8) + 0x7F00;
+        q += 3;
+      }
+
+      if (nseq) {
+        if (q >= size) {
+          return c;
+        }
+        unsigned scm = b[q];
+        c.mode[0][(scm >> 6) & 3]++;
+        c.mode[1][(scm >> 4) & 3]++;
+        c.mode[2][(scm >> 2) & 3]++;
+        c.blocks_with_sequences++;
+      }
+    }
+
+    p += (type == 1) ? 1u : size;
+    if (p > f.size()) {
+      return c;
+    }
+    if (last) {
+      break;
+    }
+  }
+  c.parsed = true;
+  return c;
+}
+
+// The sequences section may describe its own FSE tables instead of using the
+// predefined ones (RFC 8878 3.1.1.3.2), and for anything past a few hundred
+// sequences that is worth several bits each.  The encoder only ever wrote
+// mode 0, which cost about 4.7 bits per sequence -- roughly 170 KB across a
+// 4.4 MB corpus.
+//
+// The check is on the modes byte rather than on a size, because "we chose the
+// cheaper table" is the property, and the size it buys depends on the data.
+TEST_F(ZstdEntropyTest, SequencesUsePerBlockTablesWhenTheyPay) {
+  // Enough matchable structure to produce thousands of sequences, with the
+  // code distributions skewed enough that a fitted table beats the
+  // predefined one.
+  std::vector<uint8_t> data;
+  data.reserve(256 * 1024);
+  uint32_t x = 99999u;
+  const char * frags[] = {"the ", "quick ", "brown ", "fox ", "the quick ",
+      "brown fox ", "jumps ", "over ", "the lazy ", "dog "};
+  while (data.size() < 256 * 1024) {
+    x = x * 1103515245u + 12345u;
+    const char * fr = frags[(x >> 16) % 10];
+    for (const char * ch = fr; *ch; ch++) {
+      data.push_back((uint8_t)*ch);
+    }
+  }
+  data.resize(256 * 1024);
+
+  std::vector<uint8_t> packed = compress(data.data(), data.size());
+  ASSERT_FALSE(packed.empty());
+
+  SeqModeCounts c = countSequenceModes(packed);
+  ASSERT_TRUE(c.parsed) << "unparsable frame";
+  ASSERT_GT(c.blocks_with_sequences, 0) << "no block carried any sequences";
+
+  // At least one symbol type in at least one block should have described its
+  // own table rather than fallen back to the predefined one.
+  EXPECT_GT(c.mode[0][2] + c.mode[1][2] + c.mode[2][2], 0)
+      << "every sequence table was predefined (LL: " << c.mode[0][0]
+      << " predefined / " << c.mode[0][2] << " FSE)";
+
+  gcomp_options_t * dopts = makeGenerousLimits();
+  ASSERT_NE(dopts, nullptr);
+  std::vector<uint8_t> back = decompress(packed.data(), packed.size(), dopts);
+  gcomp_options_destroy(dopts);
+  ASSERT_EQ(back.size(), data.size());
+  ASSERT_EQ(memcmp(back.data(), data.data(), data.size()), 0);
+}
+
+TEST_F(ZstdEntropyTest, PerBlockSequenceTablesRoundTripAtEveryAccuracyLog) {
+  // The literal length and match length tables may use an Accuracy_Log of up
+  // to 9 (RFC 8878 3.1.1.3.2.1), which the encoder only reaches once a block
+  // holds a couple of thousand sequences.  The transition value written for
+  // such a table needs nine bits; it had been returned through a uint8_t and
+  // truncated, producing a stream the reference decoder rejects.  The
+  // sequence count crosses that threshold somewhere in this range.
+  for (size_t n = 1024; n <= 48 * 1024; n = n * 3 / 2) {
+    std::vector<uint8_t> data;
+    data.reserve(n + 64);
+    uint32_t x = (uint32_t)n * 2654435761u + 1u;
+    const char * frags[] = {"ab", "abc", "abcd", "b", "bcd", "cd", "abcde"};
+    while (data.size() < n) {
+      x = x * 1103515245u + 12345u;
+      const char * fr = frags[(x >> 16) % 7];
+      for (const char * ch = fr; *ch; ch++) {
+        data.push_back((uint8_t)*ch);
+      }
+      data.push_back((uint8_t)('a' + ((x >> 8) & 7)));
+    }
+    data.resize(n);
+
+    std::vector<uint8_t> packed = compress(data.data(), data.size());
+    ASSERT_FALSE(packed.empty()) << "n=" << n;
+
+    gcomp_options_t * dopts = makeGenerousLimits();
+    ASSERT_NE(dopts, nullptr);
+    std::vector<uint8_t> back = decompress(packed.data(), packed.size(), dopts);
+    gcomp_options_destroy(dopts);
+    ASSERT_EQ(back.size(), data.size()) << "n=" << n;
+    ASSERT_EQ(memcmp(back.data(), data.data(), data.size()), 0) << "n=" << n;
   }
 }
 

@@ -245,7 +245,7 @@ gcomp_status_t zstd_block_compress(zstd_encoder_state_t * state,
       if (status == GCOMP_OK) {
         // Encode sequences section
         size_t sequences_encoded_size = 0;
-        status = zstd_sequences_encode_predefined(state->seq_buffer,
+        status = zstd_sequences_encode(state->seq_buffer,
             num_sequences, output + literals_encoded_size,
             output_cap - literals_encoded_size, &sequences_encoded_size);
 
