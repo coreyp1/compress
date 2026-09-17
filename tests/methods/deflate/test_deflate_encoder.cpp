@@ -1885,3 +1885,88 @@ int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
+
+// The window is one circular buffer holding both history and lookahead, so a
+// refill that fills it to the brim overwrites everything the encoder could
+// match against.  These tests ask for the history the format promises: a
+// repeat is reachable at any distance up to the window size, whatever the
+// encoder happened to be doing when the earlier copy went past.
+namespace {
+
+// Bytes no LZ77 encoder can compress, so that any size difference between the
+// two streams below is the repeat being found or missed and nothing else.
+std::vector<uint8_t> IncompressibleBytes(size_t n, uint32_t seed) {
+  std::vector<uint8_t> v;
+  v.reserve(n);
+  uint32_t x = seed * 2654435761u + 1u;
+  while (v.size() < n) {
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    v.push_back((uint8_t)(x >> 19));
+  }
+  return v;
+}
+
+} // namespace
+
+TEST_F(DeflateEncoderTest, RepeatIsFoundAcrossTheWholeWindow) {
+  // A distinctive run, a gap, and then the same run again, with the pair
+  // placed so that the first copy ends exactly where a 32 KiB window's worth
+  // of input ends and the second copy begins after it.  That placement is the
+  // point of the test: an encoder that treats each window fill as a fresh
+  // start still finds a repeat that happens to sit inside one fill, so the
+  // copies have to be put on opposite sides of a fill boundary for the
+  // question to be asked at all.
+  const size_t kPhrase = 300;
+  const size_t kWindow = 32768;
+  for (size_t gap : {size_t(1000), size_t(8000), size_t(20000),
+           size_t(31000)}) {
+    std::vector<uint8_t> phrase = IncompressibleBytes(kPhrase, 1);
+    std::vector<uint8_t> other = IncompressibleBytes(kPhrase, 3);
+    std::vector<uint8_t> lead = IncompressibleBytes(kWindow - kPhrase, 2);
+    std::vector<uint8_t> filler = IncompressibleBytes(gap, 4);
+
+    std::vector<uint8_t> repeated = lead;
+    repeated.insert(repeated.end(), phrase.begin(), phrase.end());
+    repeated.insert(repeated.end(), filler.begin(), filler.end());
+    repeated.insert(repeated.end(), phrase.begin(), phrase.end());
+
+    std::vector<uint8_t> distinct = lead;
+    distinct.insert(distinct.end(), phrase.begin(), phrase.end());
+    distinct.insert(distinct.end(), filler.begin(), filler.end());
+    distinct.insert(distinct.end(), other.begin(), other.end());
+
+    std::vector<uint8_t> a;
+    std::vector<uint8_t> b;
+    size_t with_repeat = EncodeWith(registry_, "default", repeated, a);
+    size_t without = EncodeWith(registry_, "default", distinct, b);
+
+    // The repeat is at distance gap + 300, inside the 32768 that RFC 1951
+    // section 3.2.5 allows, so finding it turns 300 bytes into a couple of
+    // symbols.  Asking for 250 of those 300 leaves room for the Huffman code
+    // to shift around without making the test brittle.
+    EXPECT_LT(with_repeat + 250, without)
+        << "gap " << gap << ": " << with_repeat << " vs " << without;
+  }
+}
+
+TEST_F(DeflateEncoderTest, HistorySurvivesTheEncodersRefillBoundary) {
+  // The same question asked without a gap to aim at: a long stream whose
+  // second half repeats its first.  If history were being discarded every
+  // refill, the second half would cost about what the first half did.
+  std::vector<uint8_t> half = IncompressibleBytes(24000, 7);
+  std::vector<uint8_t> both = half;
+  both.insert(both.end(), half.begin(), half.end());
+
+  std::vector<uint8_t> a;
+  std::vector<uint8_t> b;
+  size_t once = EncodeWith(registry_, "default", half, a);
+  size_t twice = EncodeWith(registry_, "default", both, b);
+
+  // The repeat is incompressible on its own, so the whole of the second copy
+  // has to come out of the window.  Allowing a tenth of the first copy's cost
+  // is generous; a version that forgot its history would need all of it.
+  EXPECT_LT(twice, once + once / 10)
+      << "once " << once << ", twice " << twice;
+}
