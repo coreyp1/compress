@@ -329,6 +329,24 @@ typedef struct gcomp_deflate_encoder_state_s {
   size_t pending_copied;    ///< Bytes of pending_buf already delivered.
 } gcomp_deflate_encoder_state_t;
 
+/**
+ * @brief Whether deflate_find_match() may compare eight bytes at a time.
+ *
+ * Requires a little-endian target and __builtin_ctzll, so that the index of
+ * the first differing byte in `a ^ b` is `ctz(diff) / 8`.  Everything else
+ * falls back to the byte-at-a-time loop, which is what the word loop is
+ * checked against.
+ *
+ * Define GCOMP_DEFLATE_NO_WORD_COMPARE to force the byte path on a platform
+ * that would otherwise qualify; the tests build both.
+ */
+#if !defined(GCOMP_DEFLATE_NO_WORD_COMPARE) &&                                 \
+    (defined(__GNUC__) || defined(__clang__)) &&                               \
+    defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) &&             \
+    (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+#define GCOMP_DEFLATE_WORD_COMPARE 1
+#endif
+
 //
 // Hash function for LZ77
 //
@@ -624,8 +642,44 @@ static deflate_match_t deflate_find_match(gcomp_deflate_encoder_state_t * st,
       continue;
     }
 
-    // Check match length
+    // Check match length.
     size_t len = 0;
+
+#ifdef GCOMP_DEFLATE_WORD_COMPARE
+    // Both cursors run forward from scan and match_idx until one of them
+    // reaches the end of the circular window and wraps.  Up to that point the
+    // two runs are flat, so eight bytes can be compared at once; the loop
+    // below finishes the tail and handles the wrap.
+    //
+    // The bound keeps the loads in bounds without a separate check:
+    // len + 8 <= flat <= window_size - scan means scan + len + 8 <=
+    // window_size, and the same for match_idx.  A match is at most 258 bytes
+    // (RFC 1951 section 3.2.5) against a window of at least 256, so a wrap is
+    // rare and the tail loop is short.
+    {
+      size_t scan_room = st->window_size - scan;
+      size_t match_room = st->window_size - match_idx;
+      size_t flat = scan_room < match_room ? scan_room : match_room;
+      if (flat > max_len) {
+        flat = max_len;
+      }
+      while (len + 8u <= flat) {
+        uint64_t a;
+        uint64_t b;
+        memcpy(&a, data + scan + len, sizeof(a));
+        memcpy(&b, data + match_idx + len, sizeof(b));
+        uint64_t diff = a ^ b;
+        if (diff) {
+          // Little-endian: the lowest set bit sits in the first byte that
+          // differs.  Land on it and let the byte loop below stop there.
+          len += (size_t)(__builtin_ctzll(diff) / 8u);
+          break;
+        }
+        len += 8u;
+      }
+    }
+#endif
+
     while (len < max_len &&
         data[(scan + len) & st->window_mask] ==
             data[(match_idx + len) & st->window_mask]) {
