@@ -109,6 +109,7 @@
 #include <ghoti.io/cutil/safemath.h>
 #include <ghoti.io/compress/macros.h>
 #include "lz4_internal.h"
+#include <stddef.h>
 #include <string.h>
 
 //
@@ -235,8 +236,27 @@ gcomp_status_t lz4_block_compress_linked(const uint8_t * window,
     if (match_pos > 0 && match_ref < src &&
         (size_t)(src - match_ref) <= LZ4_MAX_OFFSET &&
         gcomp_read_le32(match_ref) == gcomp_read_le32(src)) {
-      // Found a match! Extend it, but not past match_limit
-      size_t match_len = 4;
+      // Found a match.  Before measuring it forward, walk both cursors back
+      // over bytes that also agree: those bytes are sitting in the pending
+      // literal run, and every one of them moved into the match is a byte
+      // that stops being sent verbatim.  The offset does not change, since
+      // both cursors move together.
+      //
+      // The walk stops at `anchor`, because anything before it has already
+      // been emitted, and at the start of the window, because there is
+      // nothing before that to compare.
+      size_t back = 0;
+      while ((size_t)(src - anchor) > back &&
+          (size_t)(match_ref - window) > back &&
+          match_ref[-(ptrdiff_t)back - 1] == src[-(ptrdiff_t)back - 1]) {
+        back++;
+      }
+      src -= back;
+      match_ref -= back;
+
+      // Extend forward, but not past match_limit.  The four bytes the hash
+      // agreed on sit just after the bytes walked back over.
+      size_t match_len = back + 4;
       while (
           src + match_len < match_limit && match_ref[match_len] == src[match_len]) {
         match_len++;

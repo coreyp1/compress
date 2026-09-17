@@ -17,6 +17,7 @@
  */
 
 #include "../common/test_helpers.h"
+#include <ghoti.io/compress/compress.h>
 #include <cstring>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/lz4.h>
@@ -796,4 +797,168 @@ TEST_F(Lz4EncoderTest, EncodeHighlyCompressibleData) {
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
+}
+
+// A match found by the hash table starts where the four hashed bytes agree,
+// but the bytes before it may agree too, and those are sitting in the pending
+// literal run.  Walking back over them turns literals into match length at no
+// cost: the offset is the same, so the sequence is the same size while
+// carrying fewer literal bytes.
+//
+// The test is the invariant rather than a size: if the last byte of a
+// sequence's literal run equals the byte just before that sequence's match,
+// the match could have been one byte longer and one literal shorter, so the
+// encoder left a byte on the table.  Checking that over a whole frame catches
+// a missing back-extension wherever it would have fired, which a size
+// comparison does not - an earlier draft of this test passed with the walk
+// disabled.
+namespace {
+
+struct Lz4Sequence {
+  size_t out_pos;   // where the literal run starts in the decoded output
+  size_t lit_len;
+  size_t offset;    // 0 for the final literal-only sequence
+};
+
+// Walk the sequences of an LZ4 frame.  Frame layout: RFC-less but specified
+// in the LZ4 frame format document - magic, FLG, BD, optional content size,
+// optional dictionary id, header checksum, then blocks.
+std::vector<Lz4Sequence> Lz4Sequences(const std::vector<uint8_t> & f) {
+  std::vector<Lz4Sequence> seqs;
+  size_t p = 4;
+  uint8_t flg = f[p++];
+  p++; // BD
+  if (flg & 0x08) {
+    p += 8;
+  }
+  if (flg & 0x01) {
+    p += 4;
+  }
+  p++; // header checksum
+  size_t out_pos = 0;
+  while (p + 4 <= f.size()) {
+    uint32_t bs = (uint32_t)f[p] | ((uint32_t)f[p + 1] << 8) |
+        ((uint32_t)f[p + 2] << 16) | ((uint32_t)f[p + 3] << 24);
+    p += 4;
+    if (bs == 0) {
+      break;
+    }
+    bool stored = (bs & 0x80000000u) != 0;
+    size_t size = bs & 0x7FFFFFFFu;
+    if (p + size > f.size()) {
+      break;
+    }
+    if (stored) {
+      out_pos += size;
+      p += size;
+      continue;
+    }
+    size_t b = p;
+    size_t end = p + size;
+    while (b < end) {
+      uint8_t tok = f[b++];
+      size_t ll = tok >> 4;
+      if (ll == 15) {
+        uint8_t x;
+        do {
+          x = f[b++];
+          ll += x;
+        } while (x == 255);
+      }
+      Lz4Sequence seq;
+      seq.out_pos = out_pos;
+      seq.lit_len = ll;
+      seq.offset = 0;
+      b += ll;
+      out_pos += ll;
+      if (b >= end) {
+        seqs.push_back(seq);
+        break;
+      }
+      seq.offset = (size_t)f[b] | ((size_t)f[b + 1] << 8);
+      b += 2;
+      size_t ml = tok & 0xF;
+      if (ml == 15) {
+        uint8_t x;
+        do {
+          x = f[b++];
+          ml += x;
+        } while (x == 255);
+      }
+      ml += 4;
+      out_pos += ml;
+      seqs.push_back(seq);
+    }
+    p += size;
+  }
+  return seqs;
+}
+
+} // namespace
+
+TEST(Lz4Encoder, MatchesAreExtendedBackwardsOverPendingLiterals) {
+  std::vector<uint8_t> data;
+  uint32_t x = 20260917u;
+  auto noise = [&x](size_t n) {
+    std::vector<uint8_t> v;
+    while (v.size() < n) {
+      x ^= x << 13;
+      x ^= x >> 17;
+      x ^= x << 5;
+      v.push_back((uint8_t)(x >> 19));
+    }
+    return v;
+  };
+
+  // A small alphabet with long-ish repeats: matches are found constantly and
+  // often one byte late, which is the case back-extension is for.
+  std::vector<uint8_t> phrase = noise(64);
+  for (uint8_t & c : phrase) {
+    c = (uint8_t)('a' + (c % 6));
+  }
+  for (int repeats = 0; repeats < 200; repeats++) {
+    data.insert(data.end(), phrase.begin(), phrase.end());
+    // Fresh filler each time, so the repeats do not collapse into one long
+    // match and the frame carries many sequences to check.
+    std::vector<uint8_t> filler = noise(300);
+    for (uint8_t & c : filler) {
+      c = (uint8_t)('a' + (c % 6));
+    }
+    data.insert(data.end(), filler.begin(), filler.end());
+  }
+
+  std::vector<uint8_t> out(data.size() * 2 + 4096);
+  size_t used = out.size();
+  ASSERT_EQ(gcomp_encode_buffer(gcomp_registry_default(), "lz4", nullptr,
+                data.data(), data.size(), out.data(), out.size(), &used),
+      GCOMP_OK);
+  out.resize(used);
+
+  std::vector<uint8_t> back(data.size() + 64);
+  size_t back_used = back.size();
+  ASSERT_EQ(gcomp_decode_buffer(gcomp_registry_default(), "lz4", nullptr,
+                out.data(), out.size(), back.data(), back.size(), &back_used),
+      GCOMP_OK);
+  ASSERT_EQ(back_used, data.size());
+  ASSERT_EQ(memcmp(back.data(), data.data(), data.size()), 0);
+
+  std::vector<Lz4Sequence> seqs = Lz4Sequences(out);
+  ASSERT_GT(seqs.size(), 40u) << "no sequences to check";
+
+  size_t missed = 0;
+  for (const Lz4Sequence & seq : seqs) {
+    if (seq.offset == 0 || seq.lit_len == 0) {
+      continue;
+    }
+    size_t match_pos = seq.out_pos + seq.lit_len;
+    if (match_pos < seq.offset + 1) {
+      continue; // nothing before the match to compare
+    }
+    if (data[match_pos - 1] == data[match_pos - seq.offset - 1]) {
+      missed++;
+    }
+  }
+  EXPECT_EQ(missed, 0u)
+      << missed << " of " << seqs.size()
+      << " sequences could have taken another byte into the match";
 }
