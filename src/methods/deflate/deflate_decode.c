@@ -306,21 +306,6 @@ static int deflate_try_fill_bits(gcomp_deflate_decoder_state_t * st,
   return 1;
 }
 
-static int deflate_try_peek_bits(gcomp_deflate_decoder_state_t * st,
-    gcomp_buffer_t * input, uint32_t nbits, uint32_t * out) {
-  if (!st || !input || !out || nbits == 0u || nbits > 24u) {
-    return 0;
-  }
-
-  if (!deflate_try_fill_bits(st, input, nbits)) {
-    return 0;
-  }
-
-  uint32_t mask = (1u << nbits) - 1u;
-  *out = st->bit_buffer & mask;
-  return 1;
-}
-
 static int deflate_try_read_bits(gcomp_deflate_decoder_state_t * st,
     gcomp_buffer_t * input, uint32_t nbits, uint32_t * out) {
   if (!st || !input || !out || nbits == 0u || nbits > 32u) {
@@ -631,13 +616,32 @@ static gcomp_status_t deflate_huff_decode_symbol(
     return GCOMP_ERR_CORRUPT;
   }
 
+  // `extra` is the width of the sub-table's index, which is sized for the
+  // longest code that lands in it - not for the code actually present.  So a
+  // shorter code in that sub-table must still be decodable when fewer than
+  // FAST_BITS + extra bits remain, and at the end of a stream that is the
+  // normal case: the last symbol is followed only by the encoder's padding to
+  // the next byte boundary, at most seven bits.
+  //
+  // Insisting on the full width here made the decoder stall on valid streams.
+  // A 14-bit end-of-block code with a 15-bit sub-table and exactly 14 bits
+  // left decoded every byte of the data and then reported the stream as
+  // truncated - a stream zlib accepted and this library did not.
+  //
+  // Peek whatever there is and pad the tail with zeros, exactly as the fast
+  // path above does; the code found that way is right whenever its own length
+  // fits in what is available, and the length check below confirms that.
   uint32_t full_bits = GCOMP_DEFLATE_HUFFMAN_FAST_BITS + extra;
-  uint32_t full_peek = 0;
-  if (!deflate_try_peek_bits(st, input, full_bits, &full_peek)) {
-    return GCOMP_OK;
+  (void)deflate_try_fill_bits(st, input, full_bits);
+  uint32_t avail_full =
+      (st->bit_count > full_bits) ? full_bits : st->bit_count;
+  if (avail_full < GCOMP_DEFLATE_HUFFMAN_FAST_BITS) {
+    return GCOMP_OK; // Fewer bits than the prefix that got us here; wait.
   }
+  uint32_t full_peek = st->bit_buffer & ((1u << avail_full) - 1u);
 
-  uint32_t full_rev = reverse_bits(full_peek, full_bits);
+  uint32_t full_rev = reverse_bits(full_peek, avail_full);
+  full_rev <<= (full_bits - avail_full);
   uint32_t low_mask = (1u << extra) - 1u;
   uint32_t low = full_rev & low_mask;
 
@@ -655,10 +659,13 @@ static gcomp_status_t deflate_huff_decode_symbol(
     return GCOMP_ERR_CORRUPT;
   }
 
-  uint32_t dummy = 0;
-  if (!deflate_try_read_bits(st, input, le.nbits, &dummy)) {
-    return GCOMP_OK;
+  // Only now is the code's real length known; consume exactly that much, and
+  // only if it is there.
+  if (st->bit_count < le.nbits) {
+    return GCOMP_OK; // Need more input
   }
+  st->bit_buffer >>= le.nbits;
+  st->bit_count -= le.nbits;
 
   *sym_out = le.symbol;
   *decoded_out = 1;
