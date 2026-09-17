@@ -235,7 +235,16 @@ typedef struct {
    * filled begins at `block_buffer + prefix_len`.
    */
   size_t prefix_len;
-  size_t prefix_capacity; ///< LZ4_WINDOW_SIZE when linked, else 0
+  size_t prefix_capacity; ///< LZ4_WINDOW_SIZE when linked or seeded, else 0
+  /**
+   * Dictionary the frame is compressed against, from `lz4.dictionary`; only
+   * its last LZ4_WINDOW_SIZE bytes, since the match offset is two bytes.
+   * With linked blocks it seeds the window once, before the first block; with
+   * independent blocks it is the window every block starts from, because such
+   * a block may reference the dictionary but not the blocks before it.
+   */
+  uint8_t * dictionary;
+  size_t dictionary_size;
 
   // Output staging buffers
   uint8_t header_buf[LZ4_HEADER_MAX_SIZE];
@@ -531,6 +540,21 @@ gcomp_status_t lz4_block_compress(const uint8_t * input, size_t input_len,
  * @param hash_table_size Hash table size in entries
  * @return GCOMP_OK on success, GCOMP_ERR_LIMIT if compression expands data
  */
+/**
+ * @brief Index a window's bytes into a hash table for match finding.
+ *
+ * Used to make a dictionary findable before any of the frame's own data has
+ * been seen.  Writes the same entries lz4_block_compress_linked() would have
+ * written had it scanned those bytes itself.
+ *
+ * @param window Bytes to index
+ * @param len How many bytes @p window holds
+ * @param hash_table Hash table to fill; not cleared first
+ * @param hash_table_size Hash table size in entries (a power of two)
+ */
+void lz4_block_index_window(const uint8_t * window, size_t len,
+    uint32_t * hash_table, size_t hash_table_size);
+
 gcomp_status_t lz4_block_compress_linked(const uint8_t * window,
     size_t prefix_len, size_t block_len, uint8_t * output, size_t output_cap,
     size_t * output_len_out, uint32_t * hash_table, size_t hash_table_size);

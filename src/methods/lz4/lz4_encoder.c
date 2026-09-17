@@ -122,11 +122,27 @@
  * is this table's "empty" marker.  One position per slide, and it costs a
  * missed match, never a wrong one.
  */
+static void lz4_encoder_seed_window(lz4_encoder_state_t * state) {
+  state->block_buffer_pos = 0;
+  memset(state->hash_table, 0, state->hash_table_size * sizeof(uint32_t));
+  state->prefix_len = state->dictionary_size;
+  if (state->dictionary_size > 0) {
+    // The dictionary is already at the front of the window and is never
+    // overwritten, so only the table has to be rebuilt.  That is a scan of up
+    // to 64 KB per block in independent mode; liblz4 keeps a preloaded table
+    // to avoid it, which would be the optimisation to make if it ever shows
+    // up in a profile.
+    lz4_block_index_window(state->block_buffer, state->dictionary_size,
+        state->hash_table, state->hash_table_size);
+  }
+}
+
 static void lz4_encoder_slide_window(lz4_encoder_state_t * state) {
-  if (state->prefix_capacity == 0) {
-    state->prefix_len = 0;
-    state->block_buffer_pos = 0;
-    memset(state->hash_table, 0, state->hash_table_size * sizeof(uint32_t));
+  if (state->header.block_independence) {
+    // An independent block starts from the dictionary alone -- and from
+    // nothing at all when there is no dictionary, which is what this did
+    // before dictionaries existed.
+    lz4_encoder_seed_window(state);
     return;
   }
 
@@ -161,6 +177,8 @@ static gcomp_status_t lz4_encoder_read_options(
   state->header.content_size = 0;
   state->header.dict_id_present = false;
   state->header.dict_id = 0;
+  state->dictionary = NULL;
+  state->dictionary_size = 0;
   state->max_memory_bytes = LZ4_DEFAULT_MAX_MEMORY_BYTES;
 
   if (!options) {
@@ -257,9 +275,32 @@ gcomp_status_t lz4_encoder_init(gcomp_registry_t * registry,
   // preceding frame in front of the block being filled, so a match can reach
   // back across the block boundary; independent blocks keep nothing and the
   // buffer is exactly one block, as before.
-  state->prefix_capacity =
-      state->header.block_independence ? 0 : LZ4_WINDOW_SIZE;
+  // How much of the dictionary we will actually hold, before anything is
+  // allocated: only the tail, since the match offset is two bytes.
+  const void * dict_data = NULL;
+  size_t dict_size = 0;
+  if (options &&
+      gcomp_options_get_bytes(options, "lz4.dictionary", &dict_data,
+          &dict_size) == GCOMP_OK &&
+      dict_data && dict_size > 0) {
+    if (dict_size > LZ4_WINDOW_SIZE) {
+      dict_data = (const uint8_t *)dict_data + (dict_size - LZ4_WINDOW_SIZE);
+      dict_size = LZ4_WINDOW_SIZE;
+    }
+  }
+  else {
+    dict_data = NULL;
+    dict_size = 0;
+  }
+
+  // Independent blocks need a window too when there is a dictionary: such a
+  // block may not reference the blocks before it, but it may reference the
+  // dictionary, so the dictionary sits in front of every one of them.
+  state->prefix_capacity = (state->header.block_independence && dict_size == 0)
+      ? 0
+      : LZ4_WINDOW_SIZE;
   state->prefix_len = 0;
+  state->dictionary_size = dict_size;
   state->block_buffer_size = state->header.block_max_size;
   size_t window_bytes = state->block_buffer_size + state->prefix_capacity;
   state->block_buffer = (uint8_t *)gcomp_malloc(alloc, window_bytes);
@@ -270,6 +311,15 @@ gcomp_status_t lz4_encoder_init(gcomp_registry_t * registry,
   }
   gcomp_memory_track_alloc(&state->mem_tracker, window_bytes);
   state->block_buffer_pos = 0;
+  if (dict_size > 0) {
+    // The dictionary lives at the front of the window.  Block data is always
+    // written after prefix_len, so with independent blocks nothing ever
+    // overwrites it and re-seeding is only a matter of re-indexing.  With
+    // linked blocks the window slides and the frame's own output displaces it,
+    // which is what should happen.
+    memcpy(state->block_buffer, dict_data, dict_size);
+    state->prefix_len = dict_size;
+  }
 
   // Allocate compressed buffer (block + header + checksum overhead)
   state->compressed_buffer_size = state->header.block_max_size +
@@ -299,6 +349,14 @@ gcomp_status_t lz4_encoder_init(gcomp_registry_t * registry,
   gcomp_memory_track_alloc(
       &state->mem_tracker, state->hash_table_size * sizeof(uint32_t));
   memset(state->hash_table, 0, state->hash_table_size * sizeof(uint32_t));
+
+  // Make the dictionary findable before the first block is compressed.  The
+  // bytes are already in the window; without this the table is empty and the
+  // first block would match nothing in them.
+  if (state->dictionary_size > 0) {
+    lz4_block_index_window(state->block_buffer, state->dictionary_size,
+        state->hash_table, state->hash_table_size);
+  }
 
   // Check memory limit
   if (state->max_memory_bytes > 0 &&
@@ -691,7 +749,6 @@ gcomp_status_t lz4_encoder_reset(gcomp_encoder_t * encoder) {
   // Reset state
   state->stage = LZ4_ENC_STAGE_HEADER;
   state->header_pos = 0;
-  state->block_buffer_pos = 0;
   state->compressed_buffer_pos = 0;
   state->compressed_buffer_len = 0;
   state->end_mark_pos = 0;
@@ -700,10 +757,10 @@ gcomp_status_t lz4_encoder_reset(gcomp_encoder_t * encoder) {
   state->finish_called = false;
   state->blocks_finished = false;
 
-  // Clear hash table.  The window must go with it: an entry and the byte it
-  // names are only meaningful together.
-  state->prefix_len = 0;
-  memset(state->hash_table, 0, state->hash_table_size * sizeof(uint32_t));
+  // Clear the hash table and put the window back where a new frame starts:
+  // at the dictionary, or at nothing.  The two must move together -- an entry
+  // and the byte it names are only meaningful as a pair.
+  lz4_encoder_seed_window(state);
 
   // Reset content checksum
   if (state->header.content_checksum) {

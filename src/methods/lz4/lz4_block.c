@@ -125,6 +125,22 @@ static inline uint32_t lz4_hash_position(const uint8_t * p) {
 // Block Compression
 //
 
+void lz4_block_index_window(const uint8_t * window, size_t len,
+    uint32_t * hash_table, size_t hash_table_size) {
+  if (!window || !hash_table || len < LZ4_MIN_MATCH) {
+    return;
+  }
+  // Same hash and the same position convention lz4_block_compress_linked()
+  // uses, so an entry left here is indistinguishable from one it wrote
+  // itself.  Position 0 is the table's "empty" marker, so the byte at the
+  // very start of the window is not indexed -- one missed match, never a
+  // wrong one.
+  for (size_t pos = 1; pos + LZ4_MIN_MATCH <= len; pos++) {
+    uint32_t hash = lz4_hash_position(window + pos) & (hash_table_size - 1);
+    hash_table[hash] = (uint32_t)pos;
+  }
+}
+
 gcomp_status_t lz4_block_compress(const uint8_t * input, size_t input_len,
     uint8_t * output, size_t output_cap, size_t * output_len_out,
     uint32_t * hash_table, size_t hash_table_size) {
