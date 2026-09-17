@@ -11,6 +11,7 @@
 #include <cstring>
 #include <ghoti.io/compress/crc32.h>
 #include <gtest/gtest.h>
+#include <vector>
 
 // Known CRC32 test vectors from RFC 1952 (standard CRC32)
 // Standard CRC32: init 0xFFFFFFFF, final XOR 0xFFFFFFFF
@@ -58,16 +59,39 @@ TEST_F(Crc32Test, InitConstantIsCorrect) {
   EXPECT_EQ(GCOMP_CRC32_INIT, 0xFFFFFFFFU);
 }
 
-// Test gcomp_crc32() with empty input
+// Test gcomp_crc32() with empty input.  The function returns the UNFINALIZED
+// running CRC, and the running CRC of no data is the initial value; it is
+// gcomp_crc32_finalize() that turns it into CRC32_EMPTY.
 TEST_F(Crc32Test, Crc32EmptyInput) {
   uint32_t crc = gcomp_crc32(nullptr, 0);
-  EXPECT_EQ(crc, CRC32_EMPTY);
+  EXPECT_EQ(crc, GCOMP_CRC32_INIT);
+  EXPECT_EQ(gcomp_crc32_finalize(crc), CRC32_EMPTY);
 }
 
 TEST_F(Crc32Test, Crc32EmptyInputWithValidPointer) {
   const uint8_t * empty = nullptr;
   uint32_t crc = gcomp_crc32(empty, 0);
-  EXPECT_EQ(crc, CRC32_EMPTY);
+  EXPECT_EQ(crc, GCOMP_CRC32_INIT);
+  EXPECT_EQ(gcomp_crc32_finalize(crc), CRC32_EMPTY);
+}
+
+// The header says the one-shot result can be carried into update().  An empty
+// first chunk is where that promise used to fail.
+TEST_F(Crc32Test, OneShotResultCanBeCarriedIntoUpdate) {
+  const uint8_t * s = reinterpret_cast<const uint8_t *>("123456789");
+  uint32_t direct = gcomp_crc32_finalize(gcomp_crc32(s, 9));
+  EXPECT_EQ(direct, 0xCBF43926u);
+
+  uint32_t staged = gcomp_crc32(reinterpret_cast<const uint8_t *>(""), 0);
+  staged = gcomp_crc32_update(staged, s, 9);
+  EXPECT_EQ(gcomp_crc32_finalize(staged), direct);
+
+  // And split anywhere, not only at the front.
+  for (size_t split = 0; split <= 9; split++) {
+    uint32_t c = gcomp_crc32(s, split);
+    c = gcomp_crc32_update(c, s + split, 9 - split);
+    EXPECT_EQ(gcomp_crc32_finalize(c), direct) << "split at " << split;
+  }
 }
 
 // Test gcomp_crc32() with known test vector "123456789"
@@ -296,6 +320,79 @@ TEST_F(Crc32Test, RoundTrip) {
   crc2 = gcomp_crc32_finalize(crc2);
 
   EXPECT_EQ(crc1, crc2);
+}
+
+// ---------------------------------------------------------------------------
+// Slicing-by-8
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The bit-reversed IEEE 802.3 polynomial, from RFC 1952 section 8.
+constexpr uint32_t kPoly = 0xEDB88320u;
+
+// The definition of the CRC, one bit at a time, owing nothing to any table.
+uint32_t CrcBitwise(const uint8_t * data, size_t len) {
+  uint32_t crc = GCOMP_CRC32_INIT;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (int bit = 0; bit < 8; bit++) {
+      crc = (crc >> 1) ^ ((crc & 1u) ? kPoly : 0u);
+    }
+  }
+  return gcomp_crc32_finalize(crc);
+}
+
+} // namespace
+
+// The fast path folds eight bytes at a time, so every length modulo 8 takes a
+// different route through the head, the folded body and the tail.  Walking
+// lengths 0..512 covers each of them many times over, against a reference that
+// shares no table with the implementation.
+TEST(Crc32SliceTable, MatchesTheBitwiseDefinitionAtEveryLength) {
+  std::vector<uint8_t> buf(512);
+  uint32_t seed = 12345u;
+  for (size_t i = 0; i < buf.size(); i++) {
+    seed = seed * 1103515245u + 12345u;
+    buf[i] = static_cast<uint8_t>(seed >> 16);
+  }
+  for (size_t len = 0; len <= buf.size(); len++) {
+    EXPECT_EQ(gcomp_crc32_finalize(gcomp_crc32(buf.data(), len)),
+        CrcBitwise(buf.data(), len))
+        << "length " << len;
+  }
+}
+
+// Splitting the input anywhere must not change the answer, which is the
+// property the folded loop is most likely to break: a chunk boundary that
+// falls inside an eight-byte group leaves a partial group for the next call.
+TEST(Crc32SliceTable, IncrementalAgreesAtEverySplitPoint) {
+  std::vector<uint8_t> buf(200);
+  for (size_t i = 0; i < buf.size(); i++) {
+    buf[i] = static_cast<uint8_t>(i * 7u + 3u);
+  }
+  uint32_t whole = gcomp_crc32_finalize(gcomp_crc32(buf.data(), buf.size()));
+  for (size_t split = 0; split <= buf.size(); split++) {
+    uint32_t crc = GCOMP_CRC32_INIT;
+    crc = gcomp_crc32_update(crc, buf.data(), split);
+    crc = gcomp_crc32_update(crc, buf.data() + split, buf.size() - split);
+    EXPECT_EQ(gcomp_crc32_finalize(crc), whole) << "split at " << split;
+  }
+}
+
+// An unaligned start, since the folded loop loads 32-bit words with memcpy
+// rather than aligned reads.
+TEST(Crc32SliceTable, UnalignedStartsAgree) {
+  std::vector<uint8_t> buf(300);
+  for (size_t i = 0; i < buf.size(); i++) {
+    buf[i] = static_cast<uint8_t>(i ^ 0x5Au);
+  }
+  for (size_t offset = 0; offset < 8; offset++) {
+    size_t len = buf.size() - offset;
+    EXPECT_EQ(gcomp_crc32_finalize(gcomp_crc32(buf.data() + offset, len)),
+        CrcBitwise(buf.data() + offset, len))
+        << "offset " << offset;
+  }
 }
 
 int main(int argc, char ** argv) {
