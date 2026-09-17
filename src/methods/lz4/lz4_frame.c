@@ -77,6 +77,7 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
+#include <ghoti.io/compress/lz4.h>
 #include <ghoti.io/compress/macros.h>
 #include "lz4_internal.h"
 #include <ghoti.io/compress/xxhash32.h>
@@ -187,5 +188,107 @@ gcomp_status_t lz4_parse_block_size(
   *uncompressed_out = (raw & LZ4_BLOCK_UNCOMPRESSED_FLAG) != 0;
   *size_out = raw & LZ4_BLOCK_SIZE_MASK;
 
+  return GCOMP_OK;
+}
+
+//
+// Skippable Frames
+//
+// LZ4 Frame Format, "Skippable Frames":
+//
+// ```
+// ┌────────────────┬────────────────┬─────────────────────┐
+// │  Magic Number  │  Frame Size    │     User Data       │
+// │   (4 bytes)    │   (4 bytes)    │  (Frame Size bytes) │
+// └────────────────┴────────────────┴─────────────────────┘
+//   0x184D2A50           little-       opaque to every
+//   .. 0x184D2A5F        endian        decoder, including
+//   (little-endian)                    this one
+// ```
+//
+// Nothing here is compressed, so these build and parse the bytes directly
+// rather than going through an encoder or decoder.
+//
+
+gcomp_status_t gcomp_lz4_write_skippable_frame(unsigned magic_variant,
+    const void * payload, size_t payload_size, void * output,
+    size_t output_capacity, size_t * output_size_out) {
+  if (!output || !output_size_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  *output_size_out = 0;
+
+  if (magic_variant > 0x0Fu) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  // NULL payload is allowed only for an empty one, matching
+  // gcomp_encode_buffer().
+  if (!payload && payload_size > 0) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  // The size field is 32 bits.  On a 32-bit size_t this comparison is always
+  // false, which is correct rather than dead: the payload cannot exceed the
+  // field there either.
+  if ((uint64_t)payload_size > (uint64_t)GCOMP_LZ4_SKIPPABLE_MAX_PAYLOAD) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  size_t needed = GCOMP_LZ4_SKIPPABLE_OVERHEAD + payload_size;
+  if (output_capacity < needed) {
+    return GCOMP_ERR_LIMIT;
+  }
+
+  uint8_t * out = (uint8_t *)output;
+  gcomp_write_le32(out, LZ4_SKIPPABLE_MAGIC | (uint32_t)magic_variant);
+  gcomp_write_le32(out + 4, (uint32_t)payload_size);
+  if (payload_size > 0) {
+    memcpy(out + GCOMP_LZ4_SKIPPABLE_OVERHEAD, payload, payload_size);
+  }
+
+  *output_size_out = needed;
+  return GCOMP_OK;
+}
+
+gcomp_status_t gcomp_lz4_read_skippable_frame(const void * input,
+    size_t input_size, unsigned * magic_variant_out,
+    size_t * payload_offset_out, size_t * payload_size_out,
+    size_t * frame_size_out) {
+  if (!input) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  if (input_size < GCOMP_LZ4_SKIPPABLE_OVERHEAD) {
+    return GCOMP_ERR_CORRUPT;
+  }
+
+  const uint8_t * in = (const uint8_t *)input;
+  uint32_t magic = gcomp_read_le32(in);
+  if (!LZ4_IS_SKIPPABLE_MAGIC(magic)) {
+    return GCOMP_ERR_CORRUPT;
+  }
+
+  uint32_t declared = gcomp_read_le32(in + 4);
+
+  // Compare in 64 bits.  The declared size is attacker-controlled and
+  // GCOMP_LZ4_SKIPPABLE_OVERHEAD + declared would wrap on a 32-bit size_t,
+  // turning a frame that claims nearly 4 GB into one that appears to fit.
+  if ((uint64_t)declared >
+      (uint64_t)input_size - (uint64_t)GCOMP_LZ4_SKIPPABLE_OVERHEAD) {
+    return GCOMP_ERR_CORRUPT;
+  }
+
+  if (magic_variant_out) {
+    *magic_variant_out = (unsigned)(magic & 0x0Fu);
+  }
+  if (payload_offset_out) {
+    *payload_offset_out = GCOMP_LZ4_SKIPPABLE_OVERHEAD;
+  }
+  if (payload_size_out) {
+    *payload_size_out = (size_t)declared;
+  }
+  if (frame_size_out) {
+    *frame_size_out = GCOMP_LZ4_SKIPPABLE_OVERHEAD + (size_t)declared;
+  }
   return GCOMP_OK;
 }

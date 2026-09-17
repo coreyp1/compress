@@ -570,6 +570,199 @@ TEST_F(Lz4FormatTest, TruncatedEndMark) {
   EXPECT_EQ(status, GCOMP_ERR_CORRUPT);
 }
 
+
+//
+// Skippable Frames: the public writer and parser
+//
+// LZ4 Frame Format, "Skippable Frames".  gcomp_lz4_write_skippable_frame() and
+// gcomp_lz4_read_skippable_frame() build and parse the bytes directly; nothing
+// in a skippable frame is compressed.  Interoperability -- that liblz4 skips
+// what we write -- is covered in test_lz4_spec_oracle.cpp; these are the API's
+// own contract.
+//
+
+TEST_F(Lz4FormatTest, SkippableWriterProducesTheSpecifiedLayout) {
+  std::vector<uint8_t> payload;
+  for (int i = 0; i < 300; i++) {
+    payload.push_back((uint8_t)(i * 13 + 7));
+  }
+
+  for (unsigned variant = 0; variant < 16; variant++) {
+    std::vector<uint8_t> out(GCOMP_LZ4_SKIPPABLE_OVERHEAD + payload.size());
+    size_t written = 0;
+    ASSERT_EQ(gcomp_lz4_write_skippable_frame(variant, payload.data(),
+                  payload.size(), out.data(), out.size(), &written),
+        GCOMP_OK)
+        << "variant " << variant;
+    ASSERT_EQ(written, out.size());
+
+    // Magic, little-endian, with the variant in the low nibble.
+    const uint32_t magic = 0x184D2A50u | variant;
+    EXPECT_EQ(out[0], (uint8_t)(magic & 0xFF)) << "variant " << variant;
+    EXPECT_EQ(out[1], (uint8_t)((magic >> 8) & 0xFF));
+    EXPECT_EQ(out[2], (uint8_t)((magic >> 16) & 0xFF));
+    EXPECT_EQ(out[3], (uint8_t)((magic >> 24) & 0xFF));
+
+    // Size, little-endian.
+    const uint32_t size = (uint32_t)payload.size();
+    EXPECT_EQ(out[4], (uint8_t)(size & 0xFF));
+    EXPECT_EQ(out[5], (uint8_t)((size >> 8) & 0xFF));
+    EXPECT_EQ(out[6], (uint8_t)((size >> 16) & 0xFF));
+    EXPECT_EQ(out[7], (uint8_t)((size >> 24) & 0xFF));
+
+    // Payload verbatim.
+    EXPECT_EQ(memcmp(out.data() + 8, payload.data(), payload.size()), 0)
+        << "variant " << variant;
+  }
+}
+
+TEST_F(Lz4FormatTest, SkippableRoundTripsThroughTheParser) {
+  for (size_t n : {(size_t)0, (size_t)1, (size_t)7, (size_t)8, (size_t)9,
+           (size_t)255, (size_t)256, (size_t)65535, (size_t)65536}) {
+    std::vector<uint8_t> payload(n);
+    for (size_t i = 0; i < n; i++) {
+      payload[i] = (uint8_t)(i * 31 + n);
+    }
+    std::vector<uint8_t> out(GCOMP_LZ4_SKIPPABLE_OVERHEAD + n + 16);
+    size_t written = 0;
+    ASSERT_EQ(gcomp_lz4_write_skippable_frame(5, n ? payload.data() : nullptr,
+                  n, out.data(), out.size(), &written),
+        GCOMP_OK)
+        << "n=" << n;
+    ASSERT_EQ(written, GCOMP_LZ4_SKIPPABLE_OVERHEAD + n);
+
+    unsigned variant = 99;
+    size_t offset = 0, payload_size = 0, frame_size = 0;
+    ASSERT_EQ(gcomp_lz4_read_skippable_frame(out.data(), written, &variant,
+                  &offset, &payload_size, &frame_size),
+        GCOMP_OK)
+        << "n=" << n;
+    EXPECT_EQ(variant, 5u) << "n=" << n;
+    EXPECT_EQ(offset, (size_t)GCOMP_LZ4_SKIPPABLE_OVERHEAD);
+    EXPECT_EQ(payload_size, n);
+    EXPECT_EQ(frame_size, written);
+    if (n > 0) {
+      EXPECT_EQ(memcmp(out.data() + offset, payload.data(), n), 0)
+          << "n=" << n;
+    }
+  }
+
+  // Every output is optional.
+  std::vector<uint8_t> out(GCOMP_LZ4_SKIPPABLE_OVERHEAD);
+  size_t written = 0;
+  ASSERT_EQ(gcomp_lz4_write_skippable_frame(
+                0, nullptr, 0, out.data(), out.size(), &written),
+      GCOMP_OK);
+  EXPECT_EQ(gcomp_lz4_read_skippable_frame(
+                out.data(), written, nullptr, nullptr, nullptr, nullptr),
+      GCOMP_OK);
+}
+
+TEST_F(Lz4FormatTest, SkippableWriterRejectsBadArguments) {
+  uint8_t payload[16] = {0};
+  uint8_t out[64];
+  size_t written = 12345;
+
+  // The variant is four bits.
+  EXPECT_EQ(gcomp_lz4_write_skippable_frame(
+                16, payload, sizeof(payload), out, sizeof(out), &written),
+      GCOMP_ERR_INVALID_ARG);
+  EXPECT_EQ(written, 0u) << "output size must be zeroed on failure";
+
+  written = 12345;
+  EXPECT_EQ(gcomp_lz4_write_skippable_frame(
+                0xFFFFFFFFu, payload, 1, out, sizeof(out), &written),
+      GCOMP_ERR_INVALID_ARG);
+  EXPECT_EQ(written, 0u);
+
+  // NULL payload is allowed only for an empty one.
+  written = 12345;
+  EXPECT_EQ(
+      gcomp_lz4_write_skippable_frame(0, nullptr, 1, out, sizeof(out), &written),
+      GCOMP_ERR_INVALID_ARG);
+  EXPECT_EQ(written, 0u);
+  EXPECT_EQ(
+      gcomp_lz4_write_skippable_frame(0, nullptr, 0, out, sizeof(out), &written),
+      GCOMP_OK);
+  EXPECT_EQ(written, (size_t)GCOMP_LZ4_SKIPPABLE_OVERHEAD);
+
+  // Required pointers.
+  EXPECT_EQ(gcomp_lz4_write_skippable_frame(0, payload, 1, nullptr, 16,
+                &written),
+      GCOMP_ERR_INVALID_ARG);
+  EXPECT_EQ(
+      gcomp_lz4_write_skippable_frame(0, payload, 1, out, sizeof(out), nullptr),
+      GCOMP_ERR_INVALID_ARG);
+
+  // Capacity: exactly enough succeeds, one byte short does not.
+  written = 12345;
+  EXPECT_EQ(gcomp_lz4_write_skippable_frame(0, payload, sizeof(payload), out,
+                GCOMP_LZ4_SKIPPABLE_OVERHEAD + sizeof(payload) - 1, &written),
+      GCOMP_ERR_LIMIT);
+  EXPECT_EQ(written, 0u);
+  EXPECT_EQ(gcomp_lz4_write_skippable_frame(0, payload, sizeof(payload), out,
+                GCOMP_LZ4_SKIPPABLE_OVERHEAD + sizeof(payload), &written),
+      GCOMP_OK);
+  EXPECT_EQ(written, GCOMP_LZ4_SKIPPABLE_OVERHEAD + sizeof(payload));
+}
+
+TEST_F(Lz4FormatTest, SkippableParserRejectsBadFrames) {
+  // A frame that declares more payload than the buffer holds.  The check is
+  // made in 64 bits: overhead + declared would wrap on a 32-bit size_t,
+  // turning a frame claiming nearly 4 GB into one that appears to fit.
+  uint8_t liar[12] = {0x50, 0x2A, 0x4D, 0x18, 0xFF, 0xFF, 0xFF, 0xFF, 1, 2, 3,
+      4};
+  EXPECT_EQ(gcomp_lz4_read_skippable_frame(
+                liar, sizeof(liar), nullptr, nullptr, nullptr, nullptr),
+      GCOMP_ERR_CORRUPT);
+
+  // One byte short of what it declares.
+  uint8_t almost[11] = {0x50, 0x2A, 0x4D, 0x18, 4, 0, 0, 0, 1, 2, 3};
+  EXPECT_EQ(gcomp_lz4_read_skippable_frame(
+                almost, sizeof(almost), nullptr, nullptr, nullptr, nullptr),
+      GCOMP_ERR_CORRUPT);
+  // ...and exactly what it declares is fine.
+  uint8_t exact[12] = {0x50, 0x2A, 0x4D, 0x18, 4, 0, 0, 0, 1, 2, 3, 4};
+  size_t frame_size = 0;
+  EXPECT_EQ(gcomp_lz4_read_skippable_frame(
+                exact, sizeof(exact), nullptr, nullptr, nullptr, &frame_size),
+      GCOMP_OK);
+  EXPECT_EQ(frame_size, 12u);
+  // Trailing bytes belong to whatever follows, not to this frame.
+  EXPECT_EQ(gcomp_lz4_read_skippable_frame(
+                exact, sizeof(exact), nullptr, nullptr, nullptr, &frame_size),
+      GCOMP_OK);
+
+  // Magic numbers that are not skippable, including the ones either side of
+  // the range.
+  static const uint32_t kBad[] = {
+      0x184D2A40u, 0x184D2A4Fu, 0x184D2A60u, 0x184D2A99u, 0x184D2204u, 0u};
+  for (uint32_t magic : kBad) {
+    uint8_t buf[12] = {0};
+    for (int i = 0; i < 4; i++) {
+      buf[i] = (uint8_t)((magic >> (8 * i)) & 0xFF);
+    }
+    char label[32];
+    snprintf(label, sizeof(label), "0x%08X", magic);
+    EXPECT_EQ(gcomp_lz4_read_skippable_frame(
+                  buf, sizeof(buf), nullptr, nullptr, nullptr, nullptr),
+        GCOMP_ERR_CORRUPT)
+        << label;
+  }
+
+  // Too short to hold even the header.
+  uint8_t stub[8] = {0x50, 0x2A, 0x4D, 0x18, 0, 0, 0, 0};
+  for (size_t n = 0; n < GCOMP_LZ4_SKIPPABLE_OVERHEAD; n++) {
+    EXPECT_EQ(gcomp_lz4_read_skippable_frame(
+                  stub, n, nullptr, nullptr, nullptr, nullptr),
+        GCOMP_ERR_CORRUPT)
+        << "n=" << n;
+  }
+  EXPECT_EQ(gcomp_lz4_read_skippable_frame(nullptr, 8, nullptr, nullptr,
+                nullptr, nullptr),
+      GCOMP_ERR_INVALID_ARG);
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

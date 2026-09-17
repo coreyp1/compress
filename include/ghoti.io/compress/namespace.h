@@ -91,6 +91,10 @@
 #define gcomp_method_get_option_keys GHOTIIO_COMPRESS(gcomp_method_get_option_keys)
 #define gcomp_method_get_option_schema GHOTIIO_COMPRESS(gcomp_method_get_option_schema)
 #define gcomp_method_gzip_register GHOTIIO_COMPRESS(gcomp_method_gzip_register)
+#define gcomp_lz4_read_skippable_frame \
+  GHOTIIO_COMPRESS(gcomp_lz4_read_skippable_frame)
+#define gcomp_lz4_write_skippable_frame \
+  GHOTIIO_COMPRESS(gcomp_lz4_write_skippable_frame)
 #define gcomp_method_lz4_register GHOTIIO_COMPRESS(gcomp_method_lz4_register)
 #define gcomp_method_lzw_register GHOTIIO_COMPRESS(gcomp_method_lzw_register)
 #define gcomp_method_rle_register GHOTIIO_COMPRESS(gcomp_method_rle_register)

@@ -1564,6 +1564,121 @@ TEST_F(Lz4SpecOracleTest, SkippableIsNotAWildcardForBadMagic) {
                       "end of stream";
 }
 
+TEST_F(Lz4SpecOracleTest, RealLz4_SkipsTheFramesWeWrite) {
+  const RealLz4 & lib = realLz4();
+  if (!lib.ok()) {
+    GTEST_SKIP() << "liblz4 is not installed";
+  }
+
+  // What the writer emits has to be skippable by something that is not us.
+  // liblz4 1.10 keeps LZ4F_writeSkippableFrame in its static-only header and
+  // does not export it, so the comparison runs one way: its decoder over our
+  // frames.  That is the direction interoperability actually needs.
+  std::vector<uint8_t> data = proseLike(4000, 41u);
+  std::vector<uint8_t> frame = gcompEncode(data);
+  ASSERT_FALSE(frame.empty());
+
+  std::vector<uint8_t> payload;
+  for (int i = 0; i < 700; i++) {
+    payload.push_back((uint8_t)(i * 17 + 5));
+  }
+
+  for (unsigned variant = 0; variant < 16; variant++) {
+    for (size_t plen : {(size_t)0, (size_t)1, (size_t)700}) {
+      std::vector<uint8_t> skip(GCOMP_LZ4_SKIPPABLE_OVERHEAD + plen);
+      size_t written = 0;
+      ASSERT_EQ(gcomp_lz4_write_skippable_frame(variant,
+                    plen ? payload.data() : nullptr, plen, skip.data(),
+                    skip.size(), &written),
+          GCOMP_OK);
+      ASSERT_EQ(written, skip.size());
+
+      std::string where = "variant " + std::to_string(variant) + " payload " +
+          std::to_string(plen);
+
+      // Ahead of the data, behind it, and on both sides.
+      std::vector<std::pair<std::string, std::vector<uint8_t>>> streams = {
+          {"before", skip + frame},
+          {"after", frame + skip},
+          {"both", skip + frame + skip},
+          {"doubled before", skip + skip + frame},
+      };
+      for (auto & [placement, stream] : streams) {
+        std::vector<uint8_t> back;
+        std::string err;
+        ASSERT_TRUE(realLz4Decode(stream, &back, &err))
+            << where << " " << placement
+            << ": liblz4 refused a skippable frame we wrote (" << err << ")";
+        ASSERT_EQ(back, data) << where << " " << placement;
+
+        // And our own decoder agrees about the same bytes.
+        bool ok = false;
+        std::vector<uint8_t> ours = gcompDecode(stream, data.size(), &ok, 1);
+        ASSERT_TRUE(ok) << where << " " << placement;
+        ASSERT_EQ(ours, data) << where << " " << placement;
+      }
+    }
+  }
+}
+
+TEST_F(Lz4SpecOracleTest, EmbeddedMetadataSurvivesARoundTrip) {
+  // The point of the writer: carry an application's own bytes through an LZ4
+  // stream that other tools still read as ordinary data.  This walks the
+  // whole path -- write the metadata, compress the data, concatenate, then
+  // recover both sides -- because the writer, the parser and the decoder are
+  // only useful if they compose.
+  const RealLz4 & lib = realLz4();
+
+  const std::string note = "ghoti.io/compress: unit test metadata, v1";
+  std::vector<uint8_t> meta(note.begin(), note.end());
+  std::vector<uint8_t> data = proseLike(9000, 12u);
+
+  std::vector<uint8_t> skip(GCOMP_LZ4_SKIPPABLE_OVERHEAD + meta.size());
+  size_t written = 0;
+  ASSERT_EQ(gcomp_lz4_write_skippable_frame(3, meta.data(), meta.size(),
+                skip.data(), skip.size(), &written),
+      GCOMP_OK);
+  ASSERT_EQ(written, skip.size());
+
+  std::vector<uint8_t> stream = skip + gcompEncode(data);
+
+  // The data comes back, from us and from the real library.
+  bool ok = false;
+  std::vector<uint8_t> back = gcompDecode(stream, data.size(), &ok, 0);
+  ASSERT_TRUE(ok);
+  ASSERT_EQ(back, data);
+  if (lib.ok()) {
+    std::vector<uint8_t> real_back;
+    std::string err;
+    ASSERT_TRUE(realLz4Decode(stream, &real_back, &err)) << err;
+    ASSERT_EQ(real_back, data);
+  }
+
+  // And the metadata comes back, which the decoder alone cannot give you --
+  // it discards skippable frames, as the format requires.
+  unsigned variant = 99;
+  size_t offset = 0, payload_size = 0, frame_size = 0;
+  ASSERT_EQ(gcomp_lz4_read_skippable_frame(stream.data(), stream.size(),
+                &variant, &offset, &payload_size, &frame_size),
+      GCOMP_OK);
+  EXPECT_EQ(variant, 3u);
+  EXPECT_EQ(payload_size, meta.size());
+  EXPECT_EQ(frame_size, skip.size());
+  EXPECT_EQ(
+      std::string(stream.begin() + (long)offset,
+          stream.begin() + (long)offset + (long)payload_size),
+      note);
+
+  // frame_size steps past it to the data frame, which is where a caller
+  // walking a stream of mixed frames would carry on.
+  EXPECT_EQ(gcomp_lz4_read_skippable_frame(stream.data() + frame_size,
+                stream.size() - frame_size, nullptr, nullptr, nullptr,
+                nullptr),
+      GCOMP_ERR_CORRUPT)
+      << "what follows the skippable frame is a data frame, not another "
+         "skippable one";
+}
+
 TEST_F(Lz4SpecOracleTest, RealLz4_ReadsTheReferenceFrames) {
   // Checks the oracle, not the library.  Without this, the reference above is
   // only known to agree with the implementation it is testing -- which is the
