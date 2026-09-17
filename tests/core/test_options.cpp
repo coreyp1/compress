@@ -592,17 +592,20 @@ TEST(OptionValidationTest, ZeroMeansUnlimitedForEveryLimitOnEveryMethod) {
       "limits.max_memory_bytes", "limits.max_expansion_ratio"};
 
   for (const char * method : {"deflate", "gzip", "lz4", "lzw", "rle", "zstd"}) {
-    std::vector<uint8_t> enc(data.size() * 2 + 65536);
-    size_t enc_len = 0;
-    ASSERT_EQ(gcomp_encode_buffer(nullptr, method, nullptr, data.data(),
-                  data.size(), enc.data(), enc.size(), &enc_len),
-        GCOMP_OK)
-        << method;
-
     for (const char * key : kKeys) {
       gcomp_options_t * opts = nullptr;
       ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
       gcomp_options_set_uint64(opts, key, 0);
+
+      // Encoding with the limit set matters too, and setting it only on the
+      // decode side is how zstd's encoder memory check stayed uncaught: the
+      // limits are read on both paths.
+      std::vector<uint8_t> enc(data.size() * 2 + 65536);
+      size_t enc_len = 0;
+      ASSERT_EQ(gcomp_encode_buffer(nullptr, method, opts, data.data(),
+                    data.size(), enc.data(), enc.size(), &enc_len),
+          GCOMP_OK)
+          << method << " encoding with " << key << " = 0 (means unlimited)";
 
       std::vector<uint8_t> dec(data.size() + 65536);
       size_t dec_len = 0;
@@ -611,7 +614,7 @@ TEST(OptionValidationTest, ZeroMeansUnlimitedForEveryLimitOnEveryMethod) {
       gcomp_options_destroy(opts);
 
       ASSERT_EQ(st, GCOMP_OK)
-          << method << " with " << key << " = 0 (which means unlimited)";
+          << method << " decoding with " << key << " = 0 (means unlimited)";
       dec.resize(dec_len);
       EXPECT_EQ(dec, data) << method << " with " << key << " = 0";
     }
