@@ -13,6 +13,7 @@
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
+#include <ghoti.io/compress/namespace.h>
 #include <ghoti.io/compress/stream.h>
 #include <gtest/gtest.h>
 #include <vector>
@@ -1500,6 +1501,97 @@ TEST_F(DeflateEncoderTest, Finish_SmallBuffer_AllLevels) {
     gcomp_decoder_destroy(decoder_);
     decoder_ = nullptr;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Length and distance code tables
+// ---------------------------------------------------------------------------
+
+extern "C" {
+uint32_t gcomp_deflate_length_code(uint32_t length);
+uint32_t gcomp_deflate_distance_code(uint32_t distance);
+}
+
+namespace {
+
+// The base tables of RFC 1951 section 3.2.5, transcribed here from the spec
+// rather than from the encoder, so that a typo in one is not copied into the
+// other.
+const uint16_t kSpecLengthBase[29] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17,
+    19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
+const uint16_t kSpecDistanceBase[30] = {1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49,
+    65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
+    8193, 12289, 16385, 24577};
+
+// The definition, stated as a search: the code is the one whose base is the
+// largest that does not exceed the value.  The encoder answers by table; these
+// say what the table has to contain.
+uint32_t SpecLengthCode(uint32_t length) {
+  uint32_t code = 0;
+  for (uint32_t i = 0; i < 29; i++) {
+    if (length >= kSpecLengthBase[i]) {
+      code = 257 + i;
+    }
+  }
+  return code;
+}
+
+uint32_t SpecDistanceCode(uint32_t distance) {
+  uint32_t code = 0;
+  for (uint32_t i = 0; i < 30; i++) {
+    if (distance >= kSpecDistanceBase[i]) {
+      code = i;
+    }
+  }
+  return code;
+}
+
+} // namespace
+
+// Every length the format allows, all 256 of them.
+TEST(DeflateEncodeCodeTables, LengthCodeMatchesTheSpecForEveryLength) {
+  for (uint32_t length = 3; length <= 258; length++) {
+    EXPECT_EQ(gcomp_deflate_length_code(length), SpecLengthCode(length))
+        << "length " << length;
+  }
+}
+
+// Every distance the format allows, all 32768 of them.  The table is split at
+// 256 and indexed by (distance - 1) >> 7 above that, so the whole range has to
+// be walked to show the split is where the encoder thinks it is.
+TEST(DeflateEncodeCodeTables, DistanceCodeMatchesTheSpecForEveryDistance) {
+  for (uint32_t distance = 1; distance <= 32768; distance++) {
+    EXPECT_EQ(gcomp_deflate_distance_code(distance), SpecDistanceCode(distance))
+        << "distance " << distance;
+  }
+}
+
+// The extra-bits arithmetic elsewhere in the encoder computes
+// `value - base[code]`, which is only in range if the value really does fall
+// inside that code's span.
+TEST(DeflateEncodeCodeTables, EveryValueFallsInsideItsOwnCodeSpan) {
+  for (uint32_t length = 3; length <= 258; length++) {
+    uint32_t code = gcomp_deflate_length_code(length);
+    ASSERT_GE(code, 257u);
+    ASSERT_LE(code, 285u);
+    EXPECT_GE(length, kSpecLengthBase[code - 257]) << "length " << length;
+  }
+  for (uint32_t distance = 1; distance <= 32768; distance++) {
+    uint32_t code = gcomp_deflate_distance_code(distance);
+    ASSERT_LE(code, 29u);
+    EXPECT_GE(distance, kSpecDistanceBase[code]) << "distance " << distance;
+  }
+}
+
+// Out of range in either direction is rejected rather than indexed.
+TEST(DeflateEncodeCodeTables, OutOfRangeValuesReturnZero) {
+  EXPECT_EQ(gcomp_deflate_length_code(0u), 0u);
+  EXPECT_EQ(gcomp_deflate_length_code(2u), 0u);
+  EXPECT_EQ(gcomp_deflate_length_code(259u), 0u);
+  EXPECT_EQ(gcomp_deflate_length_code(0xFFFFFFFFu), 0u);
+  EXPECT_EQ(gcomp_deflate_distance_code(0u), 0u);
+  EXPECT_EQ(gcomp_deflate_distance_code(32769u), 0u);
+  EXPECT_EQ(gcomp_deflate_distance_code(0xFFFFFFFFu), 0u);
 }
 
 int main(int argc, char ** argv) {

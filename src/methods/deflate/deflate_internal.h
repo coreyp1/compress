@@ -25,6 +25,23 @@ extern "C" {
 #endif
 
 /**
+ * @brief Map a match length (3..258) to its length code (257..285).
+ *
+ * RFC 1951 section 3.2.5.  Returns 0 for a length outside that range, which
+ * is not a valid length code and so cannot be mistaken for a result.
+ */
+GCOMP_INTERNAL_API uint32_t gcomp_deflate_length_code(uint32_t length);
+
+/**
+ * @brief Map a match distance (1..32768) to its distance code (0..29).
+ *
+ * RFC 1951 section 3.2.5.  Returns 0 for a distance outside that range;
+ * callers are responsible for not offering one, since 0 is also the code for
+ * distance 1.
+ */
+GCOMP_INTERNAL_API uint32_t gcomp_deflate_distance_code(uint32_t distance);
+
+/**
  * @brief Create and attach deflate decoder state to a decoder.
  *
  * On success, sets @c decoder->method_state and @c decoder->update_fn /

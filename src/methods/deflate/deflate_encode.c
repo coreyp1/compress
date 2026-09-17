@@ -401,34 +401,96 @@ static const uint8_t k_dist_extra[30] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5,
 /**
  * @brief Find the length code (257..285) for a given match length (3..258).
  */
-static uint32_t deflate_length_code(uint32_t length) {
+/**
+ * @brief Length and distance code lookups (RFC 1951 section 3.2.5).
+ *
+ * These were linear scans over k_len_base and k_dist_base, run up to three
+ * times per emitted match - once to count symbols and again in whichever
+ * block writer runs - and together they were about 8% of the encoder's
+ * instruction count.  They are lookups now.
+ *
+ * @ref k_len_code is indexed by `length - 3`, covering lengths 3..258.
+ *
+ * Distances need 32768 entries to index directly, so they are split the way
+ * zlib splits them: @ref k_dist_code_low covers 1..256 by `distance - 1`,
+ * and @ref k_dist_code_high covers 257..32768 by `(distance - 1) >> 7`.  The
+ * high half works because every distance code from 257 up spans a whole
+ * number of 128-wide buckets.
+ *
+ * Both tables were generated from the same k_len_base/k_dist_base the scans
+ * used.  DeflateEncodeCodeTables in the test suite re-derives the scan for
+ * every one of the 256 lengths and 32768 distances and checks it against the
+ * table, so the tables cannot drift from the bases they came from.
+ */
+static const uint8_t k_len_code[256] = {
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 12, 12, 13,
+    13, 13, 13, 14, 14, 14, 14, 15, 15, 15, 15, 16, 16, 16, 16, 16, 16, 16,
+    16, 17, 17, 17, 17, 17, 17, 17, 17, 18, 18, 18, 18, 18, 18, 18, 18, 19,
+    19, 19, 19, 19, 19, 19, 19, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20,
+    20, 20, 20, 20, 20, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21,
+    21, 21, 21, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22,
+    22, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 24,
+    24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+    24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 25, 25, 25, 25, 25,
+    25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25,
+    25, 25, 25, 25, 25, 25, 25, 25, 25, 26, 26, 26, 26, 26, 26, 26, 26, 26,
+    26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26,
+    26, 26, 26, 26, 26, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27,
+    27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27,
+    28
+};
+
+static const uint8_t k_dist_code_low[256] = {
+    0, 1, 2, 3, 4, 4, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 8, 8, 8, 8, 8, 9,
+    9, 9, 9, 9, 9, 9, 9, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10,
+    10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11,
+    11, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+    12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 13, 13, 13,
+    13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13,
+    13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 14, 14, 14, 14, 14, 14, 14,
+    14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
+    14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
+    14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
+    14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15
+};
+
+static const uint8_t k_dist_code_high[256] = {
+    0, 14, 16, 17, 18, 18, 19, 19, 20, 20, 20, 20, 21, 21, 21, 21, 22, 22, 22,
+    22, 22, 22, 22, 22, 23, 23, 23, 23, 23, 23, 23, 23, 24, 24, 24, 24, 24,
+    24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 25,
+    25, 25, 25, 25, 25, 25, 25, 25, 25, 26, 26, 26, 26, 26, 26, 26, 26, 26,
+    26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26,
+    26, 26, 26, 26, 26, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27,
+    27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27,
+    27, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 29, 29, 29, 29, 29, 29, 29,
+    29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29,
+    29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29,
+    29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29,
+    29, 29, 29
+};
+
+uint32_t gcomp_deflate_length_code(uint32_t length) {
   if (length < 3 || length > 258) {
     return 0; // Invalid
   }
-  // Binary search or table lookup
-  for (uint32_t i = 0; i < 29; i++) {
-    uint32_t next_base = (i + 1 < 29) ? k_len_base[i + 1] : 259;
-    if (length >= k_len_base[i] && length < next_base) {
-      return 257 + i;
-    }
-  }
-  return 285; // Length 258
+  return 257u + k_len_code[length - 3u];
 }
 
 /**
  * @brief Find the distance code (0..29) for a given distance (1..32768).
  */
-static uint32_t deflate_distance_code(uint32_t distance) {
+uint32_t gcomp_deflate_distance_code(uint32_t distance) {
   if (distance < 1 || distance > 32768) {
     return 0; // Invalid
   }
-  for (uint32_t i = 0; i < 30; i++) {
-    uint32_t next_base = (i + 1 < 30) ? k_dist_base[i + 1] : 32769;
-    if (distance >= k_dist_base[i] && distance < next_base) {
-      return i;
-    }
-  }
-  return 29; // Max distance
+  return (distance <= 256u) ? k_dist_code_low[distance - 1u]
+                            : k_dist_code_high[(distance - 1u) >> 7u];
 }
 
 //
@@ -871,7 +933,7 @@ static gcomp_status_t deflate_flush_fixed_block(
     else {
       // Length/distance pair
       // lit contains the length (3..258)
-      uint32_t len_code = deflate_length_code(lit);
+      uint32_t len_code = gcomp_deflate_length_code(lit);
       uint32_t len_sym = len_code - 257;
 
       s = deflate_write_symbol(
@@ -891,7 +953,7 @@ static gcomp_status_t deflate_flush_fixed_block(
       }
 
       // Write distance code
-      uint32_t dist_code = deflate_distance_code(dist);
+      uint32_t dist_code = gcomp_deflate_distance_code(dist);
       s = deflate_write_symbol(
           st, st->fixed_dist_codes[dist_code], st->fixed_dist_lens[dist_code]);
       if (s != GCOMP_OK) {
@@ -1387,7 +1449,7 @@ static gcomp_status_t deflate_write_dynamic_block_data(
     }
     else {
       // Length/distance pair
-      uint32_t len_code = deflate_length_code(lit);
+      uint32_t len_code = gcomp_deflate_length_code(lit);
       uint32_t len_sym = len_code - 257;
 
       s = gcomp_deflate_bitwriter_write_bits(
@@ -1407,7 +1469,7 @@ static gcomp_status_t deflate_write_dynamic_block_data(
       }
 
       // Write distance code
-      uint32_t dist_code = deflate_distance_code(dist);
+      uint32_t dist_code = gcomp_deflate_distance_code(dist);
       s = gcomp_deflate_bitwriter_write_bits(
           &st->bitwriter, dist_codes[dist_code], dist_lengths[dist_code]);
       if (s != GCOMP_OK) {
@@ -2297,9 +2359,9 @@ static gcomp_status_t deflate_encode_batch(
 
           // Track frequencies for dynamic Huffman
           if (st->lit_freq) {
-            uint32_t len_code = deflate_length_code(match.length);
+            uint32_t len_code = gcomp_deflate_length_code(match.length);
             st->lit_freq[len_code]++;
-            uint32_t dist_code = deflate_distance_code(match.distance);
+            uint32_t dist_code = gcomp_deflate_distance_code(match.distance);
             st->dist_freq[dist_code]++;
           }
 
