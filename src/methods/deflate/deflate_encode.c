@@ -91,6 +91,15 @@ typedef enum {
 //   checks if the next position has a longer match before committing
 // - This extra effort helps find the longer patterns typical in filtered data
 //
+// Note that this is the opposite of what zlib's Z_FILTERED does. zlib reduces
+// effort - it forces matches to be at least six bytes and leans on Huffman
+// coding - so Z_FILTERED is *faster* than its default. This one is slower:
+// measured on real PNG filtered rows it runs at about 1.9 MB/s against 6.6
+// MB/s for DEFAULT, and whether it produces a smaller file depends on the
+// image. The image library measured six of them and found this strategy
+// smaller on smooth and synthetic content by up to 9% and larger on
+// photographic content by up to 9%. Worth knowing before choosing it by name.
+//
 // DEFLATE_STRATEGY_HUFFMAN_ONLY (strategy="huffman_only")
 // -------------------------------------------------------
 // Skip LZ77 entirely; emit all input bytes as literals.
