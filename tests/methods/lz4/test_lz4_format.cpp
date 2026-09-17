@@ -1374,10 +1374,31 @@ TEST_F(Lz4FormatTest, PeekRejectsWhatIsNotAFrameHeader) {
   EXPECT_EQ(gcomp_lz4_peek_frame_info(bad.data(), bad.size(), &info, nullptr),
       GCOMP_ERR_CORRUPT);
 
+  // Repairing the header checksum after mutating FLG or BD is what makes
+  // these tests test anything.  Without it every mutation is rejected by the
+  // checksum and the rule being aimed at is never reached -- removing the
+  // reserved-bit and block-size checks outright still passed an earlier
+  // version of this test.
+  auto repairChecksum = [](std::vector<uint8_t> & f) {
+    size_t hc_pos = 6;
+    if (f[4] & 0x08) {
+      hc_pos += 8;
+    }
+    if (f[4] & 0x01) {
+      hc_pos += 4;
+    }
+    if (hc_pos >= f.size()) {
+      return;
+    }
+    uint32_t hash = gcomp_xxhash32(f.data() + 4, hc_pos - 4, 0);
+    f[hc_pos] = (uint8_t)((hash >> 8) & 0xFF);
+  };
+
   // Version bits other than 01.
   for (uint8_t version : {0x00, 0x80, 0xC0}) {
     bad = frame;
     bad[4] = (uint8_t)((bad[4] & 0x3F) | version);
+    repairChecksum(bad);
     EXPECT_EQ(gcomp_lz4_peek_frame_info(bad.data(), bad.size(), &info, nullptr),
         GCOMP_ERR_CORRUPT)
         << "version bits 0x" << std::hex << (int)version;
@@ -1386,20 +1407,49 @@ TEST_F(Lz4FormatTest, PeekRejectsWhatIsNotAFrameHeader) {
   // FLG reserved bit, and BD reserved bits.
   bad = frame;
   bad[4] |= 0x02;
+  repairChecksum(bad);
   EXPECT_EQ(gcomp_lz4_peek_frame_info(bad.data(), bad.size(), &info, nullptr),
-      GCOMP_ERR_CORRUPT);
-  bad = frame;
-  bad[5] |= 0x0F;
-  EXPECT_EQ(gcomp_lz4_peek_frame_info(bad.data(), bad.size(), &info, nullptr),
-      GCOMP_ERR_CORRUPT);
-
-  // Block size codes 0 through 3 are not defined.
-  for (uint8_t code = 0; code <= 3; code++) {
+      GCOMP_ERR_CORRUPT)
+      << "FLG reserved bit set";
+  for (uint8_t bits = 1; bits <= 0x0F; bits++) {
     bad = frame;
-    bad[5] = (uint8_t)(code << 4);
+    bad[5] = (uint8_t)((bad[5] & 0xF0) | bits);
+    repairChecksum(bad);
     EXPECT_EQ(gcomp_lz4_peek_frame_info(bad.data(), bad.size(), &info, nullptr),
         GCOMP_ERR_CORRUPT)
-        << "block size code " << (int)code;
+        << "BD reserved bits 0x" << std::hex << (int)bits;
+  }
+
+  // Block size codes 0 through 3 are not defined.  The header checksum has to
+  // be recomputed for each one: simply overwriting BD breaks the checksum too,
+  // and then the rejection proves only that the checksum works.  An earlier
+  // version of this test did exactly that, and removing the block-size check
+  // entirely still passed it.
+  for (uint8_t code = 0; code <= 7; code++) {
+    bad = frame;
+    bad[5] = (uint8_t)((bad[5] & 0x0F) | (code << 4));
+    size_t hc_pos = 6;
+    if (bad[4] & 0x08) {
+      hc_pos += 8; // content size
+    }
+    if (bad[4] & 0x01) {
+      hc_pos += 4; // dict id
+    }
+    ASSERT_LT(hc_pos, bad.size());
+    uint32_t hash = gcomp_xxhash32(bad.data() + 4, hc_pos - 4, 0);
+    bad[hc_pos] = (uint8_t)((hash >> 8) & 0xFF);
+
+    gcomp_status_t st =
+        gcomp_lz4_peek_frame_info(bad.data(), bad.size(), &info, nullptr);
+    if (code <= 3) {
+      EXPECT_EQ(st, GCOMP_ERR_CORRUPT)
+          << "block size code " << (int)code << " is not a defined size";
+    }
+    else {
+      EXPECT_EQ(st, GCOMP_OK) << "block size code " << (int)code;
+      static const uint32_t kSizes[] = {65536u, 262144u, 1048576u, 4194304u};
+      EXPECT_EQ(info.block_max_size, kSizes[code - 4]);
+    }
   }
 
   // Header checksum.
