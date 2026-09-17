@@ -80,6 +80,13 @@
  *
  * ## Concatenated Frames
  *
+ * A skippable frame (magic 0x184D2A50-0x184D2A5F, then a 4-byte little-endian
+ * size, then that many bytes of the writer's own data) is consumed and
+ * discarded wherever one appears, and the parser returns to HEADER for
+ * whatever follows.  This is not gated on `lz4.concat`: a skippable frame in
+ * front of the data is a preamble, not a concatenation, and a stream that is
+ * nothing but skippable frames decodes to nothing rather than erroring.
+ *
  * When `lz4.concat=true`, after reaching DONE state:
  * - If more input is available, the decoder returns to HEADER state
  * - Each frame is validated independently (checksums, content size)
@@ -298,6 +305,8 @@ gcomp_status_t lz4_decoder_init(gcomp_registry_t * registry,
   state->stage = LZ4_DEC_STAGE_HEADER;
   state->header_stage = LZ4_HEADER_MAGIC;
   state->header_accum_pos = 0;
+  state->skippable_remaining = 0;
+  state->frames_completed = 0;
   state->total_input_bytes = 0;
   state->total_output_bytes = 0;
 
@@ -328,6 +337,20 @@ void lz4_decoder_destroy(gcomp_decoder_t * decoder) {
 
   gcomp_free(alloc, state);
   decoder->method_state = NULL;
+}
+
+/**
+ * @brief Retire a fully consumed skippable frame.
+ *
+ * A skippable frame produces no output and carries no history, so whatever
+ * follows -- another skippable frame, a data frame, or the end of the stream
+ * -- starts from a clean header parse.
+ */
+static void lz4_decoder_finish_skippable(lz4_decoder_state_t * state) {
+  state->frames_completed++;
+  state->stage = LZ4_DEC_STAGE_HEADER;
+  state->header_stage = LZ4_HEADER_MAGIC;
+  state->header_accum_pos = 0;
 }
 
 gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
@@ -372,11 +395,25 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
         if (state->header_accum_pos >= 4) {
           // Validate magic
           uint32_t magic = gcomp_read_le32(state->header_accum);
+          if (LZ4_IS_SKIPPABLE_MAGIC(magic)) {
+            // LZ4 Frame Format, "Skippable Frames".  Not gated on
+            // lz4.concat: a skippable frame is a frame *type* the format
+            // defines, and one sitting in front of the data -- an
+            // application's own preamble -- has no completed frame before it
+            // for concatenation to be a question about.  lz4.concat keeps its
+            // own meaning, which is whether to carry on past a finished data
+            // frame.
+            state->header_accum_pos = 0;
+            state->stage = LZ4_DEC_STAGE_SKIPPABLE_SIZE;
+            break;
+          }
           if (magic != LZ4_MAGIC) {
             state->stage = LZ4_DEC_STAGE_ERROR;
             return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
-                "invalid lz4 magic: 0x%08X (expected 0x%08X)", magic,
-                LZ4_MAGIC);
+                "invalid lz4 magic: 0x%08X (expected 0x%08X, or 0x%08X-0x%08X "
+                "for a skippable frame)",
+                magic, LZ4_MAGIC, LZ4_SKIPPABLE_MAGIC,
+                LZ4_SKIPPABLE_MAGIC | 0x0FU);
           }
           state->header_stage = LZ4_HEADER_FLG_BD;
         }
@@ -624,6 +661,7 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
           }
           else {
             state->stage = LZ4_DEC_STAGE_DONE;
+            state->frames_completed++;
           }
         }
         else {
@@ -811,7 +849,45 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
               expected, computed);
         }
         state->stage = LZ4_DEC_STAGE_DONE;
+        state->frames_completed++;
       }
+      break;
+    }
+
+    case LZ4_DEC_STAGE_SKIPPABLE_SIZE: {
+      while (state->header_accum_pos < 4 && input->used < input->size) {
+        state->header_accum[state->header_accum_pos++] =
+            ((const uint8_t *)input->data)[input->used++];
+      }
+      if (state->header_accum_pos < 4) {
+        break; // Need more input
+      }
+      state->skippable_remaining = gcomp_read_le32(state->header_accum);
+      state->header_accum_pos = 0;
+      if (state->skippable_remaining == 0) {
+        // A zero-length payload finishes the frame here.  It cannot be left
+        // to the SKIPPABLE_DATA case: reading the size may have consumed the
+        // last of the input, and the loop would then exit before that case
+        // ever ran, leaving a complete frame looking truncated.
+        lz4_decoder_finish_skippable(state);
+        break;
+      }
+      state->stage = LZ4_DEC_STAGE_SKIPPABLE_DATA;
+      break;
+    }
+
+    case LZ4_DEC_STAGE_SKIPPABLE_DATA: {
+      // The payload is the writer's business, not ours; consume and discard.
+      size_t available = input->size - input->used;
+      size_t take = (available < state->skippable_remaining)
+          ? available
+          : (size_t)state->skippable_remaining;
+      input->used += take;
+      state->skippable_remaining -= (uint32_t)take;
+      if (state->skippable_remaining > 0) {
+        break; // Need more input
+      }
+      lz4_decoder_finish_skippable(state);
       break;
     }
 
@@ -864,6 +940,17 @@ gcomp_status_t lz4_decoder_finish(
     return GCOMP_OK;
   }
 
+  // A stream may legally end on a skippable frame -- including one that is the
+  // whole stream, which decodes to nothing.  That leaves the parser waiting on
+  // the next magic number with nothing accumulated, which is indistinguishable
+  // from a stream cut off before a frame began except by whether any frame has
+  // finished.
+  if (state->stage == LZ4_DEC_STAGE_HEADER &&
+      state->header_stage == LZ4_HEADER_MAGIC &&
+      state->header_accum_pos == 0 && state->frames_completed > 0) {
+    return GCOMP_OK;
+  }
+
   if (state->stage == LZ4_DEC_STAGE_ERROR) {
     return GCOMP_ERR_INTERNAL;
   }
@@ -894,6 +981,17 @@ gcomp_status_t lz4_decoder_finish(
     return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
         "lz4 stream truncated in content checksum (%zu of 4 bytes)",
         state->content_checksum_buf_pos);
+
+  case LZ4_DEC_STAGE_SKIPPABLE_SIZE:
+    return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+        "lz4 stream truncated in skippable frame size (%zu of 4 bytes)",
+        state->header_accum_pos);
+
+  case LZ4_DEC_STAGE_SKIPPABLE_DATA:
+    return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+        "lz4 stream truncated in skippable frame payload (%u bytes "
+        "remaining)",
+        state->skippable_remaining);
 
   default:
     return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
@@ -934,6 +1032,8 @@ gcomp_status_t lz4_decoder_reset(gcomp_decoder_t * decoder) {
   state->stage = LZ4_DEC_STAGE_HEADER;
   state->header_stage = LZ4_HEADER_MAGIC;
   state->header_accum_pos = 0;
+  state->skippable_remaining = 0;
+  state->frames_completed = 0;
   state->block_size_buf_pos = 0;
   state->block_bytes_remaining = 0;
   state->block_checksum_buf_pos = 0;

@@ -433,12 +433,15 @@ protected:
     return out;
   }
 
-  std::vector<uint8_t> gcompDecode(
-      const std::vector<uint8_t> & data, size_t expected, bool * ok_out) {
+  std::vector<uint8_t> gcompDecode(const std::vector<uint8_t> & data,
+      size_t expected, bool * ok_out, int concat = -1) {
     gcomp_options_t * opts = nullptr;
     if (gcomp_options_create(&opts) != GCOMP_OK) {
       *ok_out = false;
       return {};
+    }
+    if (concat >= 0) {
+      gcomp_options_set_bool(opts, "lz4.concat", concat);
     }
     gcomp_options_set_uint64(opts, "limits.max_output_bytes", 64u << 20);
     gcomp_options_set_uint64(opts, "limits.max_expansion_ratio", 1000000);
@@ -692,6 +695,35 @@ bool countCrossBlockMatches(const std::vector<uint8_t> & f, MatchStats * out) {
   }
   *out = st;
   return true;
+}
+
+// Builds a skippable frame from the specification: LZ4 Frame Format,
+// "Skippable Frames" -- a magic of 0x184D2A50 through 0x184D2A5F (the low
+// nibble is the writer's to choose), a 4-byte little-endian size, and that
+// many bytes of the writer's own data.  Written from the spec rather than
+// taken from any implementation, and anchored by feeding the same bytes to
+// liblz4.
+std::vector<uint8_t> makeSkippableFrame(
+    unsigned nibble, const std::vector<uint8_t> & payload) {
+  const uint32_t magic = 0x184D2A50u | (nibble & 0x0Fu);
+  std::vector<uint8_t> f;
+  f.reserve(8 + payload.size());
+  for (int i = 0; i < 4; i++) {
+    f.push_back((uint8_t)((magic >> (8 * i)) & 0xFF));
+  }
+  const uint32_t size = (uint32_t)payload.size();
+  for (int i = 0; i < 4; i++) {
+    f.push_back((uint8_t)((size >> (8 * i)) & 0xFF));
+  }
+  f.insert(f.end(), payload.begin(), payload.end());
+  return f;
+}
+
+std::vector<uint8_t> operator+(
+    const std::vector<uint8_t> & a, const std::vector<uint8_t> & b) {
+  std::vector<uint8_t> out(a);
+  out.insert(out.end(), b.begin(), b.end());
+  return out;
 }
 
 struct BlockSizeCase {
@@ -994,9 +1026,14 @@ bool realLz4Decode(const std::vector<uint8_t> & frame,
     }
     produced += osz;
     consumed += isz;
-    if (r == 0) {
-      break;
+    if (r == 0 && consumed >= frame.size()) {
+      break; // A frame ended and nothing follows it.
     }
+    // r == 0 with input still to go means one frame of several ended -- a
+    // skippable frame ahead of the data, say.  Keep feeding; LZ4F_decompress
+    // starts the next frame on the following call.  Every single-frame caller
+    // reaches r == 0 with the input exhausted, so this is the same for them.
+
     if (osz == 0 && isz == 0) {
       *err = "stalled";
       ok = false;
@@ -1349,6 +1386,182 @@ TEST_F(Lz4SpecOracleTest, LinkedBlocksSurviveAwkwardStreaming) {
       ASSERT_EQ(back, data) << where;
     }
   }
+}
+
+TEST_F(Lz4SpecOracleTest, SkippableFramesAreSkipped) {
+  // LZ4 Frame Format, "Skippable Frames".  A decoder that rejects one cannot
+  // read files other tools legitimately write, so this is an interoperability
+  // requirement rather than a nicety.
+  const RealLz4 & lib = realLz4();
+
+  std::vector<uint8_t> data = proseLike(3000, 77u);
+  std::vector<uint8_t> frame = gcompEncode(data);
+  ASSERT_FALSE(frame.empty());
+
+  std::vector<uint8_t> payload;
+  for (int i = 0; i < 300; i++) {
+    payload.push_back((uint8_t)(i * 7 + 1));
+  }
+  const std::vector<uint8_t> empty;
+
+  struct Case {
+    const char * name;
+    bool before, after;
+    unsigned nibble;
+    bool empty_payload;
+  };
+  std::vector<Case> cases;
+  // Every nibble, since the low four bits are the writer's to choose and a
+  // decoder must skip the frame whatever they say.
+  for (unsigned nibble = 0; nibble < 16; nibble++) {
+    cases.push_back({"before", true, false, nibble, false});
+    cases.push_back({"after", false, true, nibble, false});
+    cases.push_back({"both", true, true, nibble, true});
+  }
+
+  for (const Case & c : cases) {
+    const std::vector<uint8_t> & pl = c.empty_payload ? empty : payload;
+    std::vector<uint8_t> skip = makeSkippableFrame(c.nibble, pl);
+
+    std::vector<uint8_t> stream;
+    if (c.before) {
+      stream = stream + skip;
+    }
+    stream = stream + frame;
+    if (c.after) {
+      stream = stream + skip;
+    }
+
+    for (int concat = 0; concat <= 1; concat++) {
+      std::string where = std::string(c.name) + " nibble=" +
+          std::to_string(c.nibble) +
+          (c.empty_payload ? " empty" : " 300-byte") +
+          " concat=" + std::to_string(concat);
+      bool ok = false;
+      std::vector<uint8_t> back =
+          gcompDecode(stream, data.size(), &ok, concat);
+      ASSERT_TRUE(ok) << where << ": our decoder rejected a skippable frame";
+      ASSERT_EQ(back, data) << where;
+    }
+
+    // Anchor the constructed frames: the real library has to agree that what
+    // this test built is a skippable frame, or the test proves nothing about
+    // the format.
+    if (lib.ok()) {
+      std::vector<uint8_t> real_back;
+      std::string err;
+      ASSERT_TRUE(realLz4Decode(stream, &real_back, &err))
+          << c.name << " nibble=" << c.nibble
+          << ": liblz4 refused the stream this test built (" << err << ")";
+      ASSERT_EQ(real_back, data) << c.name << " nibble=" << c.nibble;
+    }
+  }
+
+  // Several in a row, mixed sizes and nibbles, ahead of the data.
+  std::vector<uint8_t> run = makeSkippableFrame(0, payload) +
+      makeSkippableFrame(1, empty) + makeSkippableFrame(15, payload) + frame;
+  bool ok = false;
+  std::vector<uint8_t> back = gcompDecode(run, data.size(), &ok, 0);
+  ASSERT_TRUE(ok) << "three skippable frames ahead of the data";
+  ASSERT_EQ(back, data);
+
+  // A stream that is nothing but a skippable frame decodes to nothing, and is
+  // not an error.  It ends with the parser waiting on a magic number, which
+  // is also what a truncated stream looks like -- the difference is whether a
+  // frame finished.
+  std::vector<uint8_t> alone = makeSkippableFrame(3, payload);
+  ok = false;
+  back = gcompDecode(alone, 0, &ok, 0);
+  EXPECT_TRUE(ok) << "a lone skippable frame should decode to nothing";
+  EXPECT_TRUE(back.empty());
+}
+
+TEST_F(Lz4SpecOracleTest, SkippableFramesSurviveByteAtATime) {
+  // The magic, the size field and the payload can each be split across
+  // update() calls; the zero-length payload is the awkward one, because the
+  // frame ends on the same call that read its size.
+  std::vector<uint8_t> data = proseLike(2000, 5u);
+  std::vector<uint8_t> frame = gcompEncode(data);
+  ASSERT_FALSE(frame.empty());
+
+  std::vector<uint8_t> payload(200, 0xA5);
+  std::vector<uint8_t> stream = makeSkippableFrame(2, payload) + frame +
+      makeSkippableFrame(9, std::vector<uint8_t>());
+
+  for (size_t chunk : {(size_t)1, (size_t)2, (size_t)3, (size_t)7, (size_t)8,
+           (size_t)9, (size_t)207, (size_t)208}) {
+    gcomp_options_t * opts = nullptr;
+    ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+    gcomp_options_set_bool(opts, "lz4.concat", 1);
+    gcomp_options_set_uint64(opts, "limits.max_output_bytes", 1u << 20);
+    gcomp_options_set_uint64(opts, "limits.max_expansion_ratio", 1000000);
+
+    gcomp_decoder_t * dec = nullptr;
+    ASSERT_EQ(gcomp_decoder_create(registry_, "lz4", opts, &dec), GCOMP_OK);
+    gcomp_options_destroy(opts);
+
+    std::string where = "chunk=" + std::to_string(chunk);
+    std::vector<uint8_t> out(data.size() + 65536);
+    size_t out_len = 0, in_used = 0;
+    while (in_used < stream.size()) {
+      size_t take = std::min(chunk, stream.size() - in_used);
+      gcomp_buffer_t ib = {stream.data() + in_used, take, 0};
+      while (ib.used < ib.size) {
+        gcomp_buffer_t ob = {out.data() + out_len, out.size() - out_len, 0};
+        ASSERT_EQ(gcomp_decoder_update(dec, &ib, &ob), GCOMP_OK) << where;
+        out_len += ob.used;
+        ASSERT_FALSE(ob.used == 0 && ib.used == 0) << where << ": stalled";
+      }
+      in_used += ib.used;
+    }
+    gcomp_buffer_t ob = {out.data() + out_len, out.size() - out_len, 0};
+    ASSERT_EQ(gcomp_decoder_finish(dec, &ob), GCOMP_OK)
+        << where << ": a stream ending on a skippable frame was called "
+                    "truncated";
+    out_len += ob.used;
+    gcomp_decoder_destroy(dec);
+
+    out.resize(out_len);
+    ASSERT_EQ(out, data) << where;
+  }
+}
+
+TEST_F(Lz4SpecOracleTest, SkippableIsNotAWildcardForBadMagic) {
+  // Only 0x184D2A50-0x184D2A5F are skippable.  Neighbouring values must stay
+  // errors, or "skip what you don't recognise" quietly swallows corruption.
+  std::vector<uint8_t> data = proseLike(500, 9u);
+  std::vector<uint8_t> frame = gcompEncode(data);
+
+  static const uint32_t kBad[] = {
+      0x184D2A40u, 0x184D2A60u, 0x184D2A99u, 0x184D2A4Fu, 0x184D2B50u,
+      0x174D2A50u, 0x184D2205u, 0x00000000u};
+  for (uint32_t magic : kBad) {
+    std::vector<uint8_t> stream;
+    for (int i = 0; i < 4; i++) {
+      stream.push_back((uint8_t)((magic >> (8 * i)) & 0xFF));
+    }
+    for (int i = 0; i < 4; i++) {
+      stream.push_back(0); // a size field, if it were skippable
+    }
+    stream = stream + frame;
+
+    bool ok = true;
+    gcompDecode(stream, data.size(), &ok, 0);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "0x%08X", magic);
+    EXPECT_FALSE(ok) << "magic " << buf << " is not skippable and must be "
+                                           "rejected";
+  }
+
+  // A skippable frame whose payload is cut short is a truncated stream, not a
+  // clean end -- the size field promised bytes that never arrived.
+  std::vector<uint8_t> truncated =
+      makeSkippableFrame(0, std::vector<uint8_t>(100, 'x'));
+  truncated.resize(truncated.size() - 40);
+  bool ok = true;
+  gcompDecode(truncated, 0, &ok, 0);
+  EXPECT_FALSE(ok) << "a truncated skippable payload must not read as a clean "
+                      "end of stream";
 }
 
 TEST_F(Lz4SpecOracleTest, RealLz4_ReadsTheReferenceFrames) {

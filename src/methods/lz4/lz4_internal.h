@@ -57,6 +57,24 @@ extern "C" {
 //
 
 #define LZ4_MAGIC 0x184D2204U     ///< LZ4 frame magic number
+
+/**
+ * @brief Lowest skippable-frame magic number.
+ *
+ * LZ4 Frame Format, "Skippable Frames": the magic is 0x184D2A50 through
+ * 0x184D2A5F -- the low nibble is the writer's to choose, so that an
+ * application can tag its own kind of embedded data.  A decoder must skip
+ * these frames whatever the nibble says.  The frame is the 4-byte magic, a
+ * 4-byte little-endian size, and that many bytes of user data.
+ */
+#define LZ4_SKIPPABLE_MAGIC 0x184D2A50U
+
+/** @brief Bits of a magic number that identify it as skippable. */
+#define LZ4_SKIPPABLE_MAGIC_MASK 0xFFFFFFF0U
+
+/** @brief True if @p magic names a skippable frame. */
+#define LZ4_IS_SKIPPABLE_MAGIC(magic) \
+  (((magic) & LZ4_SKIPPABLE_MAGIC_MASK) == LZ4_SKIPPABLE_MAGIC)
 #define LZ4_HEADER_MIN_SIZE 7     ///< Magic(4) + FLG(1) + BD(1) + HC(1)
 #define LZ4_HEADER_MAX_SIZE 19    ///< Min + ContentSize(8) + DictID(4)
 #define LZ4_TRAILER_MAX_SIZE 4    ///< Content checksum (optional)
@@ -152,6 +170,8 @@ typedef enum {
   LZ4_DEC_STAGE_BLOCK_DATA,       ///< Decompressing block content
   LZ4_DEC_STAGE_BLOCK_CHECKSUM,   ///< Reading block checksum (if enabled)
   LZ4_DEC_STAGE_CONTENT_CHECKSUM, ///< Reading content checksum (if enabled)
+  LZ4_DEC_STAGE_SKIPPABLE_SIZE,   ///< Reading a skippable frame's 4-byte size
+  LZ4_DEC_STAGE_SKIPPABLE_DATA,   ///< Discarding a skippable frame's payload
   LZ4_DEC_STAGE_DONE,             ///< Frame complete
   LZ4_DEC_STAGE_ERROR,            ///< Unrecoverable error
 } lz4_decoder_stage_t;
@@ -304,6 +324,16 @@ typedef struct {
   uint8_t * history_buffer; ///< History for back-references
   size_t history_size;      ///< Current history size
   size_t history_capacity;  ///< History buffer capacity
+
+  // Skippable frames
+  uint32_t skippable_remaining; ///< Payload bytes left to discard
+  /**
+   * Frames finished so far, skippable ones included.  finish() uses it to
+   * tell "the stream ended cleanly after a frame" from "the stream was cut
+   * off before one started" -- both leave the parser waiting on a magic
+   * number with nothing accumulated.
+   */
+  uint64_t frames_completed;
 
   // Options
   bool concat_enabled; ///< Support concatenated frames
