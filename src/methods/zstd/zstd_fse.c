@@ -494,122 +494,136 @@ gcomp_status_t zstd_fse_read_table_header(const uint8_t * src, size_t src_size,
     return GCOMP_ERR_CORRUPT;
   }
 
-  zstd_fwd_bit_reader_t br;
-  gcomp_status_t status = zstd_fwd_bit_reader_init(&br, src, src_size);
-  if (status != GCOMP_OK) {
-    return status;
+  // RFC 8878 section 4.1.1 (FSE Table Description).  The field width shrinks
+  // as the distribution is consumed, and the spec defines that shrinking as a
+  // recurrence on (threshold, nbBits) -- NOT as a width recomputed from
+  // `remaining` on each round.  Recomputing it, and starting `remaining` at
+  // 2^Accuracy_Log instead of 2^Accuracy_Log + 1, desynchronised the reader
+  // from the bitstream after the first few symbols: the counts stayed
+  // self-consistent enough to build a table, so nothing failed loudly, but
+  // the table was not the one the encoder wrote.
+  size_t bit_pos = 0;
+  const size_t total_bits = src_size * 8;
+
+  // Little-endian, least-significant-bit-first: bit i of the description is
+  // bit (i % 8) of byte (i / 8).
+
+  unsigned accuracy_log;
+  {
+    if (total_bits < 4) {
+      return GCOMP_ERR_CORRUPT;
+    }
+    uint32_t v = 0;
+    for (unsigned i = 0; i < 4; i++) {
+      v |= (uint32_t)((src[(bit_pos + i) >> 3] >> ((bit_pos + i) & 7)) & 1u)
+          << i;
+    }
+    bit_pos += 4;
+    accuracy_log = v + FSE_MIN_TABLE_LOG;
   }
 
-  // Read accuracy log (4 bits) + 5 = actual log
-  status = zstd_fwd_bit_reader_ensure(&br, 4);
-  if (status != GCOMP_OK) {
-    return status;
-  }
-
-  unsigned accuracy_log = zstd_fwd_bit_reader_read(&br, 4) + FSE_MIN_TABLE_LOG;
   if (accuracy_log > FSE_MAX_ACCURACY_LOG) {
     return GCOMP_ERR_CORRUPT;
   }
 
-  int remaining = 1 << accuracy_log;
-  unsigned symbol = 0;
-  unsigned max_symbol = 0;
+  int remaining = (1 << accuracy_log) + 1;
+  int threshold = 1 << accuracy_log;
+  unsigned nb_bits = accuracy_log + 1;
 
-  // Initialize counts to 0
+  unsigned symbol = 0;
+  bool previous0 = false;
+
   memset(norm_counts, 0, (FSE_MAX_SYMBOL_VALUE + 1) * sizeof(int16_t));
 
-  while (remaining > 0 && symbol <= FSE_MAX_SYMBOL_VALUE) {
-    // Determine number of bits needed to represent remaining
-    unsigned threshold = remaining + 1;
-    unsigned nb_bits;
-    if (threshold > 1) {
-      nb_bits = 32 - __builtin_clz(threshold - 1);
-    }
-    else {
-      nb_bits = 1;
+#define FSE_NC_PEEK(dst, count)                                                \
+  do {                                                                         \
+    if (bit_pos + (count) > total_bits) {                                      \
+      return GCOMP_ERR_CORRUPT;                                                \
+    }                                                                          \
+    uint32_t v_ = 0;                                                           \
+    for (unsigned i_ = 0; i_ < (count); i_++) {                                \
+      size_t b_ = bit_pos + i_;                                                \
+      v_ |= (uint32_t)((src[b_ >> 3] >> (b_ & 7)) & 1u) << i_;                 \
+    }                                                                          \
+    (dst) = v_;                                                                \
+  } while (0)
+
+  while (previous0 || remaining > 1) {
+    if (symbol > FSE_MAX_SYMBOL_VALUE) {
+      return GCOMP_ERR_CORRUPT;
     }
 
-    status = zstd_fwd_bit_reader_ensure(&br, nb_bits);
-    if (status != GCOMP_OK) {
-      return status;
-    }
-
-    // Read using variable-length encoding
-    unsigned low_bits = nb_bits - 1;
-    unsigned low_value = zstd_fwd_bit_reader_read(&br, low_bits);
-
-    // Calculate the cutoff
-    unsigned small_max = (1U << nb_bits) - 1 - threshold;
-
-    int count;
-    if (low_value < small_max) {
-      count = (int)low_value;
-    }
-    else {
-      status = zstd_fwd_bit_reader_ensure(&br, 1);
-      if (status != GCOMP_OK) {
-        return status;
+    if (previous0) {
+      // A zero count is followed by 2-bit repeat groups: 0b11 means "three
+      // more zeroes, keep reading", any other value ends the run.
+      for (;;) {
+        uint32_t repeat;
+        FSE_NC_PEEK(repeat, 2);
+        bit_pos += 2;
+        unsigned zeros = (repeat == 3) ? 3u : (unsigned)repeat;
+        for (unsigned i = 0; i < zeros; i++) {
+          if (symbol > FSE_MAX_SYMBOL_VALUE) {
+            return GCOMP_ERR_CORRUPT;
+          }
+          norm_counts[symbol++] = 0;
+        }
+        if (repeat != 3) {
+          break;
+        }
       }
-      unsigned extra_bit = zstd_fwd_bit_reader_read(&br, 1);
-      count = (int)(low_value + (extra_bit << low_bits) - small_max);
+      previous0 = false;
+      continue;
     }
 
-    // Convert to probability: count - 1
-    // count = 0 means prob = -1 (less than 1)
-    // count = 1 means prob = 0 (symbol not present)
-    count--;
-
-    if (count == -1) {
-      // Less than 1 probability
-      remaining--;
+    int max = (2 * threshold - 1) - remaining;
+    int count;
+    {
+      uint32_t low;
+      FSE_NC_PEEK(low, nb_bits - 1);
+      if ((int)low < max) {
+        count = (int)low;
+        bit_pos += nb_bits - 1;
+      }
+      else {
+        uint32_t full;
+        FSE_NC_PEEK(full, nb_bits);
+        bit_pos += nb_bits;
+        count = (int)full;
+        if (count >= threshold) {
+          count -= max;
+        }
+      }
     }
-    else if (count >= 0) {
-      remaining -= count;
-      if (remaining < 0) {
+
+    count--; // a stored 0 means "probability below 1", written as -1
+
+    int used = (count < 0) ? -count : count;
+    if (used > remaining) {
+      return GCOMP_ERR_CORRUPT;
+    }
+    remaining -= used;
+
+    norm_counts[symbol++] = (int16_t)count;
+    previous0 = (count == 0);
+
+    while (remaining < threshold) {
+      if (nb_bits == 0) {
         return GCOMP_ERR_CORRUPT;
       }
-    }
-
-    norm_counts[symbol] = (int16_t)count;
-    if (count != 0) {
-      max_symbol = symbol;
-    }
-
-    symbol++;
-
-    // Check for repeat zeroes
-    if (count == 0) {
-      status = zstd_fwd_bit_reader_ensure(&br, 2);
-      // It's okay if we don't have 2 bits at end
-      if (status == GCOMP_OK) {
-        unsigned repeat = zstd_fwd_bit_reader_read(&br, 2);
-        while (repeat == 3 && symbol <= FSE_MAX_SYMBOL_VALUE) {
-          norm_counts[symbol++] = 0;
-          norm_counts[symbol++] = 0;
-          norm_counts[symbol++] = 0;
-          status = zstd_fwd_bit_reader_ensure(&br, 2);
-          if (status != GCOMP_OK) {
-            break;
-          }
-          repeat = zstd_fwd_bit_reader_read(&br, 2);
-        }
-        if (repeat > 0 && repeat < 3) {
-          while (repeat > 0 && symbol <= FSE_MAX_SYMBOL_VALUE) {
-            norm_counts[symbol++] = 0;
-            repeat--;
-          }
-        }
-      }
+      nb_bits--;
+      threshold >>= 1;
     }
   }
 
-  if (remaining != 0) {
+#undef FSE_NC_PEEK
+
+  if (remaining != 1 || symbol == 0) {
     return GCOMP_ERR_CORRUPT;
   }
 
-  *max_symbol_out = max_symbol;
+  *max_symbol_out = symbol - 1;
   *table_log_out = accuracy_log;
-  *bytes_read_out = br.byte_pos;
+  *bytes_read_out = (bit_pos + 7) / 8;
 
   return GCOMP_OK;
 }
