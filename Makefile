@@ -609,13 +609,16 @@ ifeq ($(OS_NAME), Linux)
 	@printf "  Linux: Set LD_LIBRARY_PATH and run:\n"
 	@printf "    LD_LIBRARY_PATH=\"$(APP_DIR)\" $(APP_DIR)/bench/bench_deflate\n"
 	@printf "    LD_LIBRARY_PATH=\"$(APP_DIR)\" $(APP_DIR)/bench/bench_lzw\n"
+	@printf "    LD_LIBRARY_PATH=\"$(APP_DIR)\" $(APP_DIR)/bench/bench_ratio [FILE...]\n"
 else ifeq ($(OS_NAME), Mac)
 	@printf "  macOS: Set DYLD_LIBRARY_PATH and run:\n"
 	@printf "    DYLD_LIBRARY_PATH=\"$(APP_DIR)\" $(APP_DIR)/bench/bench_deflate\n"
 	@printf "    DYLD_LIBRARY_PATH=\"$(APP_DIR)\" $(APP_DIR)/bench/bench_lzw\n"
+	@printf "    DYLD_LIBRARY_PATH=\"$(APP_DIR)\" $(APP_DIR)/bench/bench_ratio [FILE...]\n"
 else ifeq ($(OS_NAME), Windows)
 	@printf "  Windows (MSYS2): Run from library directory:\n"
 	@printf "    cd $(APP_DIR) && ./bench/bench_deflate$(EXE_EXTENSION)\n"
+	@printf "    cd $(APP_DIR) && ./bench/bench_ratio$(EXE_EXTENSION) [FILE...]\n"
 	@printf "    cd $(APP_DIR) && ./bench/bench_lzw$(EXE_EXTENSION)\n"
 endif
 	@printf "\n"
