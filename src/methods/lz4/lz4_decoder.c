@@ -131,12 +131,41 @@
 // Helper: Read options and configure decoder
 //
 
-static gcomp_status_t lz4_decoder_read_options(
-    gcomp_options_t * options, lz4_decoder_state_t * state) {
+/**
+ * @brief Start the match history from the dictionary, or from nothing.
+ *
+ * LZ4 Frame Format: with linked blocks the dictionary is what precedes the
+ * first block and the frame's own output takes over from there, so this runs
+ * once per frame.  With independent blocks each block starts from the
+ * dictionary again, so it runs before every block.  That difference was
+ * settled by reading liblz4's own dictionary-compressed output rather than
+ * inferred from the specification's wording.
+ *
+ * With no dictionary this empties the history, which is what both modes did
+ * before dictionaries existed.
+ */
+static void lz4_decoder_seed_history(lz4_decoder_state_t * state) {
+  state->history_size = 0;
+  if (state->dictionary_size == 0 || !state->history_buffer) {
+    return;
+  }
+  size_t take = state->dictionary_size;
+  if (take > state->history_capacity) {
+    take = state->history_capacity;
+  }
+  memcpy(state->history_buffer,
+      state->dictionary + state->dictionary_size - take, take);
+  state->history_size = take;
+}
+
+static gcomp_status_t lz4_decoder_read_options(gcomp_options_t * options,
+    lz4_decoder_state_t * state, const gcomp_allocator_t * alloc) {
   uint64_t u64_val;
   int bool_val;
 
   // Set defaults
+  state->dictionary = NULL;
+  state->dictionary_size = 0;
   state->concat_enabled = LZ4_DEFAULT_CONCAT;
   state->max_output_bytes = LZ4_DEFAULT_MAX_OUTPUT_BYTES;
   state->max_expansion_ratio = LZ4_DEFAULT_MAX_EXPANSION_RATIO;
@@ -145,6 +174,30 @@ static gcomp_status_t lz4_decoder_read_options(
 
   if (!options) {
     return GCOMP_OK;
+  }
+
+  // Read lz4.dictionary.  Only the tail is kept: the match offset is two
+  // bytes, so a dictionary longer than LZ4_HISTORY_SIZE has an unreachable
+  // head, and this is what liblz4 does with an over-long one too.
+  {
+    const void * dict_data = NULL;
+    size_t dict_size = 0;
+    if (gcomp_options_get_bytes(options, "lz4.dictionary", &dict_data,
+            &dict_size) == GCOMP_OK &&
+        dict_data && dict_size > 0) {
+      const uint8_t * tail = (const uint8_t *)dict_data;
+      if (dict_size > LZ4_HISTORY_SIZE) {
+        tail += dict_size - LZ4_HISTORY_SIZE;
+        dict_size = LZ4_HISTORY_SIZE;
+      }
+      state->dictionary = (uint8_t *)gcomp_malloc(alloc, dict_size);
+      if (!state->dictionary) {
+        return GCOMP_ERR_MEMORY;
+      }
+      memcpy(state->dictionary, tail, dict_size);
+      state->dictionary_size = dict_size;
+      gcomp_memory_track_alloc(&state->mem_tracker, dict_size);
+    }
   }
 
   // Read lz4.concat
@@ -286,7 +339,7 @@ gcomp_status_t lz4_decoder_init(gcomp_registry_t * registry,
   gcomp_memory_track_alloc(&state->mem_tracker, sizeof(lz4_decoder_state_t));
 
   // Read options
-  gcomp_status_t status = lz4_decoder_read_options(options, state);
+  gcomp_status_t status = lz4_decoder_read_options(options, state, alloc);
   if (status != GCOMP_OK) {
     gcomp_free(alloc, state);
     return status;
@@ -300,6 +353,8 @@ gcomp_status_t lz4_decoder_init(gcomp_registry_t * registry,
   state->history_buffer = NULL;
   state->history_size = 0;
   state->history_capacity = 0;
+  // Not state->dictionary: lz4_decoder_read_options() has already run and
+  // copied it, and zeroing it here would leak the copy and lose the option.
 
   // Set initial stage
   state->stage = LZ4_DEC_STAGE_HEADER;
@@ -330,6 +385,12 @@ void lz4_decoder_destroy(gcomp_decoder_t * decoder) {
   lz4_decoder_state_t * state = (lz4_decoder_state_t *)decoder->method_state;
   const gcomp_allocator_t * alloc = state->allocator;
 
+  if (state->dictionary) {
+    gcomp_free(alloc, state->dictionary);
+    gcomp_memory_track_free(&state->mem_tracker, state->dictionary_size);
+    state->dictionary = NULL;
+    state->dictionary_size = 0;
+  }
   if (state->history_buffer) {
     gcomp_free(alloc, state->history_buffer);
   }
@@ -566,8 +627,11 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
                 "failed to allocate lz4 block buffers (%u bytes)", block_size);
           }
 
-          // Allocate history buffer for dependent blocks
-          if (!state->header.block_independence) {
+          // Allocate the history buffer for dependent blocks, and for any
+          // frame decoded against a dictionary -- an independent block reads
+          // the dictionary out of the same buffer.
+          if (!state->header.block_independence ||
+              state->dictionary_size > 0) {
             if (!state->history_buffer ||
                 state->history_capacity < LZ4_HISTORY_SIZE) {
               if (state->history_buffer) {
@@ -603,7 +667,7 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
               gcomp_memory_track_alloc(
                   &state->mem_tracker, state->history_capacity);
             }
-            state->history_size = 0;
+            lz4_decoder_seed_history(state);
           }
 
           // Check memory limit
@@ -720,6 +784,14 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
           decompressed_len = state->block_buffer_pos;
         }
         else {
+          // An independent block may reference the dictionary but not the
+          // blocks before it, so the history goes back to the dictionary
+          // alone -- and to nothing at all when there is no dictionary, which
+          // is what this did before.
+          if (state->header.block_independence) {
+            lz4_decoder_seed_history(state);
+          }
+
           // Decompress block
           gcomp_status_t status = lz4_block_decompress(state->block_buffer,
               state->block_buffer_pos, state->output_buffer,
@@ -945,9 +1017,9 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
         if (state->header.content_checksum) {
           gcomp_xxhash32_reset(&state->content_hash, 0);
         }
-        if (!state->header.block_independence && state->history_buffer) {
-          state->history_size = 0;
-        }
+        // A following frame is a new frame: its first block sees the
+        // dictionary, not the frame before it.
+        lz4_decoder_seed_history(state);
       }
       else {
         return GCOMP_OK;
@@ -1058,7 +1130,7 @@ gcomp_status_t lz4_decoder_reset(gcomp_decoder_t * decoder) {
   state->block_buffer_pos = 0;
   state->output_buffer_pos = 0;
   state->output_buffer_len = 0;
-  state->history_size = 0;
+  lz4_decoder_seed_history(state);
 
   // Memory tracker reflects retained allocations
   state->mem_tracker.current_bytes = sizeof(lz4_decoder_state_t);

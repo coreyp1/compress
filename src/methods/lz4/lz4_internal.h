@@ -348,6 +348,19 @@ typedef struct {
    */
   uint64_t frames_completed;
 
+  /**
+   * Dictionary the stream was compressed against, as supplied through
+   * `lz4.dictionary`.  Only the last LZ4_HISTORY_SIZE bytes are kept: the
+   * match offset is two bytes, so nothing earlier is reachable.
+   *
+   * LZ4 Frame Format: with linked blocks the dictionary is what precedes the
+   * first block, and the frame's own history takes over from there.  With
+   * independent blocks every block starts from the dictionary again -- which
+   * was settled against liblz4's own output, not inferred.
+   */
+  uint8_t * dictionary;
+  size_t dictionary_size;
+
   // Options
   bool concat_enabled; ///< Support concatenated frames
 

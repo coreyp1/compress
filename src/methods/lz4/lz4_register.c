@@ -25,6 +25,7 @@
  * - `lz4.content_checksum`: Enable content checksum in trailer
  * - `lz4.independent_blocks`: Use independent blocks (parallel-friendly)
  * - `lz4.concat`: Decoder: support concatenated frames
+ * - `lz4.dictionary`: Dictionary content (encoder and decoder)
  *
  * Limit options use the `limits.*` prefix (shared with core):
  * - `limits.max_output_bytes`: Maximum decompressed output
@@ -122,6 +123,20 @@ static const gcomp_option_schema_t g_lz4_option_schemas[] = {
         0,                                          // max_uint
         "Decoder: support concatenated LZ4 frames", // help
     },
+    // lz4.dictionary - Dictionary content for the encoder and decoder
+    {
+        "lz4.dictionary",  // key
+        GCOMP_OPT_BYTES,   // type
+        0,                 // has_default (optional)
+        {.str = NULL},     // default_value
+        0,                 // has_min
+        0,                 // has_max
+        0,                 // min_int
+        0,                 // max_int
+        0,                 // min_uint
+        0,                 // max_uint
+        "Dictionary content; only the last 64 KB is used", // help
+    },
     // lz4.dictionary_id - Dictionary ID (optional, parsing only in v1)
     {
         "lz4.dictionary_id",                        // key
@@ -214,6 +229,7 @@ static const char * const g_lz4_option_keys[] = {
     "lz4.content_checksum",
     "lz4.independent_blocks",
     "lz4.concat",
+    "lz4.dictionary",
     "lz4.dictionary_id",
     "lz4.content_size",
     "limits.max_output_bytes",

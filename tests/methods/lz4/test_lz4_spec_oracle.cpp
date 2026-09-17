@@ -962,8 +962,22 @@ struct RealLz4 {
   size_t (*compressBound)(size_t, const void *) = nullptr;
   size_t (*compressFrame)(void *, size_t, const void *, size_t,
       const void *) = nullptr;
+  // Dictionary entry points, used by the dictionary tests only.
+  void * (*createCDict)(const void *, size_t) = nullptr;
+  void (*freeCDict)(void *) = nullptr;
+  size_t (*createCctx)(void **, unsigned) = nullptr;
+  size_t (*freeCctx)(void *) = nullptr;
+  size_t (*beginUsingCDict)(void *, void *, size_t, const void *,
+      const void *) = nullptr;
+  size_t (*compressUpdate)(void *, void *, size_t, const void *, size_t,
+      const void *) = nullptr;
+  size_t (*compressEnd)(void *, void *, size_t, const void *) = nullptr;
 
   bool ok() const { return handle && createDctx && decompress && compressFrame; }
+  bool dictOk() const {
+    return ok() && createCDict && createCctx && beginUsingCDict &&
+        compressUpdate && compressEnd;
+  }
 };
 
 const RealLz4 & realLz4() {
@@ -992,6 +1006,18 @@ const RealLz4 & realLz4() {
         (size_t (*)(size_t, const void *))sym("LZ4F_compressFrameBound");
     out.compressFrame = (size_t (*)(void *, size_t, const void *, size_t,
         const void *))sym("LZ4F_compressFrame");
+    out.createCDict = (void * (*)(const void *, size_t))sym("LZ4F_createCDict");
+    out.freeCDict = (void (*)(void *))sym("LZ4F_freeCDict");
+    out.createCctx =
+        (size_t (*)(void **, unsigned))sym("LZ4F_createCompressionContext");
+    out.freeCctx =
+        (size_t (*)(void *))sym("LZ4F_freeCompressionContext");
+    out.beginUsingCDict = (size_t (*)(void *, void *, size_t, const void *,
+        const void *))sym("LZ4F_compressBegin_usingCDict");
+    out.compressUpdate = (size_t (*)(void *, void *, size_t, const void *,
+        size_t, const void *))sym("LZ4F_compressUpdate");
+    out.compressEnd = (size_t (*)(void *, void *, size_t,
+        const void *))sym("LZ4F_compressEnd");
     return out;
   }();
   return r;
@@ -1677,6 +1703,295 @@ TEST_F(Lz4SpecOracleTest, EmbeddedMetadataSurvivesARoundTrip) {
       GCOMP_ERR_CORRUPT)
       << "what follows the skippable frame is a data frame, not another "
          "skippable one";
+}
+
+//
+// Dictionaries
+//
+// LZ4 Frame Format: a frame may be compressed against a dictionary, which the
+// decoder must be given to read it.  liblz4 exports the compression side of
+// this, so these build genuine dictionary-compressed frames with it and read
+// them back -- there is no way to write one from the specification without
+// also writing an LZ4 encoder, so the anchor is the real library throughout.
+//
+
+// LZ4F_preferences_t as of liblz4 1.8 through 1.10: a frameInfo of
+// {blockSizeID, blockMode, contentChecksumFlag, frameType, contentSize,
+// dictID, blockChecksumFlag}, then compressionLevel, autoFlush,
+// favorDecSpeed, reserved[3].  Declared here because the layout lives in
+// lz4frame.h, which is not installed alongside the shared library.  The tests
+// below check the frame this produces against what was asked for, so a wrong
+// layout shows up as a failed assertion rather than as silence.
+struct RealLz4Prefs {
+  int block_size_id;
+  int block_mode; // 0 linked, 1 independent
+  int content_checksum;
+  int frame_type;
+  unsigned long long content_size;
+  unsigned dict_id;
+  int block_checksum;
+  int level;
+  unsigned auto_flush;
+  unsigned favor_dec_speed;
+  unsigned reserved[3];
+};
+
+// Compresses `data` with liblz4 against `dict`.  Returns an empty vector if
+// the library refuses.
+std::vector<uint8_t> realLz4CompressWithDict(const std::vector<uint8_t> & data,
+    const std::vector<uint8_t> & dict, int block_mode, int content_checksum,
+    int block_size_id) {
+  const RealLz4 & lib = realLz4();
+  void * cdict = lib.createCDict(dict.data(), dict.size());
+  if (!cdict) {
+    return {};
+  }
+  void * cctx = nullptr;
+  if (lib.isError && lib.isError(lib.createCctx(&cctx, 100))) {
+    return {};
+  }
+
+  RealLz4Prefs prefs = {};
+  prefs.block_size_id = block_size_id;
+  prefs.block_mode = block_mode;
+  prefs.content_checksum = content_checksum;
+  prefs.auto_flush = 1;
+
+  std::vector<uint8_t> out(data.size() + (data.size() / 2) + 65536);
+  size_t p = lib.beginUsingCDict(cctx, out.data(), out.size(), cdict, &prefs);
+  bool bad = lib.isError && lib.isError(p);
+  if (!bad) {
+    size_t r = lib.compressUpdate(cctx, out.data() + p, out.size() - p,
+        data.data(), data.size(), nullptr);
+    bad = lib.isError && lib.isError(r);
+    if (!bad) {
+      p += r;
+      r = lib.compressEnd(cctx, out.data() + p, out.size() - p, nullptr);
+      bad = lib.isError && lib.isError(r);
+      p += bad ? 0 : r;
+    }
+  }
+  if (lib.freeCctx) {
+    lib.freeCctx(cctx);
+  }
+  if (lib.freeCDict) {
+    lib.freeCDict(cdict);
+  }
+  if (bad) {
+    return {};
+  }
+  out.resize(p);
+  return out;
+}
+
+std::vector<uint8_t> decodeWithDictionary(const std::vector<uint8_t> & frame,
+    const std::vector<uint8_t> * dict, size_t expected, gcomp_status_t * st_out,
+    int concat = -1) {
+  gcomp_options_t * opts = nullptr;
+  if (gcomp_options_create(&opts) != GCOMP_OK) {
+    *st_out = GCOMP_ERR_INTERNAL;
+    return {};
+  }
+  if (dict && !dict->empty()) {
+    gcomp_options_set_bytes(opts, "lz4.dictionary", dict->data(), dict->size());
+  }
+  if (concat >= 0) {
+    gcomp_options_set_bool(opts, "lz4.concat", concat);
+  }
+  gcomp_options_set_uint64(opts, "limits.max_output_bytes", 64u << 20);
+  gcomp_options_set_uint64(opts, "limits.max_expansion_ratio", 1000000);
+  gcomp_options_set_uint64(opts, "limits.max_memory_bytes", 256u << 20);
+
+  std::vector<uint8_t> out(expected + 65536);
+  size_t used = out.size();
+  *st_out = gcomp_decode_buffer(nullptr, "lz4", opts, frame.data(),
+      frame.size(), out.data(), out.size(), &used);
+  gcomp_options_destroy(opts);
+  if (*st_out != GCOMP_OK) {
+    return {};
+  }
+  out.resize(used);
+  return out;
+}
+
+std::vector<uint8_t> dictionaryText(size_t n, const char * phrase) {
+  std::vector<uint8_t> d(n);
+  size_t len = strlen(phrase);
+  for (size_t i = 0; i < n; i++) {
+    d[i] = (uint8_t)phrase[i % len];
+  }
+  return d;
+}
+
+TEST_F(Lz4SpecOracleTest, DictionaryCompressedFramesDecodeInBothBlockModes) {
+  const RealLz4 & lib = realLz4();
+  if (!lib.dictOk()) {
+    GTEST_SKIP() << "liblz4 does not export the dictionary API here";
+  }
+
+  std::vector<uint8_t> dict =
+      dictionaryText(70000, "the quick brown fox jumps over the lazy dog ");
+
+  // A dictionary is only useful where it resembles the data, which is the
+  // point of having one.
+  for (size_t n : {(size_t)1, (size_t)100, (size_t)5000, (size_t)70000,
+           (size_t)200000}) {
+    std::vector<uint8_t> data =
+        dictionaryText(n, "the quick brown fox jumps over the lazy dog ");
+
+    for (int block_mode = 0; block_mode <= 1; block_mode++) {
+      for (int bsid : {4, 5}) {
+        std::vector<uint8_t> frame =
+            realLz4CompressWithDict(data, dict, block_mode, 1, bsid);
+        ASSERT_FALSE(frame.empty())
+            << "liblz4 failed to compress with a dictionary; the "
+               "LZ4F_preferences_t layout assumed by this test may be wrong";
+
+        FrameShape fs;
+        ASSERT_TRUE(walkFrame(frame, &fs)) << "n=" << n;
+        // If the preferences layout were wrong these would not match what was
+        // asked for, so they double as a check on the struct above.
+        EXPECT_EQ(fs.block_independent, block_mode != 0)
+            << "n=" << n << ": liblz4 did not honour the block mode asked for";
+        EXPECT_EQ(fs.block_size_id, (unsigned)bsid) << "n=" << n;
+
+        std::string where = "n=" + std::to_string(n) + " " +
+            (block_mode ? "independent" : "linked") + " bsid=" +
+            std::to_string(bsid);
+
+        gcomp_status_t st = GCOMP_OK;
+        std::vector<uint8_t> back =
+            decodeWithDictionary(frame, &dict, data.size(), &st);
+        ASSERT_EQ(st, GCOMP_OK)
+            << where << ": our decoder refused a dictionary-compressed frame";
+        ASSERT_EQ(back, data) << where;
+
+        // Independent blocks are the interesting half: each one starts from
+        // the dictionary again rather than from the block before it, which is
+        // not something the specification's wording settles.
+        if (block_mode == 1 && n > 65536) {
+          MatchStats stats;
+          ASSERT_TRUE(countCrossBlockMatches(frame, &stats)) << where;
+          EXPECT_GT(stats.cross_block, 0)
+              << where << ": an independent block should still be reaching "
+                          "into the dictionary";
+        }
+      }
+    }
+  }
+}
+
+TEST_F(Lz4SpecOracleTest, DictionaryFramesNeedTheDictionary) {
+  const RealLz4 & lib = realLz4();
+  if (!lib.dictOk()) {
+    GTEST_SKIP() << "liblz4 does not export the dictionary API here";
+  }
+
+  std::vector<uint8_t> dict =
+      dictionaryText(70000, "the quick brown fox jumps over the lazy dog ");
+  std::vector<uint8_t> data =
+      dictionaryText(50000, "the quick brown fox jumps over the lazy dog ");
+
+  // Without the dictionary the matches reach before anything the decoder
+  // holds, so the frame must be refused -- not decoded to whatever happens to
+  // be there.
+  std::vector<uint8_t> frame = realLz4CompressWithDict(data, dict, 0, 0, 4);
+  ASSERT_FALSE(frame.empty());
+  gcomp_status_t st = GCOMP_OK;
+  decodeWithDictionary(frame, nullptr, data.size(), &st);
+  EXPECT_EQ(st, GCOMP_ERR_CORRUPT)
+      << "a frame that needs a dictionary must be refused without one";
+
+  // The tail is what matters: the match offset is two bytes, so anything
+  // before the last 64 KB is unreachable and passing it changes nothing.
+  std::vector<uint8_t> tail(dict.end() - 65536, dict.end());
+  gcomp_status_t st_full = GCOMP_OK, st_tail = GCOMP_OK;
+  std::vector<uint8_t> from_full =
+      decodeWithDictionary(frame, &dict, data.size(), &st_full);
+  std::vector<uint8_t> from_tail =
+      decodeWithDictionary(frame, &tail, data.size(), &st_tail);
+  ASSERT_EQ(st_full, GCOMP_OK);
+  ASSERT_EQ(st_tail, GCOMP_OK);
+  EXPECT_EQ(from_full, data);
+  EXPECT_EQ(from_tail, data)
+      << "the last 64 KB of the dictionary must be enough on its own";
+}
+
+TEST_F(Lz4SpecOracleTest, WrongDictionaryIsCaughtByTheContentChecksum) {
+  const RealLz4 & lib = realLz4();
+  if (!lib.dictOk()) {
+    GTEST_SKIP() << "liblz4 does not export the dictionary API here";
+  }
+
+  std::vector<uint8_t> dict =
+      dictionaryText(70000, "the quick brown fox jumps over the lazy dog ");
+  std::vector<uint8_t> wrong =
+      dictionaryText(70000, "pack my box with five dozen liquor jugs! ");
+  std::vector<uint8_t> data =
+      dictionaryText(50000, "the quick brown fox jumps over the lazy dog ");
+
+  // This is how LZ4 works and is worth pinning down rather than discovering:
+  // the wrong dictionary yields wrong bytes, and nothing in the block format
+  // can tell.  The content checksum is the frame's own defence, and it is
+  // why a frame meant to travel with a dictionary should carry one.
+  std::vector<uint8_t> unchecked = realLz4CompressWithDict(data, dict, 0, 0, 4);
+  ASSERT_FALSE(unchecked.empty());
+  gcomp_status_t st = GCOMP_OK;
+  std::vector<uint8_t> garbled =
+      decodeWithDictionary(unchecked, &wrong, data.size(), &st);
+  EXPECT_EQ(st, GCOMP_OK)
+      << "without a content checksum there is nothing to detect this with";
+  EXPECT_NE(garbled, data) << "the wrong dictionary must not yield the right "
+                              "bytes, or this test proves nothing";
+
+  std::vector<uint8_t> checked = realLz4CompressWithDict(data, dict, 0, 1, 4);
+  ASSERT_FALSE(checked.empty());
+  FrameShape fs;
+  ASSERT_TRUE(walkFrame(checked, &fs));
+  ASSERT_TRUE(fs.content_checksum) << "this frame was asked for a checksum";
+
+  decodeWithDictionary(checked, &wrong, data.size(), &st);
+  EXPECT_EQ(st, GCOMP_ERR_CORRUPT)
+      << "the content checksum must catch a wrong dictionary";
+
+  // And the right dictionary still passes that checksum.
+  std::vector<uint8_t> good =
+      decodeWithDictionary(checked, &dict, data.size(), &st);
+  EXPECT_EQ(st, GCOMP_OK);
+  EXPECT_EQ(good, data);
+}
+
+TEST_F(Lz4SpecOracleTest, DictionaryAppliesToEveryConcatenatedFrame) {
+  const RealLz4 & lib = realLz4();
+  if (!lib.dictOk()) {
+    GTEST_SKIP() << "liblz4 does not export the dictionary API here";
+  }
+
+  std::vector<uint8_t> dict =
+      dictionaryText(70000, "the quick brown fox jumps over the lazy dog ");
+  std::vector<uint8_t> a =
+      dictionaryText(9000, "the quick brown fox jumps over the lazy dog ");
+  std::vector<uint8_t> b =
+      dictionaryText(4000, "over the lazy dog the quick brown fox jumps ");
+
+  std::vector<uint8_t> fa = realLz4CompressWithDict(a, dict, 0, 1, 4);
+  std::vector<uint8_t> fb = realLz4CompressWithDict(b, dict, 0, 1, 4);
+  ASSERT_FALSE(fa.empty());
+  ASSERT_FALSE(fb.empty());
+
+  // Each frame was compressed against the dictionary, not against the frame
+  // before it, so the history has to go back to the dictionary at every frame
+  // boundary rather than carrying over.
+  std::vector<uint8_t> stream = fa + fb;
+  std::vector<uint8_t> want = a;
+  want.insert(want.end(), b.begin(), b.end());
+
+  gcomp_status_t st = GCOMP_OK;
+  std::vector<uint8_t> back =
+      decodeWithDictionary(stream, &dict, want.size(), &st, 1);
+  ASSERT_EQ(st, GCOMP_OK)
+      << "the second frame must start from the dictionary again";
+  EXPECT_EQ(back, want);
 }
 
 TEST_F(Lz4SpecOracleTest, RealLz4_ReadsTheReferenceFrames) {
