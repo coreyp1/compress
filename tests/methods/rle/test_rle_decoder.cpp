@@ -105,7 +105,9 @@ TEST_F(RleDecoderTest, PackBitsGoldenSingleByte) {
 }
 
 TEST_F(RleDecoderTest, PackBitsGoldenRun32) {
-  uint8_t enc[] = {0xE0, 0xAA};
+  // 257 - 0xE1 = 32.  This vector said 0xE0 and expected 32 bytes, which is
+  // what our own decoder did and what no other decoder does: 0xE0 is 33.
+  uint8_t enc[] = {0xE1, 0xAA};
   uint8_t expected[32];
   memset(expected, 0xAA, 32);
   decode_expect(reg_, "packbits", enc, sizeof(enc), expected, 32);

@@ -66,8 +66,13 @@ protected:
 
 //
 // PackBits golden vectors
-// Control 0..127: next (n+1) bytes literal. 128: no-op. 129..255: run (256-n)
-// bytes.
+// Control 0..127: next (n+1) bytes literal. 128: no-op. 129..255: a run of
+// (257-n) bytes -- reading the control as a signed byte, Apple TN1023 and TIFF
+// 6.0 say "copy the next byte -n+1 times".
+//
+// The values below were checked against an independent decoder (Pillow's), not
+// read off our own output.  They previously encoded a 256-n rule, which is one
+// short: control 0xE0 is a run of 33, not 32.
 //
 
 TEST_F(RleEncoderTest, PackBitsGoldenEmpty) {
@@ -85,7 +90,7 @@ TEST_F(RleEncoderTest, PackBitsGoldenSingleByte) {
 TEST_F(RleEncoderTest, PackBitsGoldenRun32) {
   uint8_t in[32];
   memset(in, 0xAA, 32);
-  uint8_t expected[] = {0xE0, 0xAA}; // 256-32=224
+  uint8_t expected[] = {0xE1, 0xAA}; // 257-32=225
   encode_expect(reg_, "packbits", in, 32, expected, sizeof(expected));
 }
 
@@ -95,11 +100,20 @@ TEST_F(RleEncoderTest, PackBitsGoldenLiteralRun) {
   encode_expect(reg_, "packbits", in, 3, expected, sizeof(expected));
 }
 
-TEST_F(RleEncoderTest, PackBitsGoldenMaxRun127) {
+TEST_F(RleEncoderTest, PackBitsGoldenRun127) {
   uint8_t in[127];
   memset(in, 0x77, 127);
-  uint8_t expected[] = {0x81, 0x77}; // 256-127=129
+  uint8_t expected[] = {0x82, 0x77}; // 257-127=130
   encode_expect(reg_, "packbits", in, 127, expected, sizeof(expected));
+}
+
+TEST_F(RleEncoderTest, PackBitsGoldenMaxRun128) {
+  // The longest run the format can express. Control 129 is the lowest run
+  // control there is, and sits just clear of 128, the no-op.
+  uint8_t in[128];
+  memset(in, 0x77, 128);
+  uint8_t expected[] = {0x81, 0x77}; // 257-128=129
+  encode_expect(reg_, "packbits", in, 128, expected, sizeof(expected));
 }
 
 //

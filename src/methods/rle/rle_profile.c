@@ -6,8 +6,10 @@
  * Two reference profiles are implemented; they differ only in token grammar:
  *
  * - PackBits (TIFF / Apple): One-byte control. 0..127 = (n+1) literal bytes;
- *   128 = no-op; 129..255 = (256-n) copies of next byte. Max literal 128,
- *   max run 128 (we use 127 for run to avoid emitting 128 = no-op).
+ *   128 = no-op; 129..255 = a run, whose length is (257-n).  Reading the
+ *   control as a signed byte n' = n - 256, the rule in Apple TN1023 and TIFF
+ *   6.0 is "copy the next byte -n'+1 times", which is 257-n.  Max literal 128,
+ *   max run 128 (control 129); a run of 128 does not collide with the no-op.
  *
  * - TGA (Truevision Targa): One-byte header. Bit7=0: raw, (header&0x7F)+1
  *   literal bytes. Bit7=1: run, (header&0x7F)+1 copies of next byte.
@@ -42,7 +44,7 @@ rle_profile_id_t rle_profile_from_string(const char * format) {
 }
 
 //
-// PackBits decode: 0-127 = (n+1) literal; 128 = no-op; 129-255 = (256-n) run
+// PackBits decode: 0-127 = (n+1) literal; 128 = no-op; 129-255 = (257-n) run
 //
 
 static gcomp_status_t decode_packbits(rle_decoder_state_t * state,
@@ -70,7 +72,7 @@ static gcomp_status_t decode_packbits(rle_decoder_state_t * state,
       }
       else {
         p->phase = RLE_DEC_RUN_BYTE;
-        p->pending_count = (uint32_t)(256 - c);
+        p->pending_count = (uint32_t)(257 - c);
       }
     }
 
@@ -249,11 +251,20 @@ gcomp_status_t rle_profile_decode(rle_decoder_state_t * state,
 
 //
 // PackBits encode: emit literal control (n-1) then n bytes, or run control
-// (256-n) then 1 byte. Max literal 128, max run 128.
+// (257-n) then 1 byte. Max literal 128, max run 128.
 //
 
-// PackBits: control 128 is no-op, so max run is 127 (control 129..255).
-#define PACKBITS_MAX_RUN 127
+// A run of L bytes is written as control 257-L, so the longest run, 128,
+// becomes control 129 and the shortest, 2, becomes 255.  Nothing in that range
+// collides with 128, the no-op.
+//
+// This used to be 127, with a comment explaining that 128 had to be avoided
+// because it would emit the no-op control.  That was a symptom: the run
+// control was being computed as 256-L, one too low, which put a 128-byte run
+// on the no-op and shifted every other run by one byte as far as any other
+// implementation was concerned.  Both the cap and the collision go away once
+// the arithmetic is right.
+#define PACKBITS_MAX_RUN 128
 
 static gcomp_status_t encode_packbits(rle_encoder_state_t * state,
     const uint8_t * input_data, size_t input_size, size_t * input_consumed_out,
@@ -279,7 +290,7 @@ static gcomp_status_t encode_packbits(rle_encoder_state_t * state,
       if (max_out != 0 && out_used + 2 > max_out) {
         break;
       }
-      output_data[out_used++] = (uint8_t)(256 - (int)state->run_len);
+      output_data[out_used++] = (uint8_t)(257 - (int)state->run_len);
       output_data[out_used++] = state->run_byte;
       state->run_len = 0;
       continue;
@@ -331,7 +342,7 @@ static gcomp_status_t encode_packbits(rle_encoder_state_t * state,
         in_pos += run_len;
         break;
       }
-      output_data[out_used++] = (uint8_t)(256 - (int)run_len);
+      output_data[out_used++] = (uint8_t)(257 - (int)run_len);
       output_data[out_used++] = b;
       in_pos += run_len;
       continue;
@@ -452,7 +463,7 @@ static gcomp_status_t packbits_finish(rle_encoder_state_t * state,
     if (max_out != 0 && out_used + 2 > max_out) {
       return GCOMP_ERR_LIMIT;
     }
-    output_data[out_used++] = (uint8_t)(256 - (int)state->run_len);
+    output_data[out_used++] = (uint8_t)(257 - (int)state->run_len);
     output_data[out_used++] = state->run_byte;
     state->run_len = 0;
   }
