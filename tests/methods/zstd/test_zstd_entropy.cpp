@@ -22,12 +22,12 @@
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
 #include <ghoti.io/compress/stream.h>
+#include "../../../src/methods/zstd/zstd_internal.h"
 #include <ghoti.io/compress/zstd.h>
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <utility>
 #include <vector>
-
-// Constants from zstd spec
-static const uint32_t ZSTD_MAGIC = 0xFD2FB528U;
 
 class ZstdEntropyTest : public ::testing::Test {
 protected:
@@ -1117,4 +1117,135 @@ TEST_F(ZstdEntropyTest, SkewedLiteralsBeatTheClampedCode) {
     EXPECT_LE(l, 11);
   }
   EXPECT_LT(packed.size(), data.size());
+}
+
+TEST_F(ZstdEntropyTest, TheLiteralCodeBuilderHoldsTheElevenBitCap) {
+  // Frequencies that halve give a plain Huffman code one bit longer per
+  // symbol, so forty symbols want a thirty-nine bit code word.  RFC 8878
+  // section 4.2.1 allows eleven, and the builder -- not the data, and not
+  // the caller -- is what has to hold that line.
+  uint32_t freq[256] = {0};
+  uint32_t f = 1u << 30;
+  for (int i = 0; i < 40; i++) {
+    freq[i] = f > 1 ? f : 1;
+    f /= 2;
+  }
+
+  zstd_huf_enc_table_t table;
+  ASSERT_EQ(zstd_huf_build_enc_table(nullptr, freq, &table), GCOMP_OK);
+
+  EXPECT_LE(table.max_bits, 11u);
+  uint32_t kraft = 0;
+  unsigned used = 0;
+  for (int i = 0; i < 256; i++) {
+    EXPECT_LE(table.symbols[i].nb_bits, 11)
+        << "symbol " << i << " got a code word past the cap";
+    if (table.symbols[i].nb_bits > 0) {
+      kraft += 1u << (table.max_bits - table.symbols[i].nb_bits);
+      used++;
+    }
+  }
+  EXPECT_EQ(used, 40u);
+  // Zstandard derives the last symbol's weight from the code space the others
+  // leave, so a code that does not spend all of it cannot be described at all.
+  EXPECT_EQ(kraft, 1u << table.max_bits);
+
+  // A weight has four bits to fit in (RFC 8878 4.2.1.1), and weight is
+  // max_bits + 1 - nb_bits, so the cap is also what keeps the table
+  // description writable.
+  for (int i = 0; i < 256; i++) {
+    EXPECT_LE(table.weights[i], 15);
+  }
+}
+
+TEST_F(ZstdEntropyTest, TheLiteralCodeIsTheCheapestOneUnderTheCap) {
+  // The cap has to be reached by choosing the code, not by repairing one.
+  // Lengthening the most frequent symbol -- what the old limiter did while
+  // the clamped code was over-subscribed -- costs more than any assignment
+  // package-merge will produce, so comparing against it pins the behaviour.
+  uint32_t freq[256] = {0};
+  uint32_t f = 1u << 28;
+  for (int i = 0; i < 30; i++) {
+    freq[i] = f > 1 ? f : 1;
+    f = (uint32_t)((uint64_t)f * 45 / 100);
+  }
+
+  zstd_huf_enc_table_t table;
+  ASSERT_EQ(zstd_huf_build_enc_table(nullptr, freq, &table), GCOMP_OK);
+
+  uint64_t cost = 0;
+  for (int i = 0; i < 256; i++) {
+    cost += (uint64_t)freq[i] * table.symbols[i].nb_bits;
+  }
+
+  // The same frequencies, coded by a plain Huffman tree clamped to the cap
+  // and then relengthened from the shortest code up.
+  std::vector<uint8_t> lengths(256, 0);
+  {
+    std::vector<uint32_t> w;
+    std::vector<int> parent;
+    for (int i = 0; i < 256; i++) {
+      w.push_back(freq[i]);
+      parent.push_back(-1);
+    }
+    std::vector<std::pair<uint64_t, int>> live;
+    for (int i = 0; i < 256; i++) {
+      if (freq[i]) {
+        live.push_back({freq[i], i});
+      }
+    }
+    std::vector<uint64_t> weight(w.begin(), w.end());
+    while (live.size() > 1) {
+      std::sort(live.begin(), live.end());
+      auto a = live[0];
+      auto b = live[1];
+      live.erase(live.begin(), live.begin() + 2);
+      int node = (int)weight.size();
+      weight.push_back(a.first + b.first);
+      parent.push_back(-1);
+      parent[a.second] = node;
+      parent[b.second] = node;
+      live.push_back({a.first + b.first, node});
+    }
+    for (int i = 0; i < 256; i++) {
+      if (!freq[i]) {
+        continue;
+      }
+      uint8_t depth = 0;
+      for (int at = i; parent[at] >= 0; at = parent[at]) {
+        depth++;
+      }
+      lengths[i] = depth ? depth : 1;
+    }
+    uint32_t budget = 1u << 11;
+    uint32_t total = 0;
+    for (int i = 0; i < 256; i++) {
+      if (lengths[i] > 11) {
+        lengths[i] = 11;
+      }
+      if (lengths[i]) {
+        total += 1u << (11 - lengths[i]);
+      }
+    }
+    while (total > budget) {
+      int mi = -1;
+      for (int i = 0; i < 256; i++) {
+        if (lengths[i] && (mi < 0 || lengths[i] < lengths[mi])) {
+          mi = i;
+        }
+      }
+      if (mi < 0 || lengths[mi] >= 11) {
+        break;
+      }
+      total -= 1u << (11 - lengths[mi]);
+      lengths[mi]++;
+      total += 1u << (11 - lengths[mi]);
+    }
+  }
+  uint64_t clamped_cost = 0;
+  for (int i = 0; i < 256; i++) {
+    clamped_cost += (uint64_t)freq[i] * lengths[i];
+  }
+
+  EXPECT_LT(cost, clamped_cost);
 }

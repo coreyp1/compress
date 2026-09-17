@@ -58,7 +58,7 @@ static inline char * gcomp_strdup(
   if (!gcu_safe_add_size(len, 1, &alloc_size)) {
     return NULL; // len + 1 would overflow (e.g. len == SIZE_MAX)
   }
-  char * out = gcomp_malloc(allocator, alloc_size);
+  char * out = (char *)gcomp_malloc(allocator, alloc_size);
   if (!out) {
     return NULL;
   }
