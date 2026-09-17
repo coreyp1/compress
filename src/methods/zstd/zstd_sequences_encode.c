@@ -63,6 +63,7 @@ typedef struct {
   size_t byte_pos;        ///< Current write position (increasing)
   uint64_t bit_container; ///< Bit accumulator
   unsigned bits_used;     ///< Bits used in container (0-64)
+  bool overflow;          ///< Set once a write did not fit
 } zstd_enc_bit_writer_t;
 
 static void zstd_enc_bw_init(
@@ -72,6 +73,7 @@ static void zstd_enc_bw_init(
   bw->byte_pos = 0;
   bw->bit_container = 0;
   bw->bits_used = 0;
+  bw->overflow = false;
 }
 
 /**
@@ -80,7 +82,13 @@ static void zstd_enc_bw_init(
  * Writes LOW bytes to increasing addresses until fewer than 8 bits remain.
  */
 static void zstd_enc_bw_flush(zstd_enc_bit_writer_t * bw) {
-  while (bw->bits_used >= 8 && bw->byte_pos < bw->buf_size) {
+  while (bw->bits_used >= 8) {
+    if (bw->byte_pos >= bw->buf_size) {
+      // Out of room.  Record it: the caller decides whether to fall back,
+      // and must not be handed a silently truncated bitstream.
+      bw->overflow = true;
+      return;
+    }
     bw->buf[bw->byte_pos++] = (uint8_t)(bw->bit_container & 0xFF);
     bw->bit_container >>= 8;
     bw->bits_used -= 8;
@@ -132,7 +140,11 @@ static size_t zstd_enc_bw_close(zstd_enc_bit_writer_t * bw) {
   unsigned bytes_needed = (bw->bits_used + 7) / 8;
 
   // Flush exactly the needed bytes
-  for (unsigned i = 0; i < bytes_needed && bw->byte_pos < bw->buf_size; i++) {
+  for (unsigned i = 0; i < bytes_needed; i++) {
+    if (bw->byte_pos >= bw->buf_size) {
+      bw->overflow = true;
+      break;
+    }
     bw->buf[bw->byte_pos++] = (uint8_t)(bw->bit_container & 0xFF);
     bw->bit_container >>= 8;
   }
@@ -487,19 +499,19 @@ gcomp_status_t zstd_sequences_encode_predefined(
   zstd_fse_build_predefined_of_table(of_table, 32);
   zstd_fse_build_predefined_ml_table(ml_table, 64);
 
-  // Check for reasonable sequence count to avoid excessive stack usage
-  if (num_sequences > 65535) {
-    return GCOMP_ERR_LIMIT; // Too many sequences
+  // RFC 8878 section 3.1.1.3.2.1: the 3-byte Number_of_Sequences form tops
+  // out at 0xFFFF + 0x7F00.
+  if (num_sequences > ZSTD_MAX_NUM_SEQUENCES) {
+    return GCOMP_ERR_LIMIT;
   }
 
-  // Estimate max bitstream size:
-  // - Initial states: 6 + 5 + 6 = 17 bits
-  // - Per sequence: up to 16 (OF extra) + 16 (ML extra) + 16 (LL extra) +
-  //                 6 (LL state) + 6 (ML state) + 5 (OF state) = 65 bits
-  // - Marker: 1 bit
-  // Round up generously
-  size_t max_bitstream = 20 + num_sequences * 10; // ~80 bits/seq is very safe
-  if (pos + max_bitstream > output_cap) {
+  // No worst-case reservation here.  The bitstream was previously refused
+  // unless the output could hold 10 bytes per sequence -- around twelve times
+  // what a sequence actually costs -- so any block with more than a few
+  // thousand sequences was rejected outright and stored raw instead.  On
+  // ordinary text that was almost every block.  The writer now reports a
+  // genuine overflow, which is checked after the fact.
+  if (pos >= output_cap) {
     return GCOMP_ERR_LIMIT;
   }
 
@@ -639,6 +651,11 @@ gcomp_status_t zstd_sequences_encode_predefined(
 
   // Close bitstream - adds marker at HIGH end and flushes
   size_t bitstream_size = zstd_enc_bw_close(&bw);
+
+  if (bw.overflow) {
+    // The sequences did not fit.  The caller stores the block raw.
+    return GCOMP_ERR_LIMIT;
+  }
 
   *output_len_out = pos + bitstream_size;
   return GCOMP_OK;

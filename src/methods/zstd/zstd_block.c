@@ -230,9 +230,13 @@ gcomp_status_t zstd_block_compress(zstd_encoder_state_t * state,
             &num_sequences, state->literals_buffer, &literals_size,
             &state->rep_offset_1, &state->rep_offset_2, &state->rep_offset_3);
 
-    if (status == GCOMP_OK && num_sequences > 0) {
-      // We have sequences - try to compress
-
+    // A block with no sequences is still worth compressing: RFC 8878 section
+    // 3.1.1.3 lets a Compressed_Block carry Huffman-coded literals and a
+    // Sequences_Section of zero sequences, and for data with no usable
+    // matches that is where all of the gain is.  Requiring num_sequences > 0
+    // sent every such block to a raw block instead -- a skewed-alphabet file
+    // that the reference encoder takes to 36% came out at 100.003% of input.
+    if (status == GCOMP_OK && literals_size > 0) {
       // Encode literals section (with Huffman compression when beneficial)
       size_t literals_encoded_size = 0;
       status = zstd_literals_encode_compressed(state->literals_buffer,

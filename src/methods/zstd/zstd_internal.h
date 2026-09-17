@@ -875,6 +875,10 @@ gcomp_status_t zstd_huf_decode_4streams(const zstd_huf_entry_t * table,
 // Internal API: Literals Section Decoding
 //
 
+// RFC 8878 section 3.1.1.3.2.1: Number_of_Sequences is written in one, two
+// or three bytes; the three-byte form encodes 0xFFFF + 0x7F00 at most.
+#define ZSTD_MAX_NUM_SEQUENCES (0xFFFFu + 0x7F00u)
+
 // Maximum Huffman table size
 #define HUF_MAX_TABLE_SIZE 2048
 
