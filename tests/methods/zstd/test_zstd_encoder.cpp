@@ -5,6 +5,7 @@
 
 #include "../common/test_helpers.h"
 #include <cstring>
+#include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
@@ -480,4 +481,109 @@ TEST_F(ZstdParallelEncoderTest, ParallelDestroyWithoutFinish) {
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
+}
+
+//
+// History across blocks
+//
+// A Zstandard block holds at most 128 KB (RFC 8878 section 3.1.1), and the
+// window size in the frame header is what tells the decoder how far back a
+// sequence may point - across as many blocks as fit in it.  The encoder used
+// to reset its match finder for every block, so no sequence could reach past
+// the start of the block it was in and a repeat further back than 128 KB was
+// simply re-emitted as literals.
+//
+
+namespace {
+
+// Bytes that cannot be compressed on their own, so any size difference is the
+// repeat being found or missed.
+std::vector<uint8_t> ZstdNoiseBytes(size_t n, uint32_t seed) {
+  std::vector<uint8_t> v;
+  v.reserve(n);
+  uint32_t x = seed * 2654435761u + 1u;
+  while (v.size() < n) {
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    v.push_back((uint8_t)(x >> 19));
+  }
+  return v;
+}
+
+size_t ZstdEncodeWithWindow(gcomp_registry_t * reg, unsigned window_log,
+    const std::vector<uint8_t> & in) {
+  gcomp_options_t * opts = nullptr;
+  EXPECT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  EXPECT_EQ(gcomp_options_set_uint64(opts, "zstd.window_log", window_log),
+      GCOMP_OK);
+  std::vector<uint8_t> out(in.size() * 2 + 4096);
+  size_t used = out.size();
+  EXPECT_EQ(gcomp_encode_buffer(reg, "zstd", opts, in.data(), in.size(),
+                out.data(), out.size(), &used),
+      GCOMP_OK);
+  gcomp_options_destroy(opts);
+
+  // Whatever it produced has to read back, since a sequence pointing further
+  // back than the declared window would not.
+  std::vector<uint8_t> back(in.size() + 64);
+  size_t back_used = back.size();
+  EXPECT_EQ(gcomp_decode_buffer(reg, "zstd", nullptr, out.data(), used,
+                back.data(), back.size(), &back_used),
+      GCOMP_OK);
+  EXPECT_EQ(back_used, in.size());
+  EXPECT_EQ(memcmp(back.data(), in.data(), in.size()), 0);
+  return used;
+}
+
+} // namespace
+
+TEST_F(ZstdEncoderTest, SequencesReachBackIntoEarlierBlocks) {
+  const size_t kPhrase = 4096;
+  // Two blocks' worth of filler between the copies, so the repeat is several
+  // blocks back and cannot be found inside the block that needs it.
+  const size_t kGap = 300 * 1024;
+
+  std::vector<uint8_t> phrase = ZstdNoiseBytes(kPhrase, 11);
+  std::vector<uint8_t> filler = ZstdNoiseBytes(kGap, 12);
+  std::vector<uint8_t> other = ZstdNoiseBytes(kPhrase, 13);
+
+  std::vector<uint8_t> repeated = phrase;
+  repeated.insert(repeated.end(), filler.begin(), filler.end());
+  repeated.insert(repeated.end(), phrase.begin(), phrase.end());
+
+  std::vector<uint8_t> distinct = phrase;
+  distinct.insert(distinct.end(), filler.begin(), filler.end());
+  distinct.insert(distinct.end(), other.begin(), other.end());
+
+  // A 1 MB window covers the whole input, so the repeat is inside what the
+  // frame header promises the decoder.
+  size_t with_repeat = ZstdEncodeWithWindow(registry_, 20, repeated);
+  size_t without = ZstdEncodeWithWindow(registry_, 20, distinct);
+
+  EXPECT_LT(with_repeat + kPhrase / 2, without)
+      << with_repeat << " vs " << without;
+}
+
+TEST_F(ZstdEncoderTest, SequencesDoNotReachPastTheDeclaredWindow) {
+  // The other half of the same requirement: a repeat further back than the
+  // declared window must not be pointed at, however visible it is to the
+  // encoder, because the decoder is not required to still have it.  The
+  // round-trip inside the helper is what enforces this - libzstd and our own
+  // decoder both reject a sequence that reaches too far - and the sizes say
+  // the repeat was genuinely out of reach rather than merely unused.
+  const size_t kPhrase = 4096;
+  const size_t kGap = 300 * 1024;
+
+  std::vector<uint8_t> phrase = ZstdNoiseBytes(kPhrase, 21);
+  std::vector<uint8_t> filler = ZstdNoiseBytes(kGap, 22);
+
+  std::vector<uint8_t> repeated = phrase;
+  repeated.insert(repeated.end(), filler.begin(), filler.end());
+  repeated.insert(repeated.end(), phrase.begin(), phrase.end());
+
+  // 128 KB of window against a repeat 304 KB back.
+  size_t narrow = ZstdEncodeWithWindow(registry_, 17, repeated);
+  size_t wide = ZstdEncodeWithWindow(registry_, 20, repeated);
+  EXPECT_GT(narrow, wide + kPhrase / 2) << narrow << " vs " << wide;
 }

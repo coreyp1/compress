@@ -165,9 +165,11 @@ gcomp_status_t zstd_mf_init(zstd_match_finder_t * mf,
   mf->window_size = window_size;
   mf->search_depth = zstd_mf_get_search_depth(level);
 
-  // Chain table size = window size (or max block size)
-  mf->chain_size =
-      (window_size < ZSTD_BLOCK_SIZE_MAX) ? window_size : ZSTD_BLOCK_SIZE_MAX;
+  // The chain table is indexed by position in the match finder's window, and
+  // that window now holds the history carried across blocks as well as the
+  // block being compressed.  Sizing it to one block, as it was, meant no
+  // position past the first 128 KB could be chained at all.
+  mf->chain_size = (size_t)window_size + ZSTD_BLOCK_SIZE_MAX;
 
   // Allocate hash table (use calloc to initialize to zero)
   mf->hash_table = gcomp_calloc(alloc, mf->hash_size, sizeof(uint32_t));
@@ -300,8 +302,11 @@ static bool zstd_mf_find_match(zstd_match_finder_t * mf, const uint8_t * data,
   while (depth > 0 && chain_pos < pos) {
     size_t offset = pos - chain_pos;
 
-    // Check if offset is too large
-    if (offset > MF_MAX_DISTANCE || offset > pos) {
+    // Check if offset is too large.  The window the frame header declares is
+    // a promise to the decoder about how far back it must keep data (RFC 8878
+    // section 3.1.1.1.2); a sequence that reaches further is not decodable.
+    if (offset > MF_MAX_DISTANCE || offset > pos ||
+        offset > mf->window_size) {
       break;
     }
 
@@ -369,6 +374,43 @@ static void zstd_mf_insert(zstd_match_finder_t * mf, const uint8_t * data,
   }
 }
 
+void zstd_mf_slide(zstd_match_finder_t * mf, size_t shift) {
+  if (!mf || shift == 0) {
+    return;
+  }
+
+  // Entries name positions in the window, so moving the window moves every
+  // entry with it.  A position that falls off the front is dropped: the byte
+  // it named is no longer there to match against.  Zero means "no entry", so
+  // it is both the empty value and what a dropped entry becomes.
+  for (size_t i = 0; i < mf->hash_size; i++) {
+    uint32_t v = mf->hash_table[i];
+    mf->hash_table[i] = (v > shift) ? (uint32_t)(v - shift) : 0u;
+  }
+
+  if (shift >= mf->chain_size) {
+    memset(mf->chain_table, 0, mf->chain_size * sizeof(uint32_t));
+    return;
+  }
+  size_t kept = mf->chain_size - shift;
+  memmove(mf->chain_table, mf->chain_table + shift, kept * sizeof(uint32_t));
+  memset(mf->chain_table + kept, 0, shift * sizeof(uint32_t));
+  for (size_t i = 0; i < kept; i++) {
+    uint32_t v = mf->chain_table[i];
+    mf->chain_table[i] = (v > shift) ? (uint32_t)(v - shift) : 0u;
+  }
+}
+
+void zstd_mf_index_range(zstd_match_finder_t * mf, const uint8_t * data,
+    size_t from, size_t to, size_t data_size) {
+  if (!mf || !data) {
+    return;
+  }
+  for (size_t i = from; i < to && i + MF_HASH_READ_SIZE <= data_size; i++) {
+    zstd_mf_insert(mf, data, i, data_size);
+  }
+}
+
 //
 // Sequence Generation
 //
@@ -377,8 +419,10 @@ static void zstd_mf_insert(zstd_match_finder_t * mf, const uint8_t * data,
  * @brief Generate sequences from input data using match finder.
  *
  * @param mf Match finder context
- * @param data Input data
- * @param data_size Input size
+ * @param data Window contents: history followed by the block to encode
+ * @param data_size Total bytes in @p data
+ * @param start_pos First position to encode; everything before it is history
+ *        that the caller has already indexed
  * @param sequences Output sequence array
  * @param max_sequences Maximum sequences to generate
  * @param num_sequences_out Output: number of sequences generated
@@ -387,7 +431,7 @@ static void zstd_mf_insert(zstd_match_finder_t * mf, const uint8_t * data,
  * @return GCOMP_OK on success
  */
 gcomp_status_t zstd_mf_generate_sequences(zstd_match_finder_t * mf,
-    const uint8_t * data, size_t data_size, size_t dict_prefix_size,
+    const uint8_t * data, size_t data_size, size_t start_pos,
     zstd_sequence_t * sequences, size_t max_sequences,
     size_t * num_sequences_out, uint8_t * literals_out,
     size_t * literals_size_out, uint32_t * rep_offset_1,
@@ -397,17 +441,14 @@ gcomp_status_t zstd_mf_generate_sequences(zstd_match_finder_t * mf,
     return GCOMP_ERR_INVALID_ARG;
   }
 
-  zstd_mf_reset(mf);
-
-  if (dict_prefix_size > 0 &&
-      dict_prefix_size + MF_HASH_READ_SIZE <= data_size) {
-    for (size_t i = 0; i + MF_HASH_READ_SIZE <= dict_prefix_size; i++) {
-      zstd_mf_insert(mf, data, i, data_size);
-    }
-  }
-
-  size_t pos = dict_prefix_size;
-  size_t lit_start = dict_prefix_size;
+  // The tables are not reset here and the history before start_pos is not
+  // re-indexed.  Both belong to the caller: a stream's blocks share one
+  // window, so each block's history is the previous blocks, already indexed
+  // as they were encoded.  Resetting here made every block start from nothing
+  // - no match could cross a block boundary, and on a multi-megabyte file
+  // that threw the history away 128 KB at a time.
+  size_t pos = start_pos;
+  size_t lit_start = start_pos;
   size_t num_seq = 0;
   size_t lit_pos = 0;
 

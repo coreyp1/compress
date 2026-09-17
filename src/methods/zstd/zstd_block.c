@@ -167,6 +167,32 @@ gcomp_status_t zstd_block_decompress_compressed(zstd_decoder_state_t * state,
 // Minimum input size to attempt compression (small blocks rarely compress well)
 #define MIN_COMPRESSION_SIZE 64
 
+/**
+ * @brief Move the match finder's window forward, dropping the oldest bytes.
+ *
+ * History older than the declared window size cannot be pointed at by a
+ * sequence, so it is dropped rather than kept.  The match finder's tables
+ * index positions in this window, so they move with it.
+ *
+ * @param state Encoder state.
+ * @param shift Bytes to drop from the front.
+ */
+static void zstd_block_slide_window(
+    zstd_encoder_state_t * state, size_t shift) {
+  if (!state->mf_window || shift == 0) {
+    return;
+  }
+  if (shift >= state->mf_window_len) {
+    state->mf_window_len = 0;
+    zstd_mf_reset(state->match_finder);
+    return;
+  }
+  memmove(state->mf_window, state->mf_window + shift,
+      state->mf_window_len - shift);
+  state->mf_window_len -= shift;
+  zstd_mf_slide(state->match_finder, shift);
+}
+
 gcomp_status_t zstd_block_compress(zstd_encoder_state_t * state,
     const uint8_t * input, size_t input_len, uint8_t * output,
     size_t output_cap, size_t * output_len_out, uint8_t * type_out) {
@@ -210,25 +236,57 @@ gcomp_status_t zstd_block_compress(zstd_encoder_state_t * state,
     size_t literals_size = 0;
     const uint8_t * mf_data = input;
     size_t mf_data_size = input_len;
-    size_t dict_prefix = 0;
+    size_t start_pos = 0;
+    bool index_prefix = false;
 
-    if (state->dict_parsed.content && state->dict_parsed.content_size > 0 &&
+    if (state->mf_window && input_len <= state->mf_window_capacity) {
+      // Stream path: the block is appended to the history already in the
+      // window, and the match finder's tables already describe that history.
+      if (state->mf_window_len + input_len > state->mf_window_capacity) {
+        size_t shift =
+            state->mf_window_len + input_len - state->mf_window_capacity;
+        zstd_block_slide_window(state, shift);
+      }
+      memcpy(state->mf_window + state->mf_window_len, input, input_len);
+      mf_data = state->mf_window;
+      start_pos = state->mf_window_len;
+      mf_data_size = state->mf_window_len + input_len;
+    }
+    else if (state->dict_parsed.content && state->dict_parsed.content_size > 0 &&
         state->dict_block_buffer) {
+      // Job path: a parallel job compresses its block on its own, so the
+      // dictionary is prepended to it and indexed for that block alone.
       size_t copy_len = state->dict_parsed.content_size;
       if (copy_len + input_len <= state->dict_block_buffer_capacity) {
         memcpy(state->dict_block_buffer, state->dict_parsed.content, copy_len);
         memcpy(state->dict_block_buffer + copy_len, input, input_len);
         mf_data = state->dict_block_buffer;
         mf_data_size = copy_len + input_len;
-        dict_prefix = copy_len;
+        start_pos = copy_len;
+        index_prefix = true;
       }
+    }
+
+    if (index_prefix) {
+      zstd_mf_index_range(
+          state->match_finder, mf_data, 0, start_pos, mf_data_size);
     }
 
     gcomp_status_t status =
         zstd_mf_generate_sequences(state->match_finder, mf_data, mf_data_size,
-            dict_prefix, state->seq_buffer, state->seq_buffer_capacity,
+            start_pos, state->seq_buffer, state->seq_buffer_capacity,
             &num_sequences, state->literals_buffer, &literals_size,
             &state->rep_offset_1, &state->rep_offset_2, &state->rep_offset_3);
+
+    if (state->mf_window && mf_data == state->mf_window) {
+      // Keep the block as history for the next one, dropping whatever no
+      // longer fits inside the declared window.
+      state->mf_window_len = mf_data_size;
+      if (state->mf_window_len > state->mf_window_max) {
+        zstd_block_slide_window(
+            state, state->mf_window_len - state->mf_window_max);
+      }
+    }
 
     // A block with no sequences is still worth compressing: RFC 8878 section
     // 3.1.1.3 lets a Compressed_Block carry Huffman-coded literals and a

@@ -325,6 +325,15 @@ typedef struct {
   uint8_t * dict_block_buffer; ///< [dict_content][block] for match finder
   size_t dict_block_buffer_capacity;
 
+  // Match finder window: the history a sequence can reach back into,
+  // followed by the block being compressed.  Blocks share it, so a match may
+  // point at data from an earlier block, which is what the window size in the
+  // frame header promises the decoder (RFC 8878 section 3.1.1.1.2).
+  uint8_t * mf_window;         ///< History followed by the current block
+  size_t mf_window_capacity;   ///< mf_window_max + one block
+  size_t mf_window_len;        ///< History bytes currently held
+  size_t mf_window_max;        ///< Most history to keep; the declared window
+
   // Memory tracking
   gcomp_memory_tracker_t mem_tracker;
   uint64_t max_memory_bytes;
@@ -994,6 +1003,33 @@ void zstd_mf_destroy(zstd_match_finder_t * mf, const gcomp_allocator_t * alloc,
 void zstd_mf_reset(zstd_match_finder_t * mf);
 
 /**
+ * @brief Move every recorded position back by @p shift.
+ *
+ * Called when the match finder's window slides: positions are relative to the
+ * start of the window, so moving the window moves them.  Entries naming bytes
+ * that fell off the front are dropped.
+ *
+ * @param mf Match finder context.
+ * @param shift Bytes the window moved.
+ */
+void zstd_mf_slide(zstd_match_finder_t * mf, size_t shift);
+
+/**
+ * @brief Index positions [from, to) without searching for matches.
+ *
+ * Used to make a dictionary's content available as match history before any
+ * of the stream is encoded.
+ *
+ * @param mf Match finder context.
+ * @param data Window contents.
+ * @param from First position to index.
+ * @param to One past the last position to index.
+ * @param data_size Total bytes in @p data.
+ */
+void zstd_mf_index_range(zstd_match_finder_t * mf, const uint8_t * data,
+    size_t from, size_t to, size_t data_size);
+
+/**
  * @brief Generate sequences from input data.
  *
  * When dict_prefix_size > 0, data = [dict_content][block]; the first
@@ -1002,7 +1038,7 @@ void zstd_mf_reset(zstd_match_finder_t * mf);
  * dict_prefix_size..data_size).
  */
 gcomp_status_t zstd_mf_generate_sequences(zstd_match_finder_t * mf,
-    const uint8_t * data, size_t data_size, size_t dict_prefix_size,
+    const uint8_t * data, size_t data_size, size_t start_pos,
     zstd_sequence_t * sequences, size_t max_sequences,
     size_t * num_sequences_out, uint8_t * literals_out,
     size_t * literals_size_out, uint32_t * rep_offset_1,

@@ -227,10 +227,43 @@ TEST_F(ZstdOptionsTest, ValidWindowLogMin) {
   gcomp_options_destroy(opts);
 }
 
+// The window size in the frame header is a promise that a sequence may point
+// that far back, so the encoder has to hold that much history to be able to
+// make one.  A 2 GB window therefore costs 2 GB of buffer plus its position
+// tables, and the default memory limit of 256 MiB refuses it - which is the
+// limit doing its job, not the option being invalid.
 TEST_F(ZstdOptionsTest, ValidWindowLogMax) {
   gcomp_options_t * opts = nullptr;
   ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
   gcomp_options_set_uint64(opts, "zstd.window_log", 31);
+  gcomp_options_set_uint64(opts, "limits.max_memory_bytes", 0); // unlimited
+
+  gcomp_encoder_t * enc = nullptr;
+  EXPECT_EQ(gcomp_encoder_create(registry_, "zstd", opts, &enc), GCOMP_OK);
+  gcomp_encoder_destroy(enc);
+  gcomp_options_destroy(opts);
+}
+
+TEST_F(ZstdOptionsTest, LargeWindowLogNeedsTheMemoryToBackIt) {
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  gcomp_options_set_uint64(opts, "zstd.window_log", 31);
+
+  gcomp_encoder_t * enc = nullptr;
+  EXPECT_EQ(gcomp_encoder_create(registry_, "zstd", opts, &enc),
+      GCOMP_ERR_LIMIT);
+  gcomp_encoder_destroy(enc);
+  gcomp_options_destroy(opts);
+}
+
+// Declaring the content size caps what the window can be worth: a stream of
+// ten bytes has no use for a megabyte of history, and paying for one would be
+// the option's meaning leaking into the encoder's footprint.
+TEST_F(ZstdOptionsTest, ASmallDeclaredContentSizeDoesNotPayForALargeWindow) {
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  gcomp_options_set_uint64(opts, "zstd.window_log", 30);
+  gcomp_options_set_uint64(opts, "zstd.content_size", 64);
 
   gcomp_encoder_t * enc = nullptr;
   EXPECT_EQ(gcomp_encoder_create(registry_, "zstd", opts, &enc), GCOMP_OK);

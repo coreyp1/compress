@@ -581,11 +581,57 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
   }
   gcomp_memory_track_alloc(&state->mem_tracker, sizeof(zstd_match_finder_t));
 
+  // No point holding more history than the stream can produce.  When the
+  // caller declares the content size, the window buys nothing past it, and
+  // sizing to it keeps a large declared window from costing a large buffer -
+  // and a much larger position table - for a small stream.
+  state->mf_window_max = state->header.window_size;
+  if (content_size_present && content_size < state->mf_window_max) {
+    state->mf_window_max = (size_t)content_size;
+  }
+
   status = zstd_mf_init(state->match_finder, alloc, state->compression_level,
-      state->header.window_size, &state->mem_tracker);
+      state->mf_window_max, &state->mem_tracker);
   if (status != GCOMP_OK) {
     gcomp_encoder_set_error(encoder, status, "match finder init failed");
     goto cleanup;
+  }
+
+  // The window the match finder searches: the history carried from block to
+  // block, followed by the block being compressed.  Its length is the window
+  // size the frame header declares, which is what tells the decoder how far
+  // back a sequence may point.
+  state->mf_window_capacity = state->mf_window_max + block_buffer_size;
+  state->mf_window_len = 0;
+  state->mf_window = gcomp_malloc(alloc, state->mf_window_capacity);
+  if (!state->mf_window) {
+    status = GCOMP_ERR_MEMORY;
+    gcomp_encoder_set_error(encoder, status,
+        "failed to allocate %zu bytes for the match finder window",
+        state->mf_window_capacity);
+    goto cleanup;
+  }
+  gcomp_memory_track_alloc(&state->mem_tracker, state->mf_window_capacity);
+
+  // A dictionary is history the stream starts with, so it goes into the
+  // window ahead of the first block and is indexed once here rather than
+  // re-indexed for every block.
+  if (state->dict_parsed.content && state->dict_parsed.content_size > 0) {
+    size_t take = state->dict_parsed.content_size;
+    if (take > state->mf_window_max) {
+      // Only the tail is reachable: a sequence cannot point further back than
+      // the declared window.
+      memcpy(state->mf_window,
+          state->dict_parsed.content + (take - state->mf_window_max),
+          state->mf_window_max);
+      state->mf_window_len = state->mf_window_max;
+    }
+    else {
+      memcpy(state->mf_window, state->dict_parsed.content, take);
+      state->mf_window_len = take;
+    }
+    zstd_mf_index_range(state->match_finder, state->mf_window, 0,
+        state->mf_window_len, state->mf_window_len);
   }
 
   // Allocate sequence buffer
@@ -703,6 +749,9 @@ cleanup:
           &state->mem_tracker, state->dict_block_buffer_capacity);
       gcomp_free(alloc, state->dict_block_buffer);
     }
+    if (state->mf_window) {
+      gcomp_free(alloc, state->mf_window);
+    }
     if (state->block_buffer) {
       gcomp_free(alloc, state->block_buffer);
     }
@@ -745,6 +794,11 @@ void zstd_encoder_destroy(gcomp_encoder_t * encoder) {
   zstd_encoder_state_t * state = encoder->method_state;
   const gcomp_allocator_t * alloc = state->allocator;
 
+  if (state->mf_window) {
+    gcomp_memory_track_free(&state->mem_tracker, state->mf_window_capacity);
+    gcomp_free(alloc, state->mf_window);
+    state->mf_window = NULL;
+  }
   if (state->block_buffer) {
     gcomp_memory_track_free(&state->mem_tracker, state->block_buffer_capacity);
     gcomp_free(alloc, state->block_buffer);
@@ -1138,9 +1192,26 @@ gcomp_status_t zstd_encoder_reset(gcomp_encoder_t * encoder) {
     state->compressed_buffer_pos = 0;
     state->compressed_buffer_len = 0;
 
-    // Reset match finder state (clear hash tables, not free)
+    // Reset match finder state (clear hash tables, not free), and with it the
+    // window it indexes.  A reused encoder starts a new stream, so the
+    // previous stream's bytes are not history for it - but a dictionary is,
+    // so it goes back in just as it did at create time.
     if (state->match_finder) {
       zstd_mf_reset(state->match_finder);
+    }
+    state->mf_window_len = 0;
+    if (state->mf_window && state->dict_parsed.content &&
+        state->dict_parsed.content_size > 0) {
+      size_t take = state->dict_parsed.content_size;
+      const uint8_t * from = state->dict_parsed.content;
+      if (take > state->mf_window_max) {
+        from += take - state->mf_window_max;
+        take = state->mf_window_max;
+      }
+      memcpy(state->mf_window, from, take);
+      state->mf_window_len = take;
+      zstd_mf_index_range(state->match_finder, state->mf_window, 0,
+          state->mf_window_len, state->mf_window_len);
     }
 
     // Rebuild frame header
