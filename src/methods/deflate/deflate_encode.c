@@ -656,8 +656,41 @@ static deflate_match_t deflate_find_match(gcomp_deflate_encoder_state_t * st,
   uint16_t cur = st->hash_head[hash];
   int chain_count = 0;
 
+  // The byte one past the end of the best match so far, which any candidate
+  // that is going to beat it has to match.  Kept here rather than reloaded per
+  // candidate: it only changes when result.length does.
+  uint8_t probe_byte = 0;
+
   while (cur != DEFLATE_NIL && chain_count < max_chain) {
     size_t match_idx = cur;
+
+    // Cheapest rejection first, and deliberately ahead of the hash_pos read
+    // below.  Only a candidate that matches at the byte just past the end of
+    // the best match so far can beat it, and one load settles that.  Most
+    // candidates on a long chain fail here.
+    //
+    // This cannot change which match is chosen: a candidate it rejects has
+    // length <= result.length, and the code below only takes one whose length
+    // is strictly greater.  A stale entry that survives the probe is still
+    // caught by the checks that follow.
+    //
+    // result.length < max_len always holds here, because the loop breaks as
+    // soon as a match reaches max_len, so `scan + result.length` is still
+    // inside the lookahead.
+    //
+    // Ordering it first matters more than the instructions it saves.  hash_pos
+    // is one size_t per window slot - 256 KB at the default window - and is
+    // read at a random index for every candidate; it was 48% of this
+    // function's L1 read misses while being 3% of its instructions.  A
+    // candidate the probe rejects never touches it, and the window byte it
+    // reads instead is in a buffer an eighth the size that the comparison loop
+    // is walking anyway.
+    if (result.length >= DEFLATE_MIN_MATCH_LENGTH &&
+        data[(match_idx + result.length) & st->window_mask] != probe_byte) {
+      cur = st->hash_prev[cur];
+      chain_count++;
+      continue;
+    }
 
     // Check if this hash entry is still valid (not overwritten in circular buf)
     size_t match_stream_pos = st->hash_pos[match_idx];
@@ -751,6 +784,7 @@ static deflate_match_t deflate_find_match(gcomp_deflate_encoder_state_t * st,
     if (len >= DEFLATE_MIN_MATCH_LENGTH && len > result.length) {
       result.length = (uint32_t)len;
       result.distance = (uint32_t)stream_dist;
+      probe_byte = data[(scan + len) & st->window_mask];
 
       if (len >= max_len) {
         break; // Max length found
