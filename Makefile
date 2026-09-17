@@ -381,20 +381,28 @@ $(foreach pair,$(TEST_PAIRS),$(eval $(call test-executable-rule,$(word 1,$(subst
 ####################################################################
 
 # Pattern rule for example executables
+# The archive must precede $(LDFLAGS): the linker resolves left to right, and
+# LDFLAGS is where cutil lives.  With cutil first, nothing had referenced its
+# symbols yet, so the default --as-needed dropped it and every example failed
+# to link with undefined ghotiio_cutil_0_* references.
 $(APP_DIR)/examples/%$(EXE_EXTENSION): examples/%.c $(APP_DIR)/$(TARGET)
 	@printf "\n### Compiling Example: $* ###\n"
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(COMPRESSLIBRARY)
+	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(COMPRESSLIBRARY) $(LDFLAGS)
 
 ####################################################################
 # Benchmarks
 ####################################################################
 
 # Pattern rule for benchmark executables
+# The archive must precede $(LDFLAGS): the linker resolves left to right, and
+# LDFLAGS is where cutil lives.  With cutil first, nothing had referenced its
+# symbols yet, so the default --as-needed dropped it and every example failed
+# to link with undefined ghotiio_cutil_0_* references.
 $(APP_DIR)/bench/%$(EXE_EXTENSION): bench/%.c $(APP_DIR)/$(TARGET)
 	@printf "\n### Compiling Benchmark: $* ###\n"
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(COMPRESSLIBRARY)
+	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(COMPRESSLIBRARY) $(LDFLAGS)
 
 ####################################################################
 # Fuzz Testing (AFL++)
