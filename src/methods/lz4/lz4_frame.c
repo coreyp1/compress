@@ -270,11 +270,15 @@ gcomp_status_t gcomp_lz4_read_skippable_frame(const void * input,
 
   uint32_t declared = gcomp_read_le32(in + 4);
 
-  // Compare in 64 bits.  The declared size is attacker-controlled and
-  // GCOMP_LZ4_SKIPPABLE_OVERHEAD + declared would wrap on a 32-bit size_t,
-  // turning a frame that claims nearly 4 GB into one that appears to fit.
-  if ((uint64_t)declared >
-      (uint64_t)input_size - (uint64_t)GCOMP_LZ4_SKIPPABLE_OVERHEAD) {
+  // Subtract from the input size rather than adding to the declared one.
+  // The declared size is attacker-controlled and reaches 0xFFFFFFFF, so
+  // `GCOMP_LZ4_SKIPPABLE_OVERHEAD + declared` would wrap where size_t is 32
+  // bits wide and a frame claiming nearly 4 GB would appear to fit.  This
+  // subtraction cannot underflow -- input_size is already known to be at
+  // least GCOMP_LZ4_SKIPPABLE_OVERHEAD -- and is exact at either width, so
+  // the correctness does not rest on a guard that only one platform
+  // exercises.
+  if ((size_t)declared > input_size - GCOMP_LZ4_SKIPPABLE_OVERHEAD) {
     return GCOMP_ERR_CORRUPT;
   }
 
