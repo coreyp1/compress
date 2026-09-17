@@ -9,6 +9,7 @@
 
 #include "test_helpers.h"
 #include <cstring>
+#include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/deflate.h>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/options.h>
@@ -1592,6 +1593,247 @@ TEST(DeflateEncodeCodeTables, OutOfRangeValuesReturnZero) {
   EXPECT_EQ(gcomp_deflate_distance_code(0u), 0u);
   EXPECT_EQ(gcomp_deflate_distance_code(32769u), 0u);
   EXPECT_EQ(gcomp_deflate_distance_code(0xFFFFFFFFu), 0u);
+}
+
+// ---------------------------------------------------------------------------
+// Lazy matching under the "filtered" strategy
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Bytes shaped like PNG filter output: mostly small values, with short runs
+// and near-repeats at short distance, which is what lazy matching is for.
+std::vector<uint8_t> FilteredLookingBytes(size_t n) {
+  std::vector<uint8_t> v;
+  v.reserve(n);
+  uint32_t seed = 20260916u;
+  while (v.size() < n) {
+    seed = seed * 1103515245u + 12345u;
+    uint32_t r = seed >> 16;
+    size_t run = (r % 9) + 1;
+    uint8_t value = static_cast<uint8_t>((r >> 4) % 7u);
+    for (size_t i = 0; i < run && v.size() < n; i++) {
+      v.push_back(value);
+    }
+    if ((r & 0x3F) == 0) {
+      // An occasional literal that breaks the run, so a match at p is short
+      // and a match at p+1 is long - the case the deferral exists to catch.
+      seed = seed * 1103515245u + 12345u;
+      v.push_back(static_cast<uint8_t>(seed >> 24));
+    }
+  }
+  v.resize(n);
+  return v;
+}
+
+size_t EncodeWith(gcomp_registry_t * reg, const char * strategy,
+    const std::vector<uint8_t> & in, std::vector<uint8_t> & out) {
+  gcomp_options_t * opts = nullptr;
+  EXPECT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  EXPECT_EQ(gcomp_options_set_string(opts, "deflate.strategy", strategy),
+      GCOMP_OK);
+  out.assign(in.size() * 2 + 1024, 0);
+  size_t used = out.size();
+  gcomp_status_t s = gcomp_encode_buffer(reg, "deflate", opts, in.data(),
+      in.size(), out.data(), out.size(), &used);
+  gcomp_options_destroy(opts);
+  EXPECT_EQ(s, GCOMP_OK);
+  out.resize(used);
+  return used;
+}
+
+} // namespace
+
+// Lazy matching has to earn its cost. On data shaped like PNG filter output it
+// is worth several percent; this asks only that it is not worse, which is what
+// the arrangement it replaced managed to be.
+TEST_F(DeflateEncoderTest, FilteredBeatsDefaultOnFilterShapedData) {
+  std::vector<uint8_t> in = FilteredLookingBytes(200000);
+  std::vector<uint8_t> a;
+  std::vector<uint8_t> b;
+  size_t plain = EncodeWith(registry_, "default", in, a);
+  size_t lazy = EncodeWith(registry_, "filtered", in, b);
+  EXPECT_LT(lazy, plain) << "filtered " << lazy << " vs default " << plain;
+}
+
+// A match held back must be emitted exactly once, whether the stream ends
+// while it is held or another match displaces it. Every length here is a
+// different place for the stream to end relative to a held match.
+TEST_F(DeflateEncoderTest, FilteredRoundTripsAtEveryTailLength) {
+  std::vector<uint8_t> base = FilteredLookingBytes(4096);
+  for (size_t n = 0; n <= 600; n++) {
+    std::vector<uint8_t> in(base.begin(), base.begin() + n);
+    std::vector<uint8_t> enc;
+    EncodeWith(registry_, "filtered", in, enc);
+
+    std::vector<uint8_t> back;
+    ASSERT_EQ(decode_data(enc.data(), enc.size(), back, n), GCOMP_OK)
+        << "length " << n;
+    ASSERT_EQ(back.size(), n) << "length " << n;
+    if (n > 0) {
+      EXPECT_EQ(memcmp(back.data(), in.data(), n), 0) << "length " << n;
+    }
+    gcomp_decoder_destroy(decoder_);
+    decoder_ = nullptr;
+  }
+}
+
+// The deferral lives in the encoder state so that it survives a call boundary.
+// Reusing an encoder must not carry a held match into the next stream.
+TEST_F(DeflateEncoderTest, FilteredResetDropsAHeldMatch) {
+  std::vector<uint8_t> in = FilteredLookingBytes(50000);
+  std::vector<uint8_t> first;
+  std::vector<uint8_t> second;
+  size_t a = EncodeWith(registry_, "filtered", in, first);
+  size_t b = EncodeWith(registry_, "filtered", in, second);
+  ASSERT_EQ(a, b);
+  EXPECT_EQ(memcmp(first.data(), second.data(), a), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Headers that describe a code at all
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The code-length alphabet of RFC 1951 section 3.2.7 is limited to seven bits.
+// Reaching that limit needs a symbol distribution skewed enough that the tree
+// wants deeper codes, which the length-limiting step then has to flatten. This
+// shape does it: many short runs of a few values, with rare interruptions.
+std::vector<uint8_t> SkewedRunData(size_t n) {
+  std::vector<uint8_t> v;
+  v.reserve(n + 16);
+  uint32_t seed = 20260916u;
+  while (v.size() < n) {
+    seed = seed * 1103515245u + 12345u;
+    uint32_t r = seed >> 16;
+    size_t run = (r % 9) + 1;
+    uint8_t value = static_cast<uint8_t>((r >> 4) % 7u);
+    for (size_t i = 0; i < run; i++) {
+      v.push_back(value);
+    }
+    if ((r & 0x3F) == 0) {
+      seed = seed * 1103515245u + 12345u;
+      v.push_back(static_cast<uint8_t>(seed >> 24));
+    }
+  }
+  v.resize(n);
+  return v;
+}
+
+// Walk a raw deflate stream's first block header and return the Kraft sum of
+// its code-length alphabet, scaled so that a complete code sums to 128.
+// Returns 0 if the first block is not a dynamic one.
+unsigned CodeLengthKraftSum(const std::vector<uint8_t> & data) {
+  static const int kOrder[19] = {
+      16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
+  size_t bit = 0;
+  auto get = [&](int count) {
+    unsigned value = 0;
+    for (int i = 0; i < count; i++) {
+      unsigned b = (data[bit >> 3] >> (bit & 7)) & 1u;
+      value |= b << i;
+      bit++;
+    }
+    return value;
+  };
+  get(1);                    // BFINAL
+  if (get(2) != 2) {
+    return 0;                // not a dynamic block
+  }
+  get(5);                    // HLIT
+  get(5);                    // HDIST
+  unsigned hclen = get(4) + 4;
+  unsigned lengths[19] = {0};
+  for (unsigned i = 0; i < hclen; i++) {
+    lengths[kOrder[i]] = get(3);
+  }
+  unsigned kraft = 0;
+  for (int i = 0; i < 19; i++) {
+    if (lengths[i]) {
+      kraft += 1u << (7 - lengths[i]);
+    }
+  }
+  return kraft;
+}
+
+} // namespace
+
+// A set of code lengths whose Kraft sum falls short does not describe a code:
+// RFC 1951 section 3.2.2 builds the code by handing out every available code
+// word, and zlib refuses such a header with "invalid code lengths set".  The
+// length-limiting step used to leave one behind, because lengthening a symbol
+// halves its share and so steps past the target as often as it lands on it.
+TEST_F(DeflateEncoderTest, CodeLengthAlphabetIsAlwaysComplete) {
+  for (size_t n = 120000; n <= 120040; n++) {
+    std::vector<uint8_t> in = SkewedRunData(n);
+    std::vector<uint8_t> enc;
+    EncodeWith(registry_, "filtered", in, enc);
+    unsigned kraft = CodeLengthKraftSum(enc);
+    if (kraft == 0) {
+      continue; // stored or fixed block, nothing to check
+    }
+    EXPECT_EQ(kraft, 128u) << "length " << n << ": code-length alphabet is "
+                           << (kraft < 128u ? "under" : "over")
+                           << "-subscribed at " << kraft << "/128";
+  }
+}
+
+// The whole stream, not just the header: what comes out has to decode back.
+TEST_F(DeflateEncoderTest, SkewedRunDataRoundTrips) {
+  for (size_t n = 120000; n <= 120020; n++) {
+    std::vector<uint8_t> in = SkewedRunData(n);
+    std::vector<uint8_t> enc;
+    EncodeWith(registry_, "filtered", in, enc);
+    std::vector<uint8_t> back;
+    ASSERT_EQ(decode_data(enc.data(), enc.size(), back, n), GCOMP_OK)
+        << "length " << n;
+    ASSERT_EQ(back.size(), n) << "length " << n;
+    EXPECT_EQ(memcmp(back.data(), in.data(), n), 0) << "length " << n;
+    gcomp_decoder_destroy(decoder_);
+    decoder_ = nullptr;
+  }
+}
+
+// The RLE strategy reads the byte before the current position to find a run at
+// distance 1.  A refill can fill the window entirely with lookahead, and the
+// byte before the position is then unemitted data rather than history.  Taking
+// it from there emitted a distance-1 match against a byte that was never
+// written, so a run carried one byte past its end.  The small windows are
+// where the lookahead reaches the window size often enough to show it.
+TEST_F(DeflateEncoderTest, RleDoesNotMatchAgainstUnwrittenHistory) {
+  const size_t n = 40000;
+  std::vector<uint8_t> in(n);
+  for (size_t i = 0; i < n; i++) {
+    in[i] = static_cast<uint8_t>((i / 1000) & 0xFF);
+  }
+  for (uint64_t window_bits = 8; window_bits <= 12; window_bits++) {
+    gcomp_options_t * opts = nullptr;
+    ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+    ASSERT_EQ(gcomp_options_set_string(opts, "deflate.strategy", "rle"),
+        GCOMP_OK);
+    ASSERT_EQ(
+        gcomp_options_set_uint64(opts, "deflate.window_bits", window_bits),
+        GCOMP_OK);
+    std::vector<uint8_t> enc(n * 2 + 1024);
+    size_t used = enc.size();
+    ASSERT_EQ(gcomp_encode_buffer(registry_, "deflate", opts, in.data(), n,
+                  enc.data(), enc.size(), &used),
+        GCOMP_OK);
+    gcomp_options_destroy(opts);
+    enc.resize(used);
+
+    std::vector<uint8_t> back;
+    ASSERT_EQ(decode_data(enc.data(), enc.size(), back, n), GCOMP_OK)
+        << "window_bits " << window_bits;
+    ASSERT_EQ(back.size(), n) << "window_bits " << window_bits;
+    for (size_t i = 0; i < n; i++) {
+      ASSERT_EQ(back[i], in[i])
+          << "window_bits " << window_bits << ", first wrong byte at " << i;
+    }
+    gcomp_decoder_destroy(decoder_);
+    decoder_ = nullptr;
+  }
 }
 
 int main(int argc, char ** argv) {
