@@ -1195,6 +1195,7 @@ TEST_F(Lz4SpecOracleTest, LinkedBlocksActuallyLink) {
     for (const Shape & sh : shapes(n)) {
       size_t sizes[2] = {0, 0};
       MatchStats stats[2];
+      unsigned blocks_seen = 0;
 
       for (int independent = 0; independent <= 1; independent++) {
         gcomp_options_t * opts = nullptr;
@@ -1215,6 +1216,9 @@ TEST_F(Lz4SpecOracleTest, LinkedBlocksActuallyLink) {
         ASSERT_GE(fs.blocks, 2u) << where << ": need a multi-block frame";
         ASSERT_TRUE(countCrossBlockMatches(framed, &stats[independent]))
             << where << ": could not walk the block sequences";
+        if (!independent) {
+          blocks_seen = fs.blocks;
+        }
 
         // Whatever it emits still has to be a frame the real library reads.
         std::vector<uint8_t> back;
@@ -1237,6 +1241,26 @@ TEST_F(Lz4SpecOracleTest, LinkedBlocksActuallyLink) {
           << " matches)";
 
       linked_cross_total += stats[0].cross_block;
+
+      // A floor, not just "more than none".  The window and the hash table
+      // have to slide together; if the table is not rebased with the bytes,
+      // its entries name the wrong positions and nearly every cross-block
+      // candidate fails the 4-byte check.  That failure is invisible to a
+      // round-trip -- the check means a surviving match is still correct, so
+      // the frame decodes perfectly and only the ratio suffers.  Measured on
+      // this data: ~34 cross-block matches per boundary when the rebase is
+      // right, ~1 when it is missing.
+      //
+      // Only shapes that produce matches at all can be held to it; random
+      // data has none to find, and a single long run needs none.
+      if (stats[0].matches > 1000) {
+        long boundaries = (long)blocks_seen - 1;
+        EXPECT_GE(stats[0].cross_block, 5 * boundaries)
+            << where << ": only " << stats[0].cross_block
+            << " cross-block matches across " << boundaries
+            << " block boundaries -- the hash table is probably not being "
+               "rebased when the window slides";
+      }
 
       // Linking may not pay on every shape, but it must never cost.
       EXPECT_LE(sizes[0], sizes[1])
