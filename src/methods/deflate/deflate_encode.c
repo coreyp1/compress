@@ -2404,8 +2404,25 @@ static gcomp_status_t deflate_encode_batch(
           // match stays {0, 0} - will emit literal
         }
         else if (st->strategy == DEFLATE_STRATEGY_RLE) {
-          // RLE: Only look for matches at distance 1
-          if (st->lookahead >= DEFLATE_MIN_MATCH_LENGTH && stream_pos > 0) {
+          // RLE: Only look for matches at distance 1.
+          //
+          // window_fill > lookahead is the test for the window holding any
+          // history at all, and stream_pos > 0 is not it.  The refill takes
+          // the window up to window_size - lookahead bytes at a time, so the
+          // lookahead can fill the window completely; the byte before pos is
+          // then the last byte of the lookahead - data not yet emitted -
+          // rather than the byte a distance of 1 refers to.  Reading it there
+          // made the encoder emit a distance-1 match against a byte it had
+          // not written, which decodes to whatever really did precede it.
+          //
+          // It showed up as a run continuing one byte past its end: with an
+          // 8-bit window, 40,000 bytes of 1,000-byte runs decoded correctly
+          // until offset 32,000 and then carried 0x1f where 0x20 belonged.
+          // Both this library's decoder and zlib reproduced the same wrong
+          // bytes, which is what says the fault is on this side.
+          if (st->lookahead >= DEFLATE_MIN_MATCH_LENGTH && stream_pos > 0 &&
+              st->window_fill > st->lookahead) {
+            // Check for run at distance 1
             // Check for run at distance 1
             size_t prev_pos = (pos + st->window_size - 1) & st->window_mask;
             uint8_t run_byte = st->window[prev_pos];
