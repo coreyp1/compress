@@ -9,8 +9,10 @@
 
 #include "test_helpers.h"
 #include <cstring>
+#include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/lzw.h>
+#include <ghoti.io/compress/method.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
 #include <ghoti.io/compress/stream.h>
@@ -281,6 +283,159 @@ TEST_F(LzwEncoderTest, EncoderLookupLinearVsHashEquivalence) {
       data, len, decoded_hash.data(), dec_out_hash.used));
   EXPECT_TRUE(test_helpers_buffers_equal(decoded_linear.data(),
       dec_out_linear.used, decoded_hash.data(), dec_out_hash.used));
+}
+
+
+// Encode with lzw.encoder_lookup set to `mode`, or with no options at all
+// when `mode` is nullptr.
+static std::vector<uint8_t> encode_buffer_with_lookup(
+    gcomp_registry_t * reg, const char * mode, const std::vector<uint8_t> & in) {
+  gcomp_options_t * opts = nullptr;
+  if (mode) {
+    if (gcomp_options_create(&opts) != GCOMP_OK) {
+      return {};
+    }
+    gcomp_options_set_string(opts, "lzw.encoder_lookup", mode);
+  }
+
+  std::vector<uint8_t> out(in.size() * 2 + 4096);
+  size_t used = out.size();
+  gcomp_status_t s = gcomp_encode_buffer(
+      reg, "lzw", opts, in.data(), in.size(), out.data(), out.size(), &used);
+
+  if (opts) {
+    gcomp_options_destroy(opts);
+  }
+  if (s != GCOMP_OK) {
+    return {};
+  }
+  out.resize(used);
+  return out;
+}
+
+// Data with enough repeated substrings to fill the code table, so the two
+// lookup paths have to agree over a long run of dictionary entries.
+static std::vector<uint8_t> lookup_test_data(size_t n, unsigned seed) {
+  static const char * kFragments[] = {"alpha", "beta", "gamma", "alpha",
+      "delta", "beta", "epsilon", "alphabet", "gammaray", "de", "ep", "al"};
+  const size_t kNum = sizeof(kFragments) / sizeof(kFragments[0]);
+
+  std::vector<uint8_t> out;
+  out.reserve(n + 16);
+  unsigned x = seed;
+  while (out.size() < n) {
+    x = x * 1103515245u + 12345u;
+    const char * f = kFragments[(x >> 16) % kNum];
+    for (const char * c = f; *c; c++) {
+      out.push_back((uint8_t)*c);
+    }
+    if (((x >> 8) & 7) == 0) {
+      out.push_back((uint8_t)(' ' + ((x >> 3) & 31)));
+    }
+  }
+  out.resize(n);
+  return out;
+}
+
+// lzw.encoder_lookup declares "hash" as its default, but the encoder only
+// honoured that when a caller passed the option explicitly -- so encoding
+// with no options ran the linear scan, which was 98.9% of the encoder's
+// instructions.  A default that does not match its declaration is invisible
+// unless something checks it, and the two paths produce identical bytes, so
+// nothing else could have noticed.
+TEST_F(LzwEncoderTest, DefaultLookupIsTheOneTheSchemaDeclares) {
+  const gcomp_method_t * method = gcomp_registry_find(reg_, "lzw");
+  ASSERT_NE(method, nullptr);
+
+  const gcomp_option_schema_t * schema = nullptr;
+  ASSERT_EQ(
+      gcomp_method_get_option_schema(method, "lzw.encoder_lookup", &schema),
+      GCOMP_OK);
+  ASSERT_NE(schema, nullptr);
+  ASSERT_TRUE(schema->has_default)
+      << "lzw.encoder_lookup no longer declares a default";
+
+  const char * declared = schema->default_value.str;
+  ASSERT_NE(declared, nullptr);
+
+  // Comparing output cannot tell the two lookups apart -- they are required
+  // to produce identical bytes, and do.  What distinguishes them is that the
+  // hash table is allocated and charged against limits.max_memory_bytes, so a
+  // limit that admits the dictionary but not the hash table accepts one and
+  // rejects the other.  Setting only that limit leaves encoder_lookup at its
+  // default, and the outcome then says which default actually took effect.
+  const uint64_t limit = 32 * 1024;
+
+  gcomp_options_t * implicit_opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&implicit_opts), GCOMP_OK);
+  gcomp_options_set_string(implicit_opts, "lzw.format", "gif");
+  gcomp_options_set_uint64(implicit_opts, "limits.max_memory_bytes", limit);
+  gcomp_encoder_t * implicit_enc = nullptr;
+  gcomp_status_t implicit_status =
+      gcomp_encoder_create(reg_, "lzw", implicit_opts, &implicit_enc);
+  if (implicit_enc) {
+    gcomp_encoder_destroy(implicit_enc);
+  }
+  gcomp_options_destroy(implicit_opts);
+
+  gcomp_options_t * declared_opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&declared_opts), GCOMP_OK);
+  gcomp_options_set_string(declared_opts, "lzw.format", "gif");
+  gcomp_options_set_string(declared_opts, "lzw.encoder_lookup", declared);
+  gcomp_options_set_uint64(declared_opts, "limits.max_memory_bytes", limit);
+  gcomp_encoder_t * declared_enc = nullptr;
+  gcomp_status_t declared_status =
+      gcomp_encoder_create(reg_, "lzw", declared_opts, &declared_enc);
+  if (declared_enc) {
+    gcomp_encoder_destroy(declared_enc);
+  }
+  gcomp_options_destroy(declared_opts);
+
+  EXPECT_EQ(implicit_status, declared_status)
+      << "leaving lzw.encoder_lookup unset did not behave like setting it to "
+      << declared << ", which the schema declares as the default";
+
+  // And the output still has to be identical either way.
+  std::vector<uint8_t> data = lookup_test_data(64 * 1024, 20260917u);
+  std::vector<uint8_t> implicit_out =
+      encode_buffer_with_lookup(reg_, nullptr, data);
+  std::vector<uint8_t> declared_out =
+      encode_buffer_with_lookup(reg_, declared, data);
+  ASSERT_FALSE(implicit_out.empty());
+  ASSERT_EQ(implicit_out.size(), declared_out.size());
+  EXPECT_EQ(
+      memcmp(implicit_out.data(), declared_out.data(), implicit_out.size()), 0);
+}
+
+TEST_F(LzwEncoderTest, HashAndLinearLookupsAgreeByteForByte) {
+  // The hash table is an index over the same dictionary the linear scan walks,
+  // so it must not change a single bit of the output at any size.
+  static const size_t kSizes[] = {0, 1, 2, 17, 255, 256, 1024, 4095, 4096,
+      4097, 16384, 65536, 200000};
+
+  for (size_t n : kSizes) {
+    std::vector<uint8_t> data = lookup_test_data(n, (unsigned)(n * 2654435761u));
+
+    std::vector<uint8_t> hashed = encode_buffer_with_lookup(reg_, "hash", data);
+    std::vector<uint8_t> linear =
+        encode_buffer_with_lookup(reg_, "linear", data);
+
+    ASSERT_EQ(hashed.size(), linear.size()) << "n=" << n;
+    ASSERT_EQ(memcmp(hashed.data(), linear.data(), hashed.size()), 0)
+        << "n=" << n;
+
+    // And both must decode back to the input.
+    std::vector<uint8_t> back(n + 1024);
+    size_t back_used = back.size();
+    ASSERT_EQ(gcomp_decode_buffer(reg_, "lzw", nullptr, hashed.data(),
+                  hashed.size(), back.data(), back.size(), &back_used),
+        GCOMP_OK)
+        << "n=" << n;
+    ASSERT_EQ(back_used, n) << "n=" << n;
+    if (n) {
+      ASSERT_EQ(memcmp(back.data(), data.data(), n), 0) << "n=" << n;
+    }
+  }
 }
 
 int main(int argc, char ** argv) {

@@ -109,15 +109,25 @@ gcomp_status_t lzw_encoder_init(gcomp_registry_t * registry,
     state->max_code_bits = LZW_MAX_CODE_BITS_DEFAULT;
   }
 
-  state->use_hash = 0;
+  // lzw.encoder_lookup declares "hash" as its default in lzw_register.c, but
+  // this only ever switched the hash on when a caller passed the option
+  // explicitly.  Encoding with no options at all -- which is what
+  // gcomp_encode_buffer(..., NULL, ...) does, and what every caller in the
+  // suite does -- therefore ran lzw_core_encoder_find(), a linear scan over
+  // the whole code table for every input byte.  That scan was 98.9% of the
+  // encoder's instructions and held it under 3 MB/s.  Both paths produce
+  // identical bytes, so the only visible symptom was the speed.  The default
+  // now matches the one that is advertised; only an explicit "linear" turns
+  // it off.
+  state->use_hash = 1;
   state->hash_table = NULL;
   state->hash_table_bytes = 0;
   if (options) {
     const char * lookup_str = NULL;
     if (gcomp_options_get_string(options, "lzw.encoder_lookup", &lookup_str) ==
             GCOMP_OK &&
-        lookup_str && strcmp(lookup_str, "hash") == 0) {
-      state->use_hash = 1;
+        lookup_str && strcmp(lookup_str, "linear") == 0) {
+      state->use_hash = 0;
     }
   }
 
