@@ -234,8 +234,58 @@ if (gcomp_lz4_read_skippable_frame(stream, stream_len, &variant, &offset,
 }
 ```
 
-Neither function allocates, and the parser reports the payload as an offset
-into your buffer rather than copying it. A buffer of
+**Reading while decoding.** The parser needs a buffer to point at, which a
+caller reading a pipe or a socket does not have. Register a callback on the
+decoder instead and the payload is reported while it is still in hand:
+
+```c
+static gcomp_status_t on_skippable(void *ctx, unsigned variant,
+    uint64_t payload_size, uint64_t payload_offset,
+    const uint8_t *chunk, size_t chunk_size) {
+  struct my_state *st = ctx;
+  if (payload_offset == 0) {
+    // First piece of a new frame: decide whether you want it at all.
+    if (payload_size > MY_METADATA_CEILING) {
+      return GCOMP_ERR_LIMIT;   // stops the decode with this status
+    }
+    st->buf = malloc((size_t)payload_size);
+    st->len = 0;
+  }
+  memcpy(st->buf + st->len, chunk, chunk_size);
+  st->len += chunk_size;
+  return GCOMP_OK;
+}
+
+gcomp_decoder_t *dec = NULL;
+gcomp_decoder_create(registry, "lz4", opts, &dec);
+gcomp_lz4_decoder_on_skippable_frame(dec, on_skippable, &my_state);
+```
+
+The payload is **not** buffered by the library. A skippable frame may declare
+up to 4 GB and the size comes from the stream, so holding one whole would let
+the input choose an allocation. It arrives in pieces instead — in order,
+covering `[0, payload_size)` exactly — each carrying the variant, the whole
+size, and this piece's offset. That is why the example above checks
+`payload_size` against its own ceiling on the first piece: **the decision about
+how much memory to spend is yours, and it is the only place the stream cannot
+make it for you.**
+
+A frame with an empty payload is still reported, once, with `chunk_size` 0 —
+its variant may be the whole message.
+
+`chunk` points into the buffer you passed to `gcomp_decoder_update()` and is
+valid only during the call. Whatever the callback returns is what
+`gcomp_decoder_update()` returns, and the decoder stops there. The registration
+survives `gcomp_decoder_reset()`; pass NULL to clear it. Skippable frames are
+skipped either way, so the callback changes what you are told, never what the
+stream decodes to.
+
+The convenience wrappers (`gcomp_decode_buffer()`, `gcomp_decode_stream_cb()`)
+create and destroy a decoder internally, so there is none to register on — use
+`gcomp_decoder_create()` when you need this.
+
+Neither the writer nor the parser allocates, and the parser reports the payload
+as an offset into your buffer rather than copying it. A buffer of
 `GCOMP_LZ4_SKIPPABLE_OVERHEAD + payload_size` always holds the frame; the
 payload may be at most `GCOMP_LZ4_SKIPPABLE_MAX_PAYLOAD` bytes, the size field
 being 32 bits.

@@ -1090,7 +1090,9 @@ TEST_F(Lz4FormatTest, SkippableCallbackIsOptionalAndSurvivesReset) {
   // Reset clears the stream, not the caller's arrangement with the decoder.
   ASSERT_EQ(gcomp_decoder_reset(dec), GCOMP_OK);
   ASSERT_EQ(decode_once(), GCOMP_OK);
-  EXPECT_EQ(sink.frames.size(), 2u)
+  // ASSERT, not EXPECT: the indexing below is only safe once this holds, and
+  // a test that segfaults on a regression reports nothing at all.
+  ASSERT_EQ(sink.frames.size(), 2u)
       << "the callback must survive a reset -- it describes how the caller is "
          "using the decoder, not the stream it was reading";
   EXPECT_EQ(sink.frames[1].payload, payload);
