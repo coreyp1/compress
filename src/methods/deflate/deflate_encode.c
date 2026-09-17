@@ -21,6 +21,7 @@
 
 #include <ghoti.io/compress/macros.h>
 #include "../../core/alloc_internal.h"
+#include "../../core/huffman_lengths.h"
 #include "../../core/registry_internal.h"
 #include "../../core/stream_internal.h"
 #include "bitwriter.h"
@@ -1090,19 +1091,20 @@ static gcomp_status_t deflate_flush_fixed_block(
  *    - dist_freq[0..29]: Count of each distance code (distances 1-32768)
  *    - lit_freq[256] is incremented for the end-of-block marker
  *
- * 2. HUFFMAN TREE CONSTRUCTION (build_code_lengths):
- *    - Create leaf nodes for symbols with freq > 0
- *    - Build min-heap ordered by frequency
- *    - Repeatedly extract two minimum nodes and combine into internal node
- *    - This produces an optimal prefix-free code (Huffman's algorithm)
+ * 2. CODE LENGTH CONSTRUCTION (build_code_lengths):
+ *    - Hand the frequencies to the shared package-merge implementation in
+ *      src/core/huffman_lengths.c
+ *    - It returns the code lengths that encode these frequencies in the
+ *      fewest bits of any code whose longest code word fits the cap - 15 bits
+ *      for the literal/length and distance alphabets, 7 for the code-length
+ *      alphabet - and that always describe a complete code
  *
- * 3. LENGTH EXTRACTION AND LIMITING:
- *    - Walk tree depth-first to determine code length for each symbol
- *    - DEFLATE limits code lengths to 15 bits maximum
- *    - If any code exceeds 15 bits, apply length-limiting adjustment:
- *      a. Cap all lengths at 15
- *      b. Verify Kraft inequality: sum(2^(-length)) <= 1
- *      c. If over-subscribed, increment some lengths to reduce code space
+ * 3. (no separate limiting step)
+ *    - The cap is part of what package-merge solves, so there is no clamp to
+ *      repair afterwards.  Deciding the cap and the code separately is what
+ *      this encoder used to do, and it cost bits: a clamp cannot see which
+ *      lengthening elsewhere is cheapest, so it spent the code space in the
+ *      wrong place
  *
  * 4. CODE LENGTH ENCODING (RFC 1951 Section 3.2.7):
  *    - Combine literal/length and distance code lengths into one sequence
@@ -1129,9 +1131,8 @@ static gcomp_status_t deflate_flush_fixed_block(
  *
  * DESIGN RATIONALE
  * ----------------
- * - Heap-based tree construction is O(n log n) and memory-efficient
- * - The 15-bit length limit is mandated by RFC 1951; we enforce it with
- *   a post-processing step rather than package-merge for simplicity
+ * - Package-merge is O(n * max_bits) and is exact under the cap; the 15-bit
+ *   limit is mandated by RFC 1951 section 3.2.7
  * - Fallback to fixed Huffman occurs on memory allocation failure
  * - Empty distance trees are valid when no LZ77 matches are used (e.g.,
  *   incompressible data or very short inputs)
@@ -1140,291 +1141,36 @@ static gcomp_status_t deflate_flush_fixed_block(
  * -------------
  * - lit_freq: 288 uint32_t entries (allocated for levels > 3)
  * - dist_freq: 32 uint32_t entries (allocated for levels > 3)
- * - Temporary allocations in build_code_lengths: ~2*num_symbols nodes
+ * - Temporary allocations in build_code_lengths: 2 * used * max_bits chain
+ *   records, where `used` counts the symbols that actually occur
  *
  * ===========================================================================
  */
 
 /**
- * @brief Node structure for Huffman tree construction.
+ * @brief Build code lengths for an alphabet, none longer than @p max_bits.
  *
- * Used during the heap-based Huffman tree building process. Leaf nodes
- * represent symbols and have symbol >= 0 with left/right = -1. Internal
- * nodes combine two children and have symbol = -1.
+ * Thin wrapper over the shared package-merge implementation in
+ * src/core/huffman_lengths.c, which is where the algorithm and the reason
+ * for it are documented.  The lengths it returns are optimal under the cap
+ * and always describe a complete code.
  *
- * The nodes array is used as both storage and a min-heap (via separate
- * indices array). This avoids copying node data during heap operations.
+ * @param alloc Allocator for scratch memory.
+ * @param freq Frequency of each symbol.
+ * @param num_symbols Size of the alphabet.
+ * @param lengths Receives one length per symbol.
+ * @param max_bits Longest code word allowed: 15 for the literal/length and
+ *        distance alphabets, 7 for the code-length alphabet (RFC 1951
+ *        sections 3.2.2 and 3.2.7).
+ * @return GCOMP_OK, or GCOMP_ERR_MEMORY when scratch space cannot be
+ *         allocated.  A caller that cannot proceed without lengths emits a
+ *         fixed-Huffman block instead, which needs none.
  */
-typedef struct {
-  uint32_t freq;  ///< Symbol frequency (leaves) or combined freq (internal)
-  int16_t symbol; ///< Symbol value (0-285) or -1 for internal nodes
-  int16_t left;   ///< Index of left child in nodes array, or -1
-  int16_t right;  ///< Index of right child in nodes array, or -1
-} huffman_node_t;
-
-/**
- * @brief Min-heap sift down operation.
- */
-static void heap_sift_down(
-    huffman_node_t * heap, int * indices, int size, int i) {
-  while (1) {
-    int smallest = i;
-    int left = 2 * i + 1;
-    int right = 2 * i + 2;
-
-    if (left < size &&
-        heap[indices[left]].freq < heap[indices[smallest]].freq) {
-      smallest = left;
-    }
-    if (right < size &&
-        heap[indices[right]].freq < heap[indices[smallest]].freq) {
-      smallest = right;
-    }
-    if (smallest == i) {
-      break;
-    }
-    int tmp = indices[i];
-    indices[i] = indices[smallest];
-    indices[smallest] = tmp;
-    i = smallest;
-  }
-}
-
-/**
- * @brief Min-heap sift up operation.
- */
-static void heap_sift_up(huffman_node_t * heap, int * indices, int i) {
-  while (i > 0) {
-    int parent = (i - 1) / 2;
-    if (heap[indices[parent]].freq <= heap[indices[i]].freq) {
-      break;
-    }
-    int tmp = indices[i];
-    indices[i] = indices[parent];
-    indices[parent] = tmp;
-    i = parent;
-  }
-}
-
-/**
- * @brief Extract code lengths from Huffman tree.
- */
-static void extract_lengths(
-    huffman_node_t * nodes, int root, uint8_t * lengths, int depth) {
-  if (root < 0) {
-    return;
-  }
-  if (nodes[root].symbol >= 0) {
-    // Leaf node
-    lengths[nodes[root].symbol] = (uint8_t)(depth > 15 ? 15 : depth);
-    return;
-  }
-  extract_lengths(nodes, nodes[root].left, lengths, depth + 1);
-  extract_lengths(nodes, nodes[root].right, lengths, depth + 1);
-}
-
-/**
- * @brief Build optimal Huffman code lengths from symbol frequencies.
- *
- * Uses the classic Huffman algorithm with a min-heap to construct an optimal
- * prefix-free code. The algorithm is O(n log n) where n is the number of
- * symbols with non-zero frequency.
- *
- * @param alloc      Allocator for temporary memory
- * @param freq       Array of symbol frequencies (freq[i] = count of symbol i)
- * @param num_symbols Number of symbols in the frequency array
- * @param lengths    Output array for code lengths (same size as freq)
- * @param max_bits   Maximum allowed code length (15 for DEFLATE)
- *
- * Special cases:
- * - 0 symbols with freq > 0: all lengths set to 0
- * - 1 symbol with freq > 0: that symbol gets length 1
- * - Memory allocation failure: fallback to uniform 8-bit lengths
- *
- * The algorithm handles the DEFLATE 15-bit length limit by:
- * 1. Building the unconstrained Huffman tree
- * 2. Capping any lengths > max_bits
- * 3. Adjusting via Kraft inequality to ensure valid prefix code
- */
-static void build_code_lengths(const gcomp_allocator_t * alloc,
+static gcomp_status_t build_code_lengths(const gcomp_allocator_t * alloc,
     const uint32_t * freq, size_t num_symbols, uint8_t * lengths,
     unsigned max_bits) {
-  // Count non-zero frequencies
-  int count = 0;
-  for (size_t i = 0; i < num_symbols; i++) {
-    lengths[i] = 0;
-    if (freq[i] > 0) {
-      count++;
-    }
-  }
-
-  if (count == 0) {
-    return;
-  }
-
-  if (count == 1) {
-    // Single symbol gets length 1
-    for (size_t i = 0; i < num_symbols; i++) {
-      if (freq[i] > 0) {
-        lengths[i] = 1;
-        break;
-      }
-    }
-    return;
-  }
-
-  // Allocate nodes: up to num_symbols leaves + (num_symbols-1) internal nodes
-  size_t max_nodes = num_symbols * 2;
-  huffman_node_t * nodes =
-      (huffman_node_t *)gcomp_malloc(alloc, max_nodes * sizeof(huffman_node_t));
-  int * heap = (int *)gcomp_malloc(alloc, max_nodes * sizeof(int));
-  if (!nodes || !heap) {
-    gcomp_free(alloc, heap);
-    gcomp_free(alloc, nodes);
-    // Fallback: use uniform lengths
-    for (size_t i = 0; i < num_symbols; i++) {
-      if (freq[i] > 0) {
-        lengths[i] = 8;
-      }
-    }
-    return;
-  }
-
-  // Initialize leaf nodes
-  int node_count = 0;
-  int heap_size = 0;
-  for (size_t i = 0; i < num_symbols; i++) {
-    if (freq[i] > 0) {
-      nodes[node_count].freq = freq[i];
-      nodes[node_count].symbol = (int16_t)i;
-      nodes[node_count].left = -1;
-      nodes[node_count].right = -1;
-      heap[heap_size] = node_count;
-      heap_size++;
-      node_count++;
-    }
-  }
-
-  // Build heap
-  for (int i = heap_size / 2 - 1; i >= 0; i--) {
-    heap_sift_down(nodes, heap, heap_size, i);
-  }
-
-  // Build Huffman tree
-  while (heap_size > 1) {
-    // Extract two minimum nodes
-    int min1 = heap[0];
-    heap[0] = heap[heap_size - 1];
-    heap_size--;
-    heap_sift_down(nodes, heap, heap_size, 0);
-
-    int min2 = heap[0];
-    heap[0] = heap[heap_size - 1];
-    heap_size--;
-    heap_sift_down(nodes, heap, heap_size, 0);
-
-    // Create internal node
-    nodes[node_count].freq = nodes[min1].freq + nodes[min2].freq;
-    nodes[node_count].symbol = -1;
-    nodes[node_count].left = (int16_t)min1;
-    nodes[node_count].right = (int16_t)min2;
-
-    // Add to heap
-    heap[heap_size] = node_count;
-    heap_size++;
-    heap_sift_up(nodes, heap, heap_size - 1);
-    node_count++;
-  }
-
-  // Extract lengths
-  int root = heap[0];
-  extract_lengths(nodes, root, lengths, 0);
-
-  // Limit code lengths to max_bits using the package-merge simplification:
-  // If any length > max_bits, reduce it and compensate by reducing others
-  int need_adjustment = 0;
-  for (size_t i = 0; i < num_symbols; i++) {
-    if (lengths[i] > max_bits) {
-      need_adjustment = 1;
-      break;
-    }
-  }
-
-  if (need_adjustment) {
-    // Simple length limiting: cap at max_bits and rebalance
-    // This is a simplified approach that may not be optimal but produces
-    // valid codes
-    for (size_t i = 0; i < num_symbols; i++) {
-      if (lengths[i] > max_bits) {
-        lengths[i] = (uint8_t)max_bits;
-      }
-    }
-
-    // Verify/fix the code is valid (Kraft inequality)
-    // Sum of 2^(-length) must be <= 1
-    uint32_t kraft = 0;
-    for (size_t i = 0; i < num_symbols; i++) {
-      if (lengths[i] > 0) {
-        kraft += 1u << (max_bits - lengths[i]);
-      }
-    }
-
-    // If over-subscribed, increase some lengths
-    while (kraft > (1u << max_bits)) {
-      for (size_t i = 0; i < num_symbols && kraft > (1u << max_bits); i++) {
-        if (lengths[i] > 0 && lengths[i] < max_bits) {
-          kraft -= 1u << (max_bits - lengths[i]);
-          lengths[i]++;
-          kraft += 1u << (max_bits - lengths[i]);
-        }
-      }
-    }
-
-    // Lengthening halves a symbol's share of the code space, so the loop above
-    // steps past its target as often as it lands on it, and what it leaves is
-    // an under-subscribed - incomplete - code.  RFC 1951 section 3.2.2 defines
-    // the code by the construction in that section, which assigns every
-    // available code word; a set of lengths whose Kraft sum falls short does
-    // not describe a code at all, and zlib rejects such a header outright.
-    //
-    // Shortening a symbol from length L to L - 1 doubles its share, adding
-    // 2^(max_bits - L).  Taking the largest addition that still fits the
-    // shortfall each time finishes in at most max_bits steps - it is walking
-    // the binary representation of the shortfall - and cannot overshoot.
-    //
-    // A symbol always exists to shorten: the shortfall is at least one, a
-    // symbol at max_bits adds exactly one, and if every symbol were already at
-    // length 1 the sum would be at least 2^max_bits with two or more symbols,
-    // while a single symbol returns far above.
-    uint32_t target = 1u << max_bits;
-    while (kraft < target) {
-      uint32_t shortfall = target - kraft;
-      size_t best = num_symbols;
-      for (size_t i = 0; i < num_symbols; i++) {
-        if (lengths[i] <= 1) {
-          continue;
-        }
-        uint32_t gain = 1u << (max_bits - lengths[i]);
-        if (gain > shortfall) {
-          continue;
-        }
-        // Largest gain first; among equals, spend it on the symbol that is
-        // sent most often, so the repair costs as few bits as it can.
-        if (best == num_symbols || lengths[i] < lengths[best] ||
-            (lengths[i] == lengths[best] && freq[i] > freq[best])) {
-          best = i;
-        }
-      }
-      if (best == num_symbols) {
-        break; // Unreachable; leaving the loop is safer than spinning.
-      }
-      kraft += 1u << (max_bits - lengths[best]);
-      lengths[best]--;
-    }
-  }
-
-  gcomp_free(alloc, heap);
-  gcomp_free(alloc, nodes);
+  return gcomp_huffman_code_lengths(
+      alloc, freq, num_symbols, max_bits, lengths);
 }
 
 /**
@@ -1703,8 +1449,15 @@ static gcomp_status_t deflate_flush_dynamic_block(
 
   // Build code lengths for literal/length alphabet
   uint8_t lit_lengths[DEFLATE_MAX_LITLEN_SYMBOLS];
-  build_code_lengths(
+  s = build_code_lengths(
       st->allocator, st->lit_freq, DEFLATE_MAX_LITLEN_SYMBOLS, lit_lengths, 15);
+  if (s != GCOMP_OK) {
+    // Without lengths there is no dynamic block to write.  The fixed code is
+    // defined by RFC 1951 section 3.2.6 and needs no scratch memory, so it
+    // remains available when this does not.
+    st->lit_freq[256]--;
+    return deflate_flush_fixed_block(st, final);
+  }
 
   // Ensure end-of-block (256) has a code
   if (lit_lengths[256] == 0) {
@@ -1713,8 +1466,12 @@ static gcomp_status_t deflate_flush_dynamic_block(
 
   // Build code lengths for distance alphabet
   uint8_t dist_lengths[DEFLATE_MAX_DIST_SYMBOLS];
-  build_code_lengths(
+  s = build_code_lengths(
       st->allocator, st->dist_freq, DEFLATE_MAX_DIST_SYMBOLS, dist_lengths, 15);
+  if (s != GCOMP_OK) {
+    st->lit_freq[256]--;
+    return deflate_flush_fixed_block(st, final);
+  }
 
   // Determine HLIT (number of literal/length codes - 257)
   int hlit = DEFLATE_MAX_LITLEN_SYMBOLS - 257;
@@ -1762,7 +1519,12 @@ static gcomp_status_t deflate_flush_dynamic_block(
   }
 
   uint8_t cl_lengths[19];
-  build_code_lengths(st->allocator, cl_freq, 19, cl_lengths, 7);
+  s = build_code_lengths(st->allocator, cl_freq, 19, cl_lengths, 7);
+  if (s != GCOMP_OK) {
+    gcomp_free(st->allocator, all_lengths);
+    st->lit_freq[256]--;
+    return deflate_flush_fixed_block(st, final);
+  }
 
   // Ensure code-length alphabet is complete for zlib compatibility
   deflate_ensure_cl_kraft_complete(cl_lengths);
