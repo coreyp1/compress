@@ -130,6 +130,17 @@ typedef struct gcomp_deflate_decoder_state_s {
   //
   uint8_t * window;
   size_t window_size;
+  /**
+   * @brief window_size - 1, for wrapping indices into the circular window.
+   *
+   * window_size is `1 << win_bits` with win_bits bounded to 8..15 by RFC 1951
+   * section 3.2.1, so it is always a power of two and wrapping is a mask.
+   * The compiler cannot see that - window_size is a runtime value - so
+   * `% window_size` compiled to a 64-bit `div`, one for every literal emitted
+   * and two for every byte of every match.  deflate_copy_match() was 14% of a
+   * gzip decode because of it.
+   */
+  size_t window_mask;
   size_t window_pos;
   size_t window_filled;
 
@@ -412,7 +423,7 @@ static void deflate_window_put(gcomp_deflate_decoder_state_t * st, uint8_t b) {
   }
 
   st->window[st->window_pos] = b;
-  st->window_pos = (st->window_pos + 1u) % st->window_size;
+  st->window_pos = (st->window_pos + 1u) & st->window_mask;
   if (st->window_filled < st->window_size) {
     st->window_filled += 1u;
   }
@@ -519,8 +530,8 @@ static gcomp_status_t deflate_copy_match(
     }
 
     size_t src_pos =
-        (st->window_pos + st->window_size - (size_t)st->match_distance) %
-        st->window_size;
+        (st->window_pos + st->window_size - (size_t)st->match_distance) &
+        st->window_mask;
     uint8_t b = st->window ? st->window[src_pos] : 0u;
 
     gcomp_status_t st_out = deflate_emit_byte(st, output, b);
@@ -1133,6 +1144,7 @@ gcomp_status_t gcomp_deflate_decoder_init(gcomp_registry_t * registry,
   st->pending_length_sym = 0;
 
   st->window_size = window_size;
+  st->window_mask = window_size - 1u;
   st->max_window_bytes =
       gcomp_limits_read_window_max(options, (uint64_t)st->window_size);
   if (st->max_window_bytes != 0 &&
