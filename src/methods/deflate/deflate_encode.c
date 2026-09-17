@@ -93,12 +93,32 @@ typedef enum {
 //
 // Note that this is the opposite of what zlib's Z_FILTERED does. zlib reduces
 // effort - it forces matches to be at least six bytes and leans on Huffman
-// coding - so Z_FILTERED is *faster* than its default. This one is slower:
-// measured on real PNG filtered rows it runs at about 1.9 MB/s against 6.6
-// MB/s for DEFAULT, and whether it produces a smaller file depends on the
-// image. The image library measured six of them and found this strategy
-// smaller on smooth and synthetic content by up to 9% and larger on
-// photographic content by up to 9%. Worth knowing before choosing it by name.
+// coding - so Z_FILTERED is *faster* than its default. This one is slower, and
+// by more than the chain length alone accounts for. On 3 MB of real PNG
+// filtered rows it runs at 5.2 MB/s against 28.4 for DEFAULT - 5.5x - where
+// the chains are only 4x longer. The rest is the lazy-match step below: when
+// it decides the next position looks better it throws away the match it just
+// searched for and emits a literal, and the next iteration searches that same
+// position again from scratch. Two full chain walks per position, and the
+// chains are 128 deep. Carrying the lookahead result forward, the way zlib
+// carries match_start and prev_length, would remove the second walk - but not
+// for free: the literal branch inserts a hash entry for the position it just
+// passed, so the chain the second search walks is not the one the first search
+// walked, and the output would change.
+//
+// Whether the extra effort pays is content-dependent, and on filtered rows it
+// often does not. On the 3 MB sample above it produces a *larger* stream than
+// DEFAULT - 1,551,415 bytes against 1,481,112. The image library measured six
+// whole images and found this strategy smaller on smooth and synthetic content
+// by up to 9% and larger on photographic content by up to 9%. Worth knowing
+// before choosing it by name.
+//
+// For scale, zlib at level 5 encodes that same sample to 1,312,995 bytes at
+// 36.4 MB/s. The ratio gap is not the chain length; it is that lazy matching
+// here is wired only to this strategy, while zlib applies it at every level
+// from 4 up, and that there is no equivalent of zlib's good_length or
+// nice_length to stop a search early. Both of those change the output, so
+// neither is a change to make quietly.
 //
 // DEFLATE_STRATEGY_HUFFMAN_ONLY (strategy="huffman_only")
 // -------------------------------------------------------
