@@ -1512,11 +1512,33 @@ static gcomp_status_t deflate_flush_dynamic_block(
     hdist--;
   }
 
-  // Ensure at least one distance code (DEFLATE requires it).
-  // When no distance codes are used (e.g., huffman_only strategy), all
-  // dist_lengths are 0. The while loop stops at hdist == 0, but we still
-  // need to ensure dist_lengths[0] has a valid code length.
-  if (dist_lengths[0] == 0) {
+  // A block that uses no distances at all still has to declare a distance
+  // code, and RFC 1951 section 3.2.7 names the case: "If only one distance
+  // code is used, it is encoded using one bit ... Note that in this case
+  // there is an incomplete Huffman tree with only one code."
+  //
+  // The condition has to be "no distance code is used", not "distance code 0
+  // is not used".  Testing the latter - which is what this did - gave a
+  // length-1 code to distance code 0 on top of a complete code for the
+  // distances the block does use, and a complete code plus another one-bit
+  // code is over-subscribed.  gcomp_deflate_huffman_build_codes() then
+  // refused it and this function fell back to a fixed-Huffman block, quietly,
+  // for the whole block.
+  //
+  // Distance code 0 is a match at distance 1, so run-heavy data has it and
+  // structured text often does not.  On an XML registry every block took the
+  // fallback: 135,514 bytes where the dynamic code its own frequencies called
+  // for would have cost 113,265, against zlib's 112,703.  The parse was
+  // already as good as zlib's - 30,519 matches averaging 39.8 bytes against
+  // 30,320 averaging 40.1 - and all of the difference was this.
+  int any_distance_used = 0;
+  for (size_t j = 0; j < DEFLATE_MAX_DIST_SYMBOLS; j++) {
+    if (dist_lengths[j] > 0) {
+      any_distance_used = 1;
+      break;
+    }
+  }
+  if (!any_distance_used) {
     dist_lengths[0] = 1;
   }
 

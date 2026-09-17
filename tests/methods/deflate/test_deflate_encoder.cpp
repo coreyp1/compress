@@ -2007,3 +2007,57 @@ TEST_F(DeflateEncoderTest, HistorySurvivesTheEncodersRefillBoundary) {
   EXPECT_LT(twice, once + once / 10)
       << "once " << once << ", twice " << twice;
 }
+
+// A block that uses distances, but never distance 1, must still get a dynamic
+// Huffman code.
+//
+// RFC 1951 section 3.2.7 lets a block that uses *no* distances declare a
+// single one-bit distance code, and this encoder used to give that one-bit
+// code to distance code 0 whenever distance code 0 itself was unused - which
+// is a different and much more common condition.  On top of the complete code
+// the block's real distances had already produced, that extra one-bit code
+// made the distance code over-subscribed, the canonical-code builder refused
+// it, and the whole block quietly came out as a fixed-Huffman block instead.
+//
+// Distance code 0 is a match at distance 1, so run-heavy data has it and
+// structured text often does not.  The data below has repeats at many
+// distances and none at distance 1, because no two adjacent bytes are equal.
+TEST_F(DeflateEncoderTest, BlocksWithoutDistanceOneStillGetTheirOwnCode) {
+  std::vector<uint8_t> data;
+  data.reserve(200000);
+  static const char * phrases[] = {"<subtag>en</subtag>", "<type>language",
+      "<added>2005-10-16", "<description>English", "<scope>macrolanguage",
+      "<prefix>zh-min", "<comments>see also", "<deprecated>1989-01"};
+  const size_t count = sizeof(phrases) / sizeof(phrases[0]);
+  uint32_t seed = 13579u;
+  while (data.size() < 200000) {
+    seed = seed * 1103515245u + 12345u;
+    const char * p = phrases[(seed >> 16) % count];
+    for (const char * c = p; *c; c++) {
+      // Never emit the same byte twice in a row, so no match can have
+      // distance 1 and distance code 0 stays out of the block.
+      if (!data.empty() && data.back() == (uint8_t)*c) {
+        data.push_back((uint8_t)(*c ^ 0x20));
+      }
+      data.push_back((uint8_t)*c);
+    }
+    seed = seed * 1103515245u + 12345u;
+    data.push_back((uint8_t)('0' + ((seed >> 20) % 10)));
+  }
+
+  std::vector<uint8_t> out;
+  size_t used = EncodeWith(registry_, "default", data, out);
+  ASSERT_GT(used, 3u);
+
+  // Raw deflate: the first bit of the stream is BFINAL and the next two are
+  // BTYPE (RFC 1951 section 3.2.3).  10 binary, read least-significant bit
+  // first, is a dynamic Huffman block.
+  unsigned btype = (unsigned)((out[0] >> 1) & 3u);
+  EXPECT_EQ(btype, 2u) << "first block is BTYPE " << btype
+                       << ", not a dynamic Huffman block";
+
+  std::vector<uint8_t> back;
+  ASSERT_EQ(decode_data(out.data(), used, back, data.size()), GCOMP_OK);
+  ASSERT_EQ(back.size(), data.size());
+  EXPECT_EQ(memcmp(back.data(), data.data(), data.size()), 0);
+}
