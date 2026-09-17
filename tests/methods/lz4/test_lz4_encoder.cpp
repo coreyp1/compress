@@ -1030,3 +1030,87 @@ TEST(Lz4Encoder, TheFiveByteHashKeyEarnsItsMissedFourByteMatches) {
       << used << " of " << data.size() << " ("
       << (100.0 * (double)used / (double)data.size()) << "%)";
 }
+
+// A dictionary has to reach every independent block, not just the first.
+//
+// Each such block starts from the dictionary and nothing else, so each begins
+// with the same hash table, and the encoder keeps that table rather than
+// rebuilding it per block.  Nothing in the suite compressed more than one
+// block against a dictionary before, which is how a version of that
+// optimisation that allocated the table before its size was known managed to
+// segfault without a test noticing.
+TEST(Lz4Encoder, ADictionaryReachesEveryIndependentBlock) {
+  // A dictionary of phrases, then several blocks' worth of input built from
+  // those same phrases and nothing else, so what the blocks after the first
+  // match is the dictionary.
+  std::vector<uint8_t> dict;
+  for (int i = 0; i < 400; i++) {
+    char buf[64];
+    int n = snprintf(buf, sizeof(buf), "<entry id=\"%d\" kind=\"phrase\"/>", i);
+    dict.insert(dict.end(), buf, buf + n);
+  }
+
+  std::vector<uint8_t> data;
+  uint32_t seed = 555u;
+  while (data.size() < 300u * 1024u) {
+    seed = seed * 1103515245u + 12345u;
+    char buf[64];
+    int n = snprintf(
+        buf, sizeof(buf), "<entry id=\"%u\" kind=\"phrase\"/>", (seed >> 16) % 400u);
+    data.insert(data.end(), buf, buf + n);
+  }
+
+  auto encode = [&](bool with_dictionary) {
+    gcomp_options_t * opts = nullptr;
+    EXPECT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+    EXPECT_EQ(gcomp_options_set_uint64(opts, "lz4.block_size", 65536u),
+        GCOMP_OK);
+    EXPECT_EQ(gcomp_options_set_bool(opts, "lz4.independent_blocks", true),
+        GCOMP_OK);
+    if (with_dictionary) {
+      EXPECT_EQ(gcomp_options_set_bytes(
+                    opts, "lz4.dictionary", dict.data(), dict.size()),
+          GCOMP_OK);
+    }
+    std::vector<uint8_t> out(data.size() * 2 + 4096);
+    size_t used = out.size();
+    EXPECT_EQ(gcomp_encode_buffer(gcomp_registry_default(), "lz4", opts,
+                  data.data(), data.size(), out.data(), out.size(), &used),
+        GCOMP_OK);
+    gcomp_options_destroy(opts);
+    out.resize(used);
+
+    // Decoding needs the same dictionary, and getting it back proves the
+    // encoder only pointed at bytes the decoder has.
+    gcomp_options_t * dopts = nullptr;
+    EXPECT_EQ(gcomp_options_create(&dopts), GCOMP_OK);
+    if (with_dictionary) {
+      EXPECT_EQ(gcomp_options_set_bytes(
+                    dopts, "lz4.dictionary", dict.data(), dict.size()),
+          GCOMP_OK);
+    }
+    std::vector<uint8_t> back(data.size() + 64);
+    size_t back_used = back.size();
+    EXPECT_EQ(gcomp_decode_buffer(gcomp_registry_default(), "lz4", dopts,
+                  out.data(), out.size(), back.data(), back.size(),
+                  &back_used),
+        GCOMP_OK);
+    gcomp_options_destroy(dopts);
+    EXPECT_EQ(back_used, data.size());
+    EXPECT_EQ(memcmp(back.data(), data.data(), data.size()), 0);
+    return used;
+  };
+
+  size_t with = encode(true);
+  size_t without = encode(false);
+
+  // Five blocks of input against a dictionary that covers all of it.  If the
+  // dictionary only reached the first block the saving would be about a fifth
+  // of what it is - measured, 370 bytes against 1,847 - so the bound is set
+  // between the two.  Asking only that the dictionary help at all passes
+  // either way, which is what a first version of this test did.
+  ASSERT_GT(without, with);
+  EXPECT_GT(without - with, 1000u)
+      << "dictionary saved only " << (without - with) << " bytes: " << with
+      << " against " << without;
+}
