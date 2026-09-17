@@ -306,6 +306,11 @@ gcomp_status_t lz4_decoder_init(gcomp_registry_t * registry,
   state->header_stage = LZ4_HEADER_MAGIC;
   state->header_accum_pos = 0;
   state->skippable_remaining = 0;
+  state->skippable_variant = 0;
+  state->skippable_size = 0;
+  state->skippable_delivered = 0;
+  state->skippable_cb = NULL;
+  state->skippable_ctx = NULL;
   state->frames_completed = 0;
   state->total_input_bytes = 0;
   state->total_output_bytes = 0;
@@ -403,6 +408,7 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
             // for concatenation to be a question about.  lz4.concat keeps its
             // own meaning, which is whether to carry on past a finished data
             // frame.
+            state->skippable_variant = (unsigned)(magic & 0x0Fu);
             state->header_accum_pos = 0;
             state->stage = LZ4_DEC_STAGE_SKIPPABLE_SIZE;
             break;
@@ -864,11 +870,27 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
       }
       state->skippable_remaining = gcomp_read_le32(state->header_accum);
       state->header_accum_pos = 0;
+      state->skippable_size = state->skippable_remaining;
+      state->skippable_delivered = 0;
       if (state->skippable_remaining == 0) {
         // A zero-length payload finishes the frame here.  It cannot be left
         // to the SKIPPABLE_DATA case: reading the size may have consumed the
         // last of the input, and the loop would then exit before that case
         // ever ran, leaving a complete frame looking truncated.
+        //
+        // The callback still runs once.  A frame with no payload is not a
+        // frame with nothing to say -- its variant may be the whole message.
+        if (state->skippable_cb) {
+          gcomp_status_t cb_status = state->skippable_cb(state->skippable_ctx,
+              state->skippable_variant, 0, 0, NULL, 0);
+          if (cb_status != GCOMP_OK) {
+            state->stage = LZ4_DEC_STAGE_ERROR;
+            return gcomp_decoder_set_error(decoder, cb_status,
+                "skippable frame callback stopped the decode (variant %u, "
+                "empty payload)",
+                state->skippable_variant);
+          }
+        }
         lz4_decoder_finish_skippable(state);
         break;
       }
@@ -882,7 +904,29 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
       size_t take = (available < state->skippable_remaining)
           ? available
           : (size_t)state->skippable_remaining;
+
+      // Hand the bytes over before discarding them.  The chunk points into
+      // the caller's own input buffer, so nothing is copied and nothing is
+      // held.  On refusal the input is left unconsumed, so the decoder does
+      // not half-swallow a frame it is about to stop on.
+      if (state->skippable_cb && take > 0) {
+        gcomp_status_t cb_status = state->skippable_cb(state->skippable_ctx,
+            state->skippable_variant, state->skippable_size,
+            state->skippable_delivered,
+            (const uint8_t *)input->data + input->used, take);
+        if (cb_status != GCOMP_OK) {
+          state->stage = LZ4_DEC_STAGE_ERROR;
+          return gcomp_decoder_set_error(decoder, cb_status,
+              "skippable frame callback stopped the decode (variant %u, "
+              "%llu of %llu payload bytes delivered)",
+              state->skippable_variant,
+              (unsigned long long)state->skippable_delivered,
+              (unsigned long long)state->skippable_size);
+        }
+      }
+
       input->used += take;
+      state->skippable_delivered += take;
       state->skippable_remaining -= (uint32_t)take;
       if (state->skippable_remaining > 0) {
         break; // Need more input
@@ -1032,7 +1076,14 @@ gcomp_status_t lz4_decoder_reset(gcomp_decoder_t * decoder) {
   state->stage = LZ4_DEC_STAGE_HEADER;
   state->header_stage = LZ4_HEADER_MAGIC;
   state->header_accum_pos = 0;
+  // Per-frame skippable tracking resets; the registered callback does not.
+  // It describes how the caller is using this decoder, not the stream it was
+  // reading, and a caller that resets to decode another stream still wants to
+  // be told about its skippable frames.
   state->skippable_remaining = 0;
+  state->skippable_variant = 0;
+  state->skippable_size = 0;
+  state->skippable_delivered = 0;
   state->frames_completed = 0;
   state->block_size_buf_pos = 0;
   state->block_bytes_remaining = 0;
@@ -1044,5 +1095,28 @@ gcomp_status_t lz4_decoder_reset(gcomp_decoder_t * decoder) {
   // Clear header info
   memset(&state->header, 0, sizeof(state->header));
 
+  return GCOMP_OK;
+}
+
+//
+// Skippable frame reporting
+//
+
+gcomp_status_t gcomp_lz4_decoder_on_skippable_frame(gcomp_decoder_t * decoder,
+    gcomp_lz4_skippable_cb callback, void * ctx) {
+  if (!decoder || !decoder->method_state) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  // The state pointer is method-specific, so registering on another method's
+  // decoder would write through a pointer to something else entirely.
+  if (!decoder->method || !decoder->method->name ||
+      strcmp(decoder->method->name, "lz4") != 0) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  lz4_decoder_state_t * state = (lz4_decoder_state_t *)decoder->method_state;
+  state->skippable_cb = callback;
+  state->skippable_ctx = ctx;
   return GCOMP_OK;
 }

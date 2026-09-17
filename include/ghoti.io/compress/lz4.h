@@ -58,7 +58,9 @@
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/registry.h>
+#include <ghoti.io/compress/stream.h>
 #include <stddef.h>
+#include <stdint.h>
 
 
 #ifdef __cplusplus
@@ -155,6 +157,75 @@ GCOMP_API gcomp_status_t gcomp_lz4_read_skippable_frame(const void * input,
     size_t input_size, unsigned * magic_variant_out,
     size_t * payload_offset_out, size_t * payload_size_out,
     size_t * frame_size_out);
+
+/**
+ * @brief Receives a skippable frame's payload while a stream is decoded.
+ *
+ * The decoder discards skippable frames, as the LZ4 frame format requires, so
+ * without this a payload embedded in a stream is only recoverable by parsing
+ * the bytes yourself -- which a caller decoding a pipe or a socket cannot do.
+ *
+ * ## Delivery
+ *
+ * The payload arrives in pieces, in order, exactly covering
+ * `[0, payload_size)`. It is **not** buffered: a skippable frame may declare
+ * up to 4 GB, and the size comes from the stream, so holding one whole would
+ * let the input choose an allocation. A caller that wants the whole payload
+ * decides its own ceiling, checks @p payload_size against it on the first
+ * piece, and reassembles; a caller writing it elsewhere appends each piece.
+ *
+ * The callback runs at least once per skippable frame, so a frame with no
+ * payload is still reported -- once, with @p chunk_size 0 -- because its
+ * variant may be the whole message.
+ *
+ * ## Rules
+ *
+ * @p chunk points into the buffer you handed to gcomp_decoder_update(), and
+ * is valid only for the duration of the call. Copy anything you need to keep.
+ *
+ * Returning anything but GCOMP_OK stops the decode, and that status is what
+ * gcomp_decoder_update() returns. The decoder is left in its error state and
+ * will not decode further; reset it to reuse it.
+ *
+ * The callback is invoked synchronously, on the thread calling
+ * gcomp_decoder_update(). It must not call back into the same decoder.
+ *
+ * @param ctx The context pointer registered alongside the callback
+ * @param magic_variant The magic number's low nibble, 0 through 15
+ * @param payload_size The whole payload's size, known from the first call
+ * @param payload_offset Where this piece starts within the payload
+ * @param chunk The payload bytes; NULL is possible only when chunk_size is 0
+ * @param chunk_size How many bytes @p chunk holds
+ * @return GCOMP_OK to continue decoding, or any error to stop
+ */
+typedef gcomp_status_t (*gcomp_lz4_skippable_cb)(void * ctx,
+    unsigned magic_variant, uint64_t payload_size, uint64_t payload_offset,
+    const uint8_t * chunk, size_t chunk_size);
+
+/**
+ * @brief Report skippable frames to a callback as they are decoded.
+ *
+ * Registers @p callback on an LZ4 decoder created with
+ * gcomp_decoder_create(). Pass NULL to stop reporting them; the frames are
+ * still skipped either way, so removing the callback changes what you are
+ * told, never what the stream decodes to.
+ *
+ * May be called at any point, including between updates. It survives
+ * gcomp_decoder_reset(), because it is a property of how you are using the
+ * decoder rather than of the stream it is reading.
+ *
+ * The convenience wrappers -- gcomp_decode_buffer(), gcomp_decode_stream_cb()
+ * -- create and destroy a decoder internally, so there is none to register on.
+ * Use gcomp_decoder_create() directly when you need this.
+ *
+ * @param decoder An LZ4 decoder (must not be NULL)
+ * @param callback The callback, or NULL to stop reporting
+ * @param ctx Passed to the callback unchanged; may be NULL
+ * @return GCOMP_OK on success; GCOMP_ERR_INVALID_ARG if @p decoder is NULL or
+ *         is not an LZ4 decoder
+ */
+GCOMP_API gcomp_status_t gcomp_lz4_decoder_on_skippable_frame(
+    gcomp_decoder_t * decoder, gcomp_lz4_skippable_cb callback, void * ctx);
 
 #ifdef __cplusplus
 }

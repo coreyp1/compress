@@ -40,6 +40,7 @@
 #include "../../core/stream_internal.h"
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/limits.h>
+#include <ghoti.io/compress/lz4.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
 #include <ghoti.io/compress/stream.h>
@@ -327,6 +328,18 @@ typedef struct {
 
   // Skippable frames
   uint32_t skippable_remaining; ///< Payload bytes left to discard
+  unsigned skippable_variant;   ///< Low nibble of the magic being skipped
+  uint64_t skippable_size;      ///< That frame's whole payload size
+  uint64_t skippable_delivered; ///< Payload bytes handed to the callback
+  /**
+   * Reported to the caller as the payload goes past, rather than buffered: a
+   * skippable frame may declare up to 4 GB and the size comes from the
+   * stream, so holding one whole would let the input choose an allocation.
+   * Survives a reset -- it describes how the caller is using the decoder, not
+   * the stream being read.
+   */
+  gcomp_lz4_skippable_cb skippable_cb;
+  void * skippable_ctx;
   /**
    * Frames finished so far, skippable ones included.  finish() uses it to
    * tell "the stream ended cleanly after a frame" from "the stream was cut

@@ -14,8 +14,11 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
+#include <algorithm>
+#include <string>
 #include "test_helpers.h"
 #include <cstring>
+#include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/lz4.h>
 #include <ghoti.io/compress/options.h>
@@ -760,6 +763,368 @@ TEST_F(Lz4FormatTest, SkippableParserRejectsBadFrames) {
   }
   EXPECT_EQ(gcomp_lz4_read_skippable_frame(nullptr, 8, nullptr, nullptr,
                 nullptr, nullptr),
+      GCOMP_ERR_INVALID_ARG);
+}
+
+//
+// Skippable Frames: the decode-time callback
+//
+// The decoder discards skippable frames, so a caller reading a pipe or a
+// socket has no buffer to parse afterwards.  The callback is how the payload
+// reaches them, in pieces, as it goes past.
+//
+
+namespace {
+
+struct SkippableSink {
+  struct Frame {
+    unsigned variant = 0;
+    uint64_t announced = 0;
+    std::vector<uint8_t> payload;
+    int calls = 0;
+  };
+  std::vector<Frame> frames;
+  uint64_t next_offset = 0;
+  bool contiguous = true;   // offsets arrive in order, covering the payload
+  bool consistent = true;   // variant and size are the same on every call
+  int fail_on_call = -1;    // 1-based call number to refuse at, -1 for never
+  int total_calls = 0;
+  gcomp_status_t refuse_with = GCOMP_ERR_IO;
+
+  static gcomp_status_t thunk(void * ctx, unsigned variant, uint64_t total,
+      uint64_t offset, const uint8_t * chunk, size_t n) {
+    return ((SkippableSink *)ctx)->on(variant, total, offset, chunk, n);
+  }
+
+  gcomp_status_t on(unsigned variant, uint64_t total, uint64_t offset,
+      const uint8_t * chunk, size_t n) {
+    total_calls++;
+    // A new frame starts when the payload offset restarts at zero.
+    if (offset == 0) {
+      frames.push_back(Frame{variant, total, {}, 0});
+      next_offset = 0;
+    }
+    if (frames.empty()) {
+      contiguous = false;
+      return GCOMP_OK;
+    }
+    Frame & f = frames.back();
+    f.calls++;
+    if (variant != f.variant || total != f.announced) {
+      consistent = false;
+    }
+    if (offset != next_offset) {
+      contiguous = false;
+    }
+    next_offset = offset + n;
+    if (n > 0) {
+      if (chunk == nullptr) {
+        consistent = false;
+      }
+      else {
+        f.payload.insert(f.payload.end(), chunk, chunk + n);
+      }
+    }
+    if (fail_on_call > 0 && total_calls >= fail_on_call) {
+      return refuse_with;
+    }
+    return GCOMP_OK;
+  }
+};
+
+std::vector<uint8_t> lz4Frame(const std::vector<uint8_t> & data) {
+  std::vector<uint8_t> out(data.size() * 2 + 65536);
+  size_t used = 0;
+  if (gcomp_encode_buffer(nullptr, "lz4", nullptr, data.data(), data.size(),
+          out.data(), out.size(), &used) != GCOMP_OK) {
+    return {};
+  }
+  out.resize(used);
+  return out;
+}
+
+std::vector<uint8_t> skippableFrame(
+    unsigned variant, const std::vector<uint8_t> & payload) {
+  std::vector<uint8_t> out(GCOMP_LZ4_SKIPPABLE_OVERHEAD + payload.size());
+  size_t used = 0;
+  if (gcomp_lz4_write_skippable_frame(variant,
+          payload.empty() ? nullptr : payload.data(), payload.size(),
+          out.data(), out.size(), &used) != GCOMP_OK) {
+    return {};
+  }
+  out.resize(used);
+  return out;
+}
+
+// Decodes `stream` in `chunk`-sized pieces, reporting skippable frames to
+// `sink` when one is given.  Returns the status decoding stopped on.
+gcomp_status_t decodeReportingSkippable(const std::vector<uint8_t> & stream,
+    size_t chunk, SkippableSink * sink, std::vector<uint8_t> * out) {
+  gcomp_options_t * opts = nullptr;
+  if (gcomp_options_create(&opts) != GCOMP_OK) {
+    return GCOMP_ERR_INTERNAL;
+  }
+  gcomp_options_set_bool(opts, "lz4.concat", 1);
+  gcomp_options_set_uint64(opts, "limits.max_output_bytes", 4u << 20);
+  gcomp_options_set_uint64(opts, "limits.max_expansion_ratio", 1000000);
+
+  gcomp_decoder_t * dec = nullptr;
+  gcomp_status_t st =
+      gcomp_decoder_create(gcomp_registry_default(), "lz4", opts, &dec);
+  gcomp_options_destroy(opts);
+  if (st != GCOMP_OK) {
+    return st;
+  }
+  if (sink) {
+    st = gcomp_lz4_decoder_on_skippable_frame(dec, SkippableSink::thunk, sink);
+    if (st != GCOMP_OK) {
+      gcomp_decoder_destroy(dec);
+      return st;
+    }
+  }
+
+  out->assign(4u << 20, 0);
+  size_t out_len = 0, used = 0;
+  while (used < stream.size()) {
+    size_t take = std::min(chunk, stream.size() - used);
+    gcomp_buffer_t ib = {stream.data() + used, take, 0};
+    while (ib.used < ib.size) {
+      gcomp_buffer_t ob = {out->data() + out_len, out->size() - out_len, 0};
+      st = gcomp_decoder_update(dec, &ib, &ob);
+      out_len += ob.used;
+      if (st != GCOMP_OK) {
+        goto done;
+      }
+      if (ob.used == 0 && ib.used == 0) {
+        st = GCOMP_ERR_INTERNAL;
+        goto done;
+      }
+    }
+    used += ib.used;
+  }
+  {
+    gcomp_buffer_t ob = {out->data() + out_len, out->size() - out_len, 0};
+    st = gcomp_decoder_finish(dec, &ob);
+    out_len += ob.used;
+  }
+done:
+  gcomp_decoder_destroy(dec);
+  out->resize(out_len);
+  return st;
+}
+
+} // namespace
+
+TEST_F(Lz4FormatTest, SkippableCallbackDeliversThePayloadAtEveryChunkSize) {
+  std::vector<uint8_t> data(900);
+  for (size_t i = 0; i < data.size(); i++) {
+    data[i] = (uint8_t)("abcdefgh"[i % 8]);
+  }
+  std::vector<uint8_t> payload(600);
+  for (size_t i = 0; i < payload.size(); i++) {
+    payload[i] = (uint8_t)(i * 7 + 2);
+  }
+
+  std::vector<uint8_t> stream = skippableFrame(6, payload);
+  std::vector<uint8_t> body = lz4Frame(data);
+  ASSERT_FALSE(body.empty());
+  stream.insert(stream.end(), body.begin(), body.end());
+
+  // One byte at a time splits the payload across 600 calls; a large chunk
+  // delivers it in one.  Both have to describe the same frame.
+  for (size_t chunk : {(size_t)1, (size_t)2, (size_t)7, (size_t)8, (size_t)9,
+           (size_t)13, (size_t)607, (size_t)608, (size_t)4096}) {
+    SkippableSink sink;
+    std::vector<uint8_t> out;
+    std::string where = "chunk=" + std::to_string(chunk);
+
+    ASSERT_EQ(decodeReportingSkippable(stream, chunk, &sink, &out), GCOMP_OK)
+        << where;
+    EXPECT_EQ(out, data) << where << ": the data must decode unchanged";
+
+    ASSERT_EQ(sink.frames.size(), 1u) << where;
+    EXPECT_GE(sink.frames[0].calls, 1) << where;
+    EXPECT_EQ(sink.frames[0].variant, 6u) << where;
+    EXPECT_EQ(sink.frames[0].announced, 600u)
+        << where << ": the whole size must be known from the first call";
+    EXPECT_TRUE(sink.contiguous)
+        << where << ": pieces must arrive in order, covering the payload";
+    EXPECT_TRUE(sink.consistent)
+        << where << ": variant and size must not change mid-frame";
+    EXPECT_EQ(sink.frames[0].payload, payload) << where;
+  }
+}
+
+TEST_F(Lz4FormatTest, SkippableCallbackReportsEveryFrameIncludingEmptyOnes) {
+  std::vector<uint8_t> data(500, 'z');
+  std::vector<uint8_t> a(40), b;
+  for (size_t i = 0; i < a.size(); i++) {
+    a[i] = (uint8_t)(i + 1);
+  }
+
+  // An empty payload is still a frame worth reporting: its variant may be the
+  // whole message.
+  std::vector<uint8_t> stream = skippableFrame(2, a);
+  std::vector<uint8_t> empty = skippableFrame(9, b);
+  stream.insert(stream.end(), empty.begin(), empty.end());
+  std::vector<uint8_t> body = lz4Frame(data);
+  ASSERT_FALSE(body.empty());
+  stream.insert(stream.end(), body.begin(), body.end());
+  std::vector<uint8_t> tail = skippableFrame(15, a);
+  stream.insert(stream.end(), tail.begin(), tail.end());
+
+  for (size_t chunk : {(size_t)1, (size_t)5, (size_t)4096}) {
+    SkippableSink sink;
+    std::vector<uint8_t> out;
+    std::string where = "chunk=" + std::to_string(chunk);
+    ASSERT_EQ(decodeReportingSkippable(stream, chunk, &sink, &out), GCOMP_OK)
+        << where;
+    EXPECT_EQ(out, data) << where;
+
+    ASSERT_EQ(sink.frames.size(), 3u)
+        << where << ": three skippable frames, one of them empty";
+    EXPECT_EQ(sink.frames[0].variant, 2u) << where;
+    EXPECT_EQ(sink.frames[0].payload, a) << where;
+    EXPECT_EQ(sink.frames[1].variant, 9u) << where;
+    EXPECT_EQ(sink.frames[1].announced, 0u) << where;
+    EXPECT_EQ(sink.frames[1].calls, 1)
+        << where << ": an empty payload is reported exactly once";
+    EXPECT_TRUE(sink.frames[1].payload.empty()) << where;
+    EXPECT_EQ(sink.frames[2].variant, 15u) << where;
+    EXPECT_EQ(sink.frames[2].payload, a) << where;
+  }
+}
+
+TEST_F(Lz4FormatTest, SkippableCallbackRefusalStopsTheDecode) {
+  std::vector<uint8_t> data(2000, 'q');
+  std::vector<uint8_t> payload(600, 0x5A);
+  std::vector<uint8_t> stream = skippableFrame(1, payload);
+  std::vector<uint8_t> body = lz4Frame(data);
+  ASSERT_FALSE(body.empty());
+  stream.insert(stream.end(), body.begin(), body.end());
+
+  // Whatever the callback returns is what the caller sees -- the decoder does
+  // not translate it into a generic failure.
+  for (gcomp_status_t refusal :
+      {GCOMP_ERR_IO, GCOMP_ERR_LIMIT, GCOMP_ERR_INVALID_ARG}) {
+    SkippableSink sink;
+    sink.fail_on_call = 1;
+    sink.refuse_with = refusal;
+    std::vector<uint8_t> out;
+    EXPECT_EQ(decodeReportingSkippable(stream, 64, &sink, &out), refusal)
+        << "the callback's own status must reach the caller";
+    EXPECT_TRUE(out.empty())
+        << "nothing should have been decoded past the refusal";
+  }
+
+  // Refusing part-way through a multi-call payload stops it there.
+  SkippableSink sink;
+  sink.fail_on_call = 3;
+  std::vector<uint8_t> out;
+  EXPECT_EQ(decodeReportingSkippable(stream, 64, &sink, &out), GCOMP_ERR_IO);
+  EXPECT_EQ(sink.total_calls, 3) << "no further calls after a refusal";
+
+  // An empty payload's single call can refuse too.
+  std::vector<uint8_t> only_empty = skippableFrame(4, {});
+  only_empty.insert(only_empty.end(), body.begin(), body.end());
+  SkippableSink empty_sink;
+  empty_sink.fail_on_call = 1;
+  EXPECT_EQ(decodeReportingSkippable(only_empty, 4096, &empty_sink, &out),
+      GCOMP_ERR_IO);
+  EXPECT_EQ(empty_sink.total_calls, 1);
+}
+
+TEST_F(Lz4FormatTest, SkippableCallbackIsOptionalAndSurvivesReset) {
+  std::vector<uint8_t> data(700, 'k');
+  std::vector<uint8_t> payload(100, 0x11);
+  std::vector<uint8_t> stream = skippableFrame(8, payload);
+  std::vector<uint8_t> body = lz4Frame(data);
+  ASSERT_FALSE(body.empty());
+  stream.insert(stream.end(), body.begin(), body.end());
+
+  // With no callback at all the frames are still skipped: registering one
+  // changes what you are told, never what the stream decodes to.
+  std::vector<uint8_t> out;
+  ASSERT_EQ(decodeReportingSkippable(stream, 32, nullptr, &out), GCOMP_OK);
+  EXPECT_EQ(out, data);
+
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  gcomp_options_set_bool(opts, "lz4.concat", 1);
+  gcomp_options_set_uint64(opts, "limits.max_output_bytes", 1u << 20);
+  gcomp_options_set_uint64(opts, "limits.max_expansion_ratio", 1000000);
+  gcomp_decoder_t * dec = nullptr;
+  ASSERT_EQ(
+      gcomp_decoder_create(gcomp_registry_default(), "lz4", opts, &dec),
+      GCOMP_OK);
+  gcomp_options_destroy(opts);
+
+  SkippableSink sink;
+  ASSERT_EQ(
+      gcomp_lz4_decoder_on_skippable_frame(dec, SkippableSink::thunk, &sink),
+      GCOMP_OK);
+
+  std::vector<uint8_t> buf(1u << 20);
+  auto decode_once = [&]() {
+    size_t out_len = 0, used = 0;
+    while (used < stream.size()) {
+      gcomp_buffer_t ib = {stream.data() + used, stream.size() - used, 0};
+      gcomp_buffer_t ob = {buf.data() + out_len, buf.size() - out_len, 0};
+      gcomp_status_t st = gcomp_decoder_update(dec, &ib, &ob);
+      out_len += ob.used;
+      if (st != GCOMP_OK) {
+        return st;
+      }
+      used += ib.used;
+      if (ib.used == 0 && ob.used == 0) {
+        break;
+      }
+    }
+    gcomp_buffer_t ob = {buf.data() + out_len, buf.size() - out_len, 0};
+    return gcomp_decoder_finish(dec, &ob);
+  };
+
+  ASSERT_EQ(decode_once(), GCOMP_OK);
+  ASSERT_EQ(sink.frames.size(), 1u);
+
+  // Reset clears the stream, not the caller's arrangement with the decoder.
+  ASSERT_EQ(gcomp_decoder_reset(dec), GCOMP_OK);
+  ASSERT_EQ(decode_once(), GCOMP_OK);
+  EXPECT_EQ(sink.frames.size(), 2u)
+      << "the callback must survive a reset -- it describes how the caller is "
+         "using the decoder, not the stream it was reading";
+  EXPECT_EQ(sink.frames[1].payload, payload);
+
+  // Clearing it stops the reporting without disturbing the decode.
+  ASSERT_EQ(gcomp_lz4_decoder_on_skippable_frame(dec, nullptr, nullptr),
+      GCOMP_OK);
+  ASSERT_EQ(gcomp_decoder_reset(dec), GCOMP_OK);
+  ASSERT_EQ(decode_once(), GCOMP_OK);
+  EXPECT_EQ(sink.frames.size(), 2u) << "no further frames after clearing";
+
+  gcomp_decoder_destroy(dec);
+}
+
+TEST_F(Lz4FormatTest, SkippableCallbackRejectsForeignDecoders) {
+  // The state pointer is method-specific, so registering on another method's
+  // decoder would write through a pointer to something else entirely.
+  for (const char * method : {"deflate", "gzip", "zstd", "rle"}) {
+    gcomp_decoder_t * dec = nullptr;
+    if (gcomp_decoder_create(gcomp_registry_default(), method, nullptr, &dec) !=
+        GCOMP_OK) {
+      continue; // method not registered in this build
+    }
+    EXPECT_EQ(
+        gcomp_lz4_decoder_on_skippable_frame(dec, SkippableSink::thunk,
+            nullptr),
+        GCOMP_ERR_INVALID_ARG)
+        << method;
+    gcomp_decoder_destroy(dec);
+  }
+
+  EXPECT_EQ(
+      gcomp_lz4_decoder_on_skippable_frame(nullptr, SkippableSink::thunk,
+          nullptr),
       GCOMP_ERR_INVALID_ARG);
 }
 
