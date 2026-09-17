@@ -266,6 +266,7 @@ typedef struct {
 
   // Hash table for match finding
   uint32_t * hash_table;  ///< Hash table for compression
+  uint32_t * dict_hash_table; ///< The table as the dictionary alone leaves it
   size_t hash_table_size; ///< Hash table size in entries
 
   // Content size tracking (for header if known)

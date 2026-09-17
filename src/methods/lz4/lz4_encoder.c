@@ -125,17 +125,19 @@
  */
 static void lz4_encoder_seed_window(lz4_encoder_state_t * state) {
   state->block_buffer_pos = 0;
-  memset(state->hash_table, 0, state->hash_table_size * sizeof(uint32_t));
   state->prefix_len = state->dictionary_size;
-  if (state->dictionary_size > 0) {
+  if (state->dictionary_size > 0 && state->dict_hash_table) {
     // The dictionary is already at the front of the window and is never
-    // overwritten, so only the table has to be rebuilt.  That is a scan of up
-    // to 64 KB per block in independent mode; liblz4 keeps a preloaded table
-    // to avoid it, which would be the optimisation to make if it ever shows
-    // up in a profile.
-    lz4_block_index_window(state->block_buffer, state->dictionary_size,
-        state->hash_table, state->hash_table_size);
+    // overwritten, so only the table has to be restored - and the table the
+    // dictionary alone produces was worked out once, at create time.  Copying
+    // it back is one pass over the table; rebuilding it is a pass over the
+    // table plus a scan of up to 64 KB of dictionary, for every independent
+    // block.  liblz4 keeps a preloaded table for the same reason.
+    memcpy(state->hash_table, state->dict_hash_table,
+        state->hash_table_size * sizeof(uint32_t));
+    return;
   }
+  memset(state->hash_table, 0, state->hash_table_size * sizeof(uint32_t));
 }
 
 static void lz4_encoder_slide_window(lz4_encoder_state_t * state) {
@@ -357,6 +359,24 @@ gcomp_status_t lz4_encoder_init(gcomp_registry_t * registry,
   if (state->dictionary_size > 0) {
     lz4_block_index_window(state->block_buffer, state->dictionary_size,
         state->hash_table, state->hash_table_size);
+
+    // Keep that table.  Every independent block starts from the dictionary
+    // and nothing else, so this is the table each of them begins with:
+    // lz4_encoder_seed_window() copies it back instead of scanning up to
+    // 64 KB of dictionary again for every block.  liblz4 keeps a preloaded
+    // table for the same reason.
+    state->dict_hash_table = (uint32_t *)gcomp_malloc(
+        alloc, state->hash_table_size * sizeof(uint32_t));
+    if (!state->dict_hash_table) {
+      status = gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
+          "failed to allocate lz4 dictionary hash table (%zu bytes)",
+          state->hash_table_size * sizeof(uint32_t));
+      goto cleanup;
+    }
+    gcomp_memory_track_alloc(
+        &state->mem_tracker, state->hash_table_size * sizeof(uint32_t));
+    memcpy(state->dict_hash_table, state->hash_table,
+        state->hash_table_size * sizeof(uint32_t));
   }
 
   // Check memory limit through the core helper, which is where "0 means
@@ -420,6 +440,7 @@ gcomp_status_t lz4_encoder_init(gcomp_registry_t * registry,
 cleanup:
   // Single cleanup path for all error cases
   if (state) {
+    gcomp_free(alloc, state->dict_hash_table);
     gcomp_free(alloc, state->hash_table);
     gcomp_free(alloc, state->compressed_buffer);
     gcomp_free(alloc, state->block_buffer);
@@ -436,6 +457,11 @@ void lz4_encoder_destroy(gcomp_encoder_t * encoder) {
   lz4_encoder_state_t * state = (lz4_encoder_state_t *)encoder->method_state;
   const gcomp_allocator_t * alloc = state->allocator;
 
+  if (state->dict_hash_table) {
+    gcomp_memory_track_free(
+        &state->mem_tracker, state->hash_table_size * sizeof(uint32_t));
+    gcomp_free(alloc, state->dict_hash_table);
+  }
   if (state->hash_table) {
     gcomp_free(alloc, state->hash_table);
   }
