@@ -188,6 +188,43 @@ gcomp_decoder_create(registry, "lz4", opts, &dec);
 - Limits (`max_output_bytes`, `max_expansion_ratio`) apply to total output across all frames
 - If any frame fails validation, the entire decode fails
 
+## Inspecting a frame before decoding it
+
+`gcomp_lz4_peek_frame_info()` reads a frame's descriptor without decoding
+anything — how large the content will be, which checksums are present, and
+above all **which dictionary the frame needs**, which is otherwise unknowable:
+the decoder needs the dictionary to start, and the only place its identity
+appears is the header.
+
+```c
+gcomp_lz4_frame_info_t info;
+size_t needed = 0;
+gcomp_status_t st = gcomp_lz4_peek_frame_info(buf, len, &info, &needed);
+if (st == GCOMP_ERR_LIMIT) {
+  // Read `needed` bytes in total and ask again; it takes a few rounds --
+  // four bytes to recognise the magic, six to learn which optional fields
+  // are present, then the whole header.
+}
+else if (st == GCOMP_OK && info.dict_id_present) {
+  // Look up info.dict_id and pass that dictionary as lz4.dictionary.
+}
+```
+
+Nothing is allocated. Skippable frames are reported rather than refused, with
+`frame_size` set, so a reader can step over one and ask again — that is how you
+walk a stream of mixed frames.
+
+The validation is the decoder's own: `gcomp_lz4_peek_frame_info()` and the
+decoder share a single parser, so a header one accepts the other accepts, and a
+header one refuses the other refuses.
+
+> **`lz4.content_size` carries the size, it is not a flag.** It is a `uint64`
+> whose value is the uncompressed length; set it with
+> `gcomp_options_set_uint64()`. Setting it with `gcomp_options_set_bool()`
+> stores a differently-typed entry that the encoder declines, and the field
+> simply does not appear in the frame — silently. `gcomp_lz4_peek_frame_info()`
+> is the quickest way to confirm an option reached the header.
+
 ## Dictionaries
 
 A dictionary is a block of bytes both sides know in advance. The encoder can
