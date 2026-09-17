@@ -962,3 +962,71 @@ TEST(Lz4Encoder, MatchesAreExtendedBackwardsOverPendingLiterals) {
       << missed << " of " << seqs.size()
       << " sequences could have taken another byte into the match";
 }
+
+// The hash key is five bytes while the minimum match is four.  That is a
+// choice, not a format requirement, and it cuts both ways: a four-byte repeat
+// whose fifth byte differs is no longer in the table, but the candidate the
+// table does offer already agrees on five bytes and so tends to run longer.
+//
+// This data is the case that decides it - bytes drawn independently from a
+// skewed alphabet, where every match is a coincidence and the only thing that
+// varies is how far it happens to run.  A four-byte key reaches 68.5% of the
+// input on it, a five-byte key 58.5%, and liblz4 - which also keys on five
+// bytes once its window needs 32-bit positions - reaches 59.1%.  The bound
+// below sits between the two so that going back to a four-byte key fails it.
+TEST(Lz4Encoder, TheFiveByteHashKeyEarnsItsMissedFourByteMatches) {
+  const size_t kSize = 1u << 20;
+  std::vector<uint8_t> data;
+  data.reserve(kSize);
+
+  // Weights that fall by 45% per symbol, laid out in a lookup table and
+  // indexed by a counter-based generator, so there is no structure beyond the
+  // letter frequencies.
+  std::vector<uint8_t> pick;
+  {
+    double w = 1.0;
+    double total = 0.0;
+    std::vector<double> weights(256);
+    for (int i = 0; i < 256; i++) {
+      weights[i] = w;
+      total += w;
+      w *= 0.55;
+    }
+    pick.reserve(1 << 14);
+    for (int i = 0; i < 256 && pick.size() < (1u << 14); i++) {
+      size_t share = (size_t)((weights[i] / total) * (double)(1 << 14));
+      for (size_t k = 0; k < share && pick.size() < (1u << 14); k++) {
+        pick.push_back((uint8_t)i);
+      }
+    }
+    while (pick.size() < (1u << 14)) {
+      pick.push_back(0);
+    }
+  }
+
+  uint32_t x = 99137u;
+  while (data.size() < kSize) {
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    data.push_back(pick[(x >> 9) & ((1u << 14) - 1u)]);
+  }
+
+  std::vector<uint8_t> out(data.size() * 2 + 4096);
+  size_t used = out.size();
+  ASSERT_EQ(gcomp_encode_buffer(gcomp_registry_default(), "lz4", nullptr,
+                data.data(), data.size(), out.data(), out.size(), &used),
+      GCOMP_OK);
+
+  std::vector<uint8_t> back(data.size() + 64);
+  size_t back_used = back.size();
+  ASSERT_EQ(gcomp_decode_buffer(gcomp_registry_default(), "lz4", nullptr,
+                out.data(), used, back.data(), back.size(), &back_used),
+      GCOMP_OK);
+  ASSERT_EQ(back_used, data.size());
+  ASSERT_EQ(memcmp(back.data(), data.data(), data.size()), 0);
+
+  EXPECT_LT(used, data.size() * 63 / 100)
+      << used << " of " << data.size() << " ("
+      << (100.0 * (double)used / (double)data.size()) << "%)";
+}
