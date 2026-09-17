@@ -616,8 +616,10 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
   gcomp_memory_track_alloc(
       &state->mem_tracker, state->literals_buffer_capacity);
 
-  // Check memory limits
-  if (state->mem_tracker.current_bytes > max_memory) {
+  // Check memory limits through the core helper, which treats 0 as
+  // unlimited as limits.h documents.  Comparing directly, as this did, made
+  // a zero limit mean a budget of zero and refused to start.
+  if (gcomp_memory_check_limit(&state->mem_tracker, max_memory) != GCOMP_OK) {
     status = GCOMP_ERR_LIMIT;
     gcomp_encoder_set_error(encoder, status,
         "memory limit exceeded during encoder init (%zu bytes, limit %zu)",

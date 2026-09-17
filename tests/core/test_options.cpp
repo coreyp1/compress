@@ -8,7 +8,9 @@
 
 #include "test_helpers.h"
 #include <cstdlib>
+#include <vector>
 #include <cstring>
+#include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/method.h>
@@ -569,21 +571,79 @@ TEST(OptionValidationTest, ZeroIsAcceptedForTheLimitsThatMeanUnlimited) {
   }
 }
 
-TEST(OptionValidationTest, ZeroMemoryLimitMeansDifferentThingsPerMethod) {
-  // Recorded rather than asserted as correct.  limits.max_memory_bytes = 0 is
-  // "no limit" to every method except zstd, which reads it as "no memory
-  // permitted" and refuses to start.  Both readings are defensible; having
-  // two of them for one core option is not.  Reconciling them changes
-  // behaviour for whichever side moves, so it is left as a decision rather
-  // than folded into this change -- and pinned here so that whenever it is
-  // made, it is made deliberately.
-  for (const char * method : {"lz4", "lzw", "rle", "deflate", "gzip"}) {
-    EXPECT_EQ(createEncoderWith(method, setZeroMemory), GCOMP_OK)
-        << method << ": treats a zero memory limit as no limit";
+TEST(OptionValidationTest, ZeroMeansUnlimitedForEveryLimitOnEveryMethod) {
+  // limits.h documents "0 means unlimited" for every limit option, in nine
+  // places, and the core helpers implement it -- gcomp_limits_check_output(),
+  // gcomp_memory_check_limit() and gcomp_limits_check_expansion_ratio() all
+  // return GCOMP_OK on a zero limit.  Methods that open-coded the comparison
+  // instead kept forgetting: lz4's output check and zstd's output and memory
+  // checks each read 0 as "none permitted" and refused a frame they should
+  // have decoded.
+  //
+  // This goes through a real decode rather than only creating a codec,
+  // because two of those three were checks made while decoding -- creating
+  // the decoder succeeded and the failure came later.
+  std::vector<uint8_t> data(20000);
+  for (size_t i = 0; i < data.size(); i++) {
+    data[i] = (uint8_t)("the quick brown fox "[i % 20]);
   }
-  EXPECT_EQ(createEncoderWith("zstd", setZeroMemory), GCOMP_ERR_LIMIT)
-      << "zstd treats a zero memory limit as a budget of zero; if this now "
-         "passes, the inconsistency was resolved and this test should say so";
+
+  static const char * kKeys[] = {"limits.max_output_bytes",
+      "limits.max_memory_bytes", "limits.max_expansion_ratio"};
+
+  for (const char * method : {"deflate", "gzip", "lz4", "lzw", "rle", "zstd"}) {
+    std::vector<uint8_t> enc(data.size() * 2 + 65536);
+    size_t enc_len = 0;
+    ASSERT_EQ(gcomp_encode_buffer(nullptr, method, nullptr, data.data(),
+                  data.size(), enc.data(), enc.size(), &enc_len),
+        GCOMP_OK)
+        << method;
+
+    for (const char * key : kKeys) {
+      gcomp_options_t * opts = nullptr;
+      ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+      gcomp_options_set_uint64(opts, key, 0);
+
+      std::vector<uint8_t> dec(data.size() + 65536);
+      size_t dec_len = 0;
+      gcomp_status_t st = gcomp_decode_buffer(nullptr, method, opts,
+          enc.data(), enc_len, dec.data(), dec.size(), &dec_len);
+      gcomp_options_destroy(opts);
+
+      ASSERT_EQ(st, GCOMP_OK)
+          << method << " with " << key << " = 0 (which means unlimited)";
+      dec.resize(dec_len);
+      EXPECT_EQ(dec, data) << method << " with " << key << " = 0";
+    }
+  }
+}
+
+TEST(OptionValidationTest, LimitsAreStillEnforcedWhenTheyAreNotZero) {
+  // The other half: making 0 mean unlimited must not have made every limit
+  // toothless.
+  std::vector<uint8_t> data(20000, 'q');
+  for (const char * method : {"deflate", "gzip", "lz4", "lzw", "rle", "zstd"}) {
+    std::vector<uint8_t> enc(data.size() * 2 + 65536);
+    size_t enc_len = 0;
+    ASSERT_EQ(gcomp_encode_buffer(nullptr, method, nullptr, data.data(),
+                  data.size(), enc.data(), enc.size(), &enc_len),
+        GCOMP_OK)
+        << method;
+
+    gcomp_options_t * opts = nullptr;
+    ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+    gcomp_options_set_uint64(opts, "limits.max_output_bytes", 100);
+
+    std::vector<uint8_t> dec(data.size() + 65536);
+    size_t dec_len = 0;
+    gcomp_status_t st = gcomp_decode_buffer(nullptr, method, opts, enc.data(),
+        enc_len, dec.data(), dec.size(), &dec_len);
+    gcomp_options_destroy(opts);
+
+    EXPECT_EQ(st, GCOMP_ERR_LIMIT)
+        << method << ": a 100-byte output limit must stop a 20,000-byte "
+                     "decode";
+  }
 }
 
 TEST(OptionValidationTest, EveryMethodDeclaresTheLimitsItHonours) {

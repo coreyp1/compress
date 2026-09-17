@@ -190,8 +190,8 @@ gcomp_status_t zstd_decoder_init(gcomp_registry_t * registry,
   state->output_buffer_capacity = output_buffer_size;
   gcomp_memory_track_alloc(&state->mem_tracker, output_buffer_size);
 
-  // Check memory limits
-  if (state->mem_tracker.current_bytes > max_memory) {
+  // Check memory limits through the core helper; see zstd_encoder.c.
+  if (gcomp_memory_check_limit(&state->mem_tracker, max_memory) != GCOMP_OK) {
     status = GCOMP_ERR_LIMIT;
     goto cleanup;
   }
@@ -873,7 +873,8 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
       }
       state->frame_output_bytes = new_frame;
     }
-    if (state->total_output_bytes > state->max_output_bytes) {
+    if (gcomp_limits_check_output((size_t)state->total_output_bytes,
+            state->max_output_bytes) != GCOMP_OK) {
       state->stage = ZSTD_DEC_STAGE_ERROR;
       gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
           "output limit exceeded: %llu > %llu",

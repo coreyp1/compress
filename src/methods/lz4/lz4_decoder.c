@@ -121,6 +121,7 @@
 
 #include "lz4_internal.h"
 #include <ghoti.io/compress/errors.h>
+#include <ghoti.io/compress/limits.h>
 #include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/stream.h>
@@ -604,9 +605,10 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
             lz4_decoder_seed_history(state);
           }
 
-          // Check memory limit
-          if (state->max_memory_bytes > 0 &&
-              state->mem_tracker.current_bytes > state->max_memory_bytes) {
+          // Check memory limit through the core helper: see the note in
+          // lz4_encoder.c about where "0 means unlimited" lives.
+          if (gcomp_memory_check_limit(
+                  &state->mem_tracker, state->max_memory_bytes) != GCOMP_OK) {
             state->stage = LZ4_DEC_STAGE_ERROR;
             return gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
                 "lz4 decoder memory usage %llu exceeds limit %llu",
@@ -751,8 +753,11 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
         state->output_buffer_len = decompressed_len;
         state->total_output_bytes += decompressed_len;
 
-        // Check output limit
-        if (state->total_output_bytes > state->max_output_bytes) {
+        // Check output limit.  This compared directly against the limit
+        // and so treated 0 as "no output permitted" rather than "unlimited",
+        // which is what limits.h documents.
+        if (gcomp_limits_check_output((size_t)state->total_output_bytes,
+                state->max_output_bytes) != GCOMP_OK) {
           state->stage = LZ4_DEC_STAGE_ERROR;
           return gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
               "lz4 output size %llu exceeds limit %llu",

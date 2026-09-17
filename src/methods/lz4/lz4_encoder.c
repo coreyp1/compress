@@ -94,6 +94,7 @@
 
 #include "lz4_internal.h"
 #include <ghoti.io/compress/errors.h>
+#include <ghoti.io/compress/limits.h>
 #include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/stream.h>
@@ -358,9 +359,12 @@ gcomp_status_t lz4_encoder_init(gcomp_registry_t * registry,
         state->hash_table, state->hash_table_size);
   }
 
-  // Check memory limit
-  if (state->max_memory_bytes > 0 &&
-      state->mem_tracker.current_bytes > state->max_memory_bytes) {
+  // Check memory limit through the core helper, which is where "0 means
+  // unlimited" is defined (limits.h says so for every limit option).  Every
+  // open-coded copy of this comparison is a chance to forget that, and three
+  // of them had.
+  if (gcomp_memory_check_limit(&state->mem_tracker, state->max_memory_bytes) !=
+      GCOMP_OK) {
     status = gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
         "lz4 encoder memory usage %llu exceeds limit %llu",
         (unsigned long long)state->mem_tracker.current_bytes,
