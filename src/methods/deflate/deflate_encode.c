@@ -1353,6 +1353,48 @@ static void build_code_lengths(const gcomp_allocator_t * alloc,
         }
       }
     }
+
+    // Lengthening halves a symbol's share of the code space, so the loop above
+    // steps past its target as often as it lands on it, and what it leaves is
+    // an under-subscribed - incomplete - code.  RFC 1951 section 3.2.2 defines
+    // the code by the construction in that section, which assigns every
+    // available code word; a set of lengths whose Kraft sum falls short does
+    // not describe a code at all, and zlib rejects such a header outright.
+    //
+    // Shortening a symbol from length L to L - 1 doubles its share, adding
+    // 2^(max_bits - L).  Taking the largest addition that still fits the
+    // shortfall each time finishes in at most max_bits steps - it is walking
+    // the binary representation of the shortfall - and cannot overshoot.
+    //
+    // A symbol always exists to shorten: the shortfall is at least one, a
+    // symbol at max_bits adds exactly one, and if every symbol were already at
+    // length 1 the sum would be at least 2^max_bits with two or more symbols,
+    // while a single symbol returns far above.
+    uint32_t target = 1u << max_bits;
+    while (kraft < target) {
+      uint32_t shortfall = target - kraft;
+      size_t best = num_symbols;
+      for (size_t i = 0; i < num_symbols; i++) {
+        if (lengths[i] <= 1) {
+          continue;
+        }
+        uint32_t gain = 1u << (max_bits - lengths[i]);
+        if (gain > shortfall) {
+          continue;
+        }
+        // Largest gain first; among equals, spend it on the symbol that is
+        // sent most often, so the repair costs as few bits as it can.
+        if (best == num_symbols || lengths[i] < lengths[best] ||
+            (lengths[i] == lengths[best] && freq[i] > freq[best])) {
+          best = i;
+        }
+      }
+      if (best == num_symbols) {
+        break; // Unreachable; leaving the loop is safer than spinning.
+      }
+      kraft += 1u << (max_bits - lengths[best]);
+      lengths[best]--;
+    }
   }
 
   gcomp_free(alloc, heap);
