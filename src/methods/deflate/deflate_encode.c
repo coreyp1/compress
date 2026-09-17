@@ -723,13 +723,37 @@ static deflate_match_t deflate_find_match(gcomp_deflate_encoder_state_t * st,
   // candidate: it only changes when result.length does.
   uint8_t probe_byte = 0;
 
+  // A chain is built by prepending, so following it must walk strictly
+  // backwards through the stream.  When it stops doing that the chain has
+  // left this hash's history: a window slot is reused every window_size
+  // bytes, and a slot reused for a different hash still has the hash_prev
+  // link from its previous life, so a walk that reaches it continues into
+  // some other hash's older entries.
+  //
+  // Those entries are not candidates - they were stored because different
+  // bytes hashed to a different bucket - so the walk was doing nothing but
+  // reading memory at random.  On incompressible data it did that all the way
+  // to max_chain on every position: the mean walk at level 9 was 106.9 of a
+  // possible 128, where a clean chain over a 32 KB window with 32768 buckets
+  // is about one.  Stopping at the break takes it to 2.8, and the encoder's
+  // output does not change - on 2 MB of random bytes, 4.7 MB of C source and
+  // an XML registry it is byte for byte identical, because a candidate from
+  // the wrong bucket had no reason to match anyway.
+  size_t chain_bound = stream_pos;
   while (cur != DEFLATE_NIL && chain_count < max_chain) {
     size_t match_idx = cur;
 
-    // Cheapest rejection first, and deliberately ahead of the hash_pos read
-    // below.  Only a candidate that matches at the byte just past the end of
-    // the best match so far can beat it, and one load settles that.  Most
-    // candidates on a long chain fail here.
+    // Check if this hash entry is still valid (not overwritten in circular
+    // buf), and that the chain is still going backwards.
+    size_t match_stream_pos = st->hash_pos[match_idx];
+    if (match_stream_pos >= chain_bound) {
+      break;
+    }
+    chain_bound = match_stream_pos;
+
+    // Then the cheapest rejection.  Only a candidate that matches at the byte
+    // just past the end of the best match so far can beat it, and one load
+    // settles that.
     //
     // This cannot change which match is chosen: a candidate it rejects has
     // length <= result.length, and the code below only takes one whose length
@@ -739,25 +763,8 @@ static deflate_match_t deflate_find_match(gcomp_deflate_encoder_state_t * st,
     // result.length < max_len always holds here, because the loop breaks as
     // soon as a match reaches max_len, so `scan + result.length` is still
     // inside the lookahead.
-    //
-    // Ordering it first matters more than the instructions it saves.  hash_pos
-    // is one size_t per window slot - 256 KB at the default window - and is
-    // read at a random index for every candidate; it was 48% of this
-    // function's L1 read misses while being 3% of its instructions.  A
-    // candidate the probe rejects never touches it, and the window byte it
-    // reads instead is in a buffer an eighth the size that the comparison loop
-    // is walking anyway.
     if (result.length >= DEFLATE_MIN_MATCH_LENGTH &&
         data[(match_idx + result.length) & st->window_mask] != probe_byte) {
-      cur = st->hash_prev[cur];
-      chain_count++;
-      continue;
-    }
-
-    // Check if this hash entry is still valid (not overwritten in circular buf)
-    size_t match_stream_pos = st->hash_pos[match_idx];
-    if (match_stream_pos >= stream_pos) {
-      // Entry is from the future or current position - skip
       cur = st->hash_prev[cur];
       chain_count++;
       continue;
