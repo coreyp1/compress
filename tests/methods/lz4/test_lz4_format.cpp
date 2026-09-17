@@ -15,6 +15,7 @@
  */
 
 #include <algorithm>
+#include <iomanip>
 #include <string>
 #include "test_helpers.h"
 #include <cstring>
@@ -1127,6 +1128,290 @@ TEST_F(Lz4FormatTest, SkippableCallbackRejectsForeignDecoders) {
   EXPECT_EQ(
       gcomp_lz4_decoder_on_skippable_frame(nullptr, SkippableSink::thunk,
           nullptr),
+      GCOMP_ERR_INVALID_ARG);
+}
+
+//
+// Frame header inspection
+//
+
+namespace {
+
+std::vector<uint8_t> encodeWith(gcomp_options_t * opts,
+    const std::vector<uint8_t> & data) {
+  std::vector<uint8_t> out(data.size() * 2 + 65536);
+  size_t used = 0;
+  if (gcomp_encode_buffer(nullptr, "lz4", opts, data.data(), data.size(),
+          out.data(), out.size(), &used) != GCOMP_OK) {
+    return {};
+  }
+  out.resize(used);
+  return out;
+}
+
+bool decodes(const std::vector<uint8_t> & frame, size_t expected) {
+  gcomp_options_t * opts = nullptr;
+  if (gcomp_options_create(&opts) != GCOMP_OK) {
+    return false;
+  }
+  gcomp_options_set_uint64(opts, "limits.max_output_bytes", 4u << 20);
+  gcomp_options_set_uint64(opts, "limits.max_expansion_ratio", 1000000);
+  std::vector<uint8_t> out(expected + 65536);
+  size_t used = 0;
+  gcomp_status_t st = gcomp_decode_buffer(nullptr, "lz4", opts, frame.data(),
+      frame.size(), out.data(), out.size(), &used);
+  gcomp_options_destroy(opts);
+  return st == GCOMP_OK;
+}
+
+} // namespace
+
+TEST_F(Lz4FormatTest, PeekReportsWhatTheEncoderWasAskedFor) {
+  std::vector<uint8_t> data(9000);
+  for (size_t i = 0; i < data.size(); i++) {
+    data[i] = (uint8_t)("abcdefgh"[i % 8]);
+  }
+
+  for (int independent = 0; independent <= 1; independent++) {
+    for (int block_checksum = 0; block_checksum <= 1; block_checksum++) {
+      for (int content_checksum = 0; content_checksum <= 1;
+          content_checksum++) {
+        for (int content_size = 0; content_size <= 1; content_size++) {
+          for (uint64_t bs : {65536u, 262144u, 1048576u, 4194304u}) {
+            gcomp_options_t * opts = nullptr;
+            ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+            gcomp_options_set_bool(opts, "lz4.independent_blocks", independent);
+            gcomp_options_set_bool(opts, "lz4.block_checksum", block_checksum);
+            gcomp_options_set_bool(
+                opts, "lz4.content_checksum", content_checksum);
+            // lz4.content_size is a uint64 carrying the size itself, not a
+            // flag.  Setting it with set_bool() stores a BOOL-typed entry
+            // that the encoder's get_uint64() silently declines, so the
+            // field never appears -- which is exactly what two tests in
+            // test_lz4_spec_oracle.cpp were doing before this one caught it.
+            if (content_size) {
+              gcomp_options_set_uint64(
+                  opts, "lz4.content_size", (uint64_t)data.size());
+            }
+            gcomp_options_set_uint64(opts, "lz4.block_size", bs);
+            std::vector<uint8_t> frame = encodeWith(opts, data);
+            gcomp_options_destroy(opts);
+            ASSERT_FALSE(frame.empty());
+
+            gcomp_lz4_frame_info_t info;
+            ASSERT_EQ(gcomp_lz4_peek_frame_info(
+                          frame.data(), frame.size(), &info, nullptr),
+                GCOMP_OK);
+            EXPECT_FALSE(info.is_skippable);
+            EXPECT_EQ(info.block_independent, independent);
+            EXPECT_EQ(info.block_checksum, block_checksum);
+            EXPECT_EQ(info.content_checksum, content_checksum);
+            EXPECT_EQ(info.block_max_size, (uint32_t)bs);
+            EXPECT_EQ(info.content_size_present, content_size);
+            if (content_size) {
+              EXPECT_EQ(info.content_size, (uint64_t)data.size());
+            }
+            EXPECT_EQ(info.frame_header_size,
+                (size_t)(7 + (content_size ? 8 : 0)));
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST_F(Lz4FormatTest, PeekAndTheDecoderNeverDisagree) {
+  // The point of there being one parser.  A reader that peeks and then
+  // decodes must not be told two different things about the same bytes.
+  std::vector<uint8_t> data(3000, 'w');
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  gcomp_options_set_uint64(opts, "lz4.content_size", (uint64_t)data.size());
+  gcomp_options_set_bool(opts, "lz4.content_checksum", 1);
+  std::vector<uint8_t> good = encodeWith(opts, data);
+  gcomp_options_destroy(opts);
+  ASSERT_FALSE(good.empty());
+
+  // Corrupt each header byte to every other value and require the two to
+  // agree on whether the result is still a valid header.  The decoder can
+  // legitimately fail later on for reasons a header peek cannot see, so the
+  // requirement is one-directional where it has to be: whatever peek rejects,
+  // the decoder must reject too.
+  gcomp_lz4_frame_info_t info;
+  ASSERT_EQ(
+      gcomp_lz4_peek_frame_info(good.data(), good.size(), &info, nullptr),
+      GCOMP_OK);
+  const size_t header_len = info.frame_header_size;
+  ASSERT_GT(header_len, 0u);
+
+  int peek_rejected = 0, both_rejected = 0;
+  for (size_t i = 0; i < header_len; i++) {
+    for (int delta = 1; delta < 256; delta += 37) {
+      std::vector<uint8_t> bad = good;
+      bad[i] = (uint8_t)(bad[i] + delta);
+      gcomp_lz4_frame_info_t bi;
+      gcomp_status_t st =
+          gcomp_lz4_peek_frame_info(bad.data(), bad.size(), &bi, nullptr);
+      if (st == GCOMP_OK) {
+        continue;
+      }
+      peek_rejected++;
+      EXPECT_FALSE(decodes(bad, data.size()))
+          << "byte " << i << " +" << delta
+          << ": peek rejected this header but the decoder accepted the frame";
+      both_rejected++;
+    }
+  }
+  EXPECT_GT(peek_rejected, 0)
+      << "no corruption of the header was rejected, so this proves nothing";
+  EXPECT_EQ(peek_rejected, both_rejected);
+}
+
+TEST_F(Lz4FormatTest, PeekAsksForExactlyTheBytesItNeeds) {
+  std::vector<uint8_t> data(600, 'p');
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  gcomp_options_set_uint64(opts, "lz4.content_size", (uint64_t)data.size());
+  gcomp_options_set_uint64(opts, "lz4.dictionary_id", 0xABCDEF01u);
+  std::vector<uint8_t> frame = encodeWith(opts, data);
+  gcomp_options_destroy(opts);
+  ASSERT_FALSE(frame.empty());
+
+  gcomp_lz4_frame_info_t info;
+  ASSERT_EQ(
+      gcomp_lz4_peek_frame_info(frame.data(), frame.size(), &info, nullptr),
+      GCOMP_OK);
+  const size_t full = info.frame_header_size;
+  ASSERT_EQ(full, (size_t)(7 + 8 + 4)) << "content size and dict id present";
+
+  // Every prefix short of the header must say so, and must ask for a number
+  // of bytes that actually gets somewhere -- a reader feeding exactly what it
+  // is asked for has to make progress rather than loop.
+  for (size_t n = 0; n < full; n++) {
+    gcomp_lz4_frame_info_t partial;
+    size_t needed = 0;
+    gcomp_status_t st =
+        gcomp_lz4_peek_frame_info(frame.data(), n, &partial, &needed);
+    ASSERT_EQ(st, GCOMP_ERR_LIMIT) << "n=" << n;
+    EXPECT_GT(needed, n) << "n=" << n << ": asked for no more than it had";
+    EXPECT_LE(needed, full) << "n=" << n << ": asked for more than the header";
+
+    // The contract a reader actually depends on: feed exactly what it asks
+    // for and you always make progress, so the loop ends.  It takes more than
+    // one round -- four bytes to recognise the magic, six to learn which
+    // optional fields are present, then the whole header -- so the test
+    // follows it rather than assuming a number of steps.
+    gcomp_lz4_frame_info_t again;
+    size_t have = needed, asked = needed;
+    int rounds = 0;
+    gcomp_status_t st2 = GCOMP_ERR_LIMIT;
+    while ((st2 = gcomp_lz4_peek_frame_info(
+                frame.data(), have, &again, &asked)) == GCOMP_ERR_LIMIT) {
+      ASSERT_GT(asked, have) << "n=" << n << ": asked for no more than it had";
+      ASSERT_LE(asked, full) << "n=" << n << ": asked past the header";
+      have = asked;
+      ASSERT_LT(++rounds, 8) << "n=" << n << ": not converging";
+    }
+    EXPECT_EQ(st2, GCOMP_OK) << "n=" << n;
+    EXPECT_EQ(have, full)
+        << "n=" << n << ": settled on a length that is not the header's";
+  }
+
+  EXPECT_TRUE(info.dict_id_present);
+  EXPECT_EQ(info.dict_id, 0xABCDEF01u);
+}
+
+TEST_F(Lz4FormatTest, PeekReportsSkippableFramesSoAReaderCanStepOverThem) {
+  std::vector<uint8_t> payload(250);
+  for (size_t i = 0; i < payload.size(); i++) {
+    payload[i] = (uint8_t)(i * 5 + 3);
+  }
+  std::vector<uint8_t> data(1200, 'm');
+
+  for (unsigned variant = 0; variant < 16; variant++) {
+    std::vector<uint8_t> skip(GCOMP_LZ4_SKIPPABLE_OVERHEAD + payload.size());
+    size_t written = 0;
+    ASSERT_EQ(gcomp_lz4_write_skippable_frame(variant, payload.data(),
+                  payload.size(), skip.data(), skip.size(), &written),
+        GCOMP_OK);
+
+    std::vector<uint8_t> body = encodeWith(nullptr, data);
+    ASSERT_FALSE(body.empty());
+    std::vector<uint8_t> stream = skip;
+    stream.insert(stream.end(), body.begin(), body.end());
+
+    gcomp_lz4_frame_info_t info;
+    ASSERT_EQ(
+        gcomp_lz4_peek_frame_info(stream.data(), stream.size(), &info, nullptr),
+        GCOMP_OK)
+        << "variant " << variant;
+    ASSERT_TRUE(info.is_skippable) << "variant " << variant;
+    EXPECT_EQ(info.magic_variant, variant);
+    EXPECT_EQ(info.skippable_payload_size, payload.size());
+    EXPECT_EQ(info.frame_size, skip.size());
+
+    // frame_size is what makes walking a stream possible: step by it and the
+    // next peek describes the data frame.
+    gcomp_lz4_frame_info_t next;
+    ASSERT_EQ(gcomp_lz4_peek_frame_info(stream.data() + info.frame_size,
+                  stream.size() - info.frame_size, &next, nullptr),
+        GCOMP_OK)
+        << "variant " << variant;
+    EXPECT_FALSE(next.is_skippable);
+    EXPECT_EQ(next.block_max_size, 4194304u);
+  }
+}
+
+TEST_F(Lz4FormatTest, PeekRejectsWhatIsNotAFrameHeader) {
+  std::vector<uint8_t> data(400, 'r');
+  std::vector<uint8_t> frame = encodeWith(nullptr, data);
+  ASSERT_FALSE(frame.empty());
+  gcomp_lz4_frame_info_t info;
+
+  // Wrong magic.
+  std::vector<uint8_t> bad = frame;
+  bad[0] ^= 0xFF;
+  EXPECT_EQ(gcomp_lz4_peek_frame_info(bad.data(), bad.size(), &info, nullptr),
+      GCOMP_ERR_CORRUPT);
+
+  // Version bits other than 01.
+  for (uint8_t version : {0x00, 0x80, 0xC0}) {
+    bad = frame;
+    bad[4] = (uint8_t)((bad[4] & 0x3F) | version);
+    EXPECT_EQ(gcomp_lz4_peek_frame_info(bad.data(), bad.size(), &info, nullptr),
+        GCOMP_ERR_CORRUPT)
+        << "version bits 0x" << std::hex << (int)version;
+  }
+
+  // FLG reserved bit, and BD reserved bits.
+  bad = frame;
+  bad[4] |= 0x02;
+  EXPECT_EQ(gcomp_lz4_peek_frame_info(bad.data(), bad.size(), &info, nullptr),
+      GCOMP_ERR_CORRUPT);
+  bad = frame;
+  bad[5] |= 0x0F;
+  EXPECT_EQ(gcomp_lz4_peek_frame_info(bad.data(), bad.size(), &info, nullptr),
+      GCOMP_ERR_CORRUPT);
+
+  // Block size codes 0 through 3 are not defined.
+  for (uint8_t code = 0; code <= 3; code++) {
+    bad = frame;
+    bad[5] = (uint8_t)(code << 4);
+    EXPECT_EQ(gcomp_lz4_peek_frame_info(bad.data(), bad.size(), &info, nullptr),
+        GCOMP_ERR_CORRUPT)
+        << "block size code " << (int)code;
+  }
+
+  // Header checksum.
+  bad = frame;
+  bad[6] = (uint8_t)(bad[6] + 1);
+  EXPECT_EQ(gcomp_lz4_peek_frame_info(bad.data(), bad.size(), &info, nullptr),
+      GCOMP_ERR_CORRUPT);
+
+  EXPECT_EQ(gcomp_lz4_peek_frame_info(nullptr, 10, &info, nullptr),
+      GCOMP_ERR_INVALID_ARG);
+  EXPECT_EQ(gcomp_lz4_peek_frame_info(frame.data(), frame.size(), nullptr,
+                nullptr),
       GCOMP_ERR_INVALID_ARG);
 }
 

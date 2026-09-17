@@ -296,3 +296,161 @@ gcomp_status_t gcomp_lz4_read_skippable_frame(const void * input,
   }
   return GCOMP_OK;
 }
+
+//
+// Frame header parsing
+//
+
+gcomp_status_t lz4_parse_frame_header(const uint8_t * buf, size_t len,
+    lz4_frame_header_t * header_out, size_t * header_size_out) {
+  if (!buf || !header_out || !header_size_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  // Magic, FLG, BD: the smallest a header can be before its variable fields
+  // are known.
+  if (len < 6) {
+    *header_size_out = 6;
+    return GCOMP_ERR_LIMIT;
+  }
+
+  size_t pos = 0;
+  uint32_t magic = gcomp_read_le32(buf);
+  if (magic != LZ4_MAGIC) {
+    return GCOMP_ERR_CORRUPT;
+  }
+  pos += 4;
+
+  uint8_t flg = buf[pos++];
+  if ((flg & LZ4_FLG_VERSION_MASK) != LZ4_FLG_VERSION_VALUE) {
+    return GCOMP_ERR_CORRUPT;
+  }
+  if (flg & LZ4_FLG_RESERVED) {
+    return GCOMP_ERR_CORRUPT;
+  }
+
+  lz4_frame_header_t header;
+  memset(&header, 0, sizeof(header));
+  header.flg = flg;
+  header.block_independence = (flg & LZ4_FLG_B_INDEP) != 0;
+  header.block_checksum = (flg & LZ4_FLG_B_CHECKSUM) != 0;
+  header.content_size_present = (flg & LZ4_FLG_C_SIZE) != 0;
+  header.content_checksum = (flg & LZ4_FLG_C_CHECKSUM) != 0;
+  header.dict_id_present = (flg & LZ4_FLG_DICT_ID) != 0;
+
+  uint8_t bd = buf[pos++];
+  if (bd & LZ4_BD_RESERVED) {
+    return GCOMP_ERR_CORRUPT;
+  }
+  header.bd = bd;
+  uint8_t block_code = (bd & LZ4_BD_BLOCK_MAX_MASK) >> LZ4_BD_BLOCK_MAX_SHIFT;
+  header.block_max_size = lz4_block_code_to_size(block_code);
+  if (header.block_max_size == 0) {
+    return GCOMP_ERR_CORRUPT;
+  }
+
+  // Now the flags say how long the header really is.
+  size_t total = 6 + (header.content_size_present ? 8 : 0) +
+      (header.dict_id_present ? 4 : 0) + 1;
+  if (len < total) {
+    *header_size_out = total;
+    return GCOMP_ERR_LIMIT;
+  }
+
+  if (header.content_size_present) {
+    header.content_size = gcomp_read_le64(buf + pos);
+    pos += 8;
+  }
+  if (header.dict_id_present) {
+    header.dict_id = gcomp_read_le32(buf + pos);
+    pos += 4;
+  }
+
+  // Header checksum: the second byte of xxHash32 over everything from FLG up
+  // to but not including the checksum itself (the magic is not covered).
+  uint32_t hash = gcomp_xxhash32(buf + 4, pos - 4, 0);
+  if (buf[pos] != (uint8_t)((hash >> 8) & 0xFF)) {
+    return GCOMP_ERR_CORRUPT;
+  }
+
+  *header_out = header;
+  *header_size_out = total;
+  return GCOMP_OK;
+}
+
+gcomp_status_t gcomp_lz4_peek_frame_info(const void * input, size_t input_size,
+    gcomp_lz4_frame_info_t * info_out, size_t * needed_out) {
+  if (!input || !info_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  if (needed_out) {
+    *needed_out = 0;
+  }
+  memset(info_out, 0, sizeof(*info_out));
+
+  if (input_size < 4) {
+    if (needed_out) {
+      *needed_out = 4;
+    }
+    return GCOMP_ERR_LIMIT;
+  }
+
+  const uint8_t * buf = (const uint8_t *)input;
+  uint32_t magic = gcomp_read_le32(buf);
+
+  // A skippable frame has no descriptor to parse, so it is reported for what
+  // it is rather than refused: a caller walking a stream needs to know how far
+  // to step, and that is the whole of what a skippable frame tells anyone.
+  if (LZ4_IS_SKIPPABLE_MAGIC(magic)) {
+    size_t payload_size = 0, frame_size = 0;
+    unsigned variant = 0;
+    gcomp_status_t st = gcomp_lz4_read_skippable_frame(
+        input, input_size, &variant, NULL, &payload_size, &frame_size);
+    if (st != GCOMP_OK) {
+      // Short of the 8-byte header is "not yet"; short of the payload it
+      // declares is too, since frame_size is what the caller wants.
+      if (input_size < GCOMP_LZ4_SKIPPABLE_OVERHEAD) {
+        if (needed_out) {
+          *needed_out = GCOMP_LZ4_SKIPPABLE_OVERHEAD;
+        }
+        return GCOMP_ERR_LIMIT;
+      }
+      if (needed_out) {
+        *needed_out = GCOMP_LZ4_SKIPPABLE_OVERHEAD +
+            (size_t)gcomp_read_le32(buf + 4);
+      }
+      return GCOMP_ERR_LIMIT;
+    }
+    info_out->is_skippable = 1;
+    info_out->magic_variant = variant;
+    info_out->skippable_payload_size = payload_size;
+    info_out->frame_header_size = GCOMP_LZ4_SKIPPABLE_OVERHEAD;
+    info_out->frame_size = frame_size;
+    return GCOMP_OK;
+  }
+
+  lz4_frame_header_t header;
+  size_t header_size = 0;
+  gcomp_status_t st =
+      lz4_parse_frame_header(buf, input_size, &header, &header_size);
+  if (st != GCOMP_OK) {
+    if (st == GCOMP_ERR_LIMIT && needed_out) {
+      *needed_out = header_size;
+    }
+    return st;
+  }
+
+  info_out->block_independent = header.block_independence ? 1 : 0;
+  info_out->block_checksum = header.block_checksum ? 1 : 0;
+  info_out->content_checksum = header.content_checksum ? 1 : 0;
+  info_out->block_max_size = header.block_max_size;
+  info_out->content_size_present = header.content_size_present ? 1 : 0;
+  info_out->content_size = header.content_size;
+  info_out->dict_id_present = header.dict_id_present ? 1 : 0;
+  info_out->dict_id = header.dict_id;
+  info_out->frame_header_size = header_size;
+  // A data frame's total length is not knowable from its header: the blocks
+  // are only sized as they are met.  Left at zero rather than guessed.
+  info_out->frame_size = 0;
+  return GCOMP_OK;
+}

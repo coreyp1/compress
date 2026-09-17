@@ -779,7 +779,13 @@ TEST_F(Lz4SpecOracleTest, OurEncoder_SpecDecoder_Sweep) {
         gcomp_options_t * opts = nullptr;
         ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
         gcomp_options_set_bool(opts, "lz4.content_checksum", cksum);
-        gcomp_options_set_bool(opts, "lz4.content_size", cksum);
+        // A uint64 carrying the size, not a flag: set_bool() stores the wrong
+        // type and the encoder silently declines it, so this swept the
+        // content-size field without ever setting it.
+        if (cksum) {
+          gcomp_options_set_uint64(
+              opts, "lz4.content_size", (uint64_t)sh.data.size());
+        }
 
         std::vector<uint8_t> packed = gcompEncode(sh.data, opts);
         gcomp_options_destroy(opts);
@@ -1119,7 +1125,8 @@ TEST_F(Lz4SpecOracleTest, RealLz4_ReadsOurFrames) {
           gcomp_options_set_bool(opts, "lz4.block_checksum", o.block_checksum);
         }
         if (o.content_size >= 0) {
-          gcomp_options_set_bool(opts, "lz4.content_size", o.content_size);
+          gcomp_options_set_uint64(
+              opts, "lz4.content_size", (uint64_t)sh.data.size());
         }
         if (o.independent >= 0) {
           gcomp_options_set_bool(opts, "lz4.independent_blocks", o.independent);
@@ -1129,6 +1136,28 @@ TEST_F(Lz4SpecOracleTest, RealLz4_ReadsOurFrames) {
         gcomp_options_destroy(opts);
         ASSERT_FALSE(framed.empty())
             << sh.name << " n=" << n << " " << o.name;
+
+        // Assert the options actually reached the frame.  Every row here
+        // named a flag, and three of them were silently doing nothing.
+        FrameShape fs;
+        ASSERT_TRUE(walkFrame(framed, &fs)) << sh.name << " " << o.name;
+        if (o.content_checksum >= 0) {
+          EXPECT_EQ(fs.content_checksum, o.content_checksum != 0)
+              << sh.name << " n=" << n << " " << o.name;
+        }
+        if (o.block_checksum >= 0) {
+          EXPECT_EQ(fs.block_checksum, o.block_checksum != 0)
+              << sh.name << " n=" << n << " " << o.name;
+        }
+        if (o.content_size >= 0 && !sh.data.empty()) {
+          EXPECT_EQ(fs.content_size, o.content_size != 0)
+              << sh.name << " n=" << n << " " << o.name
+              << ": the content size option did not reach the frame";
+        }
+        if (o.independent >= 0) {
+          EXPECT_EQ(fs.block_independent, o.independent != 0)
+              << sh.name << " n=" << n << " " << o.name;
+        }
 
         std::vector<uint8_t> back;
         std::string err;
@@ -2141,6 +2170,82 @@ TEST_F(Lz4SpecOracleTest, StaleHistoryDoesNotLeakAcrossFrames) {
   EXPECT_EQ(st, GCOMP_ERR_CORRUPT)
       << "a frame needing a dictionary was accepted because the frame before "
          "it had left history the decoder was willing to match against";
+}
+
+TEST_F(Lz4SpecOracleTest, AReaderCanDiscoverWhichDictionaryAStreamNeeds) {
+  // The whole reason gcomp_lz4_peek_frame_info() exists.  A decoder needs the
+  // dictionary before it can start, and the only place the dictionary's
+  // identity appears is the frame header -- so without a way to read the
+  // header first, a reader holding several dictionaries cannot tell which one
+  // the stream in front of it wants.
+  struct Entry {
+    uint32_t id;
+    const char * phrase;
+  };
+  static const Entry kLibrary[] = {
+      {0x1001u, "the quick brown fox jumps over the lazy dog "},
+      {0x1002u, "pack my box with five dozen liquor jugs! "},
+      {0x1003u, "how vexingly quick daft zebras jump; "},
+  };
+
+  for (const Entry & chosen : kLibrary) {
+    std::vector<uint8_t> dict = dictionaryText(70000, chosen.phrase);
+    std::vector<uint8_t> data = dictionaryText(6000, chosen.phrase);
+
+    gcomp_options_t * opts = nullptr;
+    ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+    gcomp_options_set_bytes(opts, "lz4.dictionary", dict.data(), dict.size());
+    gcomp_options_set_uint64(opts, "lz4.dictionary_id", chosen.id);
+    gcomp_options_set_bool(opts, "lz4.content_checksum", 1);
+    std::vector<uint8_t> frame(data.size() * 2 + 65536);
+    size_t used = 0;
+    ASSERT_EQ(gcomp_encode_buffer(registry_, "lz4", opts, data.data(),
+                  data.size(), frame.data(), frame.size(), &used),
+        GCOMP_OK);
+    gcomp_options_destroy(opts);
+    frame.resize(used);
+
+    // A reader that has never seen this stream before.  It has the header and
+    // nothing else -- not even all of the first block.
+    gcomp_lz4_frame_info_t info;
+    ASSERT_EQ(gcomp_lz4_peek_frame_info(frame.data(),
+                  std::min(frame.size(), (size_t)32), &info, nullptr),
+        GCOMP_OK);
+    ASSERT_TRUE(info.dict_id_present)
+        << "the frame does not name its dictionary, so a reader cannot choose";
+    ASSERT_EQ(info.dict_id, chosen.id);
+
+    // Pick the dictionary the frame asked for, out of the ones held.
+    const Entry * picked = nullptr;
+    for (const Entry & e : kLibrary) {
+      if (e.id == info.dict_id) {
+        picked = &e;
+      }
+    }
+    ASSERT_NE(picked, nullptr);
+    std::vector<uint8_t> picked_dict = dictionaryText(70000, picked->phrase);
+
+    gcomp_status_t st = GCOMP_OK;
+    std::vector<uint8_t> back =
+        decodeWithDictionary(frame, &picked_dict, data.size(), &st);
+    ASSERT_EQ(st, GCOMP_OK);
+    EXPECT_EQ(back, data);
+
+    // And picking a different one fails, which is what makes the choice
+    // meaningful rather than incidental.  The content checksum is what
+    // detects it -- see WrongDictionaryIsCaughtByTheContentChecksum.
+    for (const Entry & e : kLibrary) {
+      if (e.id == chosen.id) {
+        continue;
+      }
+      std::vector<uint8_t> other = dictionaryText(70000, e.phrase);
+      gcomp_status_t bad_st = GCOMP_OK;
+      decodeWithDictionary(frame, &other, data.size(), &bad_st);
+      EXPECT_NE(bad_st, GCOMP_OK)
+          << "dictionary 0x" << std::hex << e.id << " decoded a frame that "
+          << "asked for 0x" << chosen.id;
+    }
+  }
 }
 
 TEST_F(Lz4SpecOracleTest, OurDictionaryFramesReadInRealLz4) {

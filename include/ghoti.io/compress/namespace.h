@@ -93,6 +93,7 @@
 #define gcomp_method_gzip_register GHOTIIO_COMPRESS(gcomp_method_gzip_register)
 #define gcomp_lz4_decoder_on_skippable_frame \
   GHOTIIO_COMPRESS(gcomp_lz4_decoder_on_skippable_frame)
+#define gcomp_lz4_peek_frame_info GHOTIIO_COMPRESS(gcomp_lz4_peek_frame_info)
 #define gcomp_lz4_read_skippable_frame \
   GHOTIIO_COMPRESS(gcomp_lz4_read_skippable_frame)
 #define gcomp_lz4_write_skippable_frame \

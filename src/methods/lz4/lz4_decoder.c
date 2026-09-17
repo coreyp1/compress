@@ -237,79 +237,13 @@ static gcomp_status_t lz4_decoder_read_options(gcomp_options_t * options,
 //
 
 static gcomp_status_t lz4_decoder_parse_header(lz4_decoder_state_t * state) {
-  const uint8_t * buf = state->header_accum;
-  size_t pos = 0;
-
-  // Magic number (already validated during accumulation)
-  pos += 4;
-
-  // FLG byte
-  uint8_t flg = buf[pos++];
-  state->header.flg = flg;
-
-  // Validate version bits (must be 01)
-  if ((flg & LZ4_FLG_VERSION_MASK) != LZ4_FLG_VERSION_VALUE) {
-    return GCOMP_ERR_CORRUPT;
-  }
-
-  // Check reserved bit
-  if (flg & LZ4_FLG_RESERVED) {
-    return GCOMP_ERR_CORRUPT;
-  }
-
-  // Extract flags
-  state->header.block_independence = (flg & LZ4_FLG_B_INDEP) != 0;
-  state->header.block_checksum = (flg & LZ4_FLG_B_CHECKSUM) != 0;
-  state->header.content_size_present = (flg & LZ4_FLG_C_SIZE) != 0;
-  state->header.content_checksum = (flg & LZ4_FLG_C_CHECKSUM) != 0;
-  state->header.dict_id_present = (flg & LZ4_FLG_DICT_ID) != 0;
-
-  // BD byte
-  uint8_t bd = buf[pos++];
-  state->header.bd = bd;
-
-  // Check reserved bits
-  if (bd & LZ4_BD_RESERVED) {
-    return GCOMP_ERR_CORRUPT;
-  }
-
-  // Extract block max size
-  uint8_t block_code = (bd & LZ4_BD_BLOCK_MAX_MASK) >> LZ4_BD_BLOCK_MAX_SHIFT;
-  state->header.block_max_size = lz4_block_code_to_size(block_code);
-  if (state->header.block_max_size == 0) {
-    return GCOMP_ERR_CORRUPT;
-  }
-
-  // Content size (if present)
-  if (state->header.content_size_present) {
-    state->header.content_size = gcomp_read_le64(buf + pos);
-    pos += 8;
-  }
-  else {
-    state->header.content_size = 0;
-  }
-
-  // Dictionary ID (if present)
-  if (state->header.dict_id_present) {
-    state->header.dict_id = gcomp_read_le32(buf + pos);
-    pos += 4;
-  }
-  else {
-    state->header.dict_id = 0;
-  }
-
-  // Header checksum (1 byte)
-  uint8_t expected_hc = buf[pos];
-
-  // Compute header checksum: xxHash32 of FLG..{optional fields} >> 8 & 0xFF
-  uint32_t hash = gcomp_xxhash32(buf + 4, pos - 4, 0);
-  uint8_t computed_hc = (uint8_t)((hash >> 8) & 0xFF);
-
-  if (expected_hc != computed_hc) {
-    return GCOMP_ERR_CORRUPT;
-  }
-
-  return GCOMP_OK;
+  // Deliberately the same parser gcomp_lz4_peek_frame_info() uses.  A reader
+  // that peeks at a header and then decodes the frame must not be told two
+  // different things about the same bytes, and the only way to be sure of
+  // that is for there to be one parser.
+  size_t header_size = 0;
+  return lz4_parse_frame_header(state->header_accum,
+      state->header_accum_pos, &state->header, &header_size);
 }
 
 //

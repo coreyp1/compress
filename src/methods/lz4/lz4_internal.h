@@ -475,6 +475,24 @@ gcomp_status_t lz4_write_frame_header(const lz4_frame_header_t * header,
  * @param uncompressed_out Output: true if uncompressed block
  * @return GCOMP_OK on success
  */
+/**
+ * @brief Parse and validate a frame header.
+ *
+ * The single place the frame descriptor is interpreted, so that
+ * gcomp_lz4_peek_frame_info() and the decoder cannot come to different
+ * conclusions about the same bytes.
+ *
+ * @param buf Buffer positioned at the frame's magic number
+ * @param len Bytes available
+ * @param header_out Filled in on success
+ * @param header_size_out On success, the header's length; on GCOMP_ERR_LIMIT,
+ *        how many bytes are needed before asking again
+ * @return GCOMP_OK, GCOMP_ERR_LIMIT if @p len is too short, or
+ *         GCOMP_ERR_CORRUPT if the header is not valid
+ */
+gcomp_status_t lz4_parse_frame_header(const uint8_t * buf, size_t len,
+    lz4_frame_header_t * header_out, size_t * header_size_out);
+
 gcomp_status_t lz4_parse_block_size(
     const uint8_t * buf, uint32_t * size_out, bool * uncompressed_out);
 

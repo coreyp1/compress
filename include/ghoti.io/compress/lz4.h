@@ -159,6 +159,77 @@ GCOMP_API gcomp_status_t gcomp_lz4_read_skippable_frame(const void * input,
     size_t * frame_size_out);
 
 /**
+ * @brief What a frame's header says about it.
+ *
+ * Filled by gcomp_lz4_peek_frame_info(). Every field is read straight out of
+ * the frame descriptor; nothing is inferred and nothing is decoded.
+ */
+typedef struct {
+  /** Non-zero for a skippable frame. The fields below it describe one; the
+   *  data-frame fields are all zero. */
+  int is_skippable;
+  /** Skippable frames: the magic number's low nibble, 0 through 15. */
+  unsigned magic_variant;
+  /** Skippable frames: the payload size the frame declares. */
+  uint64_t skippable_payload_size;
+
+  /** Data frames: blocks do not reference each other (B.Indep). */
+  int block_independent;
+  /** Data frames: each block carries an xxHash32 (B.Checksum). */
+  int block_checksum;
+  /** Data frames: the frame ends with an xxHash32 of the content. */
+  int content_checksum;
+  /** Data frames: largest block the frame may hold -- 65536, 262144, 1048576
+   *  or 4194304. */
+  uint32_t block_max_size;
+  /** Data frames: the header states the uncompressed size. */
+  int content_size_present;
+  /** Data frames: that size, or 0 when it is absent. */
+  uint64_t content_size;
+  /** Data frames: the header names a dictionary. */
+  int dict_id_present;
+  /** Data frames: which one, or 0 when absent.  This is how a reader learns
+   *  what to pass as `lz4.dictionary` before decoding. */
+  uint32_t dict_id;
+
+  /** Bytes the header occupies, so the caller can step to the first block. */
+  size_t frame_header_size;
+  /** The whole frame's size, for a skippable frame.  Zero for a data frame:
+   *  its length is not knowable from the header, since blocks are only sized
+   *  as they are met. */
+  size_t frame_size;
+} gcomp_lz4_frame_info_t;
+
+/**
+ * @brief Read a frame's header without decoding it.
+ *
+ * Answers the questions a reader has before it commits: how large the content
+ * will be, whether the frame is checksummed, and above all **which dictionary
+ * it needs**, which is otherwise unknowable -- the decoder needs the
+ * dictionary to start, and the only place its identity appears is the header.
+ *
+ * Nothing is allocated and nothing is decoded; the bytes are parsed in place.
+ * The validation is the decoder's own, so a header this accepts is one the
+ * decoder accepts and a header this refuses the decoder refuses too.
+ *
+ * Skippable frames are reported rather than refused: a reader walking a
+ * stream needs to know how far to step over one.
+ *
+ * @param input Buffer positioned at the start of a frame
+ * @param input_size Bytes available from that position
+ * @param info_out Filled in on success; zeroed first
+ * @param needed_out On GCOMP_ERR_LIMIT, set to how many bytes are needed
+ *        before asking again; may be NULL
+ * @return GCOMP_OK on success; GCOMP_ERR_LIMIT if @p input is too short, with
+ *         @p needed_out saying how short; GCOMP_ERR_CORRUPT if the bytes are
+ *         not an LZ4 frame header, carry an unknown version, set a reserved
+ *         bit, name an invalid block size, or fail the header checksum;
+ *         GCOMP_ERR_INVALID_ARG if @p input or @p info_out is NULL
+ */
+GCOMP_API gcomp_status_t gcomp_lz4_peek_frame_info(const void * input,
+    size_t input_size, gcomp_lz4_frame_info_t * info_out, size_t * needed_out);
+
+/**
  * @brief Receives a skippable frame's payload while a stream is decoded.
  *
  * The decoder discards skippable frames, as the LZ4 frame format requires, so
