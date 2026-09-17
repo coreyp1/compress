@@ -86,39 +86,43 @@ typedef enum {
 // - Longer matches tend to provide more benefit
 //
 // Implementation differences from DEFAULT:
-// - Uses 2x longer hash chains (16/128/256 vs 8/32/64)
-// - Applies lazy matching heuristic: if a short match (<32 bytes) is found,
-//   checks if the next position has a longer match before committing
-// - This extra effort helps find the longer patterns typical in filtered data
+// - Applies lazy matching: a match is held back one byte to see whether the
+//   next position starts a longer one, and the search that position performs
+//   anyway is what settles it.  See deflate_find_match()'s caller.
+// - Nothing else.  It searches exactly as hard as DEFAULT: same hash chain
+//   lengths, same everything.
 //
-// Note that this is the opposite of what zlib's Z_FILTERED does. zlib reduces
-// effort - it forces matches to be at least six bytes and leans on Huffman
-// coding - so Z_FILTERED is *faster* than its default. This one is slower, and
-// by more than the chain length alone accounts for. On 3 MB of real PNG
-// filtered rows it runs at 5.2 MB/s against 28.4 for DEFAULT - 5.5x - where
-// the chains are only 4x longer. The rest is the lazy-match step below: when
-// it decides the next position looks better it throws away the match it just
-// searched for and emits a literal, and the next iteration searches that same
-// position again from scratch. Two full chain walks per position, and the
-// chains are 128 deep. Carrying the lookahead result forward, the way zlib
-// carries match_start and prev_length, would remove the second walk - but not
-// for free: the literal branch inserts a hash entry for the position it just
-// passed, so the chain the second search walks is not the one the first search
-// walked, and the output would change.
+// It used to search four times as deep as DEFAULT as well - 16/128/256 against
+// 4/32/128 - on the reasoning that filtered data hides longer patterns behind
+// short chains.  Measured across 52 files of real PNG filtered rows, 7.3 MB,
+// that is not where the win is:
 //
-// Whether the extra effort pays is content-dependent, and on filtered rows it
-// often does not. On the 3 MB sample above it produces a *larger* stream than
-// DEFAULT - 1,551,415 bytes against 1,481,112. The image library measured six
-// whole images and found this strategy smaller on smooth and synthetic content
-// by up to 9% and larger on photographic content by up to 9%. Worth knowing
-// before choosing it by name.
+//     chain   with lazy matching   without
+//        32        31.22%           32.91%
+//        64        31.13%           33.42%
+//       128        31.13%           33.41%
+//       256        31.12%           33.40%
 //
-// For scale, zlib at level 5 encodes that same sample to 1,312,995 bytes at
-// 36.4 MB/s. The ratio gap is not the chain length; it is that lazy matching
-// here is wired only to this strategy, while zlib applies it at every level
-// from 4 up, and that there is no equivalent of zlib's good_length or
-// nice_length to stop a search early. Both of those change the output, so
-// neither is a change to make quietly.
+// Chain length is worth 0.1 points across a factor of eight.  Lazy matching is
+// worth 1.7.  So the chains came back down and the strategy is now DEFAULT
+// plus lazy matching, which is the same relationship zlib's levels 4-9 have to
+// its levels 1-3.
+//
+// On that corpus it produces 2,267,234 bytes at 38.7 MB/s against DEFAULT's
+// 2,389,633 at 56.8 - 5.1% smaller for about two thirds of the throughput,
+// which is a trade worth having if you asked for this strategy by name.  zlib
+// at level 5 gets 2,209,620 on the same corpus.
+//
+// Note that this is still not what zlib's Z_FILTERED does.  zlib *reduces*
+// effort there - it forces matches to be at least six bytes and leans on
+// Huffman coding - so Z_FILTERED is faster than its default.  This one is
+// slower than its default.  The name is shared; the meaning is not.
+//
+// What remains between this and zlib on ratio is that lazy matching is wired
+// only to this strategy, while zlib applies it at every level from 4 up, and
+// that there is no equivalent of zlib's good_length or nice_length to stop a
+// search early.  Both change the output of every level, so neither is a change
+// to make quietly.
 //
 // DEFLATE_STRATEGY_HUFFMAN_ONLY (strategy="huffman_only")
 // -------------------------------------------------------
