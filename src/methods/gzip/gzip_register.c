@@ -243,6 +243,49 @@ static const gcomp_option_schema_t g_gzip_option_schemas[] = {
         0,                                      // max_uint
         "Decoder: max FEXTRA length in bytes",  // help
     },
+    // Core limit options.  Declared here because this method honours them --
+    // a schema that omits what the method accepts cannot be used to validate
+    // a caller's options, which is what gcomp_options_validate() does at
+    // create time.
+    {
+        "limits.max_output_bytes",           // key
+        GCOMP_OPT_UINT64,                    // type
+        0,                                   // has_default
+        {.ui64 = 0},                         // default_value
+        0,                                   // has_min
+        0,                                   // has_max
+        0,                                   // min_int
+        0,                                   // max_int
+        0,                                   // min_uint
+        0,                                   // max_uint
+        "Maximum decompressed output bytes", // help
+    },
+    {
+        "limits.max_memory_bytes",    // key
+        GCOMP_OPT_UINT64,             // type
+        0,                            // has_default
+        {.ui64 = 0},                  // default_value
+        0,                            // has_min
+        0,                            // has_max
+        0,                            // min_int
+        0,                            // max_int
+        0,                            // min_uint
+        0,                            // max_uint
+        "Maximum memory usage bytes", // help
+    },
+    {
+        "limits.max_expansion_ratio",              // key
+        GCOMP_OPT_UINT64,                          // type
+        0,                                         // has_default
+        {.ui64 = 0},                               // default_value
+        0,                                         // has_min
+        0,                                         // has_max
+        0,                                         // min_int
+        0,                                         // max_int
+        0,                                         // min_uint
+        0,                                         // max_uint
+        "Maximum decompressed:compressed ratio",   // help
+    },
 };
 
 static const char * const g_gzip_option_keys[] = {
@@ -259,6 +302,9 @@ static const char * const g_gzip_option_keys[] = {
     "gzip.max_name_bytes",
     "gzip.max_comment_bytes",
     "gzip.max_extra_bytes",
+    "limits.max_output_bytes",
+    "limits.max_memory_bytes",
+    "limits.max_expansion_ratio",
 };
 
 static const gcomp_method_schema_t g_gzip_schema = {

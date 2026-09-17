@@ -171,11 +171,11 @@ static const gcomp_option_schema_t g_lz4_option_schemas[] = {
         GCOMP_OPT_UINT64,                       // type
         1,                                      // has_default
         {.ui64 = LZ4_DEFAULT_MAX_OUTPUT_BYTES}, // default_value
-        1,                                      // has_min
+        0,                                      // has_min
         0,                                      // has_max
         0,                                      // min_int
         0,                                      // max_int
-        1,                                      // min_uint (at least 1 byte)
+        0,                                      // min_uint (0 means unlimited)
         0,                                      // max_uint
         "Maximum decompressed output bytes",    // help
     },
@@ -185,11 +185,11 @@ static const gcomp_option_schema_t g_lz4_option_schemas[] = {
         GCOMP_OPT_UINT64,                   // type
         1,                                  // has_default
         {.ui64 = LZ4_DEFAULT_BLOCK_SIZE},   // default_value
-        1,                                  // has_min
+        0,                                  // has_min
         0,                                  // has_max
         0,                                  // min_int
         0,                                  // max_int
-        1,                                  // min_uint
+        0,                                  // min_uint
         0,                                  // max_uint
         "Maximum block size during decode", // help
     },
@@ -199,11 +199,11 @@ static const gcomp_option_schema_t g_lz4_option_schemas[] = {
         GCOMP_OPT_UINT64,                              // type
         1,                                             // has_default
         {.ui64 = LZ4_DEFAULT_MAX_MEMORY_BYTES},        // default_value
-        1,                                             // has_min
+        0,                                             // has_min
         0,                                             // has_max
         0,                                             // min_int
         0,                                             // max_int
-        1,                                             // min_uint
+        0,                                             // min_uint
         0,                                             // max_uint
         "Maximum memory usage (buffers, hash tables)", // help
     },
@@ -213,11 +213,11 @@ static const gcomp_option_schema_t g_lz4_option_schemas[] = {
         GCOMP_OPT_UINT64,                          // type
         1,                                         // has_default
         {.ui64 = LZ4_DEFAULT_MAX_EXPANSION_RATIO}, // default_value
-        1,                                         // has_min
+        0,                                         // has_min
         0,                                         // has_max
         0,                                         // min_int
         0,                                         // max_int
-        1,                                         // min_uint
+        0,                                         // min_uint
         0,                                         // max_uint
         "Maximum output/input ratio (decompression bomb protection)", // help
     },

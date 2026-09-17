@@ -11,6 +11,9 @@
 #include <cstring>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/options.h>
+#include <ghoti.io/compress/method.h>
+#include <ghoti.io/compress/registry.h>
+#include <ghoti.io/compress/stream.h>
 #include <gtest/gtest.h>
 
 class OptionsTest : public ::testing::Test {
@@ -435,6 +438,196 @@ TEST_F(OptionsTest, MemoryCleanupManyValues) {
   gcomp_options_destroy(options_);
   options_ = nullptr;
   // If we get here without crashing, cleanup worked
+}
+
+//
+// Option validation at create time
+//
+// The schemas have always said this happens -- "validate user-provided
+// options at create time", "unknown keys cause GCOMP_UNKNOWN_KEY_ERROR at
+// create time" -- but nothing called gcomp_options_validate(), so a
+// misspelled key or a value set with the wrong type was silently ignored and
+// the caller quietly got defaults it never asked for.
+//
+
+namespace {
+
+gcomp_status_t createEncoderWith(const char * method,
+    void (*setup)(gcomp_options_t *)) {
+  gcomp_options_t * opts = nullptr;
+  if (gcomp_options_create(&opts) != GCOMP_OK) {
+    return GCOMP_ERR_INTERNAL;
+  }
+  setup(opts);
+  gcomp_encoder_t * enc = nullptr;
+  gcomp_status_t st =
+      gcomp_encoder_create(gcomp_registry_default(), method, opts, &enc);
+  if (st == GCOMP_OK) {
+    gcomp_encoder_destroy(enc);
+  }
+  gcomp_options_destroy(opts);
+  return st;
+}
+
+gcomp_status_t createDecoderWith(const char * method,
+    void (*setup)(gcomp_options_t *)) {
+  gcomp_options_t * opts = nullptr;
+  if (gcomp_options_create(&opts) != GCOMP_OK) {
+    return GCOMP_ERR_INTERNAL;
+  }
+  setup(opts);
+  gcomp_decoder_t * dec = nullptr;
+  gcomp_status_t st =
+      gcomp_decoder_create(gcomp_registry_default(), method, opts, &dec);
+  if (st == GCOMP_OK) {
+    gcomp_decoder_destroy(dec);
+  }
+  gcomp_options_destroy(opts);
+  return st;
+}
+
+void setNothing(gcomp_options_t *) {}
+void setMisspelled(gcomp_options_t * o) {
+  gcomp_options_set_uint64(o, "lz4.blocksize", 65536);
+}
+void setForeignKey(gcomp_options_t * o) {
+  gcomp_options_set_uint64(o, "zstd.level", 3);
+}
+void setWrongTypeBool(gcomp_options_t * o) {
+  gcomp_options_set_bool(o, "lz4.content_size", 1); // uint64 in the schema
+}
+void setWrongTypeString(gcomp_options_t * o) {
+  gcomp_options_set_string(o, "lz4.block_size", "65536");
+}
+void setOutOfRange(gcomp_options_t * o) {
+  gcomp_options_set_uint64(o, "lz4.block_size", 99); // below the schema min
+}
+void setValid(gcomp_options_t * o) {
+  gcomp_options_set_uint64(o, "lz4.block_size", 65536);
+}
+void setZeroOutputAndRatio(gcomp_options_t * o) {
+  gcomp_options_set_uint64(o, "limits.max_output_bytes", 0);
+  gcomp_options_set_uint64(o, "limits.max_expansion_ratio", 0);
+}
+void setZeroMemory(gcomp_options_t * o) {
+  gcomp_options_set_uint64(o, "limits.max_memory_bytes", 0);
+}
+void setDeflateLevel(gcomp_options_t * o) {
+  gcomp_options_set_int64(o, "deflate.level", 6); // int64, not uint64
+}
+void setDeflateLevelWrongType(gcomp_options_t * o) {
+  gcomp_options_set_uint64(o, "deflate.level", 6);
+}
+void setGzipOwnAndPassthrough(gcomp_options_t * o) {
+  gcomp_options_set_string(o, "gzip.name", "x.txt");
+  gcomp_options_set_int64(o, "deflate.level", 3);
+  gcomp_options_set_uint64(o, "limits.max_output_bytes", 1u << 20);
+}
+
+} // namespace
+
+TEST(OptionValidationTest, MistakesAreRejectedAtCreateTime) {
+  struct Case {
+    const char * what;
+    const char * method;
+    void (*setup)(gcomp_options_t *);
+    gcomp_status_t want;
+  };
+  static const Case kCases[] = {
+      {"no options set", "lz4", setNothing, GCOMP_OK},
+      {"a valid option", "lz4", setValid, GCOMP_OK},
+      {"a misspelled key", "lz4", setMisspelled, GCOMP_ERR_INVALID_ARG},
+      {"another method's key", "lz4", setForeignKey, GCOMP_ERR_INVALID_ARG},
+      {"bool set on a uint64", "lz4", setWrongTypeBool,
+          GCOMP_ERR_INVALID_ARG},
+      {"string set on a uint64", "lz4", setWrongTypeString,
+          GCOMP_ERR_INVALID_ARG},
+      {"a value below the minimum", "lz4", setOutOfRange,
+          GCOMP_ERR_INVALID_ARG},
+      {"deflate.level as int64", "deflate", setDeflateLevel, GCOMP_OK},
+      {"deflate.level as uint64", "deflate", setDeflateLevelWrongType,
+          GCOMP_ERR_INVALID_ARG},
+  };
+
+  for (const Case & c : kCases) {
+    EXPECT_EQ(createEncoderWith(c.method, c.setup), c.want)
+        << c.what << " (" << c.method << " encoder)";
+    EXPECT_EQ(createDecoderWith(c.method, c.setup), c.want)
+        << c.what << " (" << c.method << " decoder)";
+  }
+}
+
+TEST(OptionValidationTest, ZeroIsAcceptedForTheLimitsThatMeanUnlimited) {
+  // Zero means "unlimited" for these, and GzipLimitsTest asserts exactly that
+  // for both -- so a schema declaring a minimum of 1 rejects a documented
+  // value before the method ever sees it.  lz4 and zstd both declared one.
+  for (const char * method : {"lz4", "zstd", "lzw", "rle", "deflate", "gzip"}) {
+    EXPECT_EQ(createEncoderWith(method, setZeroOutputAndRatio), GCOMP_OK)
+        << method << ": zero output/ratio limits must be accepted";
+    EXPECT_EQ(createDecoderWith(method, setZeroOutputAndRatio), GCOMP_OK)
+        << method;
+  }
+}
+
+TEST(OptionValidationTest, ZeroMemoryLimitMeansDifferentThingsPerMethod) {
+  // Recorded rather than asserted as correct.  limits.max_memory_bytes = 0 is
+  // "no limit" to every method except zstd, which reads it as "no memory
+  // permitted" and refuses to start.  Both readings are defensible; having
+  // two of them for one core option is not.  Reconciling them changes
+  // behaviour for whichever side moves, so it is left as a decision rather
+  // than folded into this change -- and pinned here so that whenever it is
+  // made, it is made deliberately.
+  for (const char * method : {"lz4", "lzw", "rle", "deflate", "gzip"}) {
+    EXPECT_EQ(createEncoderWith(method, setZeroMemory), GCOMP_OK)
+        << method << ": treats a zero memory limit as no limit";
+  }
+  EXPECT_EQ(createEncoderWith("zstd", setZeroMemory), GCOMP_ERR_LIMIT)
+      << "zstd treats a zero memory limit as a budget of zero; if this now "
+         "passes, the inconsistency was resolved and this test should say so";
+}
+
+TEST(OptionValidationTest, EveryMethodDeclaresTheLimitsItHonours) {
+  // A schema that omits an option the method reads cannot be used to validate
+  // a caller's options -- the caller gets rejected for passing something the
+  // method would have honoured.  deflate and gzip read the limits through the
+  // gcomp_limits_* helpers and did not declare any of them.
+  struct Expect {
+    const char * method;
+    const char * key;
+  };
+  static const Expect kExpected[] = {
+      {"deflate", "limits.max_output_bytes"},
+      {"deflate", "limits.max_memory_bytes"},
+      {"deflate", "limits.max_expansion_ratio"},
+      {"deflate", "limits.max_window_bytes"},
+      {"gzip", "limits.max_output_bytes"},
+      {"gzip", "limits.max_memory_bytes"},
+      {"gzip", "limits.max_expansion_ratio"},
+      {"lz4", "limits.max_block_bytes"},
+      {"zstd", "limits.max_window_bytes"},
+  };
+  for (const Expect & e : kExpected) {
+    const gcomp_method_t * m =
+        gcomp_registry_find(gcomp_registry_default(), e.method);
+    ASSERT_NE(m, nullptr) << e.method;
+    const gcomp_option_schema_t * opt = nullptr;
+    EXPECT_EQ(gcomp_method_get_option_schema(m, e.key, &opt), GCOMP_OK)
+        << e.method << " does not declare " << e.key
+        << ", which it honours at runtime";
+  }
+}
+
+TEST(OptionValidationTest, WrapperMethodsStillTakeTheirPassthroughOptions) {
+  // gzip wraps deflate and hands it the caller's options.  It used to hand
+  // over all of them, on the stated grounds that deflate would ignore what it
+  // did not know -- deflate's policy is GCOMP_UNKNOWN_KEY_ERROR, so that was
+  // never true, and validating at create time is what made it visible.
+  EXPECT_EQ(createEncoderWith("gzip", setGzipOwnAndPassthrough), GCOMP_OK);
+  EXPECT_EQ(createDecoderWith("gzip", setGzipOwnAndPassthrough), GCOMP_OK);
+
+  // gzip's own policy is to ignore keys it does not recognise, which a
+  // wrapper needs; that must survive validation being switched on.
+  EXPECT_EQ(createEncoderWith("gzip", setForeignKey), GCOMP_OK);
 }
 
 int main(int argc, char ** argv) {

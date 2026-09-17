@@ -274,13 +274,95 @@ void gzip_header_info_free(
  * @param dst_out Receives cloned options (set to NULL if src is NULL)
  * @return GCOMP_OK on success, GCOMP_ERR_MEMORY on allocation failure
  */
-gcomp_status_t gzip_extract_passthrough_options(
+gcomp_status_t gzip_extract_passthrough_options(gcomp_registry_t * registry,
     const gcomp_options_t * src, gcomp_options_t ** dst_out) {
-  // For now, just clone the entire options object
-  // The deflate method will ignore unknown keys with its schema
+  if (!dst_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  *dst_out = NULL;
   if (!src) {
-    *dst_out = NULL;
     return GCOMP_OK;
   }
-  return gcomp_options_clone(src, dst_out);
+
+  // This used to clone the whole options object, on the stated grounds that
+  // "the deflate method will ignore unknown keys with its schema".  Deflate's
+  // policy is GCOMP_UNKNOWN_KEY_ERROR, so that was never true; it went
+  // unnoticed only because nothing validated options at create time.  Handing
+  // the inner encoder every gzip.* key the caller set would now fail the
+  // frame outright.
+  //
+  // What passes through is what deflate declares it accepts, taken from its
+  // own schema so this cannot drift as that schema changes.
+  const gcomp_method_t * deflate = gcomp_registry_find(registry, "deflate");
+  if (!deflate) {
+    return GCOMP_ERR_UNSUPPORTED;
+  }
+  const gcomp_method_schema_t * schema = NULL;
+  gcomp_status_t status = gcomp_method_get_all_schemas(deflate, &schema);
+  if (status != GCOMP_OK) {
+    return status;
+  }
+  if (!schema) {
+    return GCOMP_ERR_INTERNAL;
+  }
+
+  gcomp_options_t * dst = NULL;
+  status = gcomp_options_create(&dst);
+  if (status != GCOMP_OK) {
+    return status;
+  }
+
+  for (size_t i = 0; i < schema->num_options; i++) {
+    const gcomp_option_schema_t * opt = &schema->options[i];
+    if (!opt || !opt->key) {
+      continue;
+    }
+    switch (opt->type) {
+    case GCOMP_OPT_INT64: {
+      int64_t v = 0;
+      if (gcomp_options_get_int64(src, opt->key, &v) == GCOMP_OK) {
+        status = gcomp_options_set_int64(dst, opt->key, v);
+      }
+      break;
+    }
+    case GCOMP_OPT_UINT64: {
+      uint64_t v = 0;
+      if (gcomp_options_get_uint64(src, opt->key, &v) == GCOMP_OK) {
+        status = gcomp_options_set_uint64(dst, opt->key, v);
+      }
+      break;
+    }
+    case GCOMP_OPT_BOOL: {
+      int v = 0;
+      if (gcomp_options_get_bool(src, opt->key, &v) == GCOMP_OK) {
+        status = gcomp_options_set_bool(dst, opt->key, v);
+      }
+      break;
+    }
+    case GCOMP_OPT_STRING: {
+      const char * v = NULL;
+      if (gcomp_options_get_string(src, opt->key, &v) == GCOMP_OK && v) {
+        status = gcomp_options_set_string(dst, opt->key, v);
+      }
+      break;
+    }
+    case GCOMP_OPT_BYTES: {
+      const void * d = NULL;
+      size_t n = 0;
+      if (gcomp_options_get_bytes(src, opt->key, &d, &n) == GCOMP_OK && d) {
+        status = gcomp_options_set_bytes(dst, opt->key, d, n);
+      }
+      break;
+    }
+    default:
+      break;
+    }
+    if (status != GCOMP_OK) {
+      gcomp_options_destroy(dst);
+      return status;
+    }
+  }
+
+  *dst_out = dst;
+  return GCOMP_OK;
 }

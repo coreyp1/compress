@@ -342,7 +342,7 @@ void gzip_header_info_free(
  * @param dst_out Receives cloned options (set to NULL if src is NULL)
  * @return GCOMP_OK on success
  */
-gcomp_status_t gzip_extract_passthrough_options(
+gcomp_status_t gzip_extract_passthrough_options(gcomp_registry_t * registry,
     const gcomp_options_t * src, gcomp_options_t ** dst_out);
 
 #ifdef __cplusplus

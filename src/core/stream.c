@@ -40,6 +40,24 @@ gcomp_status_t gcomp_encoder_create(gcomp_registry_t * registry,
     return GCOMP_ERR_UNSUPPORTED;
   }
 
+  // Validate the caller's options against the method's schema before doing
+  // anything with them.  The schemas have always described this -- "validate
+  // user-provided options at create time", "unknown keys cause
+  // GCOMP_UNKNOWN_KEY_ERROR at create time" -- but nothing called
+  // gcomp_options_validate(), so a misspelled key or a value set with the
+  // wrong type was silently ignored and the caller got defaults it never
+  // asked for.
+  //
+  // A method that publishes no schema has nothing to validate against --
+  // gcomp_options_validate() reports GCOMP_ERR_UNSUPPORTED for it, which is
+  // not the caller's mistake and must not fail the create.
+  if (options) {
+    gcomp_status_t opt_status = gcomp_options_validate(options, method);
+    if (opt_status != GCOMP_OK && opt_status != GCOMP_ERR_UNSUPPORTED) {
+      return opt_status;
+    }
+  }
+
   const gcomp_allocator_t * alloc = gcomp_registry_get_allocator(registry);
 
   // Create encoder structure
@@ -94,6 +112,24 @@ gcomp_status_t gcomp_decoder_create(gcomp_registry_t * registry,
   // Check if create_decoder function exists
   if (!method->create_decoder) {
     return GCOMP_ERR_UNSUPPORTED;
+  }
+
+  // Validate the caller's options against the method's schema before doing
+  // anything with them.  The schemas have always described this -- "validate
+  // user-provided options at create time", "unknown keys cause
+  // GCOMP_UNKNOWN_KEY_ERROR at create time" -- but nothing called
+  // gcomp_options_validate(), so a misspelled key or a value set with the
+  // wrong type was silently ignored and the caller got defaults it never
+  // asked for.
+  //
+  // A method that publishes no schema has nothing to validate against --
+  // gcomp_options_validate() reports GCOMP_ERR_UNSUPPORTED for it, which is
+  // not the caller's mistake and must not fail the create.
+  if (options) {
+    gcomp_status_t opt_status = gcomp_options_validate(options, method);
+    if (opt_status != GCOMP_OK && opt_status != GCOMP_ERR_UNSUPPORTED) {
+      return opt_status;
+    }
   }
 
   const gcomp_allocator_t * alloc = gcomp_registry_get_allocator(registry);

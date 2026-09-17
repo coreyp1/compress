@@ -354,7 +354,7 @@ gcomp_status_t gzip_encoder_init(gcomp_registry_t * registry,
   }
 
   // Extract pass-through options for deflate
-  status = gzip_extract_passthrough_options(options, &deflate_options);
+  status = gzip_extract_passthrough_options(registry, options, &deflate_options);
   if (status != GCOMP_OK) {
     goto cleanup;
   }

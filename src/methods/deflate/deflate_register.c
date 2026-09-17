@@ -80,8 +80,10 @@
 //   - "rle": Run-length encoding only (distance 1 matches)
 //   - "fixed": Always use fixed Huffman codes (simpler, slightly faster)
 //
-// Core limit options (`limits.max_output_bytes`, `limits.max_memory_bytes`)
-// are handled by the core infrastructure, not the method schema.
+// Core limit options are read by this method through the gcomp_limits_*
+// helpers, so they are declared in the schema below.  They were not, which
+// meant the schema described less than the method accepts -- harmless while
+// nothing validated against it, and wrong the moment anything did.
 //
 
 #define DEFLATE_LEVEL_DEFAULT 6
@@ -132,12 +134,72 @@ static const gcomp_option_schema_t g_deflate_option_schemas[] = {
         0,                                 // max_uint
         "Strategy: default, filtered, huffman_only, rle, fixed", // help
     },
+    // Core limit options.  Declared here because this method honours them --
+    // a schema that omits what the method accepts cannot be used to validate
+    // a caller's options, which is what gcomp_options_validate() does at
+    // create time.
+    {
+        "limits.max_output_bytes",           // key
+        GCOMP_OPT_UINT64,                    // type
+        0,                                   // has_default
+        {.ui64 = 0},                         // default_value
+        0,                                   // has_min
+        0,                                   // has_max
+        0,                                   // min_int
+        0,                                   // max_int
+        0,                                   // min_uint
+        0,                                   // max_uint
+        "Maximum decompressed output bytes", // help
+    },
+    {
+        "limits.max_memory_bytes",    // key
+        GCOMP_OPT_UINT64,             // type
+        0,                            // has_default
+        {.ui64 = 0},                  // default_value
+        0,                            // has_min
+        0,                            // has_max
+        0,                            // min_int
+        0,                            // max_int
+        0,                            // min_uint
+        0,                            // max_uint
+        "Maximum memory usage bytes", // help
+    },
+    {
+        "limits.max_expansion_ratio",              // key
+        GCOMP_OPT_UINT64,                          // type
+        0,                                         // has_default
+        {.ui64 = 0},                               // default_value
+        0,                                         // has_min
+        0,                                         // has_max
+        0,                                         // min_int
+        0,                                         // max_int
+        0,                                         // min_uint
+        0,                                         // max_uint
+        "Maximum decompressed:compressed ratio",   // help
+    },
+    {
+        "limits.max_window_bytes",        // key
+        GCOMP_OPT_UINT64,                 // type
+        0,                                // has_default
+        {.ui64 = 0},                      // default_value
+        0,                                // has_min
+        0,                                // has_max
+        0,                                // min_int
+        0,                                // max_int
+        0,                                // min_uint
+        0,                                // max_uint
+        "Maximum decoder window bytes",   // help
+    },
 };
 
 static const char * const g_deflate_option_keys[] = {
     "deflate.level",
     "deflate.window_bits",
     "deflate.strategy",
+    "limits.max_output_bytes",
+    "limits.max_memory_bytes",
+    "limits.max_expansion_ratio",
+    "limits.max_window_bytes",
 };
 
 static const gcomp_method_schema_t g_deflate_schema = {
