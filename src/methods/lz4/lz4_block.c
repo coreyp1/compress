@@ -128,17 +128,34 @@ static inline uint32_t lz4_hash_position(const uint8_t * p) {
 gcomp_status_t lz4_block_compress(const uint8_t * input, size_t input_len,
     uint8_t * output, size_t output_cap, size_t * output_len_out,
     uint32_t * hash_table, size_t hash_table_size) {
-  if (!input || !output || !output_len_out || !hash_table) {
+  if (hash_table) {
+    // An independent block may not reference anything outside itself, so it
+    // starts from an empty table.  lz4_block_compress_linked() deliberately
+    // does not clear it -- that is what lets a linked block see the block
+    // before it.
+    memset(hash_table, 0, hash_table_size * sizeof(uint32_t));
+  }
+  return lz4_block_compress_linked(input, 0, input_len, output, output_cap,
+      output_len_out, hash_table, hash_table_size);
+}
+
+gcomp_status_t lz4_block_compress_linked(const uint8_t * window,
+    size_t prefix_len, size_t block_len, uint8_t * output, size_t output_cap,
+    size_t * output_len_out, uint32_t * hash_table, size_t hash_table_size) {
+  if (!window || !output || !output_len_out || !hash_table) {
     return GCOMP_ERR_INVALID_ARG;
   }
 
-  if (input_len == 0) {
+  if (block_len == 0) {
     *output_len_out = 0;
     return GCOMP_OK;
   }
 
-  // Clear hash table
-  memset(hash_table, 0, hash_table_size * sizeof(uint32_t));
+  // `window` is prefix_len bytes of already emitted frame data followed by the
+  // block to compress.  Hash positions are offsets from `window`, so a match
+  // found in the prefix is expressed the same way as one found in the block.
+  const uint8_t * input = window + prefix_len;
+  size_t input_len = block_len;
 
   const uint8_t * src = input;
   const uint8_t * src_end = input + input_len;
@@ -176,20 +193,31 @@ gcomp_status_t lz4_block_compress(const uint8_t * input, size_t input_len,
     return GCOMP_OK;
   }
 
-  // Skip first byte (no match possible)
-  src++;
+  // The first byte of the frame has nothing behind it, so no match can start
+  // there.  The first byte of a *linked* block does: the prefix is behind it.
+  if (prefix_len == 0) {
+    src++;
+  }
 
   while (src < src_limit) {
     // Find match in hash table
     uint32_t hash = lz4_hash_position(src) & (hash_table_size - 1);
     uint32_t match_pos = hash_table[hash];
-    const uint8_t * match_ref = input + match_pos;
+    const uint8_t * match_ref = window + match_pos;
 
     // Update hash table
-    hash_table[hash] = (uint32_t)(src - input);
+    hash_table[hash] = (uint32_t)(src - window);
 
-    // Check for match (at least 4 bytes, within 64KB window)
-    if (match_pos > 0 && src - match_ref <= 65535 &&
+    // The offset field is two bytes (LZ4 block format, "Match"), so a match
+    // reaches at most 65535 bytes back however much of the frame precedes it.
+    //
+    // match_ref < src is tested explicitly rather than relying on the distance
+    // test: `src - match_ref` is a signed difference, so a hash entry naming a
+    // position at or ahead of src would satisfy `<= 65535` and then be written
+    // as a wrapped 16-bit offset.  A correctly rebased table never holds one,
+    // which is exactly why the check belongs here rather than in the caller.
+    if (match_pos > 0 && match_ref < src &&
+        (size_t)(src - match_ref) <= LZ4_MAX_OFFSET &&
         gcomp_read_le32(match_ref) == gcomp_read_le32(src)) {
       // Found a match! Extend it, but not past match_limit
       size_t match_len = 4;

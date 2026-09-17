@@ -60,7 +60,8 @@
  *
  * | Buffer | Size | Purpose |
  * |--------|------|---------|
- * | block_buffer | block_size | Collect uncompressed input |
+ * | block_buffer | block_size (+ 64 KB when linked) | Search window: the
+ *   retained prefix, then the block being collected |
  * | compressed_buffer | block_size + overhead | Hold compressed block for
  * output | | hash_table | 64K entries (256KB) | Match finding for LZ77 |
  *
@@ -74,7 +75,11 @@
  * - Only checks most recent match (no hash chains)
  * - Matches must be within 64KB window and at least 4 bytes
  *
- * For independent blocks, the hash table is cleared after each block.
+ * For independent blocks, the hash table is cleared after each block, so a
+ * block can only reference itself.  For linked blocks it is kept, and the
+ * last LZ4_WINDOW_SIZE bytes of the frame are kept in front of the block
+ * being filled, so a match can reach back across the block boundary -- see
+ * lz4_encoder_slide_window().
  * For dependent blocks, it persists (though the current implementation
  * doesn't fully utilize cross-block matching).
  *
@@ -98,6 +103,49 @@
 //
 // Helper: Read options and configure encoder
 //
+
+/**
+ * @brief Retire the block just emitted and prepare the window for the next.
+ *
+ * Independent blocks keep no history: the table is cleared so the next block
+ * can only reference itself, which is what the Block Independence flag
+ * promises.
+ *
+ * Linked blocks keep the last LZ4_WINDOW_SIZE bytes of what has been emitted
+ * so far.  Everything older is dropped -- the match offset is two bytes, so a
+ * match can never reach past it.  Hash entries are offsets from the start of
+ * the window, so sliding the bytes means rebasing the entries by the same
+ * amount; an entry that falls off the front is cleared.  The two must move
+ * together, or an entry would name a byte the window no longer holds.
+ *
+ * Entries at exactly `shift` are dropped rather than rebased to 0, because 0
+ * is this table's "empty" marker.  One position per slide, and it costs a
+ * missed match, never a wrong one.
+ */
+static void lz4_encoder_slide_window(lz4_encoder_state_t * state) {
+  if (state->prefix_capacity == 0) {
+    state->prefix_len = 0;
+    state->block_buffer_pos = 0;
+    memset(state->hash_table, 0, state->hash_table_size * sizeof(uint32_t));
+    return;
+  }
+
+  size_t total = state->prefix_len + state->block_buffer_pos;
+  size_t keep =
+      (total < state->prefix_capacity) ? total : state->prefix_capacity;
+  size_t shift = total - keep;
+
+  if (shift > 0) {
+    memmove(state->block_buffer, state->block_buffer + shift, keep);
+    for (size_t i = 0; i < state->hash_table_size; i++) {
+      uint32_t pos = state->hash_table[i];
+      state->hash_table[i] = (pos > shift) ? (uint32_t)(pos - shift) : 0;
+    }
+  }
+
+  state->prefix_len = keep;
+  state->block_buffer_pos = 0;
+}
 
 static gcomp_status_t lz4_encoder_read_options(
     gcomp_options_t * options, lz4_encoder_state_t * state) {
@@ -205,17 +253,22 @@ gcomp_status_t lz4_encoder_init(gcomp_registry_t * registry,
     goto cleanup;
   }
 
-  // Allocate block buffer
+  // Allocate block buffer.  Linked blocks keep LZ4_WINDOW_SIZE bytes of the
+  // preceding frame in front of the block being filled, so a match can reach
+  // back across the block boundary; independent blocks keep nothing and the
+  // buffer is exactly one block, as before.
+  state->prefix_capacity =
+      state->header.block_independence ? 0 : LZ4_WINDOW_SIZE;
+  state->prefix_len = 0;
   state->block_buffer_size = state->header.block_max_size;
-  state->block_buffer =
-      (uint8_t *)gcomp_malloc(alloc, state->block_buffer_size);
+  size_t window_bytes = state->block_buffer_size + state->prefix_capacity;
+  state->block_buffer = (uint8_t *)gcomp_malloc(alloc, window_bytes);
   if (!state->block_buffer) {
     status = gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
-        "failed to allocate lz4 block buffer (%zu bytes)",
-        state->block_buffer_size);
+        "failed to allocate lz4 block buffer (%zu bytes)", window_bytes);
     goto cleanup;
   }
-  gcomp_memory_track_alloc(&state->mem_tracker, state->block_buffer_size);
+  gcomp_memory_track_alloc(&state->mem_tracker, window_bytes);
   state->block_buffer_pos = 0;
 
   // Allocate compressed buffer (block + header + checksum overhead)
@@ -396,7 +449,8 @@ gcomp_status_t lz4_encoder_update(gcomp_encoder_t * encoder,
       size_t space = state->block_buffer_size - state->block_buffer_pos;
       size_t to_copy = (available < space) ? available : space;
 
-      memcpy(state->block_buffer + state->block_buffer_pos,
+      memcpy(
+          state->block_buffer + state->prefix_len + state->block_buffer_pos,
           (const uint8_t *)input->data + input->used, to_copy);
       state->block_buffer_pos += to_copy;
       input->used += to_copy;
@@ -413,16 +467,18 @@ gcomp_status_t lz4_encoder_update(gcomp_encoder_t * encoder,
         // Compress block
         size_t compressed_len;
         gcomp_status_t status =
-            lz4_block_compress(state->block_buffer, state->block_buffer_pos,
-                state->compressed_buffer + 4, state->compressed_buffer_size - 4,
-                &compressed_len, state->hash_table, state->hash_table_size);
+            lz4_block_compress_linked(state->block_buffer, state->prefix_len,
+                state->block_buffer_pos, state->compressed_buffer + 4,
+                state->compressed_buffer_size - 4, &compressed_len,
+                state->hash_table, state->hash_table_size);
 
         if (status != GCOMP_OK || compressed_len >= state->block_buffer_pos) {
           // Compression didn't help, store uncompressed
           uint32_t block_size =
               (uint32_t)state->block_buffer_pos | LZ4_BLOCK_UNCOMPRESSED_FLAG;
           gcomp_write_le32(state->compressed_buffer, block_size);
-          memcpy(state->compressed_buffer + 4, state->block_buffer,
+          memcpy(state->compressed_buffer + 4,
+              state->block_buffer + state->prefix_len,
               state->block_buffer_pos);
           compressed_len = state->block_buffer_pos;
         }
@@ -445,12 +501,9 @@ gcomp_status_t lz4_encoder_update(gcomp_encoder_t * encoder,
         state->compressed_buffer_len = total_block_len;
         state->compressed_buffer_pos = 0;
 
-        // Reset block buffer and hash table state now that the block is built
-        state->block_buffer_pos = 0;
-        if (state->header.block_independence) {
-          memset(
-              state->hash_table, 0, state->hash_table_size * sizeof(uint32_t));
-        }
+        // Retire the block: keep what the next one may match into, drop the
+        // rest, and move the hash table with it.
+        lz4_encoder_slide_window(state);
 
         // Emit as much of the staged block as fits
         while (state->compressed_buffer_pos < state->compressed_buffer_len &&
@@ -529,17 +582,18 @@ gcomp_status_t lz4_encoder_finish(
       // Compress final block
       size_t compressed_len;
       gcomp_status_t status =
-          lz4_block_compress(state->block_buffer, state->block_buffer_pos,
-              state->compressed_buffer + 4, state->compressed_buffer_size - 4,
-              &compressed_len, state->hash_table, state->hash_table_size);
+          lz4_block_compress_linked(state->block_buffer, state->prefix_len,
+              state->block_buffer_pos, state->compressed_buffer + 4,
+              state->compressed_buffer_size - 4, &compressed_len,
+              state->hash_table, state->hash_table_size);
 
       if (status != GCOMP_OK || compressed_len >= state->block_buffer_pos) {
         // Store uncompressed
         uint32_t block_size =
             (uint32_t)state->block_buffer_pos | LZ4_BLOCK_UNCOMPRESSED_FLAG;
         gcomp_write_le32(state->compressed_buffer, block_size);
-        memcpy(state->compressed_buffer + 4, state->block_buffer,
-            state->block_buffer_pos);
+        memcpy(state->compressed_buffer + 4,
+            state->block_buffer + state->prefix_len, state->block_buffer_pos);
         compressed_len = state->block_buffer_pos;
       }
       else {
@@ -646,7 +700,9 @@ gcomp_status_t lz4_encoder_reset(gcomp_encoder_t * encoder) {
   state->finish_called = false;
   state->blocks_finished = false;
 
-  // Clear hash table
+  // Clear hash table.  The window must go with it: an entry and the byte it
+  // names are only meaningful together.
+  state->prefix_len = 0;
   memset(state->hash_table, 0, state->hash_table_size * sizeof(uint32_t));
 
   // Reset content checksum

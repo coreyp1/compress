@@ -27,8 +27,10 @@
 #include <ghoti.io/compress/lz4.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
+#include <ghoti.io/compress/stream.h>
 #include <gtest/gtest.h>
 #include <dlfcn.h>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -599,6 +601,99 @@ bool walkFrame(const std::vector<uint8_t> & f, FrameShape * out) {
   return true;
 }
 
+// Counts LZ4 sequences whose match offset reaches back past the start of the
+// block containing them -- that is, into a previous block of the same frame.
+// Only a linked (non-independent) block may hold one.
+//
+// Walks the block's sequences per the LZ4 block format: token (literal length
+// high nibble, match length low nibble), optional 255-extended lengths, the
+// literals, a two-byte little-endian offset, then optional extended match
+// length.  The final sequence of a block is literals with no match.
+struct MatchStats {
+  long matches = 0;
+  long cross_block = 0;
+};
+
+bool countCrossBlockMatches(const std::vector<uint8_t> & f, MatchStats * out) {
+  FrameShape sh;
+  if (!walkFrame(f, &sh)) {
+    return false;
+  }
+  MatchStats st;
+  size_t p = 6 + (sh.content_size ? 8 : 0) + (sh.dict_id ? 4 : 0) + 1;
+  for (;;) {
+    if (p + 4 > f.size()) {
+      return false;
+    }
+    uint32_t raw = (uint32_t)f[p] | ((uint32_t)f[p + 1] << 8) |
+        ((uint32_t)f[p + 2] << 16) | ((uint32_t)f[p + 3] << 24);
+    p += 4;
+    if (raw == 0) {
+      break;
+    }
+    const bool stored = (raw & 0x80000000u) != 0;
+    const size_t len = raw & 0x7FFFFFFFu;
+    if (p + len > f.size()) {
+      return false;
+    }
+    if (!stored) {
+      size_t b = p;
+      const size_t end = p + len;
+      size_t produced = 0; // decoded bytes so far within THIS block
+      while (b < end) {
+        const uint8_t token = f[b++];
+        size_t ll = token >> 4;
+        if (ll == 15) {
+          uint8_t x;
+          do {
+            if (b >= end) {
+              return false;
+            }
+            x = f[b++];
+            ll += x;
+          } while (x == 255);
+        }
+        if (b + ll > end) {
+          return false;
+        }
+        b += ll;
+        produced += ll;
+        if (b == end) {
+          break; // last sequence: literals only
+        }
+        if (b + 2 > end) {
+          return false;
+        }
+        size_t offset = (size_t)f[b] | ((size_t)f[b + 1] << 8);
+        b += 2;
+        size_t ml = token & 0x0F;
+        if (ml == 15) {
+          uint8_t x;
+          do {
+            if (b >= end) {
+              return false;
+            }
+            x = f[b++];
+            ml += x;
+          } while (x == 255);
+        }
+        ml += 4; // MINMATCH
+        st.matches++;
+        if (offset > produced) {
+          st.cross_block++;
+        }
+        produced += ml;
+      }
+    }
+    p += len;
+    if (sh.block_checksum) {
+      p += 4;
+    }
+  }
+  *out = st;
+  return true;
+}
+
 struct BlockSizeCase {
   const char * name;
   uint64_t bytes;
@@ -1076,6 +1171,160 @@ TEST_F(Lz4SpecOracleTest, RealLz4_ReadsOurMultiBlockFrames) {
   EXPECT_GT(stored_blocks, 0u)
       << "no incompressible block was stored uncompressed, so the stored-block "
          "path inside a multi-block frame went untested";
+}
+
+TEST_F(Lz4SpecOracleTest, LinkedBlocksActuallyLink) {
+  const RealLz4 & lib = realLz4();
+  if (!lib.ok()) {
+    GTEST_SKIP() << "liblz4 is not installed";
+  }
+
+  // LZ4 Frame Format, "Blocks": with the Block Independence flag at 0 a block
+  // may reference the blocks before it.  A frame is legal either way -- the
+  // flag permits back-references, it does not require them -- so nothing that
+  // merely round-trips can tell a linked encoder from one that sets the bit
+  // and then compresses each block alone, which is what this encoder used to
+  // do.  Counting the sequences is the only way to see the difference.
+  static const uint64_t kSizes[] = {65536u, 262144u};
+  const size_t n = 700000;
+
+  long linked_cross_total = 0;
+  bool saw_linked_gain = false;
+
+  for (uint64_t bs : kSizes) {
+    for (const Shape & sh : shapes(n)) {
+      size_t sizes[2] = {0, 0};
+      MatchStats stats[2];
+
+      for (int independent = 0; independent <= 1; independent++) {
+        gcomp_options_t * opts = nullptr;
+        ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+        gcomp_options_set_uint64(opts, "lz4.block_size", bs);
+        gcomp_options_set_bool(opts, "lz4.independent_blocks", independent);
+
+        std::vector<uint8_t> framed = gcompEncode(sh.data, opts);
+        gcomp_options_destroy(opts);
+
+        std::string where = std::string(sh.name) + ", bs=" +
+            std::to_string(bs) + ", " +
+            (independent ? "independent" : "linked");
+        ASSERT_FALSE(framed.empty()) << where << ": encode failed";
+
+        FrameShape fs;
+        ASSERT_TRUE(walkFrame(framed, &fs)) << where;
+        ASSERT_GE(fs.blocks, 2u) << where << ": need a multi-block frame";
+        ASSERT_TRUE(countCrossBlockMatches(framed, &stats[independent]))
+            << where << ": could not walk the block sequences";
+
+        // Whatever it emits still has to be a frame the real library reads.
+        std::vector<uint8_t> back;
+        std::string err;
+        ASSERT_TRUE(realLz4Decode(framed, &back, &err))
+            << where << ": liblz4 refused our frame (" << err << ")";
+        ASSERT_EQ(back, sh.data) << where;
+
+        sizes[independent] = framed.size();
+      }
+
+      std::string where =
+          std::string(sh.name) + ", bs=" + std::to_string(bs);
+
+      // An independent block that reaches outside itself is a decoder bug
+      // waiting to happen, and a spec violation besides.
+      EXPECT_EQ(stats[1].cross_block, 0)
+          << where << ": an INDEPENDENT block referenced data before it ("
+          << stats[1].cross_block << " of " << stats[1].matches
+          << " matches)";
+
+      linked_cross_total += stats[0].cross_block;
+
+      // Linking may not pay on every shape, but it must never cost.
+      EXPECT_LE(sizes[0], sizes[1])
+          << where << ": linked blocks came out larger than independent ones";
+      if (sizes[0] < sizes[1]) {
+        saw_linked_gain = true;
+      }
+    }
+  }
+
+  EXPECT_GT(linked_cross_total, 0)
+      << "no linked block referenced a previous block, so lz4.independent_"
+         "blocks=false set the header bit and changed nothing else";
+  EXPECT_TRUE(saw_linked_gain)
+      << "linking never produced a smaller frame on any shape";
+}
+
+TEST_F(Lz4SpecOracleTest, LinkedBlocksSurviveAwkwardStreaming) {
+  const RealLz4 & lib = realLz4();
+  if (!lib.ok()) {
+    GTEST_SKIP() << "liblz4 is not installed";
+  }
+
+  // The window slides as soon as a block is staged, which can be several
+  // update() calls before that block finishes reaching the output.  These
+  // chunk sizes force the slide to happen mid-flush.
+  static const size_t kIn[] = {1, 3, 997, 65535, 65536, 65537};
+  static const size_t kOut[] = {1, 7, 4096};
+  const size_t n = 200000;
+  std::vector<uint8_t> data = proseLike(n, 31u);
+
+  for (size_t in_chunk : kIn) {
+    for (size_t out_chunk : kOut) {
+      gcomp_options_t * opts = nullptr;
+      ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+      gcomp_options_set_uint64(opts, "lz4.block_size", 65536u);
+      gcomp_options_set_bool(opts, "lz4.independent_blocks", 0);
+      gcomp_options_set_bool(opts, "lz4.content_checksum", 1);
+
+      gcomp_encoder_t * enc = nullptr;
+      ASSERT_EQ(gcomp_encoder_create(registry_, "lz4", opts, &enc), GCOMP_OK);
+      gcomp_options_destroy(opts);
+
+      std::string where = "in=" + std::to_string(in_chunk) + " out=" +
+          std::to_string(out_chunk);
+
+      std::vector<uint8_t> out(n * 2 + 65536);
+      size_t out_len = 0, in_used = 0;
+      while (in_used < n) {
+        size_t take = std::min(in_chunk, n - in_used);
+        gcomp_buffer_t ib = {data.data() + in_used, take, 0};
+        while (ib.used < ib.size) {
+          size_t room = std::min(out_chunk, out.size() - out_len);
+          ASSERT_GT(room, 0u) << where << ": output buffer exhausted";
+          gcomp_buffer_t ob = {out.data() + out_len, room, 0};
+          ASSERT_EQ(gcomp_encoder_update(enc, &ib, &ob), GCOMP_OK) << where;
+          out_len += ob.used;
+          ASSERT_FALSE(ob.used == 0 && ib.used == 0) << where << ": stalled";
+        }
+        in_used += ib.used;
+      }
+      for (;;) {
+        size_t room = std::min(out_chunk, out.size() - out_len);
+        gcomp_buffer_t ob = {out.data() + out_len, room, 0};
+        gcomp_status_t st = gcomp_encoder_finish(enc, &ob);
+        out_len += ob.used;
+        if (st == GCOMP_OK) {
+          break;
+        }
+        ASSERT_EQ(st, GCOMP_ERR_LIMIT) << where;
+        ASSERT_GT(ob.used, 0u) << where << ": finish stalled";
+      }
+      gcomp_encoder_destroy(enc);
+      out.resize(out_len);
+
+      FrameShape fs;
+      ASSERT_TRUE(walkFrame(out, &fs)) << where;
+      ASSERT_GE(fs.blocks, 2u) << where;
+      EXPECT_FALSE(fs.block_independent) << where;
+
+      std::vector<uint8_t> back;
+      std::string err;
+      ASSERT_TRUE(realLz4Decode(out, &back, &err))
+          << where << ": liblz4 refused a frame built in " << in_chunk
+          << "-byte pieces (" << err << ")";
+      ASSERT_EQ(back, data) << where;
+    }
+  }
 }
 
 TEST_F(Lz4SpecOracleTest, RealLz4_ReadsTheReferenceFrames) {

@@ -104,6 +104,22 @@ extern "C" {
 #define LZ4_BLOCK_SIZE_MASK 0x7FFFFFFFU         ///< Size without flag bit
 #define LZ4_MIN_MATCH 4                         ///< Minimum match length
 #define LZ4_LAST_LITERALS 5    ///< Minimum literals in last sequence
+
+/**
+ * @brief Furthest a match may reach back.
+ *
+ * The LZ4 block format writes the match offset as two little-endian bytes, so
+ * the reach is 65535 regardless of how much of the frame precedes the block.
+ */
+#define LZ4_MAX_OFFSET 65535U
+
+/**
+ * @brief Bytes of the preceding frame kept in front of a linked block.
+ *
+ * One more than LZ4_MAX_OFFSET, so that every byte a match may legally reach
+ * is present.  Held only when the Block Independence flag is 0.
+ */
+#define LZ4_WINDOW_SIZE 65536U
 #define LZ4_HISTORY_SIZE 65536 ///< History window size (64KB)
 
 // Limit defaults
@@ -188,9 +204,17 @@ typedef struct {
   gcomp_xxhash32_state_t content_hash;
 
   // Block buffer for collecting input until block is full
-  uint8_t * block_buffer;   ///< Input buffer for current block
-  size_t block_buffer_size; ///< Current block buffer capacity
-  size_t block_buffer_pos;  ///< Bytes buffered so far
+  uint8_t * block_buffer;   ///< Window: prefix, then the current block
+  size_t block_buffer_size; ///< Capacity for the block itself
+  size_t block_buffer_pos;  ///< Bytes of the current block buffered so far
+  /**
+   * Bytes of the preceding frame held in front of the current block, so a
+   * linked block can match into it.  Always 0 when blocks are independent;
+   * otherwise it grows to LZ4_WINDOW_SIZE and stays there.  The block being
+   * filled begins at `block_buffer + prefix_len`.
+   */
+  size_t prefix_len;
+  size_t prefix_capacity; ///< LZ4_WINDOW_SIZE when linked, else 0
 
   // Output staging buffers
   uint8_t header_buf[LZ4_HEADER_MAX_SIZE];
@@ -424,6 +448,36 @@ uint8_t lz4_size_to_block_code(uint32_t size);
 gcomp_status_t lz4_block_compress(const uint8_t * input, size_t input_len,
     uint8_t * output, size_t output_cap, size_t * output_len_out,
     uint32_t * hash_table, size_t hash_table_size);
+
+/**
+ * @brief Compress one block, letting matches reach back into the frame.
+ *
+ * LZ4 Frame Format, "Blocks": when the Block Independence flag is 0, a block
+ * may reference data from the blocks that precede it in the same frame.  The
+ * offset field is two bytes, so the reach is at most LZ4_MAX_OFFSET however
+ * long the frame is.
+ *
+ * Unlike lz4_block_compress(), this does NOT clear the hash table: entries
+ * left by the previous call are what make a cross-block match findable. The
+ * caller owns the window and the table, and must rebase both together -- see
+ * lz4_encoder_slide_window().
+ *
+ * @param window Search window: `prefix_len` bytes of already emitted frame
+ *        data followed by the block to compress
+ * @param prefix_len Bytes of preceding frame data in `window`; 0 compresses
+ *        the block independently
+ * @param block_len Length of the block beginning at `window + prefix_len`
+ * @param output Output buffer for compressed data
+ * @param output_cap Output buffer capacity
+ * @param output_len_out Output: actual compressed length
+ * @param hash_table Hash table for match finding, holding offsets from
+ *        `window`
+ * @param hash_table_size Hash table size in entries
+ * @return GCOMP_OK on success, GCOMP_ERR_LIMIT if compression expands data
+ */
+gcomp_status_t lz4_block_compress_linked(const uint8_t * window,
+    size_t prefix_len, size_t block_len, uint8_t * output, size_t output_cap,
+    size_t * output_len_out, uint32_t * hash_table, size_t hash_table_size);
 
 /**
  * @brief Decompress a block using LZ4 block format.
