@@ -46,6 +46,9 @@
 #define DEFLATE_MAX_MATCH_LENGTH 258u
 #define DEFLATE_MAX_DISTANCE 32768u
 
+// Distance past which a three-byte match stops paying for itself.
+#define DEFLATE_TOO_FAR 4096u
+
 // The window holds history and lookahead in one circular buffer, so every
 // byte of lookahead is a byte of history the encoder does not have.  A match
 // is at most DEFLATE_MAX_MATCH_LENGTH bytes and needs three more to be worth
@@ -98,59 +101,44 @@ typedef enum {
 //
 // DEFLATE_STRATEGY_FILTERED (strategy="filtered")
 // -----------------------------------------------
-// Optimized for pre-filtered data like PNG filter output.
-// PNG filters (Sub, Up, Average, Paeth) produce data where:
-// - Values cluster around zero (differences between adjacent pixels)
-// - Patterns may be longer but harder to find with short hash chains
-// - Longer matches tend to provide more benefit
+// Named for pre-filtered data like PNG filter output.  It no longer earns
+// that name, and the honest description is: DEFAULT, with match deferral at
+// every level instead of from level 4.
 //
 // Implementation differences from DEFAULT:
-// - Applies lazy matching at every level, including 1 to 3: a match is held
-//   back one byte to see whether the next position starts a longer one, and
-//   the search that position performs anyway is what settles it.  See
+// - Defers a match at every level, including 1 to 3: a match is held back one
+//   byte to see whether the next position starts a longer one, and the search
+//   that position performs anyway is what settles it.  See
 //   deflate_find_match()'s caller.
-// - Nothing else.  It searches exactly as hard as DEFAULT: same hash chain
-//   lengths, same everything.
+// - Nothing else.  Same hash chain lengths, same everything.
 //
-// Since DEFAULT now defers from level 4 up, that leaves FILTERED identical to
-// DEFAULT at levels 4 to 9 and different only at levels 1 to 3.  That is the
-// honest state of it: the measurements below put chain depth at 0.1 points
-// across a factor of eight and deferral at 1.7, so deferral was the whole of
-// what this strategy had, and DEFAULT now has it too.  The name stays because
-// it still means something at the fast levels, and because it is a documented
-// option that callers may already pass.  Tests pin both halves of that -
-// FilteredBeatsDefaultAtTheFastLevels and FilteredMatchesDefaultAtTheSlowLevels
-// - so the redundancy cannot drift into being accidental.
+// Since DEFAULT defers from level 4 up, that leaves FILTERED identical to
+// DEFAULT at levels 4 to 9 and different only at levels 1 to 3.
 //
-// It used to search four times as deep as DEFAULT as well - 16/128/256 against
-// 4/32/128 - on the reasoning that filtered data hides longer patterns behind
-// short chains.  Measured across 52 files of real PNG filtered rows, 7.3 MB,
-// that is not where the win is:
+// WHY THE NAME NO LONGER FITS
+// ---------------------------
+// The strategy was measured, on 7.3 MB of real PNG filtered rows, to be worth
+// 1.7 points against DEFAULT, and chain depth to be worth 0.1 across a factor
+// of eight -- so deferral was the whole of it:
 //
-//     chain   with lazy matching   without
-//        32        31.22%           32.91%
-//        64        31.13%           33.42%
-//       128        31.13%           33.41%
-//       256        31.12%           33.40%
+//     chain   with deferral   without
+//        32      31.22%       32.91%
+//        64      31.13%       33.42%
+//       128      31.13%       33.41%
+//       256      31.12%       33.40%
 //
-// Chain length is worth 0.1 points across a factor of eight.  Lazy matching is
-// worth 1.7.  So the chains came back down and the strategy is now DEFAULT
-// plus lazy matching, which is the same relationship zlib's levels 4-9 have to
-// its levels 1-3.
+// Those numbers were taken when levels 1 to 3 emitted fixed Huffman blocks.
+// They now emit dynamic ones, and the coder recovers on its own most of what
+// deferral was recovering: on the filter-shaped bytes this file's tests
+// generate, deferring now *costs* 1.3% at level 1 (25.062% against 25.382%),
+// and zlib's own Z_FILTERED rule -- discard any match shorter than six bytes
+// -- costs 0.3% there and 6.1% on general data.  Neither is worth having.
 //
-// On that corpus it produces 2,267,234 bytes at 38.7 MB/s against DEFAULT's
-// 2,389,633 at 56.8 - 5.1% smaller for about two thirds of the throughput,
-// which is a trade worth having if you asked for this strategy by name.  zlib
-// at level 5 gets 2,209,620 on the same corpus.
-//
-// Note that this is still not what zlib's Z_FILTERED does.  zlib *reduces*
-// effort there - it forces matches to be at least six bytes and leans on
-// Huffman coding - so Z_FILTERED is faster than its default.  This one is
-// slower than its default.  The name is shared; the meaning is not.
-//
-// What remains between this and zlib on ratio is that there is no equivalent
-// of zlib's good_length or nice_length to stop a search early, so the chains
-// cannot be lengthened without paying for every step of them.
+// What FILTERED still offers is real but differently named: the fast levels'
+// search effort with the slow levels' deferral, which on 12 MB of source,
+// prose, XML and binaries is 1.9% smaller than DEFAULT at level 1 for about
+// 7% of the throughput.  Renaming or retiring the option is an API decision;
+// the tests pin both halves of what it does today so that neither can drift.
 //
 // DEFLATE_STRATEGY_HUFFMAN_ONLY (strategy="huffman_only")
 // -------------------------------------------------------
@@ -1574,6 +1562,49 @@ static gcomp_status_t deflate_flush_dynamic_block(
     hclen--;
   }
 
+  // Price this block both ways and take the cheaper.
+  //
+  // RFC 1951 section 3.2.6 defines a fixed code that costs no header at all;
+  // section 3.2.7's dynamic code costs one but fits the block's own symbol
+  // frequencies.  Which wins depends on the block, so the block decides.  A
+  // level cannot: a short block, or one whose symbols are close to uniform,
+  // pays more for the table than the table saves.
+  //
+  // Extra bits for length and distance codes are identical under both
+  // codings, so they are left out of both sides rather than counted twice.
+  {
+    static const uint8_t k_cl_extra_bits[19] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 2, 3, 7};
+
+    uint64_t dynamic_bits = 3u + 5u + 5u + 4u + 3u * (uint64_t)(hclen + 4);
+    for (size_t i = 0; i < cl_count; i++) {
+      dynamic_bits += cl_lengths[cl_symbols[i]] + k_cl_extra_bits[cl_symbols[i]];
+    }
+    for (size_t i = 0; i < DEFLATE_MAX_LITLEN_SYMBOLS; i++) {
+      dynamic_bits += (uint64_t)st->lit_freq[i] * lit_lengths[i];
+    }
+    for (size_t i = 0; i < DEFLATE_MAX_DIST_SYMBOLS; i++) {
+      dynamic_bits += (uint64_t)st->dist_freq[i] * dist_lengths[i];
+    }
+
+    // The fixed code of RFC 1951 section 3.2.6: literals 0-143 and 280-287
+    // are eight bits, 144-255 are nine, 256-279 are seven, and every distance
+    // code is five.
+    uint64_t fixed_bits = 3u;
+    for (size_t i = 0; i < DEFLATE_MAX_LITLEN_SYMBOLS; i++) {
+      unsigned len = (i < 144u) ? 8u : (i < 256u) ? 9u : (i < 280u) ? 7u : 8u;
+      fixed_bits += (uint64_t)st->lit_freq[i] * len;
+    }
+    for (size_t i = 0; i < DEFLATE_MAX_DIST_SYMBOLS; i++) {
+      fixed_bits += (uint64_t)st->dist_freq[i] * 5u;
+    }
+
+    if (fixed_bits <= dynamic_bits && st->fixed_ready) {
+      gcomp_free(st->allocator, all_lengths);
+      return deflate_flush_fixed_block(st, final);
+    }
+  }
+
   // Build canonical codes for code lengths
   uint16_t cl_codes[19];
   s = gcomp_deflate_huffman_build_codes(cl_lengths, 19, 7, cl_codes, NULL);
@@ -1852,8 +1883,14 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
     gcomp_memory_track_alloc(&st->mem_tracker, sym_buf_bytes); // dist_buf
     st->sym_buf_used = 0;
 
-    // For levels > 3, allocate frequency histograms for dynamic Huffman
-    if (st->level > 3) {
+    // Frequency histograms for dynamic Huffman.  These used to be allocated
+    // only above level 3, which is what made the fast levels emit fixed
+    // Huffman blocks: deflate_flush_dynamic_block() falls back to fixed when
+    // there are no frequencies to build a code from.  Counting symbols costs
+    // an increment each and building the code costs one package-merge per
+    // block, and on a 12 MB corpus level 1 came out 12.8% smaller for 5% of
+    // the encode throughput.  There is no level at which that is a bad trade.
+    {
       size_t lit_freq_size = DEFLATE_MAX_LITLEN_SYMBOLS * sizeof(uint32_t);
       size_t dist_freq_size = DEFLATE_MAX_DIST_SYMBOLS * sizeof(uint32_t);
 
@@ -2207,10 +2244,11 @@ static gcomp_status_t deflate_encode_batch(
       max_chain = (st->level <= 3) ? 4 : (st->level <= 6) ? 32 : 128;
     }
 
-    // Determine whether to use fixed or dynamic Huffman
-    // FIXED strategy always uses fixed codes; otherwise depends on level
-    use_fixed_huffman =
-        (st->strategy == DEFLATE_STRATEGY_FIXED) || (st->level <= 3);
+    // Only the fixed strategy forces fixed codes now.  Every other block goes
+    // to deflate_flush_dynamic_block(), which prices both codings and writes
+    // whichever is smaller -- so a block whose symbols happen to suit the
+    // fixed code still gets it, without a level having to guess in advance.
+    use_fixed_huffman = (st->strategy == DEFLATE_STRATEGY_FIXED);
 
     while (input->used < input->size) {
       // Fill window with input data.
@@ -2346,6 +2384,23 @@ static gcomp_status_t deflate_encode_batch(
         else if (st->lookahead >= DEFLATE_MIN_MATCH_LENGTH) {
           // DEFAULT/FILTERED/FIXED: Standard LZ77 match finding
           match = deflate_find_match(st, pos, stream_pos, max_chain);
+
+          // A three-byte match far away is not worth its distance code.  The
+          // code for a distance past 4096 carries eleven extra bits on top of
+          // the code itself (RFC 1951 section 3.2.5), so the sequence costs
+          // about as much as the three literals it replaces -- and unlike
+          // them it interrupts the literal run, which the Huffman code was
+          // about to encode cheaply.
+          //
+          // Measured over a 12 MB corpus: 1.0% smaller at level 1, 0.1% at
+          // level 6, and faster at every level, because a discarded match is
+          // one the encoder does not have to emit.  zlib draws the same line
+          // in the same place.
+          if (match.length == DEFLATE_MIN_MATCH_LENGTH &&
+              match.distance > DEFLATE_TOO_FAR) {
+            match.length = 0;
+            match.distance = 0;
+          }
         }
 
         // Lazy matching, as a deferral rather than a second search.
