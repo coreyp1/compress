@@ -363,11 +363,18 @@ $(OBJ_DIR)/tests/%.o: tests/%.cpp
 
 # Compile each test .cpp directly to executable (link test_helpers.o in same step). Fewer targets = faster make graph.
 # Args: $1 = source path, $2 = executable name (from TEST_PAIRS; no $(call test-name) in expansion).
+# The static archive is a NORMAL prerequisite, not an order-only one.  Tests
+# link it with --whole-archive, so a test binary built against an older archive
+# keeps running the older code: an order-only prerequisite is built first but
+# never causes a relink, which meant a library-only change left every test
+# exercising the previous build and reporting green on it.  The shared target
+# stays order-only -- the tests do not link it.
 define test-executable-rule
 $(APP_DIR)/$2$(EXE_EXTENSION): \
 		$1 \
 		$(TEST_HELPER_OBJ) \
-		| $(APP_DIR)/$(TARGET) $(APP_DIR)/$(STATIC_TARGET)
+		$(APP_DIR)/$(STATIC_TARGET) \
+		| $(APP_DIR)/$(TARGET)
 	@printf "\n### Compiling and linking %s Test ###\n" "$2"
 	@mkdir -p $$(@D)
 	$$(CXX) $$(CXXFLAGS) $$(TEST_INCLUDE) -MMD -MP -MF $$(APP_DIR)/$2.d -o $$@ $$< $$(TEST_HELPER_OBJ) $$(COMPRESSLIBRARY) $$(LDFLAGS) $$(TESTFLAGS)
@@ -1335,10 +1342,11 @@ $(ASAN_OBJ_DIR)/tests/%.o: tests/%.cpp
 define asan-test-executable-rule
 ASAN_TEST_OBJ_$1 := $(ASAN_OBJ_DIR)/tests/$(patsubst tests/%.cpp,%.o,$1)
 
+# Normal prerequisite, for the same reason as the release rule above.
 $(ASAN_APP_DIR)/$2$(EXE_EXTENSION): \
 		$$(ASAN_TEST_OBJ_$1) \
 		$(ASAN_TEST_HELPER_OBJ) \
-		| $(ASAN_APP_DIR)/$(ASAN_TARGET)
+		$(ASAN_APP_DIR)/$(ASAN_TARGET)
 	@printf "\n### Linking ASan+UBSan %s Test ###\n" "$2"
 	@mkdir -p $$(@D)
 	$$(CXX) $$(ASAN_CXXFLAGS) -o $$@ $$(ASAN_TEST_OBJ_$1) $$(ASAN_TEST_HELPER_OBJ) $$(ASAN_LDFLAGS) $$(TESTFLAGS) $$(ASAN_COMPRESSLIBRARY)
