@@ -73,6 +73,22 @@ LZ4 supports two block modes:
 
 - **Dependent blocks** (`lz4.independent_blocks=false`): Blocks can reference data from previous blocks. Achieves better compression ratio but requires sequential processing.
 
+The encoder keeps the last 64 KB of the frame in front of the block it is
+filling, so matches reach back across the block boundary. The match offset
+field is two bytes, which bounds the reach at 65535 bytes however long the
+frame is — so the benefit falls away as the block size grows, because only the
+first 64 KB of any block can reach back at all. Measured on 2 MB inputs,
+dependent against independent:
+
+| data | 64 KB blocks | 256 KB | 1 MB |
+|---|---|---|---|
+| mixed text and random bytes | +3.68% | +0.55% | +0.13% |
+| all zeros | +0.54% | +0.08% | +0.01% |
+| English-like prose | +0.08% | +0.02% | +0.00% |
+
+Dependent blocks cost 64 KB of encoder memory and rule out the parallel
+encoder, which needs each block to stand alone.
+
 ## Options
 
 ### LZ4-specific options
@@ -171,6 +187,63 @@ gcomp_decoder_create(registry, "lz4", opts, &dec);
 - Limits (`max_output_bytes`, `max_expansion_ratio`) apply to total output across all frames
 - If any frame fails validation, the entire decode fails
 
+## Skippable frames
+
+A skippable frame carries bytes of your choosing through an LZ4 stream. Every
+conforming decoder steps over it, so it is where an application puts its own
+metadata without disturbing the data. The frame is a magic number of
+`0x184D2A50` through `0x184D2A5F`, a 4-byte little-endian size, and that many
+bytes of payload — none of it compressed.
+
+The low nibble of the magic number is yours to choose (the *magic variant*, 0
+through 15), so an application can tell its own kinds of embedded data apart.
+Decoders skip the frame whatever it says.
+
+**Decoding.** Skippable frames are stepped over wherever they appear — before,
+between or after data frames, or alone — and this is not gated on
+`lz4.concat`. A skippable frame in front of the data is a preamble, not a
+concatenation. `lz4.concat` keeps its own meaning: whether to carry on past a
+finished *data* frame, so a skippable frame trailing one is governed by it like
+any other trailing frame. A stream consisting only of skippable frames decodes
+to nothing, and is not an error.
+
+**Writing and reading.** Because the decoder discards skippable frames, as the
+format requires, it can never hand the payload back. Use the parser to read
+what you embedded:
+
+```c
+#include <ghoti.io/compress/lz4.h>
+
+// Write metadata ahead of the compressed data.
+const char *note = "recorded 2026-09-17";
+size_t note_len = strlen(note);
+
+uint8_t frame[GCOMP_LZ4_SKIPPABLE_OVERHEAD + 64];
+size_t written = 0;
+gcomp_lz4_write_skippable_frame(3, note, note_len, frame, sizeof(frame),
+    &written);
+// Prepend `written` bytes of `frame` to an ordinary lz4 stream.
+
+// Later, reading it back from your own buffer:
+unsigned variant = 0;
+size_t offset = 0, payload_size = 0, frame_size = 0;
+if (gcomp_lz4_read_skippable_frame(stream, stream_len, &variant, &offset,
+        &payload_size, &frame_size) == GCOMP_OK) {
+  // stream + offset holds payload_size bytes; nothing was copied.
+  // stream + frame_size is whatever follows.
+}
+```
+
+Neither function allocates, and the parser reports the payload as an offset
+into your buffer rather than copying it. A buffer of
+`GCOMP_LZ4_SKIPPABLE_OVERHEAD + payload_size` always holds the frame; the
+payload may be at most `GCOMP_LZ4_SKIPPABLE_MAX_PAYLOAD` bytes, the size field
+being 32 bits.
+
+The parser returns `GCOMP_ERR_CORRUPT` for a magic number outside the skippable
+range and for a frame cut short of the size it declares, so it is safe to point
+at untrusted bytes.
+
 ## Error handling
 
 ### Error codes
@@ -215,6 +288,8 @@ The decoder progresses through stages; errors include stage context:
 | BLOCK_DATA | Decompressing block content |
 | BLOCK_CHECKSUM | Validating block checksum (if enabled) |
 | CONTENT_CHECKSUM | Validating content checksum (if enabled) |
+| SKIPPABLE_SIZE | Reading a skippable frame's 4-byte size |
+| SKIPPABLE_DATA | Discarding a skippable frame's payload |
 | DONE | Frame complete (or ready for next concatenated frame) |
 
 ## Security considerations
@@ -463,6 +538,11 @@ The LZ4 Frame Format implementation is fully compatible with:
 - Any LZ4 Frame Format-compliant implementation
 
 Files created by this library can be decompressed by standard tools, and files created by standard tools can be decompressed by this library.
+
+This is checked rather than asserted: the test suite binds to the installed
+`liblz4` at runtime and puts our frames through its decoder — across every
+frame option, all four block sizes, multi-block and dependent-block frames, and
+skippable frames of every variant — as well as putting its frames through ours.
 
 **Note:** This library implements the LZ4 **Frame Format**, not the raw LZ4 block format. Raw LZ4 blocks (without framing) are not directly supported.
 
