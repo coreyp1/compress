@@ -99,6 +99,7 @@ encoder, which needs each block to stand alone.
 | `lz4.block_checksum` | bool | false | Enable per-block xxHash32 checksum |
 | `lz4.content_checksum` | bool | false | Enable content xxHash32 checksum in frame trailer |
 | `lz4.independent_blocks` | bool | true | Use independent blocks (parallel-friendly) |
+| `lz4.dictionary` | bytes | none | Dictionary content; only the last 64 KB is used |
 | `lz4.content_size` | uint64 | (none) | Content size to write in header (encoder); validated on decode if present |
 | `lz4.dictionary_id` | uint64 | (none) | Dictionary ID to write in header (parsing only, dictionaries not yet supported) |
 | `lz4.concat` | bool | false | Decoder: support concatenated LZ4 frames |
@@ -186,6 +187,62 @@ gcomp_decoder_create(registry, "lz4", opts, &dec);
 - Output is continuous across frames (no separation markers)
 - Limits (`max_output_bytes`, `max_expansion_ratio`) apply to total output across all frames
 - If any frame fails validation, the entire decode fails
+
+## Dictionaries
+
+A dictionary is a block of bytes both sides know in advance. The encoder can
+match against it as though it preceded the data, which is what makes small
+payloads compress at all — a 500-byte record has almost nothing of its own to
+match against, but plenty in common with the thousand records before it.
+
+Pass the content through `lz4.dictionary` on the encoder, the decoder, or both:
+
+```c
+gcomp_options_set_bytes(opts, "lz4.dictionary", dict, dict_len);
+```
+
+Only the **last 64 KB** is used. The match offset is two bytes, so nothing
+earlier is reachable, and a longer dictionary is truncated to its tail — pass
+all of it or pass the tail, the result is identical.
+
+**The block mode changes what a dictionary does**, which the specification's
+wording does not settle and which was established by reading liblz4's own
+output:
+
+- **Dependent blocks**: the dictionary precedes the first block, and the
+  frame's own output takes over from there.
+- **Independent blocks**: *every* block starts from the dictionary again — a
+  block may not reference the blocks before it, but it may reference the
+  dictionary.
+
+So with independent blocks the benefit persists across a large frame, while
+with dependent blocks it fades as the frame's own history takes over. Measured
+on text resembling the dictionary, against the same data compressed without
+one:
+
+| data | dependent | independent |
+|---|---|---|
+| 500 B | 77 → 41 (**46.8%** smaller) | 77 → 41 (**46.8%**) |
+| 5 KB | 95 → 59 (37.9%) | 95 → 59 (37.9%) |
+| 70 KB | 363 → 348 (4.1%) | 408 → 335 (17.9%) |
+| 200 KB | 942 → 927 (1.6%) | 1032 → 878 (14.9%) |
+
+A dictionary with nothing in common with the data costs nothing to speak of —
+the encoder simply finds no matches in it — so the risk of a badly chosen one
+is wasted memory, not a larger frame.
+
+> **A wrong dictionary yields wrong bytes, silently.** Nothing in the block
+> format can detect it: the matches resolve, they just resolve to the wrong
+> content. This is how LZ4 works rather than a limitation here, and the
+> frame's own defence is the content checksum, which does catch it. **Enable
+> `lz4.content_checksum` on any frame meant to travel with a dictionary**, and
+> consider `lz4.dictionary_id` so the reader can tell which one it needs.
+> Decoding without the dictionary at all is safe: the offsets reach outside
+> anything the decoder holds and the frame is refused.
+
+With independent blocks the dictionary is re-indexed for each block, a scan of
+up to 64 KB per block. If that shows up in a profile, dependent blocks avoid
+it, as does a larger block size.
 
 ## Skippable frames
 

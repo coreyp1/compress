@@ -1974,15 +1974,29 @@ TEST_F(Lz4SpecOracleTest, DictionaryAppliesToEveryConcatenatedFrame) {
 
   std::vector<uint8_t> dict =
       dictionaryText(70000, "the quick brown fox jumps over the lazy dog ");
+
+  // The first frame's content must NOT resemble the dictionary.  If it does,
+  // history carried over from it holds the same bytes the dictionary would
+  // have supplied, and the second frame decodes correctly whether or not the
+  // history was reset -- which is exactly how an earlier version of this test
+  // passed against a decoder that never reset it.
   std::vector<uint8_t> a =
-      dictionaryText(9000, "the quick brown fox jumps over the lazy dog ");
+      dictionaryText(9000, "PACK MY BOX WITH FIVE DOZEN LIQUOR JUGS -- ");
   std::vector<uint8_t> b =
-      dictionaryText(4000, "over the lazy dog the quick brown fox jumps ");
+      dictionaryText(4000, "the quick brown fox jumps over the lazy dog ");
 
   std::vector<uint8_t> fa = realLz4CompressWithDict(a, dict, 0, 1, 4);
   std::vector<uint8_t> fb = realLz4CompressWithDict(b, dict, 0, 1, 4);
   ASSERT_FALSE(fa.empty());
   ASSERT_FALSE(fb.empty());
+
+  // The second frame has to actually consult the dictionary, or there is
+  // nothing here to get wrong.
+  MatchStats stats;
+  ASSERT_TRUE(countCrossBlockMatches(fb, &stats));
+  ASSERT_GT(stats.cross_block, 0)
+      << "the second frame does not reach into the dictionary, so this test "
+         "cannot tell whether the history was reset at the frame boundary";
 
   // Each frame was compressed against the dictionary, not against the frame
   // before it, so the history has to go back to the dictionary at every frame
@@ -2065,6 +2079,68 @@ std::vector<uint8_t> encodeWithDictionary(gcomp_registry_t * registry,
   }
   out.resize(used);
   return out;
+}
+
+TEST_F(Lz4SpecOracleTest, StaleHistoryDoesNotLeakAcrossFrames) {
+  const RealLz4 & lib = realLz4();
+  if (!lib.dictOk()) {
+    GTEST_SKIP() << "liblz4 does not export the dictionary API here";
+  }
+
+  // A frame needing a dictionary, decoded without one, must be refused --
+  // including part-way through a stream, where a previous frame has left a
+  // full 64 KB of history behind.  Otherwise the out-of-range offsets resolve
+  // into the earlier frame's output and the stream decodes to plausible
+  // nonsense.
+  //
+  // Worth saying plainly: this does NOT cover the reseed at the frame
+  // boundary in lz4_decoder.c.  Removing that reseed fails no test here, and
+  // several attempts to build an input that distinguishes it did not manage
+  // it -- the seed at header time and the decoder's offset range check appear
+  // to cover every case reachable from the public API.  The reseed is kept
+  // because it costs one call per frame and removing it on the strength of
+  // "no test noticed" is how holes get made.  What this test does establish
+  // is the property above, which is worth having on its own.
+  std::vector<uint8_t> dict =
+      dictionaryText(70000, "the quick brown fox jumps over the lazy dog ");
+  // Large enough that decoding it fills the whole 64 KB history window, so
+  // the offsets in the second frame fall inside what stale history could
+  // wrongly satisfy rather than being rejected on range alone.
+  std::vector<uint8_t> first =
+      dictionaryText(200000, "PACK MY BOX WITH FIVE DOZEN LIQUOR JUGS -- ");
+  std::vector<uint8_t> second =
+      dictionaryText(4000, "the quick brown fox jumps over the lazy dog ");
+
+  // First frame: ordinary dependent blocks, no dictionary, so decoding it
+  // leaves its own output as history.
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  gcomp_options_set_bool(opts, "lz4.independent_blocks", 0);
+  gcomp_options_set_uint64(opts, "lz4.block_size", 65536u);
+  std::vector<uint8_t> f1(first.size() * 2 + 65536);
+  size_t used = 0;
+  ASSERT_EQ(gcomp_encode_buffer(registry_, "lz4", opts, first.data(),
+                first.size(), f1.data(), f1.size(), &used),
+      GCOMP_OK);
+  gcomp_options_destroy(opts);
+  f1.resize(used);
+
+  // Second frame: independent blocks against the dictionary, so without the
+  // dictionary its offsets reach outside anything it may legally see.
+  std::vector<uint8_t> f2 = realLz4CompressWithDict(second, dict, 1, 0, 4);
+  ASSERT_FALSE(f2.empty());
+  MatchStats stats;
+  ASSERT_TRUE(countCrossBlockMatches(f2, &stats));
+  ASSERT_GT(stats.cross_block, 0)
+      << "the second frame does not reach outside itself, so there is nothing "
+         "for stale history to wrongly satisfy";
+
+  gcomp_status_t st = GCOMP_OK;
+  std::vector<uint8_t> back = decodeWithDictionary(
+      f1 + f2, nullptr, first.size() + second.size(), &st, 1);
+  EXPECT_EQ(st, GCOMP_ERR_CORRUPT)
+      << "a frame needing a dictionary was accepted because the frame before "
+         "it had left history the decoder was willing to match against";
 }
 
 TEST_F(Lz4SpecOracleTest, OurDictionaryFramesReadInRealLz4) {
