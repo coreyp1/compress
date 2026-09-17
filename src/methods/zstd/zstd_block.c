@@ -288,13 +288,22 @@ gcomp_status_t zstd_block_compress(zstd_encoder_state_t * state,
       }
     }
 
-    // A block with no sequences is still worth compressing: RFC 8878 section
-    // 3.1.1.3 lets a Compressed_Block carry Huffman-coded literals and a
-    // Sequences_Section of zero sequences, and for data with no usable
-    // matches that is where all of the gain is.  Requiring num_sequences > 0
-    // sent every such block to a raw block instead -- a skewed-alphabet file
-    // that the reference encoder takes to 36% came out at 100.003% of input.
-    if (status == GCOMP_OK && literals_size > 0) {
+    // A block needs either sequences or literals, and neither one on its own
+    // disqualifies it.  RFC 8878 section 3.1.1.3 lets a Compressed_Block
+    // carry Huffman-coded literals with a Sequences_Section of zero
+    // sequences, and it equally lets one carry sequences with an empty
+    // Literals_Section.
+    //
+    // Both halves of that have been got wrong here.  Requiring
+    // num_sequences > 0 sent every match-less block to a raw block -- a
+    // skewed-alphabet file that the reference encoder takes to 36% came out
+    // at 100.003% of input.  Requiring literals_size > 0 then did the same to
+    // every block that matched *everything*, which became reachable the
+    // moment sequences could reach back into earlier blocks: a megabyte of
+    // words drawn at random from a thirteen-word vocabulary went from 189,076
+    // bytes to 833,633, six of its eight blocks stored raw, because after the
+    // first block there was nothing left to emit as a literal.
+    if (status == GCOMP_OK && (num_sequences > 0 || literals_size > 0)) {
       // Encode literals section (with Huffman compression when beneficial)
       size_t literals_encoded_size = 0;
       status = zstd_literals_encode_compressed(state->allocator,

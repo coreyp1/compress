@@ -587,3 +587,86 @@ TEST_F(ZstdEncoderTest, SequencesDoNotReachPastTheDeclaredWindow) {
   size_t wide = ZstdEncodeWithWindow(registry_, 20, repeated);
   EXPECT_GT(narrow, wide + kPhrase / 2) << narrow << " vs " << wide;
 }
+
+// A block that matches everything has no literals, and that is not a reason
+// to give up on it.  RFC 8878 section 3.1.1.3 lets a Compressed_Block carry
+// sequences with an empty Literals_Section, just as it lets one carry
+// literals with no sequences.
+//
+// This became reachable the moment sequences could reach back into earlier
+// blocks: on repetitive data the first block leaves nothing for the later
+// ones to emit as a literal, and the encoder was storing every one of them
+// raw.  A megabyte of words drawn at random from a thirteen-word vocabulary
+// went from 189,076 bytes to 833,633 that way.
+TEST_F(ZstdEncoderTest, ABlockThatMatchesEverythingIsStillCompressed) {
+  // Long enough to need several blocks - a block holds at most 128 KB - and
+  // repetitive enough that after the first one there is nothing new to say.
+  static const char * words[] = {"the ", "quick ", "brown ", "fox ", "jumps ",
+      "over ", "lazy ", "dog ", "and ", "then ", "returns ", "home ", "with "};
+  const size_t count = sizeof(words) / sizeof(words[0]);
+  std::vector<uint8_t> data;
+  data.reserve(600u * 1024u);
+  uint32_t seed = 12345u;
+  while (data.size() < 600u * 1024u) {
+    seed = seed * 1103515245u + 12345u;
+    const char * w = words[(seed >> 16) % count];
+    for (const char * c = w; *c; c++) {
+      data.push_back((uint8_t)*c);
+    }
+  }
+
+  std::vector<uint8_t> out(data.size() * 2 + 4096);
+  size_t used = out.size();
+  ASSERT_EQ(gcomp_encode_buffer(registry_, "zstd", nullptr, data.data(),
+                data.size(), out.data(), out.size(), &used),
+      GCOMP_OK);
+
+  std::vector<uint8_t> back(data.size() + 64);
+  size_t back_used = back.size();
+  ASSERT_EQ(gcomp_decode_buffer(registry_, "zstd", nullptr, out.data(), used,
+                back.data(), back.size(), &back_used),
+      GCOMP_OK);
+  ASSERT_EQ(back_used, data.size());
+  ASSERT_EQ(memcmp(back.data(), data.data(), data.size()), 0);
+
+  // Walk the blocks: none of them may be a Raw_Block carrying data.  The
+  // check is on the block type rather than on the size, because a raw block
+  // is the specific failure - a compressed block that merely came out large
+  // would be a different problem and should not be reported as this one.
+  size_t p = 4;
+  uint8_t fhd = out[p++];
+  unsigned fcs_flag = fhd >> 6;
+  bool single = ((fhd >> 5) & 1) != 0;
+  unsigned did = fhd & 3;
+  if (!single) {
+    p += 1;
+  }
+  static const unsigned kDid[4] = {0, 1, 2, 4};
+  p += kDid[did];
+  p += (fcs_flag == 0) ? (single ? 1u : 0u)
+                       : (fcs_flag == 1 ? 2u : (fcs_flag == 2 ? 4u : 8u));
+
+  int raw_blocks = 0;
+  int compressed_blocks = 0;
+  for (;;) {
+    ASSERT_LE(p + 3, used);
+    uint32_t h = (uint32_t)out[p] | ((uint32_t)out[p + 1] << 8) |
+        ((uint32_t)out[p + 2] << 16);
+    p += 3;
+    bool last = (h & 1) != 0;
+    unsigned type = (h >> 1) & 3;
+    size_t size = h >> 3;
+    if (type == 0 && size > 0) {
+      raw_blocks++;
+    }
+    if (type == 2) {
+      compressed_blocks++;
+    }
+    p += (type == 1) ? 1u : size;
+    if (last || p >= used) {
+      break;
+    }
+  }
+  EXPECT_GT(compressed_blocks, 1) << "expected several compressed blocks";
+  EXPECT_EQ(raw_blocks, 0) << raw_blocks << " blocks were stored raw";
+}
