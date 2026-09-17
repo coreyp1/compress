@@ -649,6 +649,40 @@ gcomp_status_t zstd_fse_build_decoding_table(const uint8_t * src,
     size_t * bytes_read_out);
 
 /**
+ * @brief Choose an Accuracy_Log for a distribution.
+ *
+ * Small inputs do not repay a large table, and the table must be at least as
+ * large as the alphabet.  Result is clamped to [5, max_table_log].
+ *
+ * @param max_table_log Format limit for this symbol type (RFC 8878 3.1.1.3.2.1:
+ *                      9 for literal lengths and match lengths, 8 for offsets,
+ *                      6 for Huffman weights).
+ * @param num_values    How many symbols the table will encode.
+ * @param max_symbol    Highest symbol value present.
+ */
+GCOMP_INTERNAL_API unsigned zstd_fse_optimal_table_log(
+    unsigned max_table_log, size_t num_values, unsigned max_symbol);
+
+/**
+ * @brief Normalize a frequency histogram into FSE normalized counts.
+ *
+ * RFC 8878 section 4.1.1: a normalized count is a symbol's number of table
+ * slots, and the counts sum to exactly 2^table_log; -1 means "probability
+ * below one slot" and consumes one slot.  Every symbol with a non-zero
+ * frequency receives a non-zero count.
+ *
+ * @param freq       Frequency per symbol, indexed 0..max_symbol.
+ * @param max_symbol Highest symbol value to consider.
+ * @param total      Sum of freq[0..max_symbol]; must be non-zero.
+ * @param table_log  Accuracy_Log to normalize to.
+ * @param norm_out   Receives counts for 0..max_symbol.
+ * @return GCOMP_OK, or GCOMP_ERR_LIMIT if the alphabet cannot fit the table.
+ */
+GCOMP_INTERNAL_API gcomp_status_t zstd_fse_normalize_counts(
+    const uint32_t * freq, unsigned max_symbol, uint64_t total,
+    unsigned table_log, int16_t * norm_out);
+
+/**
  * @brief Write FSE table header from normalized counts (for encoding).
  *
  * Used by the Huffman encoder when the weight table has >127 symbols

@@ -311,8 +311,13 @@ static gcomp_status_t zstd_fwd_bit_writer_write(
   if (nb_bits == 0) {
     return GCOMP_OK;
   }
-  if (bw->bits_used + nb_bits > 64) {
-    // Flush low byte
+  // Keep flushing until the value fits.  Flushing a single byte is not always
+  // enough: with the container near full, one byte leaves 56 bits used and a
+  // 10-bit field would still run past the end of the accumulator.
+  while (bw->bits_used + nb_bits > 64) {
+    if (bw->bits_used < 8) {
+      return GCOMP_ERR_INVALID_ARG; // nb_bits wider than the accumulator
+    }
     if (bw->byte_pos >= bw->buf_size) {
       return GCOMP_ERR_LIMIT;
     }
@@ -633,6 +638,130 @@ gcomp_status_t zstd_fse_read_table_header(const uint8_t * src, size_t src_size,
  *
  * Encodes norm_counts into the same bit format the decoder expects.
  */
+unsigned zstd_fse_optimal_table_log(
+    unsigned max_table_log, size_t num_values, unsigned max_symbol) {
+  // Mirrors the reference heuristic: a table much larger than the data it
+  // describes spends more on its own description than it saves, and a table
+  // smaller than the alphabet cannot give every present symbol a slot.
+  unsigned table_log = max_table_log;
+
+  if (num_values > 2) {
+    unsigned hb = 0;
+    size_t v = num_values - 1;
+    while (v > 1) {
+      v >>= 1;
+      hb++;
+    }
+    if (hb > 2 && table_log > hb - 2) {
+      table_log = hb - 2;
+    }
+  }
+
+  // Every symbol up to max_symbol needs at least one slot.
+  unsigned min_bits = 1;
+  while ((1u << min_bits) < (unsigned)(max_symbol + 1)) {
+    min_bits++;
+  }
+  min_bits++; // headroom so the distribution is not forced flat
+  if (table_log < min_bits) {
+    table_log = min_bits;
+  }
+
+  if (table_log < FSE_MIN_TABLE_LOG) {
+    table_log = FSE_MIN_TABLE_LOG;
+  }
+  if (table_log > max_table_log) {
+    table_log = max_table_log;
+  }
+  return table_log;
+}
+
+gcomp_status_t zstd_fse_normalize_counts(const uint32_t * freq,
+    unsigned max_symbol, uint64_t total, unsigned table_log,
+    int16_t * norm_out) {
+  if (!freq || !norm_out || total == 0 || max_symbol > FSE_MAX_SYMBOL_VALUE) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  if (table_log < FSE_MIN_TABLE_LOG || table_log > FSE_MAX_ACCURACY_LOG) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  // RFC 8878 section 4.1.1: a normalized count is the number of table slots a
+  // symbol owns, and they sum to exactly 2^Accuracy_Log.  The special value -1
+  // means "probability below one slot" and still consumes a slot.
+  //
+  // (Not to be confused with a Huffman weight, where the slot count is
+  // 2^(weight-1).  Normalizing as though these were weights produces a
+  // distribution that does not sum to the table size, and a table description
+  // no decoder can use.)
+  const int32_t table_size = (int32_t)(1u << table_log);
+  int32_t remaining = table_size;
+
+  unsigned largest = 0;
+  uint32_t largest_freq = 0;
+  unsigned present = 0;
+
+  for (unsigned sym = 0; sym <= max_symbol; sym++) {
+    norm_out[sym] = 0;
+    if (freq[sym] == 0) {
+      continue;
+    }
+    present++;
+
+    uint64_t scaled =
+        ((uint64_t)freq[sym] * (uint64_t)table_size + total / 2) / total;
+    int16_t n = (scaled == 0) ? (int16_t)-1 : (int16_t)scaled;
+    norm_out[sym] = n;
+    remaining -= (n < 0) ? 1 : n;
+
+    if (freq[sym] > largest_freq) {
+      largest_freq = freq[sym];
+      largest = sym;
+    }
+  }
+
+  if (present == 0) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  if ((int32_t)present > table_size) {
+    // The alphabet does not fit: the caller picked too small a table_log.
+    return GCOMP_ERR_LIMIT;
+  }
+
+  // Reclaim any over-allocation one slot at a time from whichever symbol
+  // currently holds the most, which is the least distorted by losing one.
+  while (remaining < 0) {
+    unsigned best = max_symbol + 1;
+    int16_t best_n = 1;
+    for (unsigned sym = 0; sym <= max_symbol; sym++) {
+      if (norm_out[sym] > best_n) {
+        best_n = norm_out[sym];
+        best = sym;
+      }
+    }
+    if (best > max_symbol) {
+      return GCOMP_ERR_CORRUPT;
+    }
+    norm_out[best]--;
+    remaining++;
+  }
+
+  // Hand any slack to the most frequent symbol.
+  if (remaining > 0) {
+    if (norm_out[largest] < 0) {
+      // It held one slot as a below-one probability; it now holds that slot
+      // plus the slack.
+      norm_out[largest] = (int16_t)(1 + remaining);
+    }
+    else {
+      norm_out[largest] = (int16_t)(norm_out[largest] + remaining);
+    }
+    remaining = 0;
+  }
+
+  return GCOMP_OK;
+}
+
 gcomp_status_t zstd_fse_write_table_header(uint8_t * dst, size_t dst_cap,
     const int16_t * norm_counts, unsigned max_symbol, unsigned table_log,
     size_t * bytes_written_out) {
@@ -642,80 +771,108 @@ gcomp_status_t zstd_fse_write_table_header(uint8_t * dst, size_t dst_cap,
   if (table_log < FSE_MIN_TABLE_LOG || table_log > FSE_MAX_ACCURACY_LOG) {
     return GCOMP_ERR_INVALID_ARG;
   }
+  if (max_symbol > FSE_MAX_SYMBOL_VALUE) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
 
   zstd_fwd_bit_writer_t bw;
   zstd_fwd_bit_writer_init(&bw, dst, dst_cap);
 
-  // 4 bits: table_log - 5
+  // 4 bits: Accuracy_Log - 5
   gcomp_status_t status = zstd_fwd_bit_writer_write(
       &bw, (uint32_t)(table_log - FSE_MIN_TABLE_LOG), 4);
   if (status != GCOMP_OK) {
     return status;
   }
 
-  int remaining = 1 << table_log;
+  // The exact inverse of zstd_fse_read_table_header(), sharing its
+  // (threshold, nbBits) recurrence from RFC 8878 section 4.1.1.  This had
+  // mirrored the older, incorrect reader instead -- `remaining` one low and
+  // the field width recomputed each round -- so the two agreed with each
+  // other and with no other implementation, and a zero run never emitted the
+  // terminating group that ends it.
+  int remaining = (1 << table_log) + 1;
+  int threshold = 1 << table_log;
+  unsigned nb_bits = table_log + 1;
+
   unsigned symbol = 0;
+  bool previous0 = false;
 
-  while (remaining > 0 && symbol <= max_symbol) {
+  while (previous0 || remaining > 1) {
+    if (previous0) {
+      // Count the zeroes that follow the one already written, then emit them
+      // as 2-bit groups: 0b11 means "three more, keep reading", and any other
+      // value ends the run -- so a run that is a multiple of three still
+      // needs a closing group of zero.
+      unsigned run = 0;
+      while (symbol + run <= max_symbol && norm_counts[symbol + run] == 0) {
+        run++;
+      }
+      while (run >= 3) {
+        status = zstd_fwd_bit_writer_write(&bw, 3, 2);
+        if (status != GCOMP_OK) {
+          return status;
+        }
+        symbol += 3;
+        run -= 3;
+      }
+      status = zstd_fwd_bit_writer_write(&bw, run, 2);
+      if (status != GCOMP_OK) {
+        return status;
+      }
+      symbol += run;
+      previous0 = false;
+      continue;
+    }
+
+    if (symbol > max_symbol) {
+      return GCOMP_ERR_CORRUPT; // counts do not add up to the table size
+    }
+
     int count = (int)norm_counts[symbol];
-    // Encode count+1 (0, 1, 2, ...) so decode gets count = (count+1)-1
+    if (count < -1) {
+      return GCOMP_ERR_INVALID_ARG;
+    }
+
+    // The reader recovers `count + 1`; pick the bit pattern that makes it do
+    // so, matching its short/long field decision.
     unsigned value = (unsigned)(count + 1);
+    int max = (2 * threshold - 1) - remaining;
 
-    unsigned threshold = (unsigned)remaining + 1;
-    unsigned nb_bits =
-        (threshold > 1) ? (32 - __builtin_clz(threshold - 1)) : 1;
-    unsigned low_bits = nb_bits - 1;
-    unsigned small_max = (1U << nb_bits) - 1 - threshold;
-
-    if (value <= small_max) {
-      status = zstd_fwd_bit_writer_write(&bw, value, low_bits);
+    if (max > 0 && (int)value < max) {
+      status = zstd_fwd_bit_writer_write(&bw, value, nb_bits - 1);
+    }
+    else if ((int)value < threshold) {
+      // Low nb_bits-1 bits are >= max, and the full field is below threshold,
+      // so the reader keeps it as-is.
+      status = zstd_fwd_bit_writer_write(&bw, value, nb_bits);
     }
     else {
-      // value in (small_max, threshold]: encode as low_bits + 1 bit
-      unsigned low_value = value + small_max - (1U << low_bits);
-      status = zstd_fwd_bit_writer_write(&bw, low_value, low_bits);
-      if (status == GCOMP_OK) {
-        status = zstd_fwd_bit_writer_write(&bw, 1, 1);
-      }
+      // The reader subtracts max from any field at or above threshold.
+      status = zstd_fwd_bit_writer_write(&bw, value + (unsigned)max, nb_bits);
     }
     if (status != GCOMP_OK) {
       return status;
     }
 
-    if (count == -1) {
-      remaining--;
-    }
-    else if (count >= 0) {
-      remaining -= count;
+    remaining -= (count < 0) ? -count : count;
+    if (remaining < 1) {
+      return GCOMP_ERR_CORRUPT;
     }
 
     symbol++;
+    previous0 = (count == 0);
 
-    // Repeat zeroes: same encoding as read (2 bits per run)
-    if (count == 0) {
-      unsigned run = 0;
-      while (symbol + run <= max_symbol && norm_counts[symbol + run] == 0) {
-        run++;
+    while (remaining < threshold) {
+      if (nb_bits == 0) {
+        return GCOMP_ERR_CORRUPT;
       }
-      while (run > 0) {
-        unsigned chunk = (run >= 3) ? 3 : run;
-        status = zstd_fwd_bit_writer_write(&bw, (uint32_t)chunk, 2);
-        if (status != GCOMP_OK) {
-          return status;
-        }
-        if (chunk == 3) {
-          symbol += 3;
-          run -= 3;
-        }
-        else {
-          symbol += chunk;
-          run -= chunk;
-        }
-      }
+      nb_bits--;
+      threshold >>= 1;
     }
   }
 
-  if (remaining != 0) {
+  if (remaining != 1) {
     return GCOMP_ERR_CORRUPT;
   }
 

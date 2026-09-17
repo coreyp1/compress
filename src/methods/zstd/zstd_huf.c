@@ -1294,6 +1294,7 @@ typedef struct {
   size_t byte_pos;
   uint64_t bit_container;
   unsigned bits_used;
+  bool overflow;
 } zstd_huf_fse_bw_t;
 
 static void zstd_huf_fse_bw_init(
@@ -1303,10 +1304,15 @@ static void zstd_huf_fse_bw_init(
   bw->byte_pos = 0;
   bw->bit_container = 0;
   bw->bits_used = 0;
+  bw->overflow = false;
 }
 
 static void zstd_huf_fse_bw_flush(zstd_huf_fse_bw_t * bw) {
-  while (bw->bits_used >= 8 && bw->byte_pos < bw->buf_size) {
+  while (bw->bits_used >= 8) {
+    if (bw->byte_pos >= bw->buf_size) {
+      bw->overflow = true;
+      return;
+    }
     bw->buf[bw->byte_pos++] = (uint8_t)(bw->bit_container & 0xFF);
     bw->bit_container >>= 8;
     bw->bits_used -= 8;
@@ -1329,7 +1335,11 @@ static size_t zstd_huf_fse_bw_close(zstd_huf_fse_bw_t * bw) {
   bw->bit_container |= (1ULL << bw->bits_used);
   bw->bits_used++;
   unsigned bytes_needed = (bw->bits_used + 7) / 8;
-  for (unsigned i = 0; i < bytes_needed && bw->byte_pos < bw->buf_size; i++) {
+  for (unsigned i = 0; i < bytes_needed; i++) {
+    if (bw->byte_pos >= bw->buf_size) {
+      bw->overflow = true;
+      break;
+    }
     bw->buf[bw->byte_pos++] = (uint8_t)(bw->bit_container & 0xFF);
     bw->bit_container >>= 8;
   }
@@ -1377,119 +1387,76 @@ static uint16_t zstd_huf_fse_find_encode_state(const zstd_fse_entry_t * table,
 static gcomp_status_t zstd_huf_write_weights_fse(
     const zstd_huf_enc_table_t * table, unsigned num_weights, uint8_t * output,
     size_t output_cap, size_t * output_len_out) {
-  if (!table || !output || !output_len_out || num_weights <= 128) {
+  if (!table || !output || !output_len_out || num_weights < 2) {
     return GCOMP_ERR_INVALID_ARG;
   }
 
-  // 1. Build weight value histogram (0..12)
-  unsigned counts[HUF_FSE_WEIGHT_MAX_SYMBOL + 1];
+  // 1. Histogram the weight values (0..HUF_MAX_BITS).
+  uint32_t counts[HUF_FSE_WEIGHT_MAX_SYMBOL + 1];
   memset(counts, 0, sizeof(counts));
   for (unsigned i = 0; i < num_weights; i++) {
     uint8_t w = table->weights[i];
-    if (w <= HUF_FSE_WEIGHT_MAX_SYMBOL) {
-      counts[w]++;
+    if (w > HUF_FSE_WEIGHT_MAX_SYMBOL) {
+      return GCOMP_ERR_CORRUPT;
+    }
+    counts[w]++;
+  }
+
+  unsigned max_symbol = 0;
+  unsigned distinct = 0;
+  for (unsigned i = 0; i <= HUF_FSE_WEIGHT_MAX_SYMBOL; i++) {
+    if (counts[i]) {
+      max_symbol = i;
+      distinct++;
     }
   }
 
-  unsigned total_count = 0;
-  for (unsigned i = 0; i <= HUF_FSE_WEIGHT_MAX_SYMBOL; i++) {
-    total_count += counts[i];
-  }
-  if (total_count == 0) {
-    return GCOMP_ERR_CORRUPT;
+  // A single distinct weight would give that symbol the whole table and a
+  // zero-bit state transition, which the decoder cannot terminate on.  The
+  // caller falls back; such an alphabet is degenerate anyway.
+  if (distinct < 2) {
+    return GCOMP_ERR_UNSUPPORTED;
   }
 
-  // 2. Normalize to FSE norm_counts (table_log=6, sum = 64)
-  int16_t norm_counts[HUF_FSE_WEIGHT_MAX_SYMBOL + 2]; // 0..12 + 1
+  // 2. Normalize.  RFC 8878 section 4.2.1.2 caps the weights' Accuracy_Log at
+  // 6.  These are FSE normalized counts -- slots per symbol summing to the
+  // table size -- not Huffman weights; normalizing them as 2^(n-1) shares, as
+  // this did, produces a table description nothing can read.
+  unsigned table_log = zstd_fse_optimal_table_log(
+      HUF_FSE_WEIGHT_TABLE_LOG, num_weights, max_symbol);
+
+  int16_t norm_counts[HUF_FSE_WEIGHT_MAX_SYMBOL + 2];
   memset(norm_counts, 0, sizeof(norm_counts));
-  unsigned table_size = HUF_FSE_WEIGHT_TABLE_SIZE;
-
-  for (unsigned i = 0; i <= HUF_FSE_WEIGHT_MAX_SYMBOL; i++) {
-    if (counts[i] == 0) {
-      continue;
-    }
-    // Share of table: (count * 64) / total_count. Norm such that 2^(n-1) ≈
-    // share.
-    unsigned share = (counts[i] * table_size) / total_count;
-    if (share == 0) {
-      norm_counts[i] = -1; // less-than-one probability
-    }
-    else {
-      unsigned n = 1;
-      while ((1U << (n - 1)) < share && n < 12) {
-        n++;
-      }
-      norm_counts[i] = (int16_t)(int)n;
-    }
+  gcomp_status_t status = zstd_fse_normalize_counts(
+      counts, max_symbol, num_weights, table_log, norm_counts);
+  if (status != GCOMP_OK) {
+    return status;
   }
 
-  // Adjust so sum(2^(norm-1)) + num(-1) = 64
-  int sum = 0;
-  int num_neg1 = 0;
-  for (unsigned i = 0; i <= HUF_FSE_WEIGHT_MAX_SYMBOL; i++) {
-    if (norm_counts[i] == -1) {
-      num_neg1++;
-    }
-    else if (norm_counts[i] > 0) {
-      sum += 1 << (norm_counts[i] - 1);
-    }
-  }
-  while (sum + num_neg1 < (int)table_size) {
-    unsigned best = 0;
-    int best_norm = 0;
-    for (unsigned i = 0; i <= HUF_FSE_WEIGHT_MAX_SYMBOL; i++) {
-      if (norm_counts[i] > 0 && norm_counts[i] < 12 &&
-          (best_norm == 0 || norm_counts[i] > best_norm)) {
-        best = i;
-        best_norm = norm_counts[i];
-      }
-    }
-    if (best_norm == 0) {
-      break;
-    }
-    sum -= 1 << (norm_counts[best] - 1);
-    norm_counts[best]++;
-    sum += 1 << (norm_counts[best] - 1);
-  }
-  while (sum + num_neg1 > (int)table_size) {
-    unsigned best = 0;
-    int best_norm = 0;
-    for (unsigned i = 0; i <= HUF_FSE_WEIGHT_MAX_SYMBOL; i++) {
-      if (norm_counts[i] > 1 &&
-          (best_norm == 0 || norm_counts[i] > best_norm)) {
-        best = i;
-        best_norm = norm_counts[i];
-      }
-    }
-    if (best_norm == 0) {
-      break;
-    }
-    sum -= 1 << (norm_counts[best] - 1);
-    norm_counts[best]--;
-    sum += (norm_counts[best] > 0) ? (1 << (norm_counts[best] - 1)) : 0;
-  }
-
-  // 3. Write FSE table header at output+1 (output[0] reserved for header byte)
+  // 3. Table description, written after the header byte.
   if (output_cap < 2) {
     return GCOMP_ERR_LIMIT;
   }
   size_t header_size = 0;
-  gcomp_status_t status = zstd_fse_write_table_header(output + 1,
-      output_cap - 1, norm_counts, (unsigned)HUF_FSE_WEIGHT_MAX_SYMBOL,
-      HUF_FSE_WEIGHT_TABLE_LOG, &header_size);
+  status = zstd_fse_write_table_header(output + 1, output_cap - 1, norm_counts,
+      max_symbol, table_log, &header_size);
   if (status != GCOMP_OK) {
     return status;
   }
 
-  // 4. Build FSE decoding table
+  // 4. Decoding table, which also drives the encoder's state search.
   zstd_fse_entry_t fse_table[HUF_FSE_WEIGHT_TABLE_SIZE];
-  status = zstd_fse_build_table_from_norm(norm_counts,
-      (unsigned)HUF_FSE_WEIGHT_MAX_SYMBOL, HUF_FSE_WEIGHT_TABLE_LOG, fse_table);
+  status = zstd_fse_build_table_from_norm(
+      norm_counts, max_symbol, table_log, fse_table);
   if (status != GCOMP_OK) {
     return status;
   }
+  const size_t table_size = (size_t)1 << table_log;
 
-  // 5. Encode weight sequence in reverse order (backward bitstream)
+  // 5. Encode the weights backwards with TWO interleaved states, because that
+  // is how section 4.2.1.2 says they are read: state 1 takes the even-indexed
+  // weights, state 2 the odd ones.  A single state cannot be decoded by any
+  // conformant reader.
   if (output_cap < 1 + header_size + 1) {
     return GCOMP_ERR_LIMIT;
   }
@@ -1497,42 +1464,49 @@ static gcomp_status_t zstd_huf_write_weights_fse(
   zstd_huf_fse_bw_init(
       &bw, output + 1 + header_size, output_cap - 1 - header_size);
 
-  uint16_t enc_state = 0;
+  uint16_t state[2] = {0, 0};
+
   for (unsigned idx = num_weights; idx > 0; idx--) {
     unsigned i = idx - 1;
+    unsigned c = i & 1u;
     uint8_t weight = table->weights[i];
-    if (weight > HUF_FSE_WEIGHT_MAX_SYMBOL) {
-      return GCOMP_ERR_CORRUPT;
-    }
 
-    if (i == num_weights - 1) {
-      enc_state = zstd_huf_fse_find_state_for_symbol(
-          fse_table, HUF_FSE_WEIGHT_TABLE_SIZE, weight);
+    if (i + 2 >= num_weights) {
+      // Last weight of this chain: the decoder reads no update for it, so the
+      // encoder is free to pick any state carrying the symbol.
+      state[c] = zstd_huf_fse_find_state_for_symbol(fse_table, table_size, weight);
     }
     else {
       uint8_t bits_out, nb_bits_out;
-      uint16_t prev_state =
-          zstd_huf_fse_find_encode_state(fse_table, HUF_FSE_WEIGHT_TABLE_SIZE,
-              weight, enc_state, &bits_out, &nb_bits_out);
-      if (prev_state == 0xFFFF) {
+      uint16_t prev = zstd_huf_fse_find_encode_state(
+          fse_table, table_size, weight, state[c], &bits_out, &nb_bits_out);
+      if (prev == 0xFFFF) {
         return GCOMP_ERR_CORRUPT;
       }
-      enc_state = prev_state;
+      state[c] = prev;
       zstd_huf_fse_bw_add_bits(&bw, bits_out, nb_bits_out);
     }
   }
 
-  zstd_huf_fse_bw_add_bits(&bw, enc_state, HUF_FSE_WEIGHT_TABLE_LOG);
-  size_t bitstream_size = zstd_huf_fse_bw_close(&bw);
+  // The decoder reads state 1 first, so it is written last.
+  zstd_huf_fse_bw_add_bits(&bw, state[1], table_log);
+  zstd_huf_fse_bw_add_bits(&bw, state[0], table_log);
 
-  size_t total_size = 1 + header_size + bitstream_size;
-  if (total_size >= HUF_WEIGHTS_COMPRESSED) {
-    return GCOMP_ERR_LIMIT; // FSE header byte must be < 128
+  size_t bitstream_size = zstd_huf_fse_bw_close(&bw);
+  if (bw.overflow) {
+    return GCOMP_ERR_LIMIT;
   }
 
-  // 6. Write header byte = compressed size (per RFC 8878: header_byte < 128)
-  output[0] = (uint8_t)total_size;
-  *output_len_out = total_size;
+  // 6. RFC 8878 section 4.2.1.1: the header byte is the compressed size of
+  // what FOLLOWS it, and must stay below 128 to remain distinguishable from a
+  // direct weight list.  It had counted itself, describing one byte too many.
+  size_t described = header_size + bitstream_size;
+  if (described >= HUF_WEIGHTS_COMPRESSED) {
+    return GCOMP_ERR_LIMIT;
+  }
+
+  output[0] = (uint8_t)described;
+  *output_len_out = 1 + described;
   return GCOMP_OK;
 }
 
@@ -1576,39 +1550,53 @@ gcomp_status_t zstd_huf_write_weights(const zstd_huf_enc_table_t * table,
     return GCOMP_ERR_UNSUPPORTED;
   }
 
-  if (num_explicit <= 128) {
-    // Direct representation: header_byte = 127 + Number_Of_Symbols
-    size_t weights_size = ((size_t)num_explicit + 1) / 2;
-    size_t total_size = 1 + weights_size;
+  // The direct form can only name up to 128 symbols (headerByte = 127 + N must
+  // stay in a byte), so a larger alphabet has to use the FSE form.  Where both
+  // are possible, take whichever is smaller -- FSE usually wins once the
+  // weight list is more than a few dozen entries.
+  size_t direct_size = 1 + (((size_t)num_explicit + 1) / 2);
+  bool direct_possible = (num_explicit <= 128);
 
-    if (output_cap < total_size) {
-      return GCOMP_ERR_LIMIT;
-    }
+  uint8_t fse_buf[HUF_MAX_SYMBOL_VALUE + 2];
+  size_t fse_len = 0;
+  bool fse_ok = false;
 
-    output[0] = (uint8_t)(127 + num_explicit);
-
-    // Write weights as 4-bit pairs (high nibble first)
-    for (unsigned i = 0; i < num_explicit; i += 2) {
-      uint8_t w0 = table->weights[i];
-      uint8_t w1 = (i + 1 < num_explicit) ? table->weights[i + 1] : 0;
-      output[1 + i / 2] = (uint8_t)((w0 << 4) | (w1 & 0x0F));
-    }
-
-    *output_len_out = total_size;
-    return GCOMP_OK;
+  if (zstd_huf_write_weights_fse(
+          table, num_explicit, fse_buf, sizeof(fse_buf), &fse_len) == GCOMP_OK) {
+    fse_ok = (!direct_possible || fse_len < direct_size);
   }
 
-  // More weights than the direct form can carry: FSE-compress them
-  {
-    size_t fse_len = 0;
-    gcomp_status_t status = zstd_huf_write_weights_fse(
-        table, num_explicit, output, output_cap, &fse_len);
-    if (status != GCOMP_OK) {
-      return status;
+  if (fse_ok) {
+    if (output_cap < fse_len) {
+      return GCOMP_ERR_LIMIT;
     }
+    memcpy(output, fse_buf, fse_len);
     *output_len_out = fse_len;
     return GCOMP_OK;
   }
+
+  if (!direct_possible) {
+    // Too many symbols for the direct form and the FSE form did not work:
+    // the caller stores the literals instead.
+    return GCOMP_ERR_UNSUPPORTED;
+  }
+
+  if (output_cap < direct_size) {
+    return GCOMP_ERR_LIMIT;
+  }
+
+  // Direct representation: header_byte = 127 + Number_Of_Symbols
+  output[0] = (uint8_t)(127 + num_explicit);
+
+  // Write weights as 4-bit pairs (high nibble first)
+  for (unsigned i = 0; i < num_explicit; i += 2) {
+    uint8_t w0 = table->weights[i];
+    uint8_t w1 = (i + 1 < num_explicit) ? table->weights[i + 1] : 0;
+    output[1 + i / 2] = (uint8_t)((w0 << 4) | (w1 & 0x0F));
+  }
+
+  *output_len_out = direct_size;
+  return GCOMP_OK;
 }
 
 gcomp_status_t zstd_huf_encode_1stream(const zstd_huf_enc_table_t * table,

@@ -573,6 +573,127 @@ TEST_F(ZstdEntropyTest, FSECompressedWeightsRoundtrip) {
   EXPECT_EQ(memcmp(decompressed.data(), input.data(), input.size()), 0);
 }
 
+
+// Count the literals-section types across a frame's compressed blocks.
+// RFC 8878 sections 3.1.1.2 (block header) and 3.1.1.3.1.1 (literals header).
+struct LiteralsTypeCounts {
+  int raw = 0;
+  int rle = 0;
+  int huffman = 0;  // Compressed_Literals_Block
+  int treeless = 0; // Treeless_Literals_Block
+  int raw_blocks = 0;
+  bool parsed = false;
+};
+
+static LiteralsTypeCounts countLiteralsTypes(const std::vector<uint8_t> & f) {
+  LiteralsTypeCounts c;
+  if (f.size() < 6 || f[0] != 0x28 || f[1] != 0xB5 || f[2] != 0x2F ||
+      f[3] != 0xFD) {
+    return c;
+  }
+  size_t p = 4;
+  uint8_t fhd = f[p++];
+  unsigned fcs_flag = fhd >> 6;
+  bool single = ((fhd >> 5) & 1) != 0;
+  unsigned did = fhd & 3;
+  if (!single) {
+    p += 1;
+  }
+  static const unsigned kDid[4] = {0, 1, 2, 4};
+  p += kDid[did];
+  p += (fcs_flag == 0) ? (single ? 1u : 0u)
+                       : (fcs_flag == 1 ? 2u : (fcs_flag == 2 ? 4u : 8u));
+
+  for (;;) {
+    if (p + 3 > f.size()) {
+      return c;
+    }
+    uint32_t h = (uint32_t)f[p] | ((uint32_t)f[p + 1] << 8) |
+        ((uint32_t)f[p + 2] << 16);
+    p += 3;
+    bool last = (h & 1) != 0;
+    unsigned type = (h >> 1) & 3;
+    size_t size = h >> 3;
+    if (type == 3) {
+      return c;
+    }
+    if (type == 0) {
+      c.raw_blocks++;
+    }
+    if (type == 2) {
+      if (p >= f.size()) {
+        return c;
+      }
+      switch (f[p] & 3) {
+      case 0: c.raw++; break;
+      case 1: c.rle++; break;
+      case 2: c.huffman++; break;
+      default: c.treeless++; break;
+      }
+    }
+    p += (type == 1) ? 1u : size;
+    if (p > f.size()) {
+      return c;
+    }
+    if (last) {
+      break;
+    }
+  }
+  c.parsed = true;
+  return c;
+}
+
+// The Huffman tree description has two forms (RFC 8878 4.2.1.1): a direct
+// 4-bit weight list, whose header byte is 127 + Number_Of_Symbols and so
+// cannot name more than 128 symbols, and an FSE-compressed form for anything
+// larger.  The FSE form normalized its counts as though they were Huffman
+// weights -- 2^(n-1) shares rather than slots summing to the table size --
+// and encoded them with one FSE state where the decoder uses two.  It failed
+// for every alphabet that needed it, and zstd_literals_encode_compressed
+// quietly stored the literals instead.  Any data using more than 129 distinct
+// byte values was therefore never Huffman-coded at all.
+//
+// Sweeping the alphabet size across that boundary is what catches it; below
+// it, the direct form hides the problem completely.  The check is on the
+// literals section type rather than on a compression ratio, because the ratio
+// this data reaches varies with the alphabet size while the requirement --
+// that the literals are entropy-coded at all -- does not.
+TEST_F(ZstdEntropyTest, LiteralsAreHuffmanCodedAtEveryAlphabetSize) {
+  for (unsigned distinct = 4; distinct <= 256;
+      distinct += (distinct < 120 ? 29 : 7)) {
+    // Strongly skewed frequencies over `distinct` byte values, with no long
+    // repeats, so the only available gain is the Huffman coder's.
+    std::vector<uint8_t> data;
+    data.reserve(96 * 1024);
+    uint32_t x = 2654435761u ^ distinct;
+    while (data.size() < 96 * 1024) {
+      x = x * 1103515245u + 12345u;
+      uint64_t r = (x >> 16) & 0xFFFFu;
+      // r^4 / 65536^4, scaled to the alphabet: heavily biased to low indices.
+      uint64_t q = (r * r) / 65536u;
+      uint64_t pick = ((q * q) / 65536u) * distinct / 65536u;
+      data.push_back((uint8_t)(pick % distinct));
+    }
+
+    std::vector<uint8_t> packed = compress(data.data(), data.size());
+    ASSERT_FALSE(packed.empty()) << "distinct=" << distinct;
+
+    LiteralsTypeCounts c = countLiteralsTypes(packed);
+    ASSERT_TRUE(c.parsed) << "distinct=" << distinct << ": unparsable frame";
+    EXPECT_GT(c.huffman + c.treeless, 0)
+        << "distinct=" << distinct << ": literals were stored ("
+        << c.raw << " raw literal sections, " << c.raw_blocks
+        << " raw blocks) rather than Huffman-coded";
+    EXPECT_LT(packed.size(), data.size())
+        << "distinct=" << distinct;
+
+    std::vector<uint8_t> back = decompress(packed.data(), packed.size());
+    ASSERT_EQ(back.size(), data.size()) << "distinct=" << distinct;
+    ASSERT_EQ(memcmp(back.data(), data.data(), data.size()), 0)
+        << "distinct=" << distinct;
+  }
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
