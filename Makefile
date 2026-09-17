@@ -392,7 +392,8 @@ $(foreach pair,$(TEST_PAIRS),$(eval $(call test-executable-rule,$(word 1,$(subst
 # LDFLAGS is where cutil lives.  With cutil first, nothing had referenced its
 # symbols yet, so the default --as-needed dropped it and every example failed
 # to link with undefined ghotiio_cutil_0_* references.
-$(APP_DIR)/examples/%$(EXE_EXTENSION): examples/%.c $(APP_DIR)/$(TARGET)
+$(APP_DIR)/examples/%$(EXE_EXTENSION): examples/%.c $(APP_DIR)/$(STATIC_TARGET) \
+		| $(APP_DIR)/$(TARGET)
 	@printf "\n### Compiling Example: $* ###\n"
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(COMPRESSLIBRARY) $(LDFLAGS)
@@ -406,7 +407,15 @@ $(APP_DIR)/examples/%$(EXE_EXTENSION): examples/%.c $(APP_DIR)/$(TARGET)
 # LDFLAGS is where cutil lives.  With cutil first, nothing had referenced its
 # symbols yet, so the default --as-needed dropped it and every example failed
 # to link with undefined ghotiio_cutil_0_* references.
-$(APP_DIR)/bench/%$(EXE_EXTENSION): bench/%.c $(APP_DIR)/$(TARGET)
+# The static archive is a real prerequisite, not an order-only one: these link
+# $(COMPRESSLIBRARY), which is the archive.  Naming only the shared library
+# meant a clean tree could reach this rule before the archive existed - `make
+# bench` on a fresh checkout failed with "cannot find ...-0.a" - and, worse,
+# that a tree where the archive already existed would link a stale copy of it
+# without rebuilding.  That second failure is the one that cost a day of
+# untrustworthy test runs before the test rules were given the same fix.
+$(APP_DIR)/bench/%$(EXE_EXTENSION): bench/%.c $(APP_DIR)/$(STATIC_TARGET) \
+		| $(APP_DIR)/$(TARGET)
 	@printf "\n### Compiling Benchmark: $* ###\n"
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(COMPRESSLIBRARY) $(LDFLAGS)
