@@ -75,6 +75,12 @@ typedef enum {
 // Standard LZ77 with hash-chain match finding, suitable for most data.
 // - Uses hash chains to find repeated byte sequences in the sliding window
 // - Chain length varies by compression level (8/32/64 at L1-3/L4-6/L7-9)
+// - Levels 4 and up defer a match one byte to see whether the next position
+//   starts a longer one; levels 1 to 3 take what they find.  This is where
+//   zlib switches from deflate_fast to deflate_slow, and it is the same
+//   trade: across a 19 MB corpus of source, prose, XML, binaries and images
+//   it is worth 2.3% at level 6 and 2.6% at level 9, for about half the
+//   encode throughput on text.
 // - Chooses fixed or dynamic Huffman based on compression level
 // - Good balance of speed and compression for general-purpose data
 //
@@ -87,11 +93,22 @@ typedef enum {
 // - Longer matches tend to provide more benefit
 //
 // Implementation differences from DEFAULT:
-// - Applies lazy matching: a match is held back one byte to see whether the
-//   next position starts a longer one, and the search that position performs
-//   anyway is what settles it.  See deflate_find_match()'s caller.
+// - Applies lazy matching at every level, including 1 to 3: a match is held
+//   back one byte to see whether the next position starts a longer one, and
+//   the search that position performs anyway is what settles it.  See
+//   deflate_find_match()'s caller.
 // - Nothing else.  It searches exactly as hard as DEFAULT: same hash chain
 //   lengths, same everything.
+//
+// Since DEFAULT now defers from level 4 up, that leaves FILTERED identical to
+// DEFAULT at levels 4 to 9 and different only at levels 1 to 3.  That is the
+// honest state of it: the measurements below put chain depth at 0.1 points
+// across a factor of eight and deferral at 1.7, so deferral was the whole of
+// what this strategy had, and DEFAULT now has it too.  The name stays because
+// it still means something at the fast levels, and because it is a documented
+// option that callers may already pass.  Tests pin both halves of that -
+// FilteredBeatsDefaultAtTheFastLevels and FilteredMatchesDefaultAtTheSlowLevels
+// - so the redundancy cannot drift into being accidental.
 //
 // It used to search four times as deep as DEFAULT as well - 16/128/256 against
 // 4/32/128 - on the reasoning that filtered data hides longer patterns behind
@@ -119,11 +136,9 @@ typedef enum {
 // Huffman coding - so Z_FILTERED is faster than its default.  This one is
 // slower than its default.  The name is shared; the meaning is not.
 //
-// What remains between this and zlib on ratio is that lazy matching is wired
-// only to this strategy, while zlib applies it at every level from 4 up, and
-// that there is no equivalent of zlib's good_length or nice_length to stop a
-// search early.  Both change the output of every level, so neither is a change
-// to make quietly.
+// What remains between this and zlib on ratio is that there is no equivalent
+// of zlib's good_length or nice_length to stop a search early, so the chains
+// cannot be lengthened without paying for every step of them.
 //
 // DEFLATE_STRATEGY_HUFFMAN_ONLY (strategy="huffman_only")
 // -------------------------------------------------------
@@ -2115,13 +2130,27 @@ static gcomp_status_t deflate_encode_batch(
     int skip_lz77 = (st->strategy == DEFLATE_STRATEGY_HUFFMAN_ONLY);
 
     // Lazy matching: hold a match back one byte to see whether the next
-    // position starts a longer one.  Only FILTERED uses it, as before.
+    // position starts a longer one.
+    //
+    // zlib draws this line between its deflate_fast and deflate_slow paths at
+    // level 4, and this now draws it in the same place: levels 4 and up defer
+    // a match, levels 1 to 3 take what they find.  A level is a statement
+    // about how much work to spend, and deferring is the cheapest large gain
+    // available at that price -- it costs no extra searching at all, because
+    // the search that settles a held match is the one the next position was
+    // going to perform anyway.
+    //
+    // FILTERED keeps deferring at every level: asking for it by name is
+    // asking for the effort, and its levels 1 to 3 were already spending it.
     //
     // A match already at or above max_lazy is taken as it stands: the search
     // that would test it costs as much as the search that found it, and a
     // match that long has little room to improve.  The thresholds follow
     // zlib's, which spends more of this at higher levels.
-    int use_lazy = (st->strategy == DEFLATE_STRATEGY_FILTERED);
+    int use_lazy = (st->strategy == DEFLATE_STRATEGY_FILTERED) ||
+        ((st->strategy == DEFLATE_STRATEGY_DEFAULT ||
+             st->strategy == DEFLATE_STRATEGY_FIXED) &&
+            st->level >= 4);
     uint32_t max_lazy = (st->level <= 3)    ? 4u
         : (st->level <= 6)                  ? 16u
         : (st->level <= 8)                  ? 32u

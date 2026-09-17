@@ -1626,12 +1626,15 @@ std::vector<uint8_t> FilteredLookingBytes(size_t n) {
   return v;
 }
 
-size_t EncodeWith(gcomp_registry_t * reg, const char * strategy,
+size_t EncodeWithLevel(gcomp_registry_t * reg, const char * strategy, int level,
     const std::vector<uint8_t> & in, std::vector<uint8_t> & out) {
   gcomp_options_t * opts = nullptr;
   EXPECT_EQ(gcomp_options_create(&opts), GCOMP_OK);
   EXPECT_EQ(gcomp_options_set_string(opts, "deflate.strategy", strategy),
       GCOMP_OK);
+  if (level > 0) {
+    EXPECT_EQ(gcomp_options_set_int64(opts, "deflate.level", level), GCOMP_OK);
+  }
   out.assign(in.size() * 2 + 1024, 0);
   size_t used = out.size();
   gcomp_status_t s = gcomp_encode_buffer(reg, "deflate", opts, in.data(),
@@ -1642,18 +1645,60 @@ size_t EncodeWith(gcomp_registry_t * reg, const char * strategy,
   return used;
 }
 
+size_t EncodeWith(gcomp_registry_t * reg, const char * strategy,
+    const std::vector<uint8_t> & in, std::vector<uint8_t> & out) {
+  return EncodeWithLevel(reg, strategy, 0, in, out);
+}
+
 } // namespace
 
 // Lazy matching has to earn its cost. On data shaped like PNG filter output it
-// is worth several percent; this asks only that it is not worse, which is what
-// the arrangement it replaced managed to be.
-TEST_F(DeflateEncoderTest, FilteredBeatsDefaultOnFilterShapedData) {
+// is worth several percent.
+//
+// DEFAULT now defers matches from level 4 up, the same place zlib switches
+// from deflate_fast to deflate_slow, so the two strategies differ only at
+// levels 1 to 3 - which is where this asks the question.  FILTERED defers at
+// every level; DEFAULT at those levels takes what it finds.
+TEST_F(DeflateEncoderTest, FilteredBeatsDefaultAtTheFastLevels) {
   std::vector<uint8_t> in = FilteredLookingBytes(200000);
-  std::vector<uint8_t> a;
-  std::vector<uint8_t> b;
-  size_t plain = EncodeWith(registry_, "default", in, a);
-  size_t lazy = EncodeWith(registry_, "filtered", in, b);
-  EXPECT_LT(lazy, plain) << "filtered " << lazy << " vs default " << plain;
+  for (int level = 1; level <= 3; level++) {
+    std::vector<uint8_t> a;
+    std::vector<uint8_t> b;
+    size_t plain = EncodeWithLevel(registry_, "default", level, in, a);
+    size_t lazy = EncodeWithLevel(registry_, "filtered", level, in, b);
+    EXPECT_LT(lazy, plain)
+        << "level " << level << ": filtered " << lazy << " vs default "
+        << plain;
+  }
+}
+
+// And from level 4 up they are the same encoder.  That is a consequence of
+// giving DEFAULT the only thing FILTERED had - this file's own measurements
+// put chain depth at 0.1 points across a factor of eight and deferral at 1.7 -
+// so it is recorded here rather than left to be discovered.  The option stays
+// because it still means something at levels 1 to 3, and because it is a
+// documented name that callers may already pass.
+TEST_F(DeflateEncoderTest, FilteredMatchesDefaultAtTheSlowLevels) {
+  std::vector<uint8_t> in = FilteredLookingBytes(200000);
+  for (int level = 4; level <= 9; level++) {
+    std::vector<uint8_t> a;
+    std::vector<uint8_t> b;
+    size_t plain = EncodeWithLevel(registry_, "default", level, in, a);
+    size_t lazy = EncodeWithLevel(registry_, "filtered", level, in, b);
+    ASSERT_EQ(plain, lazy) << "level " << level;
+    EXPECT_EQ(memcmp(a.data(), b.data(), plain), 0) << "level " << level;
+  }
+}
+
+// Deferring is what a higher level buys here, so the levels that defer have to
+// come out smaller than the levels that do not.
+TEST_F(DeflateEncoderTest, DefaultImprovesWhenDeferralTurnsOn) {
+  std::vector<uint8_t> in = FilteredLookingBytes(200000);
+  std::vector<uint8_t> fast;
+  std::vector<uint8_t> slow;
+  size_t at3 = EncodeWithLevel(registry_, "default", 3, in, fast);
+  size_t at4 = EncodeWithLevel(registry_, "default", 4, in, slow);
+  EXPECT_LT(at4, at3) << "level 4 " << at4 << " vs level 3 " << at3;
 }
 
 // A match held back must be emitted exactly once, whether the stream ends
