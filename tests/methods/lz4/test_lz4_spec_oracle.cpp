@@ -28,6 +28,7 @@
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
 #include <gtest/gtest.h>
+#include <dlfcn.h>
 #include <string>
 #include <vector>
 
@@ -705,6 +706,269 @@ TEST_F(Lz4SpecOracleTest, RoundTripThroughBothImplementations) {
     unlink((p1 + ".out").c_str());
     unlink(p2.c_str());
     unlink((p2 + ".lz4").c_str());
+  }
+}
+
+
+//
+// The real library, when it is here
+//
+// liblz4 is installed on many systems without its development header, so
+// these bind to it at runtime instead of at build time: no new build
+// dependency, and no reason to skip when the library is present.
+//
+// They matter more than they look.  Everything above compares our code
+// against a reference written from the same specification by the same person
+// who read it -- exactly the circularity that a round-trip has, one step
+// removed.  Only these tests put a genuinely independent implementation on
+// the other side, and one of them checks the reference itself.
+//
+
+struct RealLz4 {
+  void * handle = nullptr;
+  size_t (*createDctx)(void **, unsigned) = nullptr;
+  size_t (*freeDctx)(void *) = nullptr;
+  size_t (*decompress)(void *, void *, size_t *, const void *, size_t *,
+      const void *) = nullptr;
+  unsigned (*isError)(size_t) = nullptr;
+  const char * (*errorName)(size_t) = nullptr;
+  size_t (*compressBound)(size_t, const void *) = nullptr;
+  size_t (*compressFrame)(void *, size_t, const void *, size_t,
+      const void *) = nullptr;
+
+  bool ok() const { return handle && createDctx && decompress && compressFrame; }
+};
+
+const RealLz4 & realLz4() {
+  static RealLz4 r = [] {
+    RealLz4 out;
+    static const char * kNames[] = {"liblz4.so.1", "liblz4.so", "liblz4.1.dylib",
+        "liblz4.dylib"};
+    for (const char * name : kNames) {
+      out.handle = dlopen(name, RTLD_NOW);
+      if (out.handle) {
+        break;
+      }
+    }
+    if (!out.handle) {
+      return out;
+    }
+    auto sym = [&](const char * n) { return dlsym(out.handle, n); };
+    out.createDctx = (size_t (*)(void **, unsigned))sym(
+        "LZ4F_createDecompressionContext");
+    out.freeDctx = (size_t (*)(void *))sym("LZ4F_freeDecompressionContext");
+    out.decompress = (size_t (*)(void *, void *, size_t *, const void *,
+        size_t *, const void *))sym("LZ4F_decompress");
+    out.isError = (unsigned (*)(size_t))sym("LZ4F_isError");
+    out.errorName = (const char * (*)(size_t))sym("LZ4F_getErrorName");
+    out.compressBound =
+        (size_t (*)(size_t, const void *))sym("LZ4F_compressFrameBound");
+    out.compressFrame = (size_t (*)(void *, size_t, const void *, size_t,
+        const void *))sym("LZ4F_compressFrame");
+    return out;
+  }();
+  return r;
+}
+
+// Decode a frame with liblz4. Returns false and fills `err` if it refuses.
+bool realLz4Decode(const std::vector<uint8_t> & frame,
+    std::vector<uint8_t> * out, std::string * err) {
+  const RealLz4 & lib = realLz4();
+  void * ctx = nullptr;
+  size_t r = lib.createDctx(&ctx, 100 /* LZ4F_VERSION */);
+  if (lib.isError && lib.isError(r)) {
+    *err = "context";
+    return false;
+  }
+
+  out->assign(4096, 0);
+  size_t produced = 0, consumed = 0;
+  bool ok = true;
+  while (consumed < frame.size()) {
+    if (out->size() - produced < 65536) {
+      out->resize(out->size() * 2 + 65536);
+    }
+    size_t osz = out->size() - produced;
+    size_t isz = frame.size() - consumed;
+    r = lib.decompress(ctx, out->data() + produced, &osz,
+        frame.data() + consumed, &isz, nullptr);
+    if (lib.isError && lib.isError(r)) {
+      *err = lib.errorName ? lib.errorName(r) : "error";
+      ok = false;
+      break;
+    }
+    produced += osz;
+    consumed += isz;
+    if (r == 0) {
+      break;
+    }
+    if (osz == 0 && isz == 0) {
+      *err = "stalled";
+      ok = false;
+      break;
+    }
+  }
+  lib.freeDctx(ctx);
+  out->resize(ok ? produced : 0);
+  return ok;
+}
+
+TEST_F(Lz4SpecOracleTest, RealLz4_ReadsOurFrames) {
+  const RealLz4 & lib = realLz4();
+  if (!lib.ok()) {
+    GTEST_SKIP() << "liblz4 is not installed; the spec-based tests in this "
+                    "file still cover this method unconditionally";
+  }
+
+  // Every frame option our encoder exposes, including the two that nothing
+  // else here reaches: block checksums, and linked (non-independent) blocks,
+  // which the reference encoder above cannot even produce.
+  struct Opt {
+    const char * name;
+    int content_checksum, block_checksum, content_size, independent;
+  };
+  static const Opt kOpts[] = {
+      {"defaults", -1, -1, -1, -1},
+      {"content checksum", 1, -1, -1, -1},
+      {"block checksum", -1, 1, -1, -1},
+      {"content size", -1, -1, 1, -1},
+      {"all three", 1, 1, 1, -1},
+      {"linked blocks", -1, -1, -1, 0},
+      {"linked + block checksum", -1, 1, -1, 0},
+      {"independent blocks", -1, -1, -1, 1},
+  };
+
+  for (size_t n : sweepSizes()) {
+    for (const Shape & sh : shapes(n)) {
+      for (const Opt & o : kOpts) {
+        gcomp_options_t * opts = nullptr;
+        ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+        if (o.content_checksum >= 0) {
+          gcomp_options_set_bool(opts, "lz4.content_checksum", o.content_checksum);
+        }
+        if (o.block_checksum >= 0) {
+          gcomp_options_set_bool(opts, "lz4.block_checksum", o.block_checksum);
+        }
+        if (o.content_size >= 0) {
+          gcomp_options_set_bool(opts, "lz4.content_size", o.content_size);
+        }
+        if (o.independent >= 0) {
+          gcomp_options_set_bool(opts, "lz4.independent_blocks", o.independent);
+        }
+
+        std::vector<uint8_t> framed = gcompEncode(sh.data, opts);
+        gcomp_options_destroy(opts);
+        ASSERT_FALSE(framed.empty())
+            << sh.name << " n=" << n << " " << o.name;
+
+        std::vector<uint8_t> back;
+        std::string err;
+        ASSERT_TRUE(realLz4Decode(framed, &back, &err))
+            << sh.name << " n=" << n << " " << o.name
+            << ": liblz4 refused our frame (" << err << ")";
+        ASSERT_EQ(back, sh.data) << sh.name << " n=" << n << " " << o.name;
+      }
+    }
+  }
+}
+
+TEST_F(Lz4SpecOracleTest, RealLz4_ReadsTheReferenceFrames) {
+  // Checks the oracle, not the library.  Without this, the reference above is
+  // only known to agree with the implementation it is testing -- which is the
+  // same standing a round-trip has.
+  const RealLz4 & lib = realLz4();
+  if (!lib.ok()) {
+    GTEST_SKIP() << "liblz4 is not installed";
+  }
+
+  static const char * kStyles[] = {"literals_only", "offset1_only", "first_match"};
+  static const char * kFlagSets[] = {"", "C", "SC", "BC", "SBC"};
+
+  std::vector<std::vector<uint8_t>> originals;
+  std::vector<std::string> labels;
+  std::vector<BatchCase> batch;
+  std::vector<std::string> paths;
+
+  for (size_t n : sweepSizes()) {
+    if (n > 70000) {
+      continue;
+    }
+    for (const Shape & sh : shapes(n)) {
+      for (const char * style : kStyles) {
+        for (const char * flags : kFlagSets) {
+          std::string in = tempPath(".raw");
+          ASSERT_TRUE(writeFile(in, sh.data));
+          batch.push_back({"encode", std::string(style) + ":65536:" + flags, in,
+              in + ".lz4"});
+          paths.push_back(in);
+          originals.push_back(sh.data);
+          labels.push_back(std::string(sh.name) + " n=" + std::to_string(n) +
+              " " + style + " flags=" + (flags[0] ? flags : "none"));
+        }
+      }
+    }
+  }
+
+  std::vector<std::string> report;
+  bool ran = runBatch(batch, &report);
+
+  int bad = 0;
+  std::string detail;
+  for (size_t i = 0; i < batch.size() && ran; i++) {
+    if (report[i] != "ok") {
+      continue;
+    }
+    std::vector<uint8_t> framed;
+    if (!readFile(batch[i].out_path, &framed)) {
+      continue;
+    }
+    std::vector<uint8_t> back;
+    std::string err;
+    if (!realLz4Decode(framed, &back, &err) || back != originals[i]) {
+      bad++;
+      if (detail.size() < 300) {
+        detail += (detail.empty() ? "" : "; ") + labels[i] + " (" + err + ")";
+      }
+    }
+    unlink(batch[i].out_path.c_str());
+  }
+  for (const std::string & p : paths) {
+    unlink(p.c_str());
+  }
+
+  ASSERT_TRUE(ran) << "the reference encoder did not run";
+  EXPECT_EQ(bad, 0) << bad << " of " << batch.size()
+                    << " reference frames liblz4 could not read, so the "
+                       "reference is not trustworthy as an oracle; "
+                    << detail;
+}
+
+TEST_F(Lz4SpecOracleTest, OurDecoder_ReadsRealLz4Frames) {
+  const RealLz4 & lib = realLz4();
+  if (!lib.ok() || !lib.compressBound) {
+    GTEST_SKIP() << "liblz4 is not installed";
+  }
+
+  for (size_t n : sweepSizes()) {
+    for (const Shape & sh : shapes(n)) {
+      // Default preferences: passing a preferences struct would mean pinning
+      // liblz4's layout, which is not worth the fragility here -- our own
+      // encoder covers the option matrix in RealLz4_ReadsOurFrames.
+      size_t cap = lib.compressBound(sh.data.size(), nullptr);
+      std::vector<uint8_t> framed(cap ? cap : 1);
+      size_t r = lib.compressFrame(framed.data(), framed.size(),
+          sh.data.empty() ? "" : (const void *)sh.data.data(), sh.data.size(),
+          nullptr);
+      ASSERT_FALSE(lib.isError && lib.isError(r))
+          << sh.name << " n=" << n << ": liblz4 failed to compress";
+      framed.resize(r);
+
+      bool ok = false;
+      std::vector<uint8_t> back = gcompDecode(framed, sh.data.size(), &ok);
+      ASSERT_TRUE(ok) << sh.name << " n=" << n
+                      << ": our decoder refused a genuine liblz4 frame";
+      ASSERT_EQ(back, sh.data) << sh.name << " n=" << n;
+    }
   }
 }
 

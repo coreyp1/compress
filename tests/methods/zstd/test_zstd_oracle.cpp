@@ -3,8 +3,20 @@
  *
  * Cross-tool validation ("oracle") tests for the zstd method.
  *
+ * This file used to carry a second set of tests driven through the Python
+ * `zstandard` module.  Sixteen of the twenty tests here needed it, and where
+ * it is not installed -- which is usual -- they skipped, leaving a summary
+ * line that read PASSED over four tests that between them never exercised
+ * Huffman-coded literals, FSE-coded sequence tables, or treeless blocks.  All
+ * three were broken.
+ *
+ * They were removed rather than fixed: the zstd CLI covers the same ground,
+ * is far more commonly present, and is what the tests below use.  Short
+ * inputs were the only thing the Python tests reached that nothing else did,
+ * and that moved into *_EveryShortLength.
+ *
  * These tests compare our zstd implementation against external tools
- * (Python zstandard module, system zstd CLI) to verify correctness.
+ * (the system zstd CLI) to verify correctness.
  * Tests are skipped gracefully when external tools are not available.
  *
  * Environment variables:
@@ -57,35 +69,7 @@ static bool isVerbose() {
   return env && std::string(env) == "1";
 }
 
-// Get the Python command name (python3 on Unix, python on Windows)
-static const char * getPythonCommand() {
-#ifdef _WIN32
-  static const char * cmd = nullptr;
-  if (!cmd) {
-    if (system("python3 --version >NUL 2>&1") == 0) {
-      cmd = "python3";
-    }
-    else {
-      cmd = "python";
-    }
-  }
-  return cmd;
-#else
-  return "python3";
-#endif
-}
 
-// Check if Python 3 with zstandard is available
-static bool hasPythonZstd() {
-  std::string cmd =
-      std::string(getPythonCommand()) + " -c \"import zstandard\"";
-#ifdef _WIN32
-  cmd += " >NUL 2>&1";
-#else
-  cmd += " >/dev/null 2>&1";
-#endif
-  return system(cmd.c_str()) == 0;
-}
 
 // Check if zstd CLI is available
 static bool hasZstdCli() {
@@ -107,12 +91,9 @@ protected:
     registry_ = gcomp_registry_default();
     ASSERT_NE(registry_, nullptr);
 
-    has_python_zstd_ = hasPythonZstd();
     has_zstd_cli_ = hasZstdCli();
 
     if (isVerbose()) {
-      std::cout << "Python zstandard available: "
-                << (has_python_zstd_ ? "yes" : "no") << std::endl;
       std::cout << "zstd CLI available: " << (has_zstd_cli_ ? "yes" : "no")
                 << std::endl;
     }
@@ -209,72 +190,8 @@ protected:
 #endif
   }
 
-  // Use Python zstandard to compress data
-  std::vector<uint8_t> pythonZstdCompress(
-      const std::vector<uint8_t> & data, bool content_checksum = false) {
-    if (!has_python_zstd_) {
-      return {};
-    }
 
-    std::string tmpfile = writeTempFile(data);
-    if (tmpfile.empty()) {
-      return {};
-    }
-
-    std::string escaped_path = tmpfile;
-#ifdef _WIN32
-    for (char & c : escaped_path) {
-      if (c == '\\')
-        c = '/';
-    }
-#endif
-    std::stringstream cmd;
-    cmd << getPythonCommand() << " -c \""
-        << "import zstandard,sys;"
-        << "cctx = zstandard.ZstdCompressor(level=3, write_checksum="
-        << (content_checksum ? "True" : "False") << ");"
-        << "data = open('" << escaped_path << "', 'rb').read();"
-        << "sys.stdout.buffer.write(cctx.compress(data));"
-        << "\"";
-
-    std::vector<uint8_t> result = runCommandGetOutput(cmd.str());
-    unlink(tmpfile.c_str());
-    return result;
-  }
-
-  // Use Python zstandard to decompress data
   // Uses stream_reader for frames without content size in header
-  std::vector<uint8_t> pythonZstdDecompress(const std::vector<uint8_t> & data) {
-    if (!has_python_zstd_ || data.empty()) {
-      return {};
-    }
-
-    std::string tmpfile = writeTempFile(data, ".zst");
-    if (tmpfile.empty()) {
-      return {};
-    }
-
-    std::string escaped_path = tmpfile;
-#ifdef _WIN32
-    for (char & c : escaped_path) {
-      if (c == '\\')
-        c = '/';
-    }
-#endif
-    // Use stream_reader to handle frames without content size
-    std::stringstream cmd;
-    cmd << getPythonCommand() << " -c \""
-        << "import zstandard,sys,io;"
-        << "dctx = zstandard.ZstdDecompressor();"
-        << "data = open('" << escaped_path << "', 'rb').read();"
-        << "reader = dctx.stream_reader(io.BytesIO(data));"
-        << "sys.stdout.buffer.write(reader.read());"
-        << "\"";
-
-    std::vector<uint8_t> result = runCommandGetOutput(cmd.str());
-    unlink(tmpfile.c_str());
-    return result;
-  }
 
   // Use zstd CLI to compress data
   std::vector<uint8_t> zstdCliCompress(const std::vector<uint8_t> & data) {
@@ -315,7 +232,7 @@ protected:
   }
 
   // Create a raw content dictionary (>= 8 bytes). Same bytes used by our
-  // encoder/decoder and written to a temp file for zstd CLI / Python.
+  // encoder/decoder and written to a temp file for the zstd CLI.
   // Returns (dict_bytes, dict_path). Caller should unlink dict_path when done.
   std::pair<std::vector<uint8_t>, std::string> createDictionaryFromSamples() {
     const size_t raw_dict_size = 8 * 1024;
@@ -330,7 +247,7 @@ protected:
   }
 
   // Create a formatted dictionary using zstd --train so that external encoders
-  // (zstd CLI, Python) write Dictionary_ID and our decoder can match.
+  // (the zstd CLI) writes Dictionary_ID and our decoder can match.
   // Returns (dict_bytes, dict_path). Path empty on failure. Caller unlinks.
   // Requires zstd CLI. Uses --maxdict and -B so small samples suffice.
   std::pair<std::vector<uint8_t>, std::string> createFormattedDictionary() {
@@ -508,78 +425,7 @@ protected:
     return result;
   }
 
-  // Use Python zstandard to compress with dictionary
-  std::vector<uint8_t> pythonZstdCompressWithDict(
-      const std::vector<uint8_t> & data, const std::string & dict_path) {
-    if (!has_python_zstd_ || dict_path.empty()) {
-      return {};
-    }
-    std::string datafile = writeTempFile(data);
-    if (datafile.empty()) {
-      return {};
-    }
-    std::string escaped_data = datafile;
-    std::string escaped_dict = dict_path;
-#ifdef _WIN32
-    for (char & c : escaped_data) {
-      if (c == '\\')
-        c = '/';
-    }
-    for (char & c : escaped_dict) {
-      if (c == '\\')
-        c = '/';
-    }
-#endif
-    std::stringstream cmd;
-    cmd << getPythonCommand() << " -c \""
-        << "import zstandard,sys;"
-        << "dict_data=zstandard.ZstdCompressionDict(open('" << escaped_dict
-        << "','rb').read());"
-        << "cctx=zstandard.ZstdCompressor(level=3,dict_data=dict_data);"
-        << "data=open('" << escaped_data << "','rb').read();"
-        << "sys.stdout.buffer.write(cctx.compress(data));"
-        << "\"";
-    std::vector<uint8_t> result = runCommandGetOutput(cmd.str());
-    unlink(datafile.c_str());
-    return result;
-  }
 
-  // Use Python zstandard to decompress with dictionary
-  std::vector<uint8_t> pythonZstdDecompressWithDict(
-      const std::vector<uint8_t> & data, const std::string & dict_path) {
-    if (!has_python_zstd_ || data.empty() || dict_path.empty()) {
-      return {};
-    }
-    std::string tmpfile = writeTempFile(data, ".zst");
-    if (tmpfile.empty()) {
-      return {};
-    }
-    std::string escaped_tmp = tmpfile;
-    std::string escaped_dict = dict_path;
-#ifdef _WIN32
-    for (char & c : escaped_tmp) {
-      if (c == '\\')
-        c = '/';
-    }
-    for (char & c : escaped_dict) {
-      if (c == '\\')
-        c = '/';
-    }
-#endif
-    std::stringstream cmd;
-    cmd << getPythonCommand() << " -c \""
-        << "import zstandard,sys,io;"
-        << "dict_data=zstandard.ZstdCompressionDict(open('" << escaped_dict
-        << "','rb').read());"
-        << "dctx=zstandard.ZstdDecompressor(dict_data=dict_data);"
-        << "data=open('" << escaped_tmp << "','rb').read();"
-        << "reader=dctx.stream_reader(io.BytesIO(data));"
-        << "sys.stdout.buffer.write(reader.read());"
-        << "\"";
-    std::vector<uint8_t> result = runCommandGetOutput(cmd.str());
-    unlink(tmpfile.c_str());
-    return result;
-  }
 
   // Compress with our library
   std::vector<uint8_t> gcompCompress(
@@ -684,140 +530,8 @@ protected:
   }
 
   gcomp_registry_t * registry_ = nullptr;
-  bool has_python_zstd_ = false;
   bool has_zstd_cli_ = false;
 };
-
-//
-// Tests: Our encoder, Python decoder
-//
-
-TEST_F(ZstdOracleTest, OurEncoder_PythonDecoder_TextData) {
-  if (!has_python_zstd_) {
-    GTEST_SKIP() << "Python zstandard not available";
-  }
-
-  std::vector<uint8_t> original = generateTextData(10 * 1024);
-  std::vector<uint8_t> compressed = gcompCompress(original);
-  ASSERT_FALSE(compressed.empty()) << "Compression failed";
-
-  std::vector<uint8_t> decompressed = pythonZstdDecompress(compressed);
-  ASSERT_EQ(decompressed.size(), original.size()) << "Size mismatch";
-  ASSERT_EQ(memcmp(decompressed.data(), original.data(), original.size()), 0)
-      << "Data mismatch";
-
-  if (isVerbose()) {
-    std::cout << "Text data: " << original.size() << " -> " << compressed.size()
-              << " bytes (" << (100 * compressed.size() / original.size())
-              << "%)" << std::endl;
-  }
-}
-
-TEST_F(ZstdOracleTest, OurEncoder_PythonDecoder_RandomData) {
-  if (!has_python_zstd_) {
-    GTEST_SKIP() << "Python zstandard not available";
-  }
-
-  std::vector<uint8_t> original = generateRandomData(10 * 1024);
-  std::vector<uint8_t> compressed = gcompCompress(original);
-  ASSERT_FALSE(compressed.empty()) << "Compression failed";
-
-  std::vector<uint8_t> decompressed = pythonZstdDecompress(compressed);
-  ASSERT_EQ(decompressed.size(), original.size()) << "Size mismatch";
-  ASSERT_EQ(memcmp(decompressed.data(), original.data(), original.size()), 0)
-      << "Data mismatch";
-}
-
-TEST_F(ZstdOracleTest, OurEncoder_PythonDecoder_RepeatedPattern) {
-  if (!has_python_zstd_) {
-    GTEST_SKIP() << "Python zstandard not available";
-  }
-
-  std::vector<uint8_t> original = generateRepeatedPattern(10 * 1024);
-  std::vector<uint8_t> compressed = gcompCompress(original);
-  ASSERT_FALSE(compressed.empty()) << "Compression failed";
-
-  std::vector<uint8_t> decompressed = pythonZstdDecompress(compressed);
-  ASSERT_EQ(decompressed.size(), original.size()) << "Size mismatch";
-  ASSERT_EQ(memcmp(decompressed.data(), original.data(), original.size()), 0)
-      << "Data mismatch";
-
-  if (isVerbose()) {
-    std::cout << "Repeated pattern: " << original.size() << " -> "
-              << compressed.size() << " bytes ("
-              << (100 * compressed.size() / original.size()) << "%)"
-              << std::endl;
-  }
-}
-
-TEST_F(ZstdOracleTest, OurEncoder_PythonDecoder_WithChecksum) {
-  if (!has_python_zstd_) {
-    GTEST_SKIP() << "Python zstandard not available";
-  }
-
-  std::vector<uint8_t> original = generateTextData(4 * 1024);
-  std::vector<uint8_t> compressed =
-      gcompCompress(original, true /* content_checksum */);
-  ASSERT_FALSE(compressed.empty()) << "Compression failed";
-
-  std::vector<uint8_t> decompressed = pythonZstdDecompress(compressed);
-  ASSERT_EQ(decompressed.size(), original.size()) << "Size mismatch";
-  ASSERT_EQ(memcmp(decompressed.data(), original.data(), original.size()), 0)
-      << "Data mismatch";
-}
-
-//
-// Tests: Python encoder, Our decoder
-//
-
-TEST_F(ZstdOracleTest, PythonEncoder_OurDecoder_TextData) {
-  if (!has_python_zstd_) {
-    GTEST_SKIP() << "Python zstandard not available";
-  }
-
-  std::vector<uint8_t> original = generateTextData(10 * 1024);
-  std::vector<uint8_t> compressed = pythonZstdCompress(original);
-  ASSERT_FALSE(compressed.empty()) << "Python compression failed";
-
-  std::vector<uint8_t> decompressed =
-      gcompDecompress(compressed, original.size());
-  ASSERT_EQ(decompressed.size(), original.size()) << "Size mismatch";
-  ASSERT_EQ(memcmp(decompressed.data(), original.data(), original.size()), 0)
-      << "Data mismatch";
-}
-
-TEST_F(ZstdOracleTest, PythonEncoder_OurDecoder_RandomData) {
-  if (!has_python_zstd_) {
-    GTEST_SKIP() << "Python zstandard not available";
-  }
-
-  std::vector<uint8_t> original = generateRandomData(10 * 1024);
-  std::vector<uint8_t> compressed = pythonZstdCompress(original);
-  ASSERT_FALSE(compressed.empty()) << "Python compression failed";
-
-  std::vector<uint8_t> decompressed =
-      gcompDecompress(compressed, original.size());
-  ASSERT_EQ(decompressed.size(), original.size()) << "Size mismatch";
-  ASSERT_EQ(memcmp(decompressed.data(), original.data(), original.size()), 0)
-      << "Data mismatch";
-}
-
-TEST_F(ZstdOracleTest, PythonEncoder_OurDecoder_WithChecksum) {
-  if (!has_python_zstd_) {
-    GTEST_SKIP() << "Python zstandard not available";
-  }
-
-  std::vector<uint8_t> original = generateTextData(4 * 1024);
-  std::vector<uint8_t> compressed =
-      pythonZstdCompress(original, true /* content_checksum */);
-  ASSERT_FALSE(compressed.empty()) << "Python compression failed";
-
-  std::vector<uint8_t> decompressed =
-      gcompDecompress(compressed, original.size());
-  ASSERT_EQ(decompressed.size(), original.size()) << "Size mismatch";
-  ASSERT_EQ(memcmp(decompressed.data(), original.data(), original.size()), 0)
-      << "Data mismatch";
-}
 
 //
 // Tests: zstd CLI interop
@@ -858,135 +572,13 @@ TEST_F(ZstdOracleTest, ZstdCli_OurDecoder_TextData) {
 // Tests: Empty and edge cases
 //
 
-TEST_F(ZstdOracleTest, OurEncoder_PythonDecoder_Empty) {
-  if (!has_python_zstd_) {
-    GTEST_SKIP() << "Python zstandard not available";
-  }
-
-  std::vector<uint8_t> original;
-  std::vector<uint8_t> compressed = gcompCompress(original);
-  ASSERT_FALSE(compressed.empty()) << "Compression failed";
-
-  std::vector<uint8_t> decompressed = pythonZstdDecompress(compressed);
-  ASSERT_EQ(decompressed.size(), 0) << "Expected empty output";
-}
-
-TEST_F(ZstdOracleTest, PythonEncoder_OurDecoder_Empty) {
-  if (!has_python_zstd_) {
-    GTEST_SKIP() << "Python zstandard not available";
-  }
-
-  std::vector<uint8_t> original;
-  std::vector<uint8_t> compressed = pythonZstdCompress(original);
-  ASSERT_FALSE(compressed.empty()) << "Python compression failed";
-
-  std::vector<uint8_t> decompressed = gcompDecompress(compressed, 0);
-  ASSERT_EQ(decompressed.size(), 0) << "Expected empty output";
-}
-
-TEST_F(ZstdOracleTest, OurEncoder_PythonDecoder_SingleByte) {
-  if (!has_python_zstd_) {
-    GTEST_SKIP() << "Python zstandard not available";
-  }
-
-  std::vector<uint8_t> original = {0x42};
-  std::vector<uint8_t> compressed = gcompCompress(original);
-  ASSERT_FALSE(compressed.empty()) << "Compression failed";
-
-  std::vector<uint8_t> decompressed = pythonZstdDecompress(compressed);
-  ASSERT_EQ(decompressed.size(), original.size()) << "Size mismatch";
-  ASSERT_EQ(decompressed[0], original[0]) << "Data mismatch";
-}
-
 //
 // Tests: Various sizes
 //
 
-TEST_F(ZstdOracleTest, OurEncoder_PythonDecoder_VariousSizes) {
-  if (!has_python_zstd_) {
-    GTEST_SKIP() << "Python zstandard not available";
-  }
-
-  std::vector<size_t> sizes = {1, 10, 100, 1000, 10000, 65535, 65536, 100000};
-
-  for (size_t size : sizes) {
-    std::vector<uint8_t> original = generateTextData(size);
-    std::vector<uint8_t> compressed = gcompCompress(original);
-    ASSERT_FALSE(compressed.empty()) << "Compression failed for size " << size;
-
-    std::vector<uint8_t> decompressed = pythonZstdDecompress(compressed);
-    ASSERT_EQ(decompressed.size(), original.size())
-        << "Size mismatch for size " << size;
-    ASSERT_EQ(memcmp(decompressed.data(), original.data(), original.size()), 0)
-        << "Data mismatch for size " << size;
-  }
-}
-
-TEST_F(ZstdOracleTest, PythonEncoder_OurDecoder_VariousSizes) {
-  if (!has_python_zstd_) {
-    GTEST_SKIP() << "Python zstandard not available";
-  }
-
-  std::vector<size_t> sizes = {1, 10, 100, 1000, 10000, 65535, 65536, 100000};
-
-  for (size_t size : sizes) {
-    std::vector<uint8_t> original = generateTextData(size);
-    std::vector<uint8_t> compressed = pythonZstdCompress(original);
-    ASSERT_FALSE(compressed.empty())
-        << "Python compression failed for size " << size;
-
-    std::vector<uint8_t> decompressed =
-        gcompDecompress(compressed, original.size());
-    ASSERT_EQ(decompressed.size(), original.size())
-        << "Size mismatch for size " << size;
-    ASSERT_EQ(memcmp(decompressed.data(), original.data(), original.size()), 0)
-        << "Data mismatch for size " << size;
-  }
-}
-
 //
 // Tests: Large data
 //
-
-TEST_F(ZstdOracleTest, OurEncoder_PythonDecoder_LargeData) {
-  if (!has_python_zstd_) {
-    GTEST_SKIP() << "Python zstandard not available";
-  }
-
-  // 500KB of data
-  std::vector<uint8_t> original = generateTextData(500 * 1024);
-  std::vector<uint8_t> compressed = gcompCompress(original);
-  ASSERT_FALSE(compressed.empty()) << "Compression failed";
-
-  std::vector<uint8_t> decompressed = pythonZstdDecompress(compressed);
-  ASSERT_EQ(decompressed.size(), original.size()) << "Size mismatch";
-  ASSERT_EQ(memcmp(decompressed.data(), original.data(), original.size()), 0)
-      << "Data mismatch";
-
-  if (isVerbose()) {
-    std::cout << "Large data: " << original.size() << " -> "
-              << compressed.size() << " bytes ("
-              << (100 * compressed.size() / original.size()) << "%)"
-              << std::endl;
-  }
-}
-
-TEST_F(ZstdOracleTest, PythonEncoder_OurDecoder_LargeData) {
-  if (!has_python_zstd_) {
-    GTEST_SKIP() << "Python zstandard not available";
-  }
-
-  // 500KB of data
-  std::vector<uint8_t> original = generateTextData(500 * 1024);
-  std::vector<uint8_t> compressed = pythonZstdCompress(original);
-  ASSERT_FALSE(compressed.empty()) << "Python compression failed";
-
-  std::vector<uint8_t> decompressed =
-      gcompDecompress(compressed, original.size());
-  ASSERT_EQ(decompressed.size(), original.size()) << "Size mismatch";
-  ASSERT_EQ(memcmp(decompressed.data(), original.data(), original.size()), 0)
-      << "Data mismatch";
-}
 
 //
 // Tests: Dictionary compression (oracle)
@@ -1040,56 +632,6 @@ TEST_F(ZstdOracleTest, ZstdCli_OurDecoder_WithDictionary) {
 
   unlink(dict_path.c_str());
 }
-
-TEST_F(ZstdOracleTest, OurEncoder_PythonDecoder_WithDictionary) {
-  if (!has_python_zstd_) {
-    GTEST_SKIP() << "Python zstandard not available";
-  }
-
-  auto [dict_bytes, dict_path] = createDictionaryFromSamples();
-  if (dict_bytes.empty() || dict_path.empty()) {
-    GTEST_SKIP() << "Could not create dictionary";
-  }
-
-  std::vector<uint8_t> original = generateTextData(4 * 1024);
-  std::vector<uint8_t> compressed =
-      gcompCompressWithDict(original, &dict_bytes);
-  ASSERT_FALSE(compressed.empty()) << "Our compression with dict failed";
-
-  std::vector<uint8_t> decompressed =
-      pythonZstdDecompressWithDict(compressed, dict_path);
-  ASSERT_EQ(decompressed.size(), original.size()) << "Size mismatch";
-  ASSERT_EQ(memcmp(decompressed.data(), original.data(), original.size()), 0)
-      << "Data mismatch";
-
-  unlink(dict_path.c_str());
-}
-
-TEST_F(ZstdOracleTest, PythonEncoder_OurDecoder_WithDictionary) {
-  if (!has_python_zstd_) {
-    GTEST_SKIP() << "Python zstandard not available";
-  }
-
-  auto [dict_bytes, dict_path] = createDictionaryFromSamples();
-  if (dict_bytes.empty() || dict_path.empty()) {
-    GTEST_SKIP() << "Could not create dictionary";
-  }
-
-  std::vector<uint8_t> original = generateTextData(4 * 1024);
-  std::vector<uint8_t> compressed =
-      pythonZstdCompressWithDict(original, dict_path);
-  ASSERT_FALSE(compressed.empty()) << "Python compression with dict failed";
-
-  std::vector<uint8_t> decompressed =
-      gcompDecompressWithDict(compressed, &dict_bytes, original.size());
-  ASSERT_FALSE(decompressed.empty()) << "Our decoder failed to decode";
-  ASSERT_EQ(decompressed.size(), original.size()) << "Size mismatch";
-  ASSERT_EQ(memcmp(decompressed.data(), original.data(), original.size()), 0)
-      << "Data mismatch";
-
-  unlink(dict_path.c_str());
-}
-
 
 //
 // Tests: paths that only a real zstd stream reaches
@@ -1247,11 +789,10 @@ TEST_F(ZstdOracleTest, OracleIsActuallyAvailable) {
   // A skipped oracle test and an absent one look identical in the summary
   // line.  If no oracle at all can run, say so as a failure rather than
   // reporting a green suite that checked nothing against a reference.
-  ASSERT_TRUE(has_zstd_cli_ || has_python_zstd_)
-      << "No zstd oracle is available: neither the zstd CLI nor the Python "
-         "zstandard module was found, so nothing in this file compares our "
-         "output against a reference implementation. Install either one, or "
-         "set GCOMP_SKIP_ORACLE_TESTS=1 to state that the gap is intentional.";
+  ASSERT_TRUE(has_zstd_cli_)
+      << "The zstd CLI was not found, so nothing in this file compares our "
+         "output against a reference implementation. Install it, or set "
+         "GCOMP_SKIP_ORACLE_TESTS=1 to say the gap is intentional.";
 }
 
 TEST_F(ZstdOracleTest, ZstdCli_OurDecoder_HuffmanCodedLiterals) {
@@ -1427,6 +968,58 @@ TEST_F(ZstdOracleTest, OurEncoder_ZstdCli_AcrossShapes) {
     ASSERT_EQ(out.size(), c.data.size())
         << c.name << ": the reference CLI could not read our frame";
     ASSERT_EQ(memcmp(out.data(), c.data.data(), c.data.size()), 0) << c.name;
+  }
+}
+
+
+TEST_F(ZstdOracleTest, OurEncoder_ZstdCli_EveryShortLength) {
+  if (!has_zstd_cli_) {
+    GTEST_SKIP() << "zstd CLI not available";
+  }
+
+  // Empty, single bytes, and the sizes around the frame header's content-size
+  // field widths.  Short inputs were the only ground the Python-module tests
+  // covered that nothing else did, so it moved here when those were removed.
+  std::vector<size_t> lengths;
+  for (size_t n = 0; n <= 40; n++) {
+    lengths.push_back(n);
+  }
+  for (size_t n : {size_t(254), size_t(255), size_t(256), size_t(257),
+           size_t(65534), size_t(65535), size_t(65536), size_t(65537)}) {
+    lengths.push_back(n);
+  }
+
+  for (size_t n : lengths) {
+    std::vector<uint8_t> original = generateProseLikeData(n, (unsigned)n + 1u);
+    ASSERT_EQ(original.size(), n);
+
+    std::vector<uint8_t> compressed = gcompCompress(original);
+    ASSERT_FALSE(compressed.empty()) << "n=" << n;
+
+    std::vector<uint8_t> out = zstdCliDecompress(compressed);
+    ASSERT_EQ(out.size(), n)
+        << "n=" << n << ": the zstd CLI could not read our frame";
+    if (n) {
+      ASSERT_EQ(memcmp(out.data(), original.data(), n), 0) << "n=" << n;
+    }
+  }
+}
+
+TEST_F(ZstdOracleTest, ZstdCli_OurDecoder_EveryShortLength) {
+  if (!has_zstd_cli_) {
+    GTEST_SKIP() << "zstd CLI not available";
+  }
+
+  for (size_t n = 0; n <= 40; n++) {
+    std::vector<uint8_t> original = generateProseLikeData(n, (unsigned)n + 7u);
+    std::vector<uint8_t> compressed = zstdCliCompressWith(original, "-3");
+    ASSERT_FALSE(compressed.empty()) << "n=" << n;
+
+    std::vector<uint8_t> out = gcompDecompress(compressed, n);
+    ASSERT_EQ(out.size(), n) << "n=" << n;
+    if (n) {
+      ASSERT_EQ(memcmp(out.data(), original.data(), n), 0) << "n=" << n;
+    }
   }
 }
 
