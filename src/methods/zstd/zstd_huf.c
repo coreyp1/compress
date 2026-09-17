@@ -95,6 +95,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <ghoti.io/compress/macros.h>
+#include "../../core/huffman_lengths.h"
 #include "zstd_internal.h"
 #include <string.h>
 
@@ -847,17 +848,14 @@ gcomp_status_t zstd_huf_decode_4streams(const zstd_huf_entry_t * table,
 // 1. COUNT FREQUENCIES
 //    Count occurrences of each byte value (0-255) in the literals.
 //
-// 2. BUILD HUFFMAN TREE
-//    Use the classic two-queue algorithm:
-//    - Create leaf node for each symbol with non-zero frequency
-//    - Sort leaves by frequency (ascending)
-//    - Repeatedly merge two lowest-frequency nodes into internal node
-//    - Tree depth at each leaf = code length for that symbol
-//
-// 3. LIMIT CODE LENGTHS
-//    Zstd limits Huffman codes to 11 bits maximum. If the tree produces
-//    longer codes (highly skewed distributions), redistribute bit lengths
-//    to stay within the limit while maintaining decodability.
+// 2. BUILD CODE LENGTHS UNDER THE 11-BIT CAP
+//    Zstd limits Huffman codes to 11 bits (RFC 8878 section 4.2.1), and a
+//    skewed distribution wants longer ones.  The cap and the code are solved
+//    together by the shared package-merge builder in
+//    src/core/huffman_lengths.c, so there is no separate redistribution step:
+//    redistributing after the fact is what this used to do, and it lengthened
+//    the shortest code in the block -- the most frequent symbol -- which is
+//    the most expensive symbol to lengthen.
 //
 // 4. GENERATE CANONICAL CODES
 //    Sort symbols by (bit_length, symbol_value), then assign codes
@@ -887,242 +885,6 @@ gcomp_status_t zstd_huf_decode_4streams(const zstd_huf_entry_t * table,
 //   Output: Reversed bytes with marker at end
 //
 //============================================================================
-
-//
-// Huffman Tree Node (for building)
-//
-
-typedef struct {
-  uint32_t freq;   ///< Symbol frequency
-  int16_t parent;  ///< Parent node index (-1 if root)
-  int16_t left;    ///< Left child (-1 if leaf)
-  int16_t right;   ///< Right child (-1 if leaf)
-  uint16_t symbol; ///< Symbol value (for leaves)
-  uint8_t depth;   ///< Depth in tree (= code length)
-} zstd_huf_node_t;
-
-/**
- * @brief Build Huffman tree using standard algorithm.
- *
- * Creates a binary tree where more frequent symbols have shorter paths.
- *
- * @param freq Symbol frequencies (256 entries)
- * @param nodes Node array (must have space for 511 nodes: 256 leaves + 255
- * internal)
- * @param num_symbols_out Output: number of symbols with non-zero frequency
- * @param root_out Output: index of root node
- * @return GCOMP_OK on success
- */
-static gcomp_status_t zstd_huf_build_tree(const uint32_t * freq,
-    zstd_huf_node_t * nodes, unsigned * num_symbols_out, int * root_out) {
-  // Initialize leaf nodes for symbols with non-zero frequency
-  unsigned num_leaves = 0;
-  for (unsigned i = 0; i < 256; i++) {
-    if (freq[i] > 0) {
-      nodes[num_leaves].freq = freq[i];
-      nodes[num_leaves].symbol = (uint16_t)i;
-      nodes[num_leaves].parent = -1;
-      nodes[num_leaves].left = -1;
-      nodes[num_leaves].right = -1;
-      nodes[num_leaves].depth = 0;
-      num_leaves++;
-    }
-  }
-
-  if (num_leaves == 0) {
-    *num_symbols_out = 0;
-    *root_out = -1;
-    return GCOMP_OK;
-  }
-
-  if (num_leaves == 1) {
-    // Single symbol: give it depth 1
-    nodes[0].depth = 1;
-    *num_symbols_out = 1;
-    *root_out = 0;
-    return GCOMP_OK;
-  }
-
-  *num_symbols_out = num_leaves;
-
-  // Sort leaves by frequency (simple insertion sort - fine for 256 elements)
-  for (unsigned i = 1; i < num_leaves; i++) {
-    zstd_huf_node_t temp = nodes[i];
-    unsigned j = i;
-    while (j > 0 && nodes[j - 1].freq > temp.freq) {
-      nodes[j] = nodes[j - 1];
-      j--;
-    }
-    nodes[j] = temp;
-  }
-
-  // Build tree using two-queue algorithm
-  // Queue 1: sorted leaves (front at index q1_front)
-  // Queue 2: internal nodes (at indices num_leaves and beyond)
-  unsigned q1_front = 0;
-  unsigned q2_front = num_leaves;
-  unsigned q2_back = num_leaves;
-
-  // Build internal nodes.  The loop must run until a single node is left
-  // across both queues, so the termination test counts the leaves still
-  // queued -- not merely whether the leaf queue is non-empty.  Collapsing
-  // that queue to "1" made the condition false on the very first test for
-  // every input with two or more distinct symbols, so no internal node was
-  // ever created, every leaf kept depth 0, and zstd_huf_build_enc_table
-  // returned a table whose entries all had nb_bits == 0.  Both Huffman
-  // stream encoders reject such a table (RFC 8878 section 4.2.2 requires a
-  // code for every literal present), so zstd_literals_encode_compressed
-  // silently fell back to raw literals on every block.
-  while ((num_leaves - q1_front) + (q2_back - q2_front) > 1) {
-    // Get first minimum node
-    int left;
-    if (q1_front < num_leaves &&
-        (q2_front >= q2_back || nodes[q1_front].freq <= nodes[q2_front].freq)) {
-      left = (int)q1_front++;
-    }
-    else {
-      left = (int)q2_front++;
-    }
-
-    // Get second minimum node
-    int right;
-    if (q1_front < num_leaves &&
-        (q2_front >= q2_back || nodes[q1_front].freq <= nodes[q2_front].freq)) {
-      right = (int)q1_front++;
-    }
-    else {
-      right = (int)q2_front++;
-    }
-
-    // Create internal node
-    nodes[q2_back].freq = nodes[left].freq + nodes[right].freq;
-    nodes[q2_back].left = (int16_t)left;
-    nodes[q2_back].right = (int16_t)right;
-    nodes[q2_back].parent = -1;
-    nodes[q2_back].symbol = 0xFFFF; // Internal node marker
-    nodes[q2_back].depth = 0;
-
-    nodes[left].parent = (int16_t)q2_back;
-    nodes[right].parent = (int16_t)q2_back;
-
-    q2_back++;
-  }
-
-  // Root is the last internal node (or the single remaining node)
-  int root;
-  if (q1_front < num_leaves) {
-    root = (int)q1_front;
-  }
-  else {
-    root = (int)q2_front;
-  }
-
-  // Calculate depths using BFS from root
-  nodes[root].depth = 0;
-
-  // Process nodes in reverse order (parents before children in q2)
-  for (int i = (int)q2_back - 1; i >= (int)num_leaves; i--) {
-    uint8_t parent_depth = nodes[i].depth;
-    if (nodes[i].left >= 0) {
-      nodes[nodes[i].left].depth = parent_depth + 1;
-    }
-    if (nodes[i].right >= 0) {
-      nodes[nodes[i].right].depth = parent_depth + 1;
-    }
-  }
-
-  *root_out = root;
-  return GCOMP_OK;
-}
-
-/**
- * @brief Limit code lengths to maximum allowed (11 bits for zstd).
- *
- * Uses the package-merge algorithm concept to redistribute bit lengths.
- *
- * @param depths Array of code lengths for each symbol (modified in place)
- * @param freq Original frequencies
- * @param num_symbols Number of symbols
- * @param max_bits Maximum allowed code length
- */
-static void zstd_huf_limit_depths(uint8_t * depths, const uint32_t * freq,
-    unsigned num_symbols, unsigned max_bits) {
-  // Check if any depth exceeds max
-  bool need_limit = false;
-  for (unsigned i = 0; i < num_symbols; i++) {
-    if (depths[i] > max_bits) {
-      need_limit = true;
-      break;
-    }
-  }
-
-  if (!need_limit) {
-    return;
-  }
-
-  // Simple approach: cap depths and redistribute
-  // This isn't optimal but produces valid codes
-  uint32_t total = 0;
-  for (unsigned i = 0; i < num_symbols; i++) {
-    if (depths[i] > max_bits) {
-      depths[i] = (uint8_t)max_bits;
-    }
-    total += 1U << (max_bits - depths[i]);
-  }
-
-  // If total > 2^max_bits, we need to increase some depths
-  uint32_t max_total = 1U << max_bits;
-  while (total > max_total) {
-    // Find symbol with smallest depth and increase it
-    unsigned min_idx = 0;
-    uint8_t min_depth = depths[0];
-    for (unsigned i = 1; i < num_symbols; i++) {
-      if (depths[i] < min_depth) {
-        min_depth = depths[i];
-        min_idx = i;
-      }
-    }
-
-    if (min_depth >= max_bits) {
-      break; // Can't increase further
-    }
-
-    total -= 1U << (max_bits - depths[min_idx]);
-    depths[min_idx]++;
-    total += 1U << (max_bits - depths[min_idx]);
-  }
-
-  // If total < 2^max_bits, decrease some depths (make codes shorter)
-  // This redistributes unused code space
-  while (total < max_total) {
-    // Find symbol with largest depth (shortest code = biggest contribution)
-    unsigned max_idx = 0;
-    uint8_t max_depth = 0;
-    for (unsigned i = 0; i < num_symbols; i++) {
-      if (depths[i] > max_depth) {
-        max_depth = depths[i];
-        max_idx = i;
-      }
-    }
-
-    if (max_depth <= 1) {
-      break;
-    }
-
-    // Check if we can decrease this depth
-    uint32_t gain = 1U << (max_bits - max_depth + 1);
-    uint32_t loss = 1U << (max_bits - max_depth);
-    if (total - loss + gain <= max_total) {
-      total = total - loss + gain;
-      depths[max_idx]--;
-    }
-    else {
-      break;
-    }
-  }
-
-  (void)freq; // freq could be used for better redistribution
-}
 
 /**
  * @brief Generate canonical Huffman codes from sorted symbols and depths.
@@ -1216,7 +978,7 @@ static void zstd_huf_generate_codes(const uint16_t * symbols,
   }
 }
 
-gcomp_status_t zstd_huf_build_enc_table(
+gcomp_status_t zstd_huf_build_enc_table(const gcomp_allocator_t * alloc,
     const uint32_t * freq, zstd_huf_enc_table_t * table) {
   if (!freq || !table) {
     return GCOMP_ERR_INVALID_ARG;
@@ -1225,14 +987,24 @@ gcomp_status_t zstd_huf_build_enc_table(
   // Clear table
   memset(table, 0, sizeof(*table));
 
-  // Build Huffman tree
-  zstd_huf_node_t nodes[511]; // 256 leaves + 255 internal nodes max
-  unsigned num_symbols;
-  int root;
-
-  gcomp_status_t status = zstd_huf_build_tree(freq, nodes, &num_symbols, &root);
+  // The 11-bit cap of RFC 8878 section 4.2.1 is solved together with the
+  // code, not applied to it afterwards.  See src/core/huffman_lengths.c.
+  uint8_t lengths[256];
+  gcomp_status_t status =
+      gcomp_huffman_code_lengths(alloc, freq, 256, HUF_MAX_BITS, lengths);
   if (status != GCOMP_OK) {
     return status;
+  }
+
+  uint16_t symbols[256];
+  uint8_t depths[256];
+  unsigned num_symbols = 0;
+  for (unsigned i = 0; i < 256; i++) {
+    if (lengths[i] > 0) {
+      symbols[num_symbols] = (uint16_t)i;
+      depths[num_symbols] = lengths[i];
+      num_symbols++;
+    }
   }
 
   if (num_symbols == 0) {
@@ -1240,23 +1012,6 @@ gcomp_status_t zstd_huf_build_enc_table(
     table->num_symbols = 0;
     return GCOMP_OK;
   }
-
-  // Extract depths and symbols from tree
-  uint16_t symbols[256];
-  uint8_t depths[256];
-
-  unsigned sym_idx = 0;
-  for (unsigned i = 0; i < num_symbols; i++) {
-    if (nodes[i].symbol < 256) { // Leaf node
-      symbols[sym_idx] = nodes[i].symbol;
-      depths[sym_idx] = nodes[i].depth;
-      sym_idx++;
-    }
-  }
-  num_symbols = sym_idx;
-
-  // Limit depths to 11 bits (zstd maximum)
-  zstd_huf_limit_depths(depths, freq, num_symbols, HUF_MAX_BITS);
 
   // Sort symbols by (depth, symbol) for canonical code generation
   for (unsigned i = 1; i < num_symbols; i++) {

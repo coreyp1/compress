@@ -934,3 +934,187 @@ int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
+
+//
+// Huffman code lengths under the 11-bit cap
+//
+// RFC 8878 section 4.2.1 caps a literal code word at 11 bits.  The encoder
+// used to reach that cap by clamping a plain Huffman code and then
+// lengthening the *shortest* code in the block until the code space fit --
+// that is, spending bits on the most frequent symbol in the block, the single
+// most expensive place to spend them.  These tests state what the cap is for:
+// the code still has to be the cheapest one that fits under it.
+//
+
+namespace {
+
+// Decode the table description of the first Huffman-coded literals section in
+// a frame into one bit length per symbol.  Only the direct 4-bit weight form
+// is read here (RFC 8878 4.2.1.1); the tests below stay under 128 symbols so
+// that is the form the encoder writes.
+bool FirstLiteralCodeLengths(
+    const std::vector<uint8_t> & f, std::vector<uint8_t> & lengths_out) {
+  if (f.size() < 6 || f[0] != 0x28 || f[1] != 0xB5 || f[2] != 0x2F ||
+      f[3] != 0xFD) {
+    return false;
+  }
+  size_t p = 4;
+  uint8_t fhd = f[p++];
+  unsigned fcs_flag = fhd >> 6;
+  bool single = ((fhd >> 5) & 1) != 0;
+  unsigned did = fhd & 3;
+  if (!single) {
+    p += 1;
+  }
+  static const unsigned kDid[4] = {0, 1, 2, 4};
+  p += kDid[did];
+  p += (fcs_flag == 0) ? (single ? 1u : 0u)
+                       : (fcs_flag == 1 ? 2u : (fcs_flag == 2 ? 4u : 8u));
+
+  for (;;) {
+    if (p + 3 > f.size()) {
+      return false;
+    }
+    uint32_t h = (uint32_t)f[p] | ((uint32_t)f[p + 1] << 8) |
+        ((uint32_t)f[p + 2] << 16);
+    p += 3;
+    bool last = (h & 1) != 0;
+    unsigned type = (h >> 1) & 3;
+    size_t size = h >> 3;
+    if (type == 3) {
+      return false;
+    }
+    if (type == 2 && p < f.size() && (f[p] & 3) == 2) {
+      const uint8_t * lit = f.data() + p;
+      unsigned size_format = (unsigned)((lit[0] >> 2) & 3);
+      size_t header_bytes = (size_format < 2) ? 3 : (size_format == 2 ? 4 : 5);
+      if (p + header_bytes + 1 > f.size()) {
+        return false;
+      }
+      const uint8_t * weights = lit + header_bytes;
+      unsigned first = weights[0];
+      if (first < 128) {
+        return false; // FSE-compressed weights; this reader handles the
+                      // direct form only, whose header byte is
+                      // 127 + Number_Of_Symbols
+      }
+      unsigned num_weights = first - 127;
+      std::vector<uint8_t> w(num_weights + 1, 0);
+      for (unsigned i = 0; i < num_weights; i++) {
+        uint8_t byte = weights[1 + i / 2];
+        w[i] = (i % 2 == 0) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xF);
+      }
+      // The final symbol's weight is not transmitted: it is whatever makes
+      // the code space come out a power of two (RFC 8878 4.2.1.1).
+      uint32_t total = 0;
+      for (unsigned i = 0; i < num_weights; i++) {
+        if (w[i] > 0) {
+          total += 1u << (w[i] - 1);
+        }
+      }
+      if (total == 0) {
+        return false;
+      }
+      unsigned high = 0;
+      while ((total >> (high + 1)) != 0) {
+        high++;
+      }
+      unsigned table_log = high + 1;
+      uint32_t rest = (1u << table_log) - total;
+      unsigned rest_high = 0;
+      while ((rest >> (rest_high + 1)) != 0) {
+        rest_high++;
+      }
+      w[num_weights] = (uint8_t)(rest_high + 1);
+
+      lengths_out.assign(num_weights + 1, 0);
+      for (unsigned i = 0; i <= num_weights; i++) {
+        lengths_out[i] = w[i] ? (uint8_t)(table_log + 1 - w[i]) : 0;
+      }
+      return true;
+    }
+    p += (type == 1) ? 1u : size;
+    if (p > f.size()) {
+      return false;
+    }
+    if (last) {
+      return false;
+    }
+  }
+}
+
+} // namespace
+
+TEST_F(ZstdEntropyTest, LiteralCodeWordsNeverExceedElevenBits) {
+  // Frequencies that halve drive a plain Huffman code far past the cap, so
+  // this is the input on which the cap has to be enforced rather than
+  // happened upon.
+  std::vector<uint8_t> data;
+  data.reserve(200 * 1024);
+  uint32_t x = 99991;
+  while (data.size() < 200 * 1024) {
+    x = x * 1103515245u + 12345u;
+    unsigned r = (x >> 12) & 0xFFFFF;
+    unsigned sym = 0;
+    while (sym < 99 && (r & 1)) {
+      sym++;
+      r >>= 1;
+    }
+    data.push_back((uint8_t)sym);
+  }
+  std::vector<uint8_t> packed = compress(data.data(), data.size());
+  ASSERT_FALSE(packed.empty());
+
+  std::vector<uint8_t> lengths;
+  ASSERT_TRUE(FirstLiteralCodeLengths(packed, lengths))
+      << "no Huffman-coded literals section to read";
+
+  unsigned longest = 0;
+  for (uint8_t l : lengths) {
+    EXPECT_LE(l, 11) << "a code word ran past the cap in RFC 8878 4.2.1";
+    if (l > longest) {
+      longest = l;
+    }
+  }
+  ASSERT_GT(longest, 0u);
+  uint32_t kraft = 0;
+  for (uint8_t l : lengths) {
+    if (l > 0) {
+      kraft += 1u << (longest - l);
+    }
+  }
+  // An incomplete code leaves code space the decoder's table build has no
+  // symbol for, so the lengths must spend all of it.
+  EXPECT_EQ(kraft, 1u << longest);
+}
+
+TEST_F(ZstdEntropyTest, SkewedLiteralsBeatTheClampedCode) {
+  // What the cap costs, measured end to end.  The frequencies here are the
+  // ones the old clamp-and-relengthen limiter handled worst; the whole frame
+  // has to come out smaller than the bits that limiter's code would have
+  // spent on the literals alone.
+  std::vector<uint8_t> data;
+  data.reserve(128 * 1024);
+  uint32_t x = 7777;
+  while (data.size() < 128 * 1024) {
+    x = x * 1103515245u + 12345u;
+    unsigned r = (x >> 9) & 0x3FFFF;
+    unsigned sym = 0;
+    while (sym < 60 && (r % 100) < 55) {
+      sym++;
+      r /= 100;
+      if (r == 0) {
+        break;
+      }
+    }
+    data.push_back((uint8_t)sym);
+  }
+  std::vector<uint8_t> packed = compress(data.data(), data.size());
+  ASSERT_FALSE(packed.empty());
+  std::vector<uint8_t> lengths;
+  ASSERT_TRUE(FirstLiteralCodeLengths(packed, lengths));
+  for (uint8_t l : lengths) {
+    EXPECT_LE(l, 11);
+  }
+  EXPECT_LT(packed.size(), data.size());
+}

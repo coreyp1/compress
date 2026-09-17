@@ -792,18 +792,23 @@ typedef struct {
 /**
  * @brief Build Huffman encoding table from symbol frequencies.
  *
- * Builds an optimal Huffman tree from the given frequencies, limits code
- * lengths to 11 bits (Zstd maximum), and generates canonical codes.
+ * Builds the code that encodes these frequencies in the fewest bits of any
+ * code whose longest code word fits Zstandard's 11-bit cap (RFC 8878 section
+ * 4.2.1), and generates the canonical codes for it.  The cap is part of what
+ * the shared builder in src/core/huffman_lengths.c solves, so there is no
+ * separate limiting step here.
  *
  * The resulting table can be used for encoding via zstd_huf_encode_1stream()
  * and the weights can be written via zstd_huf_write_weights().
  *
+ * @param alloc Allocator for scratch memory; NULL uses the default.
  * @param freq Symbol frequency array (256 entries, one per byte value).
  *             Symbols with freq[i] == 0 are not included in the tree.
  * @param table Output: encoding table with codes, weights, and metadata.
- * @return GCOMP_OK on success, GCOMP_ERR_INVALID_ARG if freq or table is NULL.
+ * @return GCOMP_OK on success, GCOMP_ERR_INVALID_ARG if freq or table is NULL,
+ *         GCOMP_ERR_MEMORY if scratch space cannot be allocated.
  */
-gcomp_status_t zstd_huf_build_enc_table(
+gcomp_status_t zstd_huf_build_enc_table(const gcomp_allocator_t * alloc,
     const uint32_t * freq, zstd_huf_enc_table_t * table);
 
 /**
@@ -1031,7 +1036,8 @@ gcomp_status_t zstd_literals_encode_raw(const uint8_t * literals,
  * @param output_len_out Output: bytes written
  * @return GCOMP_OK on success
  */
-gcomp_status_t zstd_literals_encode_compressed(const uint8_t * literals,
+gcomp_status_t zstd_literals_encode_compressed(
+    const gcomp_allocator_t * alloc, const uint8_t * literals,
     size_t literals_size, uint8_t * output, size_t output_cap,
     size_t * output_len_out);
 

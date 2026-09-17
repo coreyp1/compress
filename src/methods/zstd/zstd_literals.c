@@ -537,6 +537,7 @@ gcomp_status_t zstd_literals_encode_raw(const uint8_t * literals,
  * - Huffman weights description
  * - Compressed bitstream
  *
+ * @param alloc Allocator for scratch memory; NULL uses the default
  * @param literals Input literal bytes
  * @param literals_size Number of literals
  * @param output Output buffer
@@ -544,7 +545,8 @@ gcomp_status_t zstd_literals_encode_raw(const uint8_t * literals,
  * @param output_len_out Output: bytes written
  * @return GCOMP_OK on success, error code on failure
  */
-gcomp_status_t zstd_literals_encode_compressed(const uint8_t * literals,
+gcomp_status_t zstd_literals_encode_compressed(
+    const gcomp_allocator_t * alloc, const uint8_t * literals,
     size_t literals_size, uint8_t * output, size_t output_cap,
     size_t * output_len_out) {
   if (!output || !output_len_out) {
@@ -567,7 +569,8 @@ gcomp_status_t zstd_literals_encode_compressed(const uint8_t * literals,
 
   // Build Huffman encoding table
   zstd_huf_enc_table_t huf_table;
-  gcomp_status_t status = zstd_huf_build_enc_table(freq, &huf_table);
+  gcomp_status_t status =
+      zstd_huf_build_enc_table(alloc, freq, &huf_table);
   if (status != GCOMP_OK) {
     // Fall back to raw encoding
     return zstd_literals_encode_raw(
