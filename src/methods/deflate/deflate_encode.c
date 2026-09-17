@@ -176,6 +176,17 @@ typedef struct gcomp_deflate_encoder_state_s {
   int level;
   size_t window_bits;
   size_t window_size;
+  /**
+   * @brief window_size - 1, for wrapping indices into the circular window.
+   *
+   * window_size is always a power of two (it is `1 << window_bits`, and
+   * RFC 1951 section 3.2.1 bounds window_bits to 8..15), so wrapping is a
+   * mask rather than a division.  The compiler cannot make that rewrite on
+   * its own because window_size is a runtime value, so `% window_size` had
+   * been compiling to a 64-bit `div` - including two per byte compared in
+   * the innermost loop of deflate_find_match().
+   */
+  size_t window_mask;
   gcomp_deflate_strategy_t strategy;
 
   //
@@ -333,11 +344,11 @@ static uint32_t deflate_hash_update(uint32_t h, uint8_t b) {
  * Handles wrapping around the end of the circular window buffer.
  */
 static uint32_t deflate_hash_3bytes_wrap(
-    const uint8_t * data, size_t pos, size_t window_size) {
+    const uint8_t * data, size_t pos, size_t window_mask) {
   uint32_t h = 0;
-  h = deflate_hash_update(h, data[pos % window_size]);
-  h = deflate_hash_update(h, data[(pos + 1) % window_size]);
-  h = deflate_hash_update(h, data[(pos + 2) % window_size]);
+  h = deflate_hash_update(h, data[pos & window_mask]);
+  h = deflate_hash_update(h, data[(pos + 1) & window_mask]);
+  h = deflate_hash_update(h, data[(pos + 2) & window_mask]);
   return h;
 }
 
@@ -554,14 +565,14 @@ static deflate_match_t deflate_find_match(gcomp_deflate_encoder_state_t * st,
     return result;
   }
 
-  size_t scan = pos % st->window_size;
+  size_t scan = pos & st->window_mask;
   const uint8_t * data = st->window;
   size_t max_len = st->lookahead;
   if (max_len > DEFLATE_MAX_MATCH_LENGTH) {
     max_len = DEFLATE_MAX_MATCH_LENGTH;
   }
 
-  uint32_t hash = deflate_hash_3bytes_wrap(data, scan, st->window_size);
+  uint32_t hash = deflate_hash_3bytes_wrap(data, scan, st->window_mask);
   uint16_t cur = st->hash_head[hash];
   int chain_count = 0;
 
@@ -616,8 +627,8 @@ static deflate_match_t deflate_find_match(gcomp_deflate_encoder_state_t * st,
     // Check match length
     size_t len = 0;
     while (len < max_len &&
-        data[(scan + len) % st->window_size] ==
-            data[(match_idx + len) % st->window_size]) {
+        data[(scan + len) & st->window_mask] ==
+            data[(match_idx + len) & st->window_mask]) {
       len++;
     }
 
@@ -676,8 +687,8 @@ static void deflate_insert_hash(
     return;
   }
 
-  size_t idx = pos % st->window_size;
-  uint32_t hash = deflate_hash_3bytes_wrap(st->window, idx, st->window_size);
+  size_t idx = pos & st->window_mask;
+  uint32_t hash = deflate_hash_3bytes_wrap(st->window, idx, st->window_mask);
 
   // Proactive invalidation: If this buffer index was previously the head of
   // a different hash chain, clear that chain head to prevent corruption.
@@ -1734,6 +1745,7 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
   }
 
   st->window_size = (size_t)1u << st->window_bits;
+  st->window_mask = st->window_size - 1u;
   st->stage = DEFLATE_ENC_STAGE_INIT;
   st->final_block_written = 0;
 
@@ -2128,7 +2140,7 @@ static gcomp_status_t deflate_encode_batch(
       if (copy > 0) {
         for (size_t i = 0; i < copy; i++) {
           st->window[st->window_pos] = src[input->used + i];
-          st->window_pos = (st->window_pos + 1) % st->window_size;
+          st->window_pos = (st->window_pos + 1) & st->window_mask;
         }
         st->lookahead += copy;
         st->total_in += copy;
@@ -2183,7 +2195,7 @@ static gcomp_status_t deflate_encode_batch(
           // RLE: Only look for matches at distance 1
           if (st->lookahead >= DEFLATE_MIN_MATCH_LENGTH && stream_pos > 0) {
             // Check for run at distance 1
-            size_t prev_pos = (pos + st->window_size - 1) % st->window_size;
+            size_t prev_pos = (pos + st->window_size - 1) & st->window_mask;
             uint8_t run_byte = st->window[prev_pos];
             size_t run_len = 0;
             size_t max_len = st->lookahead;
@@ -2193,7 +2205,7 @@ static gcomp_status_t deflate_encode_batch(
 
             // Count how many bytes match the previous byte
             while (run_len < max_len &&
-                st->window[(pos + run_len) % st->window_size] == run_byte) {
+                st->window[(pos + run_len) & st->window_mask] == run_byte) {
               run_len++;
             }
 
@@ -2213,7 +2225,7 @@ static gcomp_status_t deflate_encode_batch(
               match.length >= DEFLATE_MIN_MATCH_LENGTH && match.length < 32 &&
               st->lookahead > match.length) {
             // Check if the next position has a longer match
-            size_t next_pos = (pos + 1) % st->window_size;
+            size_t next_pos = (pos + 1) & st->window_mask;
             deflate_match_t next_match =
                 deflate_find_match(st, next_pos, stream_pos + 1, max_chain);
             // If next match is significantly better, emit current as literal
@@ -2242,7 +2254,7 @@ static gcomp_status_t deflate_encode_batch(
             if (st->lookahead >= 3) {
               deflate_insert_hash(st, pos, stream_pos);
             }
-            pos = (pos + 1) % st->window_size;
+            pos = (pos + 1) & st->window_mask;
             stream_pos++;
             st->lookahead--;
           }
