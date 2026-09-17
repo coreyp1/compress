@@ -638,55 +638,49 @@ static gcomp_status_t zstd_sequences_execute(zstd_decoder_state_t * state,
       }
     }
 
-    // Handle repeat offsets
-    uint32_t actual_offset = offset;
-    if (offset <= 3) {
-      // Repeat offset
-      if (literal_length == 0) {
-        // Special case: offset codes are shifted
-        if (offset == 3) {
-          actual_offset = state->rep_offset_1 - 1;
-        }
-        else if (offset == 1) {
-          actual_offset = state->rep_offset_2;
-        }
-        else { // offset == 2
-          actual_offset = state->rep_offset_3;
-        }
-      }
-      else {
-        if (offset == 1) {
-          actual_offset = state->rep_offset_1;
-        }
-        else if (offset == 2) {
-          actual_offset = state->rep_offset_2;
-        }
-        else { // offset == 3
-          actual_offset = state->rep_offset_3;
-        }
-      }
-
-      // Update repeat offsets
-      if (offset != 1) {
-        if (offset == 2) {
-          uint32_t temp = state->rep_offset_2;
-          state->rep_offset_2 = state->rep_offset_1;
-          state->rep_offset_1 = temp;
-        }
-        else { // offset == 3
-          uint32_t temp = state->rep_offset_3;
-          state->rep_offset_3 = state->rep_offset_2;
-          state->rep_offset_2 = state->rep_offset_1;
-          state->rep_offset_1 = temp;
-        }
-      }
-    }
-    else {
-      // New offset
+    // RFC 8878 section 3.1.1.5 (Repeat Offsets).  Offset_Value selects an
+    // entry in the three-slot repeat list; a literals length of zero shifts
+    // that selection up by one, so Offset_Value 1/2/3 mean rep2/rep3/rep1-1
+    // instead of rep1/rep2/rep3.  The list update follows the SELECTED slot,
+    // not the raw Offset_Value -- keying the update off Offset_Value left the
+    // repeat list wrong for every zero-literal sequence, and the first match
+    // that then reused a repeat offset copied from the wrong distance.
+    uint32_t actual_offset;
+    if (offset > 3) {
       actual_offset = offset - 3;
       state->rep_offset_3 = state->rep_offset_2;
       state->rep_offset_2 = state->rep_offset_1;
       state->rep_offset_1 = actual_offset;
+    }
+    else {
+      unsigned idx = (unsigned)offset - 1u + (literal_length == 0 ? 1u : 0u);
+
+      if (idx == 0) {
+        // rep1 reused: the list is unchanged.
+        actual_offset = state->rep_offset_1;
+      }
+      else if (idx == 1) {
+        actual_offset = state->rep_offset_2;
+        state->rep_offset_2 = state->rep_offset_1;
+        state->rep_offset_1 = actual_offset;
+      }
+      else if (idx == 2) {
+        actual_offset = state->rep_offset_3;
+        state->rep_offset_3 = state->rep_offset_2;
+        state->rep_offset_2 = state->rep_offset_1;
+        state->rep_offset_1 = actual_offset;
+      }
+      else {
+        // Only reachable as Offset_Value 3 with no literals: rep1 - 1, which
+        // then enters the list as a new offset would.
+        if (state->rep_offset_1 <= 1) {
+          return GCOMP_ERR_CORRUPT;
+        }
+        actual_offset = state->rep_offset_1 - 1;
+        state->rep_offset_3 = state->rep_offset_2;
+        state->rep_offset_2 = state->rep_offset_1;
+        state->rep_offset_1 = actual_offset;
+      }
     }
 
     // Copy literals

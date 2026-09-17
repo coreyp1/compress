@@ -326,37 +326,22 @@ gcomp_status_t zstd_literals_decode(zstd_decoder_state_t * state,
 
       size_t decoded_size;
       if (header.four_streams) {
-        // 4-stream mode: jump table present only if regenerated_size >= 1024
-        // Per RFC 8878: when regenerated_size < 1024, streams are equally
-        // divided
+        // RFC 8878 section 4.2.2: whenever the literals are carried in four
+        // streams the 6-byte Jump_Table is present.  It is not conditional on
+        // Regenerated_Size -- the reference encoder picks four streams well
+        // below 1024 bytes, and skipping the table there consumed the jump
+        // offsets as literal bits.
         uint32_t jump_table[3];
-        const uint8_t * stream_data;
-        size_t stream_data_size;
 
-        if (header.regenerated_size >= 1024) {
-          // Jump table present (6 bytes)
-          if (huf_stream_size < 6) {
-            return GCOMP_ERR_CORRUPT;
-          }
-          jump_table[0] = gcomp_read_le16(huf_stream);
-          jump_table[1] = gcomp_read_le16(huf_stream + 2);
-          jump_table[2] = gcomp_read_le16(huf_stream + 4);
-          stream_data = huf_stream + 6;
-          stream_data_size = huf_stream_size - 6;
+        if (huf_stream_size < 6) {
+          return GCOMP_ERR_CORRUPT;
         }
-        else {
-          // No jump table - streams are equally divided
-          // Segment_Size = (Compressed_Streams_Size + 3) / 4
-          uint32_t segment_size = (uint32_t)((huf_stream_size + 3) / 4);
-          jump_table[0] = segment_size;
-          jump_table[1] = segment_size * 2;
-          jump_table[2] = segment_size * 3;
-          stream_data = huf_stream;
-          stream_data_size = huf_stream_size;
-        }
+        jump_table[0] = gcomp_read_le16(huf_stream);
+        jump_table[1] = gcomp_read_le16(huf_stream + 2);
+        jump_table[2] = gcomp_read_le16(huf_stream + 4);
 
         status = zstd_huf_decode_4streams(state->huf_table, max_bits,
-            stream_data, stream_data_size, jump_table, dst,
+            huf_stream + 6, huf_stream_size - 6, jump_table, dst,
             header.regenerated_size, &decoded_size);
       }
       else {
@@ -387,37 +372,20 @@ gcomp_status_t zstd_literals_decode(zstd_decoder_state_t * state,
       // Decode using existing Huffman table
       size_t decoded_size;
       if (header.four_streams) {
-        // 4-stream mode: jump table present only if regenerated_size >= 1024
-        // Per RFC 8878: when regenerated_size < 1024, streams are equally
-        // divided
+        // RFC 8878 section 4.2.2: four streams always carry the 6-byte
+        // Jump_Table, at any Regenerated_Size.  See the same correction in
+        // the Compressed_Literals_Block path above.
         uint32_t jump_table[3];
-        const uint8_t * stream_data;
-        size_t stream_data_size;
 
-        if (header.regenerated_size >= 1024) {
-          // Jump table present (6 bytes)
-          if (literals_data_size < 6) {
-            return GCOMP_ERR_CORRUPT;
-          }
-          jump_table[0] = gcomp_read_le16(literals_data);
-          jump_table[1] = gcomp_read_le16(literals_data + 2);
-          jump_table[2] = gcomp_read_le16(literals_data + 4);
-          stream_data = literals_data + 6;
-          stream_data_size = header.compressed_size - 6;
+        if (literals_data_size < 6 || header.compressed_size < 6) {
+          return GCOMP_ERR_CORRUPT;
         }
-        else {
-          // No jump table - streams are equally divided
-          // Segment_Size = (Compressed_Streams_Size + 3) / 4
-          uint32_t segment_size = (uint32_t)((header.compressed_size + 3) / 4);
-          jump_table[0] = segment_size;
-          jump_table[1] = segment_size * 2;
-          jump_table[2] = segment_size * 3;
-          stream_data = literals_data;
-          stream_data_size = header.compressed_size;
-        }
+        jump_table[0] = gcomp_read_le16(literals_data);
+        jump_table[1] = gcomp_read_le16(literals_data + 2);
+        jump_table[2] = gcomp_read_le16(literals_data + 4);
 
         status = zstd_huf_decode_4streams(state->huf_table, state->huf_max_bits,
-            stream_data, stream_data_size, jump_table, dst,
+            literals_data + 6, header.compressed_size - 6, jump_table, dst,
             header.regenerated_size, &decoded_size);
       }
       else {
@@ -670,45 +638,41 @@ gcomp_status_t zstd_literals_encode_compressed(const uint8_t * literals,
   uint8_t header_buf[5];
   bool use_4streams = (literals_size >= 1024);
 
-  if (literals_size <= 1023 && compressed_size <= 1023) {
-    // 3-byte header: size_format = 0 (single stream) or 1 (4 streams)
-    // 10+10 bit sizes. Use format 0 for single stream so decoder gets
-    // four_streams = false.
-    uint8_t fmt = use_4streams ? 1 : 0;
-    header_buf[0] = (uint8_t)(((literals_size & 0x0F) << 4) | (fmt << 2) |
-        LITERALS_TYPE_COMPRESSED);
-    header_buf[1] = (uint8_t)(((literals_size >> 4) & 0x3F) |
-        ((compressed_size & 0x03) << 6));
-    header_buf[2] = (uint8_t)(compressed_size >> 2);
-    header_size = 3;
-  }
-  else if (literals_size <= 16383 && compressed_size <= 16383) {
-    // 4-byte header: size_format = 2 (14+14 bit sizes, 4 streams)
-    // byte0: type(2) | size_format(2) | regen_size_lo(4)
-    // byte1: regen_size_mid(6) | regen_size_hi(2)
-    // byte2: comp_size_lo(6) | regen_size_top(2)
-    // byte3: comp_size_hi(8)
-    // Actually, let's use the 4-stream format header but with single stream
-    // data This requires 4-byte header
-    header_buf[0] = (uint8_t)(((literals_size & 0x0F) << 4) | (2 << 2) |
-        LITERALS_TYPE_COMPRESSED);
-    header_buf[1] = (uint8_t)(((literals_size >> 4) & 0x3F) |
-        (((literals_size >> 10) & 0x03) << 6));
-    header_buf[2] = (uint8_t)(((compressed_size & 0x3F) << 2) |
-        ((literals_size >> 10) & 0x03));
-    header_buf[3] = (uint8_t)(compressed_size >> 6);
-    header_size = 4;
-  }
-  else {
-    // 5-byte header: size_format = 3 (18+18 bit sizes)
-    header_buf[0] = (uint8_t)(((literals_size & 0x0F) << 4) | (3 << 2) |
-        LITERALS_TYPE_COMPRESSED);
-    header_buf[1] = (uint8_t)((literals_size >> 4) & 0xFF);
-    header_buf[2] = (uint8_t)(((literals_size >> 12) & 0x03) |
-        ((compressed_size & 0x3F) << 2));
-    header_buf[3] = (uint8_t)((compressed_size >> 6) & 0xFF);
-    header_buf[4] = (uint8_t)((compressed_size >> 14) & 0xFF);
-    header_size = 5;
+  // RFC 8878 section 3.1.1.3.1.1: the literals header is one little-endian
+  // bit field -- type in bits 0-1, size_format in 2-3, Regenerated_Size and
+  // then Compressed_Size in the bits above, each as wide as the format says.
+  // Writing it as hand-packed bytes had dropped bits 12-13 of
+  // Regenerated_Size in the 14-bit form and written bits 10-11 twice.
+  {
+    unsigned fmt;
+    unsigned size_bits;
+
+    if (literals_size <= 1023 && compressed_size <= 1023) {
+      fmt = use_4streams ? 1u : 0u;
+      size_bits = 10;
+      header_size = 3;
+    }
+    else if (literals_size <= 16383 && compressed_size <= 16383) {
+      fmt = 2; // 14-bit sizes; size_format 2 and 3 are always four streams
+      size_bits = 14;
+      header_size = 4;
+    }
+    else if (literals_size <= 262143 && compressed_size <= 262143) {
+      fmt = 3;
+      size_bits = 18;
+      header_size = 5;
+    }
+    else {
+      return GCOMP_ERR_LIMIT;
+    }
+
+    uint64_t val = (uint64_t)LITERALS_TYPE_COMPRESSED | ((uint64_t)fmt << 2) |
+        ((uint64_t)literals_size << 4) |
+        ((uint64_t)compressed_size << (4 + size_bits));
+
+    for (size_t i = 0; i < header_size; i++) {
+      header_buf[i] = (uint8_t)(val >> (i * 8));
+    }
   }
 
   // Move data to make room for header (we wrote at offset 5)
