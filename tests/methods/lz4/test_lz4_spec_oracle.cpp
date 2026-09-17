@@ -4,12 +4,12 @@
  * Cross-implementation tests for the LZ4 method against a reference written
  * from the LZ4 frame and block specifications.
  *
- * The existing test_lz4_oracle.cpp compares against the `lz4` CLI or the
- * Python `lz4.frame` module.  Where neither is installed -- which is the
- * common case, and the case here -- 18 of its 19 tests skip and the summary
- * line still reports a pass.  A skipped oracle test and an absent one are
- * indistinguishable, so in practice this method had one golden-vector test
- * standing between 3,000 lines of codec and nobody noticing.
+ * This file replaced test_lz4_oracle.cpp, which compared against the `lz4`
+ * CLI or the Python `lz4.frame` module.  Where neither was installed -- the
+ * common case, and the case here -- 18 of its 19 tests skipped and the
+ * summary line still reported a pass.  A skipped oracle test and an absent
+ * one are indistinguishable, so in practice this method had one golden-vector
+ * test standing between 3,000 lines of codec and nobody noticing.
  *
  * The reference below is written from the specification rather than adapted
  * from any implementation, including xxHash-32, which the frame format needs
@@ -513,6 +513,106 @@ std::vector<size_t> sweepSizes() {
 }
 
 //
+// Frame walking
+//
+// A test that only checks "it decoded" cannot tell a multi-block frame from a
+// single-block one, which is exactly how the block loop went uncovered: the
+// default block size is 4 MB (LZ4_DEFAULT_BLOCK_SIZE) and the sweep above
+// stops at 140,000 bytes, so every frame in every other test here holds one
+// block.  These tests assert the construct is present before asserting it
+// round-trips.
+//
+struct FrameShape {
+  unsigned blocks = 0;
+  unsigned stored_blocks = 0;
+  unsigned block_size_id = 0; // BD bits 6-4: 4=64KB, 5=256KB, 6=1MB, 7=4MB
+  bool block_independent = false;
+  bool block_checksum = false;
+  bool content_checksum = false;
+  bool content_size = false;
+  bool dict_id = false;
+};
+
+// Walks the frame header and block sequence per RFC-less LZ4 Frame Format
+// v1.6.3 section "General Structure of LZ4 Frame format".  Returns false if
+// the frame is malformed or truncated.
+bool walkFrame(const std::vector<uint8_t> & f, FrameShape * out) {
+  if (f.size() < 7) {
+    return false;
+  }
+  if (f[0] != 0x04 || f[1] != 0x22 || f[2] != 0x4D || f[3] != 0x18) {
+    return false; // not a frame magic number
+  }
+  const uint8_t flg = f[4];
+  const uint8_t bd = f[5];
+  if ((flg & 0xC0) != 0x40) {
+    return false; // version bits must be 01
+  }
+
+  FrameShape sh;
+  sh.block_independent = (flg >> 5) & 1;
+  sh.block_checksum = (flg >> 4) & 1;
+  sh.content_size = (flg >> 3) & 1;
+  sh.content_checksum = (flg >> 2) & 1;
+  sh.dict_id = flg & 1;
+  sh.block_size_id = (bd >> 4) & 7;
+
+  size_t p = 6;
+  p += sh.content_size ? 8 : 0;
+  p += sh.dict_id ? 4 : 0;
+  p += 1; // header checksum
+  if (p > f.size()) {
+    return false;
+  }
+
+  for (;;) {
+    if (p + 4 > f.size()) {
+      return false; // no room for a block size or the EndMark
+    }
+    uint32_t raw = (uint32_t)f[p] | ((uint32_t)f[p + 1] << 8) |
+        ((uint32_t)f[p + 2] << 16) | ((uint32_t)f[p + 3] << 24);
+    p += 4;
+    if (raw == 0) {
+      break; // EndMark
+    }
+    if (raw & 0x80000000u) {
+      sh.stored_blocks++;
+    }
+    size_t len = raw & 0x7FFFFFFFu;
+    p += len;
+    if (sh.block_checksum) {
+      p += 4;
+    }
+    if (p > f.size()) {
+      return false;
+    }
+    sh.blocks++;
+  }
+
+  if (sh.content_checksum) {
+    p += 4;
+  }
+  if (p != f.size()) {
+    return false; // trailing bytes, or a truncated trailer
+  }
+  *out = sh;
+  return true;
+}
+
+struct BlockSizeCase {
+  const char * name;
+  uint64_t bytes;
+  unsigned bd_id;
+};
+
+const BlockSizeCase kBlockSizes[] = {
+    {"64 KB", 65536u, 4},
+    {"256 KB", 262144u, 5},
+    {"1 MB", 1048576u, 6},
+    {"4 MB", 4194304u, 7},
+};
+
+//
 // Tests
 //
 
@@ -823,6 +923,12 @@ TEST_F(Lz4SpecOracleTest, RealLz4_ReadsOurFrames) {
   // Every frame option our encoder exposes, including the two that nothing
   // else here reaches: block checksums, and linked (non-independent) blocks,
   // which the reference encoder above cannot even produce.
+  //
+  // These are all SINGLE-block frames.  sweepSizes() stops at 140,000 bytes
+  // and the default block size is 4 MB, so the "linked blocks" rows below say
+  // only that the flag reaches the header -- there is no second block for a
+  // linked block to link to.  Multi-block frames are
+  // RealLz4_ReadsOurMultiBlockFrames, below.
   struct Opt {
     const char * name;
     int content_checksum, block_checksum, content_size, independent;
@@ -870,6 +976,106 @@ TEST_F(Lz4SpecOracleTest, RealLz4_ReadsOurFrames) {
       }
     }
   }
+}
+
+TEST_F(Lz4SpecOracleTest, RealLz4_ReadsOurMultiBlockFrames) {
+  const RealLz4 & lib = realLz4();
+  if (!lib.ok()) {
+    GTEST_SKIP() << "liblz4 is not installed";
+  }
+
+  // The cross-product runs at the two small block sizes, where it is cheap.
+  // What is genuinely block-size-dependent -- the BD byte, and whether the
+  // encoder splits at the size it was asked for -- is checked at all four.
+  unsigned total_blocks = 0, stored_blocks = 0, checksummed_frames = 0;
+  unsigned multiblock_frames = 0;
+
+  for (const BlockSizeCase & bs : kBlockSizes) {
+    const bool small = bs.bytes <= 262144u;
+
+    std::vector<size_t> sizes;
+    if (small) {
+      // Straddle the boundary in both directions, then two whole blocks, then
+      // a partial final block.
+      sizes = {(size_t)bs.bytes - 1, (size_t)bs.bytes, (size_t)bs.bytes + 1,
+          (size_t)(2 * bs.bytes), (size_t)(2 * bs.bytes + 37),
+          (size_t)(3 * bs.bytes + bs.bytes / 2)};
+    }
+    else {
+      sizes = {(size_t)bs.bytes + 1, (size_t)(2 * bs.bytes + 37)};
+    }
+
+    for (size_t n : sizes) {
+      std::vector<Shape> shape_list =
+          small ? shapes(n) : std::vector<Shape>{{"prose", proseLike(n, 4u)},
+                    {"incompressible", incompressible(n, 11u)}};
+
+      for (const Shape & sh : shape_list) {
+        for (int independent = 0; independent <= 1; independent++) {
+          for (int cksum = 0; cksum <= (small ? 1 : 0); cksum++) {
+            gcomp_options_t * opts = nullptr;
+            ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+            gcomp_options_set_uint64(opts, "lz4.block_size", bs.bytes);
+            gcomp_options_set_bool(opts, "lz4.independent_blocks", independent);
+            gcomp_options_set_bool(opts, "lz4.block_checksum", cksum || !small);
+
+            std::vector<uint8_t> framed = gcompEncode(sh.data, opts);
+            gcomp_options_destroy(opts);
+
+            std::string where = std::string(bs.name) + " blocks, n=" +
+                std::to_string(n) + ", " + sh.name + ", " +
+                (independent ? "independent" : "linked") +
+                (cksum || !small ? ", block checksums" : "");
+            ASSERT_FALSE(framed.empty()) << where << ": encode failed";
+
+            // The construct has to be there before its round-trip means
+            // anything.
+            FrameShape fs;
+            ASSERT_TRUE(walkFrame(framed, &fs))
+                << where << ": our own frame does not walk";
+            EXPECT_EQ(fs.block_size_id, bs.bd_id)
+                << where << ": BD byte does not name the block size we asked "
+                            "for";
+            EXPECT_EQ(fs.block_independent, independent != 0) << where;
+            // A frame must hold exactly as many blocks as the block size
+            // implies -- including the n = block_size - 1 case, which is one
+            // block and is here to catch an off-by-one at the split.
+            unsigned want = (unsigned)((n + bs.bytes - 1) / bs.bytes);
+            ASSERT_EQ(fs.blocks, want)
+                << where << ": expected " << want << " block(s), got "
+                << fs.blocks << " -- the encoder did not split at "
+                << bs.bytes;
+
+            total_blocks += fs.blocks;
+            stored_blocks += fs.stored_blocks;
+            if (fs.blocks >= 2) {
+              multiblock_frames++;
+            }
+            if (fs.block_checksum && fs.blocks >= 2) {
+              checksummed_frames++;
+            }
+
+            std::vector<uint8_t> back;
+            std::string err;
+            ASSERT_TRUE(realLz4Decode(framed, &back, &err))
+                << where << ": liblz4 refused our frame (" << err << ")";
+            ASSERT_EQ(back, sh.data) << where;
+          }
+        }
+      }
+    }
+  }
+
+  // Falsifiable floors.  If a later change quietly stops splitting blocks, or
+  // stops storing incompressible ones, these fail rather than the test
+  // silently shrinking back to what it used to cover.
+  EXPECT_GT(multiblock_frames, 50u);
+  EXPECT_GT(total_blocks, 200u);
+  EXPECT_GT(checksummed_frames, 20u)
+      << "no multi-block frame carried per-block checksums";
+  EXPECT_GT(stored_blocks, 0u)
+      << "no incompressible block was stored uncompressed, so the stored-block "
+         "path inside a multi-block frame went untested";
 }
 
 TEST_F(Lz4SpecOracleTest, RealLz4_ReadsTheReferenceFrames) {
