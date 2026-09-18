@@ -44,10 +44,10 @@ Limits are enforced by the core; the decoder returns `GCOMP_ERR_LIMIT` when any 
 | Strategy | Description |
 |----------|-------------|
 | `"default"` | Standard LZ77 + Huffman compression. Best for most data types. |
-| `"lazy"` | Defers every match one byte to see whether the next position starts a longer one, at every level rather than from level 4 up. Good for PNG filter output, where a match one byte later is often longer, and worth about 2.7% on general data at level 1. Identical to `"default"` from level 4 up. |
+| `"lazy"` | Defers every match one byte to see whether the next position starts a longer one, at every level rather than from level 4 up. Good for PNG filter output, where a match one byte later is often longer, and worth 2.4% at level 1 over the 19 MB corpus measured below. Identical to `"default"` from level 4 up, shortest-path levels included. |
 | `"huffman_only"` | Skip LZ77 matching entirely; emit all bytes as literals. Very fast encoding, minimal compression. Useful for already-compressed or high-entropy data where LZ77 would find few matches. |
 | `"rle"` | Run-length encoding mode: only find matches at distance 1. Very fast, limited compression. Best for data with long runs of repeated bytes. |
-| `"fixed"` | Always use fixed Huffman tables (skip dynamic tree building). Faster encoding at the cost of compression ratio. Equivalent to low compression levels but can be combined with any level. |
+| `"fixed"` | Always use fixed Huffman tables, skipping both the tree build and the pricing that would choose between them. Faster encoding at the cost of compression ratio. It is the only way to force fixed codes - no level does so - and it can be combined with any level. |
 
 **Example: Using strategies**
 
@@ -55,9 +55,11 @@ Limits are enforced by the core; the decoder returns `GCOMP_ERR_LIMIT` when any 
 gcomp_options_t *opts = NULL;
 gcomp_options_create(&opts);
 
-// For PNG filter output, or any data where deferring a match pays
+// For PNG filter output, or any data where deferring a match pays.
+// This only changes anything at levels 1 to 3: from level 4 up the
+// default parse already defers, and from 7 up both parse by shortest path.
 gcomp_options_set_string(opts, "deflate.strategy", "lazy");
-gcomp_options_set_int64(opts, "deflate.level", 9);
+gcomp_options_set_int64(opts, "deflate.level", 3);
 
 // For already-compressed data (JPEG inside a container)
 gcomp_options_set_string(opts, "deflate.strategy", "huffman_only");
@@ -72,10 +74,10 @@ gcomp_encoder_create(registry, "deflate", opts, &enc);
 **Strategy selection guidelines:**
 
 - **General data**: Use `"default"` (or omit the option).
-- **PNG images**: Use `"lazy"` with a high compression level for best results.
+- **PNG images**: Use `"lazy"` at levels 1 to 3, where it buys deferral the default parse does not do; above that the level already defers or parses by shortest path.
 - **Pre-compressed data**: Use `"huffman_only"` to avoid wasting CPU on futile LZ77 searches.
 - **Simple patterns**: Use `"rle"` for data dominated by repeated byte runs.
-- **Speed-critical**: Use `"fixed"` or `"huffman_only"` to minimize encoding time.
+- **Speed-critical**: Use a low level first - level 1 is the fastest parse - and `"fixed"` or `"huffman_only"` on top of it to drop the entropy-coding work as well.
 
 ## Error Handling
 
@@ -187,34 +189,97 @@ The decoder correctly handles this edge case: the distance tree is only accessed
 
 ## Compression levels
 
-| Level | Huffman Mode | LZ77 Effort | Use Case |
-|-------|--------------|-------------|----------|
-| 0 | Stored blocks | None | No compression (data copied verbatim) |
-| 1-3 | Fixed | Short hash chains | Fast compression, reasonable ratio |
-| 4-6 | Dynamic | Medium hash chains | Balanced speed and compression |
-| 7-9 | Dynamic | Long hash chains | Best compression, slower |
+A level sets two things that are independent of each other: how hard the match
+finder looks, and how the parse decides which of the matches it found to
+actually emit. The second is the larger difference between the bands.
 
-Higher levels spend more effort searching for matches and build optimal Huffman codes from actual symbol frequencies, improving compression ratio at the cost of speed.
+| Level | Hash chain | Parse | Use case |
+|-------|-----------:|-------|----------|
+| 0 | - | none; blocks are stored | data copied verbatim |
+| 1 | 4 | greedy - take the first match found | fastest |
+| 2 | 8 | greedy | |
+| 3 | 16 | greedy | |
+| 4 | 16 | deferred - the first level to defer | |
+| 5 | 32 | deferred | |
+| 6 | 128 | deferred | **default** |
+| 7 | 64 | **shortest path**, 32 shortenings per position | first level to parse by shortest path |
+| 8 | 96 | shortest path, 64 shortenings | |
+| 9 | 128 | shortest path, 128 shortenings | best ratio |
+
+**Greedy** takes each match as it is found. **Deferred** (what zlib calls lazy
+matching) holds a match back to see whether the next position starts a longer
+one. **Shortest path** does neither: it treats the block as a graph, one vertex
+per byte position and one edge per literal and per match, prices every edge in
+256ths of a bit from the block's own symbol statistics, and emits the cheapest
+path through it. Because DEFLATE has no literal-length code - a literal is just
+a symbol in the same alphabet as the lengths, RFC 1951 section 3.2.5 - the cost
+of a path is exactly the sum of its edges, so the sweep finds the true minimum
+for the prices it is given. `src/methods/deflate/deflate_encode.c` carries the
+derivation.
+
+Note that the chain at level 7 is *shorter* than at level 6. The shortest-path
+parse asks for a list of candidate matches at every position rather than the
+single longest one, so it pays for the chain many more times; the levels were
+re-tuned against that, not inherited from the deferring band.
+
+### What it costs and buys
+
+Measured 2026-09-18 over 19,181,880 bytes of source, manuals, XML, CSV,
+binaries and images, against **zlib 1.3.1** at the same level, in one run of
+`bench/bench_ratio` so that both sides saw the same machine. Negative means our
+output is smaller. Encode speed is MiB of input per second; sizes are exact,
+speeds good to about five percent.
+
+| Level | Ours | zlib | Delta | Encode | zlib encode |
+|-------|-----:|-----:|------:|-------:|------------:|
+| 1 | 5,388,771 | 5,788,889 | **-6.91%** | 78.7 MiB/s | 143.5 MiB/s |
+| 6 | 4,865,580 | 4,861,938 | +0.07% | 18.8 MiB/s | 36.6 MiB/s |
+| 7 | 4,688,422 | 4,831,806 | **-2.97%** | 5.5 MiB/s | 26.3 MiB/s |
+| 9 | 4,666,795 | 4,793,634 | **-2.65%** | 3.8 MiB/s | 9.4 MiB/s |
+
+The shortest-path levels cost three to five times level 6's encode time - 5.5
+MiB/s at level 7 and 3.8 at level 9, against 18.8 - and buy about 3%. Whether
+that trade is worth making is the caller's decision, which is why it is a level
+rather than the default.
 
 **Level and strategy interaction:** The `deflate.strategy` option modifies how matching works at each level:
 
-- `"default"`: Uses the standard LZ77 algorithm with hash chain length determined by level.
-- `"lazy"`: Same hash chains as default; it differs only in deferring matches at levels 1 to 3, where default takes the first match it finds.
-- `"huffman_only"`: Ignores level for matching (no LZ77), but level still affects Huffman mode.
-- `"rle"`: Ignores hash chains entirely; only checks distance-1 matches.
-- `"fixed"`: Forces fixed Huffman codes regardless of level (skips dynamic tree building).
+- `"default"`: the level's own parse - greedy at 1 to 3, deferred at 4 to 6, shortest path at 7 to 9.
+- `"lazy"`: same hash chains as default; it differs only in deferring matches at levels 1 to 3, where default takes the first match it finds. At 4 and above it is default, shortest-path levels included.
+- `"huffman_only"`: no LZ77 at all, so there is no parse for the level to choose; only the entropy coding applies.
+- `"rle"`: ignores hash chains entirely; only checks distance-1 matches, and so has no parse to replace either.
+- `"fixed"`: forces fixed Huffman codes. This is the only thing that does; see below. Matching still follows the level, shortest path included.
 
-### Dynamic Huffman encoding (levels 4-9)
+### Huffman coding: priced, not assumed
 
-At compression levels 4 and above, the encoder:
+**Every level builds a code from its own block's frequencies.** Which coding a
+block gets is decided by pricing both: the dynamic block's cost including its
+table description, and the same symbols under the fixed code of RFC 1951
+section 3.2.6, with the smaller one written. Extra bits are identical under
+both, so they are left out of both sides.
+
+No level makes this call, because no level can: a short block, or one whose
+symbols are near uniform, pays more for the table than the table saves, and
+that depends on the block rather than on the effort setting. Only
+`deflate.strategy = "fixed"` forces the fixed code.
+
+This is a change from earlier versions, where levels 1 to 3 always emitted
+fixed blocks. Pricing them instead is worth 17.1% at level 1 over a 19 MB
+corpus - the last 0.56% of that being the blocks flushed at the *end* of a
+stream, which kept the old behaviour after the streaming loop had dropped it.
+
+At every level the encoder:
 
 1. **Collects frequency histograms** during LZ77 matching for:
    - Literal bytes (0-255) and length codes (257-285)
    - Distance codes (0-29)
 
-2. **Builds optimal Huffman trees** using a heap-based algorithm:
-   - Creates length-limited codes (max 15 bits per RFC 1951)
-   - Uses Kraft inequality validation for code validity
+2. **Builds optimal length-limited codes** by boundary package-merge
+   (Larmore and Hirschberg, JACM 37(3), 1990), in `src/core/huffman_lengths.c`:
+   - Creates codes no longer than the 15 bits RFC 1951 allows
+   - Optimal *under* that cap, rather than a plain Huffman tree clamped to it
+     and repaired: clamping cannot see which lengthening costs fewest bits, so
+     it spends the budget in the wrong place
    - Falls back to uniform 8-bit codes on memory allocation failure
 
 3. **Encodes the Huffman trees** in the block header using:
@@ -223,7 +288,7 @@ At compression levels 4 and above, the encoder:
 
 4. **Writes compressed data** using the dynamic codes, which typically achieve better compression than fixed Huffman for varied input data.
 
-The encoder automatically falls back to fixed Huffman blocks if the dynamic tree would be larger than the savings.
+The fixed code is written whenever it prices smaller, which is the same rule stated above rather than a fallback.
 
 ## Streaming usage
 

@@ -123,27 +123,76 @@ Limits are enforced by the infrastructure; the decoder returns `GCOMP_ERR_LIMIT`
 
 ### Compression level guidelines
 
-| Level | Speed | Ratio | Memory | Use Case |
-|-------|-------|-------|--------|----------|
-| 1-3 | Fastest | Lower | Low | Real-time compression, logging |
-| 4-9 | Balanced | Medium | Medium | General purpose (default: 3) |
-| 10-15 | Slower | Higher | Higher | Archival, file storage |
-| 16-22 | Slowest | Highest | Highest | Maximum compression needed |
+RFC 8878 says nothing about levels: it describes the frame, not how to choose
+what goes in it. A level here is a promise about how much work the encoder will
+spend, and it sets three things - what the match finder searches, how the parse
+picks from what it finds, and how large a window it declares.
+
+| Levels | Search | Parse | Window | Use case |
+|--------|--------|-------|-------:|----------|
+| 1 | hash chain, 4 candidates | greedy | 128 KB | real-time, logging |
+| 2-3 | hash chain, 8-16 | deferred | 128 KB | general purpose (**default: 3**) |
+| 4-6 | hash chain, 24-64 | deferred | 512 KB | |
+| 7-8 | hash chain, 80-112 | deferred | 2 MB | the fast end of the chain |
+| 9-10 | **binary tree**, 14-16 | deferred | 2 MB | where the tree takes over |
+| 11-15 | binary tree, 18-26 | deferred | 8 MB | archival |
+| 16-22 | binary tree, 28-64 | **shortest path** | 8 MB at 16, 32 MB from 17 | maximum compression |
+
+**The candidate counts either side of level 9 are not comparable.** A hash-chain
+step crosses off one position and learns nothing about the next, so searching
+harder means walking further and the counts run to the hundreds. A binary-tree
+step halves what is left, and a descent takes about six steps - so 14 candidates
+at level 9 is *more* search than 112 at level 8, not less.
+
+**Deferred** parsing holds a match back to see whether the next position starts a
+longer one. **Shortest path** does not defer at all: it prices every candidate
+match and every literal in 256ths of a bit, from statistics primed off the
+predefined FSE distributions of RFC 8878 section 3.1.1.3.2.2 and the block's own
+byte histogram, and walks the cheapest path through the block. Because a zstd
+sequence carries a literal-length code, a path's cost is not exactly the sum of
+its edges, so this is a very good approximation rather than a proof of optimality;
+`src/methods/zstd/zstd_optimal.c` says where the approximation lies.
+
+Levels 9 and 10 pay for the tree in memory: two slots per position where the
+chain had one, 16 MiB against 8.5 over the 2 MB window they declare.
+
+### What it costs and buys
+
+Measured 2026-09-18 over 19,181,880 bytes of source, manuals, XML, CSV, binaries
+and images, against **libzstd 1.5.7** at the same level, in one run of
+`bench/bench_ratio` so that both sides saw the same machine. Negative means our
+output is smaller. Speed is MiB of input per second; sizes are exact, speeds
+good to about five percent.
+
+| Level | Ours | libzstd | Delta | Encode | libzstd encode |
+|-------|-----:|--------:|------:|-------:|---------------:|
+| 1 | 5,029,655 | 5,223,057 | **-3.70%** | 108.6 MiB/s | 531.9 MiB/s |
+| 3 | 4,693,228 | 4,831,204 | **-2.86%** | 55.5 MiB/s | 401.7 MiB/s |
+| 9 | 4,334,525 | 4,341,823 | **-0.17%** | 11.2 MiB/s | 85.7 MiB/s |
+| 16 | 3,907,753 | 3,959,522 | **-1.31%** | 5.4 MiB/s | 7.7 MiB/s |
+| 19 | 3,881,087 | 3,836,814 | +1.15% | 5.1 MiB/s | 4.3 MiB/s |
+
+A corpus total is an average. Per file these span a wider range than the totals
+suggest - level 1 runs from -9.4% on prose to +7.2% on a skewed-alphabet file -
+so measure on your own data before choosing a level on ratio alone.
 
 ### Window size
 
-The window size controls how far back the compressor can reference previous data. Larger windows enable better compression but require more memory.
+The window size controls how far back the compressor can reference previous
+data. Larger windows compress better and cost more memory.
 
-| Window Log | Window Size | Memory Impact |
-|------------|-------------|---------------|
-| 10 | 1 KB | Minimal |
-| 14 | 16 KB | Low |
-| 18 | 256 KB | Moderate |
-| 22 | 4 MB | Default for level 3 |
-| 27 | 128 MB | High compression |
-| 31 | 2 GB | Maximum (per spec) |
+| Window Log | Window Size | Where it is used |
+|------------|-------------|------------------|
+| 17 | 128 KB | levels 1-3 |
+| 19 | 512 KB | levels 4-6 |
+| 21 | 2 MB | levels 7-10 |
+| 23 | 8 MB | levels 11-16 |
+| 25 | 32 MB | levels 17-22 |
+| 31 | 2 GB | maximum the format allows; reachable only by setting `zstd.window_log` |
 
-When `zstd.window_log=0` (default), the window size is automatically selected based on the compression level.
+When `zstd.window_log=0` (the default) the window comes from the level, as
+above. Setting it explicitly overrides the level, and the decoder enforces
+`limits.max_window_bytes` against whatever the frame declares.
 
 ## Content checksum
 
