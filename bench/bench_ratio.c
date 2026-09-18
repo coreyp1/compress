@@ -607,6 +607,14 @@ int main(int argc, char ** argv) {
   memset(ref_encode_s, 0, sizeof(ref_encode_s));
   memset(ref_decode_s, 0, sizeof(ref_decode_s));
 
+  // A table of bare numbers is a table nobody can read six months later, so
+  // say what they are and which way is better before printing any.
+  printf("Sizes are bytes; smaller is better, and a negative delta means our\n"
+         "output is smaller than the reference's.  Speeds are MB of\n"
+         "UNCOMPRESSED data per second, so compressing and decompressing are\n"
+         "charged the same way; higher is better.  A ratio of ours to the\n"
+         "reference is written 1.00x for parity, 0.50x for half the speed.\n\n");
+
   printf("%-16s %-16s %10s %10s %10s %9s %9s %9s\n", "input", "case", "raw",
       "ours", "reference", "delta", "enc MB/s", "ref MB/s");
 
@@ -706,8 +714,12 @@ int main(int argc, char ** argv) {
 
   // Throughput, in MB of *uncompressed* data per second, so that the
   // compression and decompression columns are charged the same way.
-  printf("\n%-16s %-16s %9s %9s %9s %9s %9s %9s\n", "SPEED", "case",
-      "enc MB/s", "ref enc", "enc x", "dec MB/s", "ref dec", "dec x");
+  printf("\nSPEED: MB of uncompressed data per second, higher is better.\n");
+  printf("  \"ours/ref\" is our rate divided by the reference's: 1.00x is "
+         "parity.\n\n");
+  printf("%-16s %-16s %9s %9s %9s %9s %9s %9s\n", "SPEED", "case",
+      "enc ours", "enc ref", "ours/ref", "dec ours", "dec ref",
+      "ours/ref");
   for (size_t c = 0; c < BENCH_CASE_COUNT; c++) {
     if (timed_bytes[c] == 0) {
       continue;
