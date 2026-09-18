@@ -670,3 +670,99 @@ TEST_F(ZstdEncoderTest, ABlockThatMatchesEverythingIsStillCompressed) {
   EXPECT_GT(compressed_blocks, 1) << "expected several compressed blocks";
   EXPECT_EQ(raw_blocks, 0) << raw_blocks << " blocks were stored raw";
 }
+
+//
+// Encoding into a buffer that barely fits
+//
+
+// The sequence bitstream writer drains whole bytes out of its 64-bit
+// container with one 8-byte store, which touches eight bytes however few are
+// actually due.  It may only do that with eight bytes free inside the output
+// buffer; within eight bytes of the end it goes back to writing one byte at
+// a time.  So the last few bytes of a tight output buffer are a different
+// code path from all the rest of the stream, and this is what exercises it.
+//
+// The contract being checked is the encoder's, not the bit writer's: given
+// too little room the encoder must say so.  It must never report success
+// with a stream that is short, and must never write past what it was given
+// (which is what the sanitizer build makes this test able to see).
+class ZstdTightOutputTest : public ::testing::TestWithParam<int> {
+protected:
+  // Input with enough structure to produce real sequences, real FSE tables
+  // and a bitstream of a few hundred bytes -- not an RLE block that never
+  // reaches the writer.
+  static std::vector<uint8_t> MakeInput() {
+    std::vector<uint8_t> in;
+    const char * words[] = {"alpha ", "beta ", "gamma ", "delta ",
+        "epsilon ", "zeta ", "eta ", "theta "};
+    uint32_t r = 12345u;
+    while (in.size() < 60000) {
+      r = r * 1103515245u + 12345u;
+      const char * w = words[(r >> 16) % 8];
+      in.insert(in.end(), w, w + strlen(w));
+      if (((r >> 8) & 0x1f) == 0) {
+        for (int k = 0; k < 40; k++) {
+          in.push_back(static_cast<uint8_t>(r >> (k % 24)));
+        }
+      }
+    }
+    return in;
+  }
+
+  static gcomp_status_t EncodeInto(const std::vector<uint8_t> & in, int level,
+      size_t cap, std::vector<uint8_t> & out, size_t * used) {
+    gcomp_options_t * opts = nullptr;
+    EXPECT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+    gcomp_options_set_int64(opts, "zstd.level", level);
+    out.assign(cap, 0);
+    *used = 0;
+    gcomp_status_t st = gcomp_encode_buffer(gcomp_registry_default(), "zstd",
+        opts, in.data(), in.size(), cap ? out.data() : nullptr, cap, used);
+    gcomp_options_destroy(opts);
+    return st;
+  }
+};
+
+// Every capacity from well short of the compressed size to just over it.
+// Each one either fails or produces a stream that reads back exactly.
+TEST_P(ZstdTightOutputTest, EveryCapacityAroundTheCompressedSizeIsHonest) {
+  const int level = GetParam();
+  std::vector<uint8_t> in = MakeInput();
+
+  std::vector<uint8_t> roomy;
+  size_t exact = 0;
+  ASSERT_EQ(EncodeInto(in, level, in.size() * 2 + 4096, roomy, &exact),
+      GCOMP_OK);
+  ASSERT_GT(exact, 64u);
+
+  // A window around the true size, one byte at a time, so the store's
+  // eight-byte guard is crossed in both directions.
+  const size_t lo = (exact > 64u) ? exact - 64u : 0u;
+  size_t successes = 0;
+  for (size_t cap = lo; cap <= exact + 8u; cap++) {
+    std::vector<uint8_t> out;
+    size_t used = 0;
+    gcomp_status_t st = EncodeInto(in, level, cap, out, &used);
+    if (st != GCOMP_OK) {
+      continue;
+    }
+    successes++;
+    ASSERT_LE(used, cap) << "reported " << used << " bytes into " << cap;
+
+    std::vector<uint8_t> back(in.size() + 64);
+    size_t back_len = 0;
+    ASSERT_EQ(gcomp_decode_buffer(gcomp_registry_default(), "zstd", nullptr,
+                  out.data(), used, back.data(), back.size(), &back_len),
+        GCOMP_OK)
+        << "capacity " << cap << " reported success but did not decode";
+    ASSERT_EQ(back_len, in.size()) << "capacity " << cap;
+    ASSERT_EQ(memcmp(back.data(), in.data(), in.size()), 0)
+        << "capacity " << cap;
+  }
+  // The roomiest capacities in the window must have worked, or the test is
+  // not testing what it claims to.
+  EXPECT_GT(successes, 0u);
+}
+
+INSTANTIATE_TEST_SUITE_P(Levels, ZstdTightOutputTest,
+    ::testing::Values(1, 3, 6, 9, 19));

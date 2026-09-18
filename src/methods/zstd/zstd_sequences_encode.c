@@ -11,6 +11,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <ghoti.io/compress/macros.h>
+#include "../../core/endian.h"
 #include "zstd_internal.h"
 #include <string.h>
 #include "zstd_sequences_private.h"
@@ -81,24 +82,52 @@ static void zstd_enc_bw_init(
  * @brief Flush complete bytes from the bit container.
  *
  * Writes LOW bytes to increasing addresses until fewer than 8 bits remain.
+ *
+ * The container holds at most 64 bits, so a flush has up to seven whole
+ * bytes to write and they are the low bytes of one 64-bit word in exactly
+ * the order they go to memory.  One store puts them all there, which is why
+ * the common path here is a store and not a loop: draining a byte at a time,
+ * with its own bounds check each time, was 2% of encoding on its own.
+ *
+ * That store touches eight bytes whatever the count, so it is only taken
+ * when eight bytes are free inside the buffer.  The bytes past the count are
+ * not part of the stream; the next flush starts on top of them, and the
+ * length this writer finally reports never includes them.  Within eight
+ * bytes of the end the loop takes over, so nothing is written past the
+ * buffer either way.
  */
 // A writer created with buf == NULL measures instead of writing, so a
 // candidate encoding can be priced without a buffer to hold it.
 static void zstd_enc_bw_flush(zstd_enc_bit_writer_t * bw) {
-  while (bw->bits_used >= 8) {
-    if (bw->buf && bw->byte_pos >= bw->buf_size) {
-      // Out of room.  Record it: the caller decides whether to fall back,
-      // and must not be handed a silently truncated bitstream.
-      bw->overflow = true;
-      return;
-    }
-    if (bw->buf) {
-      bw->buf[bw->byte_pos] = (uint8_t)(bw->bit_container & 0xFF);
-    }
-    bw->byte_pos++;
-    bw->bit_container >>= 8;
-    bw->bits_used -= 8;
+  unsigned whole = bw->bits_used >> 3;
+  if (whole == 0u) {
+    return;
   }
+
+  if (!bw->buf) {
+    bw->byte_pos += whole;
+  }
+  else if (bw->byte_pos + 8u <= bw->buf_size) {
+    gcomp_write_le64(bw->buf + bw->byte_pos, bw->bit_container);
+    bw->byte_pos += whole;
+  }
+  else {
+    for (unsigned i = 0; i < whole; i++) {
+      if (bw->byte_pos >= bw->buf_size) {
+        // Out of room.  Record it: the caller decides whether to fall back,
+        // and must not be handed a silently truncated bitstream.
+        bw->overflow = true;
+        bw->bit_container >>= (i * 8u);
+        bw->bits_used -= (i * 8u);
+        return;
+      }
+      bw->buf[bw->byte_pos] = (uint8_t)(bw->bit_container >> (i * 8u));
+      bw->byte_pos++;
+    }
+  }
+
+  bw->bit_container >>= (whole * 8u);
+  bw->bits_used -= whole * 8u;
 }
 
 /**
@@ -111,13 +140,19 @@ static void zstd_enc_bw_flush(zstd_enc_bit_writer_t * bw) {
  * - Last bits added (marker) → HIGH addresses → HIGH bit positions when loaded
  *
  * Automatically flushes when the container gets too full.
+ *
+ * `value` must carry no bits above `nb_bits`, which every caller satisfies:
+ * an FSE transition is a target state minus the base of the range holding
+ * it, an extra-bits value is its code's offset from that code's baseline
+ * (RFC 8878 3.1.1.3.2.1), and an initial state is below its table size.
+ * Nothing is masked here.  That also makes a zero-bit write harmless rather
+ * than something to test for -- it contributes nothing and advances
+ * nothing -- and zero-bit writes are common enough (three of the six calls
+ * per sequence, whenever a code has no extra bits) that the test for them
+ * cost 2% of encoding.
  */
 static void zstd_enc_bw_add_bits(
     zstd_enc_bit_writer_t * bw, uint32_t value, unsigned nb_bits) {
-  if (nb_bits == 0) {
-    return;
-  }
-
   // Flush if we don't have room for the new bits
   // Keep at least 32 bits of headroom for safety
   if (bw->bits_used + nb_bits > 56) {
