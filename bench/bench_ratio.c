@@ -93,7 +93,7 @@ static double bench_now(void) {
 }
 
 /**
- * @brief Throughput in MB/s over the uncompressed size.
+ * @brief Throughput in MiB/s over the uncompressed size.
  *
  * Zero seconds means the measurement did not happen (the reference is not
  * installed, or the case failed), not that it was infinitely fast.
@@ -616,13 +616,13 @@ int main(int argc, char ** argv) {
   // A table of bare numbers is a table nobody can read six months later, so
   // say what they are and which way is better before printing any.
   printf("Sizes are bytes; smaller is better, and a negative delta means our\n"
-         "output is smaller than the reference's.  Speeds are MB of\n"
+         "output is smaller than the reference's.  Speeds are MiB of\n"
          "UNCOMPRESSED data per second, so compressing and decompressing are\n"
          "charged the same way; higher is better.  A ratio of ours to the\n"
          "reference is written 1.00x for parity, 0.50x for half the speed.\n\n");
 
   printf("%-16s %-16s %10s %10s %10s %9s %9s %9s\n", "input", "case", "raw",
-      "ours", "reference", "delta", "enc MB/s", "ref MB/s");
+      "ours", "reference", "delta", "enc MiB/s", "ref MiB/s");
 
   int inputs = argc > 1 ? argc - 1 : 3;
   for (int a = 0; a < inputs; a++) {
@@ -718,9 +718,9 @@ int main(int argc, char ** argv) {
             (double)ref_total[c]);
   }
 
-  // Throughput, in MB of *uncompressed* data per second, so that the
+  // Throughput, in MiB of *uncompressed* data per second, so that the
   // compression and decompression columns are charged the same way.
-  printf("\nSPEED: MB of uncompressed data per second, higher is better.\n");
+  printf("\nSPEED: MiB of uncompressed data per second, higher is better.\n");
   printf("  \"ours/ref\" is our rate divided by the reference's: 1.00x is "
          "parity.\n\n");
   printf("%-16s %-16s %9s %9s %9s %9s %9s %9s\n", "SPEED", "case",
