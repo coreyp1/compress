@@ -21,6 +21,7 @@
 
 #include <ghoti.io/compress/macros.h>
 #include "../../core/alloc_internal.h"
+#include "../../core/bitcost.h"
 #include "../../core/huffman_lengths.h"
 #include "../../core/stepdown.h"
 #include "../../core/registry_internal.h"
@@ -128,21 +129,189 @@
 typedef struct {
   uint32_t max_lazy; ///< Defer a match shorter than this.
   int max_chain;     ///< Longest hash chain walk.
+  int use_opt;       ///< Parse by shortest path instead of deferring.
+  uint32_t opt_budget; ///< Shortened matches one swept position may try.
 } deflate_effort_t;
 
 /// Indexed by compression level; entry 0 is unused (level 0 stores).
 static const deflate_effort_t k_deflate_effort[10] = {
-    {0, 0},     // 0: stored, nothing is searched
-    {16, 4},    // 1
-    {16, 8},    // 2
-    {16, 16},   // 3
-    {16, 16},   // 4: the first level that defers
-    {16, 32},   // 5
-    {16, 128},  // 6: the default
-    {32, 256},  // 7
-    {128, 1024},// 8
-    {258, 4096},// 9
+    {0, 0, 0, 0},      // 0: stored, nothing is searched
+    {16, 4, 0, 0},     // 1
+    {16, 8, 0, 0},     // 2
+    {16, 16, 0, 0},    // 3
+    {16, 16, 0, 0},    // 4: the first level that defers
+    {16, 32, 0, 0},    // 5
+    {16, 128, 0, 0},   // 6: the default
+    {32, 64, 1, 32},   // 7: first to parse by shortest path
+    {128, 96, 1, 64},  // 8
+    {258, 128, 1, 128} // 9
 };
+
+//
+// The optimal parse
+// =================
+//
+// WHAT A PARSE IS CHOOSING
+// ------------------------
+//
+// The match finder answers "what can I match here".  The parse answers the
+// harder question: which of those matches to actually emit.  A match taken at
+// one position blocks every match that starts inside it, so the stream that
+// costs the fewest bits is often not the stream of longest matches.
+//
+// Everything above this is greedy, with a look-ahead of one byte (lazy
+// matching).  That look-ahead cannot see what either choice costs three
+// matches later, and no amount of deepening will make it.
+//
+// This replaces it with a shortest path search.  Think of the lookahead as a
+// graph: one vertex per byte position, one edge for "write this byte as a
+// literal", and one edge per (length, distance) pair for "emit this match".
+// Give every edge the bits writing it would cost and the cheapest encoding is
+// the shortest path across it.  Every edge goes forward and there are no
+// cycles, so one sweep left to right settles it: when the sweep reaches a
+// position, every edge into it has been relaxed and its cost is final.
+//
+// DEFLATE IS THE EASY CASE
+// ------------------------
+//
+// The zstd parse in zstd_optimal.c has to approximate, because a sequence
+// carries a literal length code: what a run of literals costs depends on how
+// long the run is, so the cost of a path is not the sum of the costs of its
+// edges.  DEFLATE has no such code.  Every literal is its own symbol in the
+// same alphabet as the lengths (RFC 1951 section 3.2.5), and a match costs a
+// length code, a distance code, and their extra bits, and nothing else.
+//
+// The cost is therefore exactly additive, and this sweep finds the true
+// minimum for the prices it is given -- not an approximation of it.  What is
+// approximate is only the prices, and they are approximate for a reason no
+// parse can avoid: the Huffman codes are not built until the block is
+// finished, and the block cannot be finished until the parse has chosen it.
+//
+// WHAT AN EDGE COSTS
+// ------------------
+//
+// The entropy of the symbol under the statistics of what has been encoded
+// recently -- a symbol that has been coming up often is cheap, one that has
+// not is dear, which is what a Huffman code will charge for it.  Prices are
+// in 256ths of a bit; see ../../core/bitcost.h.
+//
+// The extra bits after a length or distance code are priced exactly, because
+// the format fixes them: they are written uncompressed, so their count is
+// their cost (RFC 1951 section 3.2.5).  That is what lets the parse prefer a
+// shorter match nearby to a longer one far away -- a distance over 24576
+// carries thirteen raw bits, which is more than a literal byte usually
+// costs.
+//
+// WHERE THE STATISTICS COME FROM
+// ------------------------------
+//
+// Before anything has been encoded there is nothing to measure, so the model
+// starts from the fixed Huffman code the format itself defines (RFC 1951
+// section 3.2.6): eight bits for the common literals, nine for the rest,
+// seven for the short length codes, five for every distance.  A count of
+// 2^(15-len) prices each symbol at exactly the length that code gives it, so
+// the first block is parsed as though it were going to be written with the
+// fixed code -- which is the format's own guess at what a block looks like.
+//
+// From there the model counts what it emits as it emits it, and the prices
+// are rebuilt at every sweep.  The counts are halved at the start of each
+// block, which makes the model a moving average rather than a running total:
+// the block being parsed counts fully, the one before it half as much, the
+// one before that a quarter.
+//
+
+/// Bits an optimal-parse price carries.  See ../../core/bitcost.h.
+#define DEFLATE_OPT_PRICE_ONE GCOMP_BITCOST_ONE
+#define DEFLATE_OPT_PRICE_SHIFT GCOMP_BITCOST_SHIFT
+
+/// No path reaches here yet.  Large enough that adding any one edge cannot
+/// wrap: the dearest edge is a length code, a distance code and their extra
+/// bits, well under a hundred bits.
+#define DEFLATE_OPT_PRICE_INF 0xF0000000u
+
+/// Most lookahead the optimal levels hold, against 1 KB for the rest.
+///
+/// This does NOT simply want to be as large as it fits, and the reason is
+/// worth stating.  The sweep cannot see past the lookahead, so a longer one
+/// sees further -- but the window holds history and lookahead together, so
+/// every byte of one is a byte of reachable history the other does not have.
+/// The two cross, and they cross early.  On 9 MB of manuals, C source and
+/// XML at a chain of 64:
+///
+///   bytes of lookahead   1024    2048    4096    8192   16384
+///   output bytes      1852559 1848256 1851696 1861539 1890667
+///
+/// Sixteen kilobytes is 2.3% worse than two, and slower for having swept
+/// more to get there: half the window spent on lookahead is half the
+/// distance range the matches can reach into.
+#define DEFLATE_OPT_LOOKAHEAD 2048u
+
+/**
+ * @brief Lookahead an optimal level holds over a window of @p window_size.
+ *
+ * A sixteenth of the window, which is where the measurement above puts it
+ * for the 32 KB window the format allows, and keeps the same share of a
+ * smaller one.
+ */
+static inline size_t deflate_opt_lookahead(size_t window_size) {
+  size_t want = window_size / 16u;
+  if (want > DEFLATE_OPT_LOOKAHEAD) {
+    want = DEFLATE_OPT_LOOKAHEAD;
+  }
+  return want;
+}
+
+/// Shortened versions of matches one position may relax, over and above each
+/// match's whole length, which is always relaxed.  Set per level; this is
+/// what the table calls opt_budget.
+///
+/// Truncating a match is worth trying because it moves where the next one may
+/// start, but trying every truncation of every match would make a run of
+/// identical bytes cost time quadratic in its length.  The budget is spent
+/// from the short end upwards, and candidates are offered shortest first,
+/// because that is where a truncation can change a parse: shortening a
+/// five-byte match to four moves where the next one may start, shortening a
+/// two-hundred byte match to a hundred and ninety-nine almost never does.
+
+/// Fewest positions worth sweeping.  A block is closed rather than swept in
+/// smaller pieces than this, which is also what guarantees the sweep always
+/// makes progress: without a floor, a symbol buffer with one or two entries
+/// left produced a sweep of one or two positions, which is shorter than the
+/// shortest match, and the encoder went round its loop for ever emitting
+/// nothing.
+#define DEFLATE_OPT_MIN_SWEEP 64u
+
+/// Matches one position may consider.  A walk records one per improvement,
+/// and no level walks a chain further than this many candidates deep without
+/// the improvements having long since run out.
+#define DEFLATE_OPT_MAX_CANDIDATES 32u
+
+/**
+ * @brief One position in the sweep.
+ *
+ * `price` and the edge that arrives are filled going forwards; `out_length`
+ * and `out_distance` are filled afterwards by walking the finished path
+ * backwards from its end, which is what lets the emit walk it forwards.
+ */
+typedef struct deflate_opt_node_s {
+  uint32_t price;         ///< Bits*256 to encode everything before here.
+  uint32_t length;        ///< Arriving edge's match length; 0 for a literal.
+  uint32_t distance;      ///< Arriving edge's distance.
+  /**
+   * @brief How long the arriving match could have run, had it been allowed.
+   *
+   * A match is relaxed at every length up to where the sweep ends, so a
+   * match that would have run past the end arrives truncated.  For every
+   * step but the last that is the right answer -- the path continues from
+   * there -- but the last step of a path has nothing after it, and cutting
+   * it is the boundary deciding rather than the cost.  Keeping the whole
+   * length lets the last step be put back to it; see the emit loop.
+   */
+  uint32_t full;
+  uint32_t out_length;    ///< Leaving edge's match length; 0 for a literal.
+  uint32_t out_distance;  ///< Leaving edge's distance.
+  uint32_t out_full;      ///< Leaving edge's untruncated length.
+} deflate_opt_node_t;
 
 // The window holds history and lookahead in one circular buffer, so every
 // byte of lookahead is a byte of history the encoder does not have.  A match
@@ -521,6 +690,23 @@ typedef struct gcomp_deflate_encoder_state_s {
    * impossible. Blocks are now rendered here first and copied out as space
    * allows, exactly as finish() already did with finish_buf.
    */
+  //
+  // Optimal parse (see "The optimal parse" below).  The counts are a moving
+  // average of what has been emitted, the prices are built from them, and
+  // the nodes are the sweep's table -- one per position of a sweep, plus the
+  // one past its end.
+  //
+  uint32_t opt_lit_freq[DEFLATE_MAX_LITLEN_SYMBOLS];
+  uint32_t opt_dist_freq[DEFLATE_MAX_DIST_SYMBOLS];
+  uint32_t opt_lit_price[DEFLATE_MAX_LITLEN_SYMBOLS];
+  uint32_t opt_dist_price[DEFLATE_MAX_DIST_SYMBOLS];
+  uint32_t opt_budget;                   ///< Shortenings a position may try.
+  size_t opt_inserted_to;                ///< Stream position the sweeps have
+                                         ///< entered into the chains up to.
+  struct deflate_opt_node_s * opt_nodes; ///< NULL unless this level uses it.
+  size_t opt_node_cap;                   ///< Entries in opt_nodes.
+  int use_opt;                           ///< Parse by shortest path.
+
   uint8_t * pending_buf;    ///< Output staged by update() before delivery.
   size_t pending_size;      ///< Allocated size of pending_buf.
   size_t pending_used;      ///< Bytes rendered into pending_buf.
@@ -548,6 +734,31 @@ typedef struct gcomp_deflate_encoder_state_s {
 //
 // Hash function for LZ77
 //
+
+static void deflate_opt_decay(gcomp_deflate_encoder_state_t * st);
+static void deflate_opt_prime(gcomp_deflate_encoder_state_t * st);
+
+/**
+ * @brief Clear what a block accumulated, ready for the next one.
+ *
+ * Two places finish a block, and both used to clear this by hand.  A third
+ * thing to keep in step -- the optimal parse's moving average, which is
+ * halved here so that a block weighs against its predecessors -- is two
+ * places too many to add it in.
+ */
+static void deflate_reset_block_stats(gcomp_deflate_encoder_state_t * st) {
+  st->sym_buf_used = 0;
+  st->block_input_len = 0;
+  if (st->lit_freq) {
+    memset(st->lit_freq, 0, DEFLATE_MAX_LITLEN_SYMBOLS * sizeof(uint32_t));
+  }
+  if (st->dist_freq) {
+    memset(st->dist_freq, 0, DEFLATE_MAX_DIST_SYMBOLS * sizeof(uint32_t));
+  }
+  if (st->use_opt) {
+    deflate_opt_decay(st);
+  }
+}
 
 static uint32_t deflate_hash_update(uint32_t h, uint8_t b) {
   // Simple multiplicative hash
@@ -652,14 +863,7 @@ static gcomp_status_t deflate_flush_stored_block_from_window(
     }
   }
 
-  st->sym_buf_used = 0;
-  st->block_input_len = 0;
-  if (st->lit_freq) {
-    memset(st->lit_freq, 0, DEFLATE_MAX_LITLEN_SYMBOLS * sizeof(uint32_t));
-  }
-  if (st->dist_freq) {
-    memset(st->dist_freq, 0, DEFLATE_MAX_DIST_SYMBOLS * sizeof(uint32_t));
-  }
+  deflate_reset_block_stats(st);
   return GCOMP_OK;
 }
 
@@ -1355,14 +1559,7 @@ static gcomp_status_t deflate_flush_fixed_block(
   }
 
   // Reset for next block
-  st->sym_buf_used = 0;
-  st->block_input_len = 0;
-  if (st->lit_freq) {
-    memset(st->lit_freq, 0, DEFLATE_MAX_LITLEN_SYMBOLS * sizeof(uint32_t));
-  }
-  if (st->dist_freq) {
-    memset(st->dist_freq, 0, DEFLATE_MAX_DIST_SYMBOLS * sizeof(uint32_t));
-  }
+  deflate_reset_block_stats(st);
   return GCOMP_OK;
 }
 
@@ -2257,6 +2454,36 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
       gcomp_memory_track_alloc(&st->mem_tracker, dist_freq_size);
     }
 
+    const deflate_effort_t * effort =
+        &k_deflate_effort[(st->level >= 1 && st->level <= 9) ? st->level : 6];
+
+    // The optimal parse's table, for the levels that use it.  One entry per
+    // position of a sweep, plus the one past its end: a match that would
+    // reach beyond the sweep ends it instead of being relaxed, so nothing is
+    // written past this.
+    //
+    // HUFFMAN_ONLY emits no matches and RLE looks only at distance 1, so
+    // neither has a parse for this to replace.  The other three do: LAZY is
+    // DEFAULT plus deferral at levels 1 to 3 and FIXED is DEFAULT with the
+    // coding forced, and both are meant to be DEFAULT everywhere else --
+    // which they only stay by taking this too.
+    st->use_opt = effort->use_opt &&
+        (st->strategy == DEFLATE_STRATEGY_DEFAULT ||
+            st->strategy == DEFLATE_STRATEGY_LAZY ||
+            st->strategy == DEFLATE_STRATEGY_FIXED);
+    if (st->use_opt) {
+      st->opt_budget = effort->opt_budget;
+      st->opt_node_cap = deflate_opt_lookahead(st->window_size) + 1u;
+      size_t opt_bytes = st->opt_node_cap * sizeof(deflate_opt_node_t);
+      st->opt_nodes = (deflate_opt_node_t *)gcomp_malloc(alloc, opt_bytes);
+      if (!st->opt_nodes) {
+        status = GCOMP_ERR_MEMORY;
+        goto cleanup;
+      }
+      gcomp_memory_track_alloc(&st->mem_tracker, opt_bytes);
+      deflate_opt_prime(st);
+    }
+
     // Build fixed Huffman codes
     status = deflate_build_fixed_codes(st);
     if (status != GCOMP_OK) {
@@ -2280,6 +2507,7 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
 
 cleanup:
   // Clean up all allocations on error (gcomp_free handles NULL safely)
+  gcomp_free(alloc, st->opt_nodes);
   gcomp_free(alloc, st->dist_freq);
   gcomp_free(alloc, st->lit_freq);
   gcomp_free(alloc, st->dist_buf);
@@ -2310,6 +2538,7 @@ void gcomp_deflate_encoder_destroy(gcomp_encoder_t * encoder) {
 
   gcomp_free(alloc, st->pending_buf);
   gcomp_free(alloc, st->finish_buf);
+  gcomp_free(alloc, st->opt_nodes);
   gcomp_free(alloc, st->dist_freq);
   gcomp_free(alloc, st->lit_freq);
   gcomp_free(alloc, st->dist_buf);
@@ -2382,6 +2611,13 @@ gcomp_status_t gcomp_deflate_encoder_reset(gcomp_encoder_t * encoder) {
   }
   if (st->dist_freq) {
     memset(st->dist_freq, 0, DEFLATE_MAX_DIST_SYMBOLS * sizeof(uint32_t));
+  }
+
+  // A reset starts a new stream, so what the optimal parse learned about the
+  // last one goes back to the format's own default coding.
+  if (st->use_opt) {
+    deflate_opt_prime(st);
+    st->opt_inserted_to = 0;
   }
 
   // Free and reset finish buffer (if any partial finish was in progress)
@@ -2471,6 +2707,306 @@ static int deflate_drain_pending(
  * @param input The caller's input buffer; used is advanced by what was taken.
  * @return Status code.
  */
+
+/**
+ * @brief Start the cost model from the fixed Huffman code.
+ *
+ * RFC 1951 section 3.2.6 fixes those code lengths, and a count of 2^(15-len)
+ * prices a symbol at exactly the length the fixed code gives it.  So before
+ * anything has been measured, the parse prices a block as the format's own
+ * default coding would.
+ */
+static void deflate_opt_prime(gcomp_deflate_encoder_state_t * st) {
+  for (size_t i = 0; i < DEFLATE_MAX_LITLEN_SYMBOLS; i++) {
+    unsigned len = (i < 144u) ? 8u : (i < 256u) ? 9u : (i < 280u) ? 7u : 8u;
+    st->opt_lit_freq[i] = 1u << (15u - len);
+  }
+  for (size_t i = 0; i < DEFLATE_MAX_DIST_SYMBOLS; i++) {
+    st->opt_dist_freq[i] = 1u << (15u - 5u);
+  }
+}
+
+/**
+ * @brief Halve every count, so a block weighs against its predecessors.
+ *
+ * No count reaches zero: a symbol that has not come up is unseen, not
+ * impossible, and a count of zero would price it at infinity -- a symbol the
+ * parse would refuse to emit however much it saved.
+ */
+static void deflate_opt_decay(gcomp_deflate_encoder_state_t * st) {
+  for (size_t i = 0; i < DEFLATE_MAX_LITLEN_SYMBOLS; i++) {
+    uint32_t v = st->opt_lit_freq[i] >> 1;
+    st->opt_lit_freq[i] = v ? v : 1u;
+  }
+  for (size_t i = 0; i < DEFLATE_MAX_DIST_SYMBOLS; i++) {
+    uint32_t v = st->opt_dist_freq[i] >> 1;
+    st->opt_dist_freq[i] = v ? v : 1u;
+  }
+}
+
+/**
+ * @brief Rebuild the prices from the counts.
+ *
+ * A Huffman code is at least one bit long however common its symbol, so no
+ * symbol is priced below one bit; RFC 1951 section 3.2.7 caps them at
+ * fifteen, so none is priced above that either.  Pricing outside that range
+ * would be promising something the format cannot deliver.
+ */
+static void deflate_opt_rebuild_prices(gcomp_deflate_encoder_state_t * st) {
+  gcomp_bitcost_from_freq(st->opt_lit_freq, st->opt_lit_price,
+      DEFLATE_MAX_LITLEN_SYMBOLS, DEFLATE_OPT_PRICE_ONE);
+  gcomp_bitcost_from_freq(st->opt_dist_freq, st->opt_dist_price,
+      DEFLATE_MAX_DIST_SYMBOLS, DEFLATE_OPT_PRICE_ONE);
+  for (size_t i = 0; i < DEFLATE_MAX_LITLEN_SYMBOLS; i++) {
+    if (st->opt_lit_price[i] > 15u * DEFLATE_OPT_PRICE_ONE) {
+      st->opt_lit_price[i] = 15u * DEFLATE_OPT_PRICE_ONE;
+    }
+  }
+  for (size_t i = 0; i < DEFLATE_MAX_DIST_SYMBOLS; i++) {
+    if (st->opt_dist_price[i] > 15u * DEFLATE_OPT_PRICE_ONE) {
+      st->opt_dist_price[i] = 15u * DEFLATE_OPT_PRICE_ONE;
+    }
+  }
+}
+
+/**
+ * @brief What a match of @p length at @p distance costs, in 256ths of a bit.
+ */
+static inline uint32_t deflate_opt_match_price(
+    const gcomp_deflate_encoder_state_t * st, uint32_t length,
+    uint32_t distance) {
+  uint32_t lc = gcomp_deflate_length_code(length);
+  uint32_t dc = gcomp_deflate_distance_code(distance);
+  return st->opt_lit_price[lc] +
+      ((uint32_t)k_len_extra[lc - 257u] << DEFLATE_OPT_PRICE_SHIFT) +
+      st->opt_dist_price[dc] +
+      ((uint32_t)k_dist_extra[dc] << DEFLATE_OPT_PRICE_SHIFT);
+}
+
+/**
+ * @brief Record one symbol against the model and in the block.
+ */
+static inline void deflate_opt_emit(gcomp_deflate_encoder_state_t * st,
+    uint32_t length, uint32_t distance, uint8_t literal) {
+  if (length >= DEFLATE_MIN_MATCH_LENGTH) {
+    st->lit_buf[st->sym_buf_used] = (uint16_t)length;
+    st->dist_buf[st->sym_buf_used] = (uint16_t)distance;
+    st->sym_buf_used++;
+    st->block_input_len += (size_t)length;
+    uint32_t lc = gcomp_deflate_length_code(length);
+    uint32_t dc = gcomp_deflate_distance_code(distance);
+    if (st->lit_freq) {
+      st->lit_freq[lc]++;
+      st->dist_freq[dc]++;
+    }
+    st->opt_lit_freq[lc]++;
+    st->opt_dist_freq[dc]++;
+  }
+  else {
+    st->lit_buf[st->sym_buf_used] = literal;
+    st->dist_buf[st->sym_buf_used] = 0;
+    st->sym_buf_used++;
+    st->block_input_len += 1u;
+    if (st->lit_freq) {
+      st->lit_freq[literal]++;
+    }
+    st->opt_lit_freq[literal]++;
+  }
+}
+
+/**
+ * @brief Parse a stretch of the lookahead by shortest path, and emit it.
+ *
+ * @param st Encoder state.
+ * @param pos Window index of the first position to parse.
+ * @param stream_pos Stream position of that first position.
+ * @param max_chain How many chain candidates a position may consider.
+ * @param sweep Positions to sweep.  Matches leaving the last of them may
+ *        reach up to DEFLATE_MAX_MATCH_LENGTH further, which is why the
+ *        caller keeps that much lookahead in hand when there is more input.
+ */
+static void deflate_optimal_parse(gcomp_deflate_encoder_state_t * st,
+    size_t pos, size_t stream_pos, int max_chain, size_t sweep) {
+  deflate_opt_node_t * nodes = st->opt_nodes;
+  const size_t mask = st->window_mask;
+
+  deflate_opt_rebuild_prices(st);
+
+  // Nothing has reached any of these yet.  A match edge can land well past
+  // the next position, so a node the sweep has not arrived at may already
+  // hold a price -- which means "unreached" has to be a value, not the
+  // absence of one.
+  for (size_t t = 1; t <= sweep; t++) {
+    nodes[t].price = DEFLATE_OPT_PRICE_INF;
+  }
+  nodes[0].price = 0;
+  nodes[0].length = 0;
+  nodes[0].distance = 0;
+  nodes[0].full = 0;
+
+  for (size_t j = 0; j < sweep; j++) {
+    const size_t p = (pos + j) & mask;
+    const size_t avail = st->lookahead - j;
+    const uint32_t here = nodes[j].price;
+
+    // The literal edge.  Every literal is its own symbol, so this is the
+    // whole of its cost -- there is no run length to account for, which is
+    // what makes this sweep exact rather than approximate.
+    {
+      uint32_t next = here + st->opt_lit_price[st->window[p]];
+      if (next < nodes[j + 1u].price) {
+        nodes[j + 1u].price = next;
+        nodes[j + 1u].length = 0;
+        nodes[j + 1u].distance = 0;
+        nodes[j + 1u].full = 0;
+      }
+    }
+
+    if (avail < DEFLATE_MIN_MATCH_LENGTH) {
+      continue;
+    }
+
+    deflate_match_t cand[DEFLATE_OPT_MAX_CANDIDATES];
+    size_t ncand = 0;
+    (void)deflate_find_match_list(st, p, stream_pos + j, max_chain, avail, cand,
+        DEFLATE_OPT_MAX_CANDIDATES, &ncand);
+
+    // Searching a position does not enter it into the chains; that is a
+    // separate step.  It has to happen here rather than when the path is
+    // emitted, because a match at a later position of this same sweep may
+    // point at this one and can only find it if it is already in the chain.
+    deflate_insert_hash(st, p, stream_pos + j);
+
+    // The match edges, shortest candidate first.  Each covers the lengths
+    // the one before it could not reach, so no length is priced twice
+    // against a worse distance.
+    uint32_t budget = st->opt_budget;
+    uint32_t covered = DEFLATE_MIN_MATCH_LENGTH - 1u;
+    for (size_t c = 0; c < ncand; c++) {
+      const uint32_t whole = cand[c].length;
+      if (whole <= covered) {
+        continue;
+      }
+      // A match may not be relaxed past the end of the sweep; the path has
+      // to land there.  What it would have been is kept, for the one step
+      // where being cut short is the boundary talking and not the cost.
+      uint32_t hi = whole;
+      if (j + hi > sweep) {
+        hi = (uint32_t)(sweep - j);
+      }
+      const uint32_t lo = covered + 1u;
+      covered = whole;
+      if (hi < lo) {
+        continue;
+      }
+
+      uint32_t span = hi - lo;
+      if (span > budget) {
+        span = budget;
+      }
+      budget -= span;
+
+      for (uint32_t len = lo;; len++) {
+        if (len > lo + span) {
+          len = hi; // Only the whole match is left in the budget.
+        }
+        uint32_t price =
+            here + deflate_opt_match_price(st, len, cand[c].distance);
+        size_t t = j + len;
+        if (price < nodes[t].price) {
+          nodes[t].price = price;
+          nodes[t].length = len;
+          nodes[t].distance = cand[c].distance;
+          nodes[t].full = whole;
+        }
+        if (len >= hi) {
+          break;
+        }
+      }
+    }
+  }
+
+  // Walk the best path to the end of the sweep backwards, recording at each
+  // position the edge the path leaves by, so it can then be walked forwards
+  // to emit.
+  // `last` is where the path's final step starts, which is the FIRST thing
+  // this walk meets, since it goes backwards.  Taking it from the last
+  // iteration instead makes it zero, and then only one step of each sweep is
+  // emitted and everything else the sweep worked out is thrown away -- which
+  // still terminates, so it shows up as the encoder being a hundred times
+  // slower rather than as anything failing.
+  size_t last = 0;
+  {
+    size_t k = sweep;
+    int seen_last = 0;
+    while (k > 0) {
+      const uint32_t m = nodes[k].length;
+      const size_t prev = (m == 0u) ? (k - 1u) : (k - m);
+      nodes[prev].out_length = m;
+      nodes[prev].out_distance = (m == 0u) ? 0u : nodes[k].distance;
+      nodes[prev].out_full = (m == 0u) ? 0u : nodes[k].full;
+      if (!seen_last) {
+        last = prev;
+        seen_last = 1;
+      }
+      k = prev;
+    }
+  }
+
+  // Emit forwards, consuming the lookahead as it goes.  Positions inside a
+  // match were entered into the chains by the sweep, so nothing is inserted
+  // here -- except past the end of the sweep, which the last step may reach.
+  size_t i = 0;
+  while (i < last) {
+    const uint32_t m = nodes[i].out_length;
+    const size_t p = (pos + i) & mask;
+    if (m == 0u) {
+      deflate_opt_emit(st, 0, 0, st->window[p]);
+      st->lookahead--;
+      i++;
+      continue;
+    }
+    deflate_opt_emit(st, m, nodes[i].out_distance, 0);
+    st->lookahead -= m;
+    i += m;
+  }
+
+  // The last step, put back to its whole length.
+  //
+  // Every other step of the path is followed by another, so a match cut to
+  // fit the end of the sweep would only have displaced the step after it.
+  // The last one has nothing after it: cutting it is the boundary deciding,
+  // not the cost.  On ordinary text that is one truncated match in a hundred
+  // and fifty and does not show, but on a run of identical bytes, where every
+  // match is the full 258, it is one in seven -- 4 MB of zeroes came out 44%
+  // larger at level 9 than at level 6, which is the wrong way round.
+  {
+    const size_t p = (pos + i) & mask;
+    uint32_t m = nodes[i].out_length;
+    if (m >= DEFLATE_MIN_MATCH_LENGTH) {
+      uint32_t whole = nodes[i].out_full;
+      if (whole > m && (size_t)whole <= st->lookahead) {
+        m = whole;
+      }
+      deflate_opt_emit(st, m, nodes[i].out_distance, 0);
+      // Whatever this reached past the end of the sweep was never swept, so
+      // it is not in the chains yet.
+      size_t q = (pos + sweep) & mask;
+      size_t qs = stream_pos + sweep;
+      for (size_t f = sweep; f < i + m; f++) {
+        deflate_insert_hash(st, q, qs);
+        q = (q + 1u) & mask;
+        qs++;
+      }
+      st->lookahead -= m;
+    }
+    else {
+      deflate_opt_emit(st, 0, 0, st->window[p]);
+      st->lookahead--;
+    }
+  }
+}
+
 static gcomp_status_t deflate_encode_batch(
     gcomp_deflate_encoder_state_t * st, gcomp_buffer_t * input) {
 
@@ -2627,9 +3163,15 @@ static gcomp_status_t deflate_encode_batch(
       // window as history.  Across 12 MB of source, prose, XML and binaries
       // that is 8.0% fewer bytes out, and faster: the encoder finds longer
       // matches, so it emits fewer symbols for the same input.
+      // The optimal parse cannot see past the lookahead, and a boundary it
+      // cannot see past costs whatever the match crossing it would have been
+      // worth, so those levels hold more of it.  See DEFLATE_OPT_LOOKAHEAD.
       size_t refill_to = st->window_size / 2u;
-      if (refill_to > DEFLATE_REFILL_LOOKAHEAD) {
-        refill_to = DEFLATE_REFILL_LOOKAHEAD;
+      size_t want_lookahead = st->use_opt
+          ? deflate_opt_lookahead(st->window_size)
+          : (size_t)DEFLATE_REFILL_LOOKAHEAD;
+      if (refill_to > want_lookahead) {
+        refill_to = want_lookahead;
       }
       size_t avail = input->size - input->used;
       size_t space = (st->lookahead < refill_to) ? (refill_to - st->lookahead)
@@ -2684,8 +3226,19 @@ static gcomp_status_t deflate_encode_batch(
         // across the corpus.  The mean-coverage test keeps that cost off
         // compressible data, where blocks cover three to fourteen bytes per
         // symbol and a stored block could never have won anyway.
-        size_t stored_reach = (st->window_size > 4u * DEFLATE_REFILL_LOOKAHEAD)
-            ? st->window_size - 2u * DEFLATE_REFILL_LOOKAHEAD
+        // The reach and the step are both measured against how much
+        // lookahead this level holds, not against a constant.  A block's
+        // bytes have to still be in the window when it is written, so the
+        // lookahead in front of them is what they cannot cover -- and the
+        // check has to fire a whole step early, because one step is the
+        // most the block can grow by before it is asked again.  For the
+        // greedy parse a step is a match; for a sweep it is the whole
+        // stretch swept, which is why this is not DEFLATE_MAX_MATCH_LENGTH.
+        size_t held = st->use_opt ? deflate_opt_lookahead(st->window_size)
+                                  : (size_t)DEFLATE_REFILL_LOOKAHEAD;
+        size_t step = st->use_opt ? held : (size_t)DEFLATE_MAX_MATCH_LENGTH;
+        size_t stored_reach = (st->window_size > 4u * held)
+            ? st->window_size - 2u * held
             : st->window_size;
         // Within an eighth of one byte per symbol: essentially nothing is
         // matching.  A looser test - twice a byte per symbol - also fires on
@@ -2694,9 +3247,16 @@ static gcomp_status_t deflate_encode_batch(
         int literal_heavy = st->block_input_len <
             (size_t)st->sym_buf_used + (size_t)st->sym_buf_used / 8u;
         int out_of_window_reach = literal_heavy && st->sym_buf_used > 0 &&
-            st->block_input_len + DEFLATE_MAX_MATCH_LENGTH >= stored_reach;
+            st->block_input_len + step >= stored_reach;
 
-        if (st->sym_buf_used >= st->sym_buf_size - 2 || out_of_window_reach) {
+        // A sweep emits at most one symbol per position and will not run in
+        // less room than DEFLATE_OPT_MIN_SWEEP, so the block is closed once
+        // that much is all that is left.
+        int no_room_to_sweep = st->use_opt &&
+            st->sym_buf_used + DEFLATE_OPT_MIN_SWEEP > st->sym_buf_size - 2u;
+
+        if (st->sym_buf_used >= st->sym_buf_size - 2 || out_of_window_reach ||
+            no_room_to_sweep) {
           if (use_fixed_huffman) {
             s = deflate_flush_fixed_block(st, 0);
           }
@@ -2722,6 +3282,44 @@ static gcomp_status_t deflate_encode_batch(
         size_t pos = (st->window_pos + st->window_size - st->lookahead) %
             st->window_size;
         size_t stream_pos = st->total_in - st->lookahead;
+
+        // The levels that parse by shortest path do a stretch at a time.
+        //
+        // When there is more input to come, the sweep stops a whole match
+        // short of the end of the lookahead, so that a match leaving its
+        // last position is not cut off by data that has not arrived.  When
+        // the input is finished there is nothing to wait for and the rest is
+        // swept as it stands.
+        //
+        // The symbol buffer bounds it too: a sweep emits at most one symbol
+        // per position, and the block is closed above when the buffer fills.
+        if (st->use_opt) {
+          size_t sweep = st->lookahead;
+          // With more input to come, stop a whole match short of the end of
+          // the lookahead, so that a match leaving the last position swept is
+          // not cut off by data that has not arrived.  That only makes sense
+          // while the lookahead is comfortably longer than a match; where it
+          // is not -- a small declared window -- the boundary is taken as it
+          // comes, which costs a match at the edge rather than the sweep.
+          if (input->used < input->size &&
+              sweep > 2u * DEFLATE_MAX_MATCH_LENGTH) {
+            sweep -= DEFLATE_MAX_MATCH_LENGTH;
+          }
+          if (sweep > st->opt_node_cap - 1u) {
+            sweep = st->opt_node_cap - 1u;
+          }
+          size_t room = st->sym_buf_size - 2u - st->sym_buf_used;
+          if (sweep > room) {
+            sweep = room;
+          }
+          // Every bound above is at least DEFLATE_MIN_MATCH_LENGTH here: the
+          // loop only runs with that much lookahead, the table holds at least
+          // half a window, and the block was closed if less than
+          // DEFLATE_OPT_MIN_SWEEP symbols were left.  So a sweep always
+          // consumes something, which is what stops this looping.
+          deflate_optimal_parse(st, pos, stream_pos, max_chain, sweep);
+          continue;
+        }
 
         // Strategy-specific match finding
         deflate_match_t match = {0, 0};
