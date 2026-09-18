@@ -287,7 +287,7 @@ static void example_strategies(gcomp_registry_t * registry) {
   // Different data types benefit from different strategies
   const char * text_data = "The quick brown fox jumps over the lazy dog. "
                            "The quick brown fox jumps over the lazy dog.";
-  const char * strategies[] = {"default", "filtered", "huffman_only", "rle"};
+  const char * strategies[] = {"default", "lazy", "huffman_only", "rle"};
 
   for (int i = 0; i < 4; i++) {
     gcomp_options_t * opts = NULL;
@@ -311,7 +311,7 @@ static void example_strategies(gcomp_registry_t * registry) {
 
   printf("  Strategy selection:\n");
   printf("    - 'default': Best for general data\n");
-  printf("    - 'filtered': Optimized for pre-filtered data (PNG)\n");
+  printf("    - 'lazy': Defers matches at every level (PNG filter output)\n");
   printf("    - 'huffman_only': Skip LZ77 for pre-compressed data\n");
   printf("    - 'rle': Run-length encoding for repeated bytes\n");
 }

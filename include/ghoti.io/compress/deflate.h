@@ -33,7 +33,9 @@
  *
  * - `deflate.strategy` (string): Compression strategy for specialized data
  *   - "default": Standard LZ77 + Huffman (recommended for most data)
- *   - "filtered": Optimized for pre-processed/filtered data (PNG, pre-sorted)
+ *   - "lazy": Defers matches at every level, not only from level 4 up;
+ *     good for PNG filter output and other data where a match one byte later
+ *     is often longer
  *   - "huffman_only": Huffman coding only, no LZ77 (fast, poor compression)
  *   - "rle": Run-length encoding mode (useful for PNG images)
  *

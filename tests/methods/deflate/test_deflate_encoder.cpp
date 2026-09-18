@@ -767,11 +767,11 @@ TEST_F(DeflateEncoderTest, Strategy_RLE_CompressesRuns) {
   EXPECT_EQ(memcmp(decompressed.data(), input.data(), input.size()), 0);
 }
 
-TEST_F(DeflateEncoderTest, Strategy_Filtered_RoundTrip) {
+TEST_F(DeflateEncoderTest, Strategy_Lazy_RoundTrip) {
   gcomp_options_t * opts = nullptr;
   ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
   ASSERT_EQ(
-      gcomp_options_set_string(opts, "deflate.strategy", "filtered"), GCOMP_OK);
+      gcomp_options_set_string(opts, "deflate.strategy", "lazy"), GCOMP_OK);
   ASSERT_EQ(gcomp_options_set_int64(opts, "deflate.level", 6), GCOMP_OK);
 
   // Simulate PNG-like filtered data (small differences)
@@ -801,32 +801,43 @@ TEST_F(DeflateEncoderTest, Strategy_Filtered_RoundTrip) {
   EXPECT_EQ(memcmp(decompressed.data(), input.data(), input.size()), 0);
 }
 
-TEST_F(DeflateEncoderTest, Strategy_InvalidFallsBackToDefault) {
-  gcomp_options_t * opts = nullptr;
-  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
-  // Invalid strategy should silently fall back to default
-  ASSERT_EQ(gcomp_options_set_string(opts, "deflate.strategy", "invalid_xyz"),
-      GCOMP_OK);
-  ASSERT_EQ(gcomp_options_set_int64(opts, "deflate.level", 6), GCOMP_OK);
+// A strategy name this encoder does not know is a mistake, not a preference.
+//
+// It used to fall back to the default silently, which turns a typo - or a
+// name that has been renamed out from under the caller, as "filtered" was -
+// into output that is merely different, with nothing saying which strategy
+// actually ran.
+TEST_F(DeflateEncoderTest, Strategy_UnknownIsRejected) {
+  for (const char * name : {"invalid_xyz", "filtered", "", "LAZY"}) {
+    gcomp_options_t * opts = nullptr;
+    ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+    ASSERT_EQ(
+        gcomp_options_set_string(opts, "deflate.strategy", name), GCOMP_OK);
 
-  const char * input_str = "Hello, World!";
-  const uint8_t * input = (const uint8_t *)input_str;
-  size_t input_len = strlen(input_str);
+    gcomp_encoder_t * enc = nullptr;
+    EXPECT_EQ(gcomp_encoder_create(registry_, "deflate", opts, &enc),
+        GCOMP_ERR_INVALID_ARG)
+        << "strategy \"" << name << "\" was accepted";
+    gcomp_encoder_destroy(enc);
+    gcomp_options_destroy(opts);
+  }
+}
 
-  std::vector<uint8_t> compressed;
-  ASSERT_EQ(encode_data(input, input_len, compressed, opts), GCOMP_OK);
+// And every name it does know is accepted.
+TEST_F(DeflateEncoderTest, Strategy_EveryDocumentedNameIsAccepted) {
+  for (const char * name :
+      {"default", "lazy", "huffman_only", "rle", "fixed"}) {
+    gcomp_options_t * opts = nullptr;
+    ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+    ASSERT_EQ(
+        gcomp_options_set_string(opts, "deflate.strategy", name), GCOMP_OK);
 
-  gcomp_options_destroy(opts);
-  gcomp_encoder_destroy(encoder_);
-  encoder_ = nullptr;
-
-  std::vector<uint8_t> decompressed;
-  ASSERT_EQ(decode_data(
-                compressed.data(), compressed.size(), decompressed, input_len),
-      GCOMP_OK);
-
-  ASSERT_EQ(decompressed.size(), input_len);
-  EXPECT_EQ(memcmp(decompressed.data(), input, input_len), 0);
+    gcomp_encoder_t * enc = nullptr;
+    EXPECT_EQ(gcomp_encoder_create(registry_, "deflate", opts, &enc), GCOMP_OK)
+        << "strategy \"" << name << "\" was rejected";
+    gcomp_encoder_destroy(enc);
+    gcomp_options_destroy(opts);
+  }
 }
 
 TEST_F(DeflateEncoderTest, Strategy_Default_LargeInput) {
@@ -909,7 +920,7 @@ TEST_F(DeflateEncoderTest, Strategy_HuffmanOnly_SizeProgression) {
 TEST_F(DeflateEncoderTest, Strategy_AllStrategies_SmallInput) {
   // Test all strategies with small input (256 bytes)
   const char * strategies[] = {
-      "default", "filtered", "huffman_only", "rle", "fixed"};
+      "default", "lazy", "huffman_only", "rle", "fixed"};
 
   // Simple incrementing pattern
   std::vector<uint8_t> input(256);
@@ -1596,14 +1607,14 @@ TEST(DeflateEncodeCodeTables, OutOfRangeValuesReturnZero) {
 }
 
 // ---------------------------------------------------------------------------
-// Lazy matching under the "filtered" strategy
+// Lazy matching under the "lazy" strategy
 // ---------------------------------------------------------------------------
 
 namespace {
 
 // Bytes shaped like PNG filter output: mostly small values, with short runs
 // and near-repeats at short distance, which is what lazy matching is for.
-std::vector<uint8_t> FilteredLookingBytes(size_t n) {
+std::vector<uint8_t> LazyLookingBytes(size_t n) {
   std::vector<uint8_t> v;
   v.reserve(n);
   uint32_t seed = 20260916u;
@@ -1682,33 +1693,33 @@ size_t EncodeWith(gcomp_registry_t * reg, const char * strategy,
 // switches from deflate_fast to deflate_slow, and FILTERED defers at every
 // level - so the two differ only at levels 1 to 3, which is where these ask
 // the question.
-TEST_F(DeflateEncoderTest, FilteredBeatsDefaultOnFilterShapedData) {
-  std::vector<uint8_t> in = FilteredLookingBytes(400000);
+TEST_F(DeflateEncoderTest, LazyBeatsDefaultOnFilterShapedData) {
+  std::vector<uint8_t> in = LazyLookingBytes(400000);
   for (int level = 1; level <= 3; level++) {
     std::vector<uint8_t> a;
     std::vector<uint8_t> b;
     size_t plain = EncodeWithLevel(registry_, "default", level, in, a);
-    size_t deferred = EncodeWithLevel(registry_, "filtered", level, in, b);
+    size_t deferred = EncodeWithLevel(registry_, "lazy", level, in, b);
     // Measured at 10.5% smaller; asking for 5% leaves room to move without
     // letting the strategy quietly stop earning its name.  It did stop, once:
     // the deferral threshold at levels 1 to 3 was the one value that makes
     // deferring pointless - hold a match only if it is exactly three bytes -
     // and FILTERED came out larger than DEFAULT on this very data.
     EXPECT_LT(deferred + deferred / 20, plain)
-        << "level " << level << ": filtered " << deferred << " vs default "
+        << "level " << level << ": lazy " << deferred << " vs default "
         << plain;
   }
 }
 
-TEST_F(DeflateEncoderTest, FilteredDefersWhereDefaultDoesNotAtTheFastLevels) {
+TEST_F(DeflateEncoderTest, LazyDefersWhereDefaultDoesNotAtTheFastLevels) {
   std::vector<uint8_t> in = TextLikeBytes(400000);
   for (int level = 1; level <= 3; level++) {
     std::vector<uint8_t> a;
     std::vector<uint8_t> b;
     size_t plain = EncodeWithLevel(registry_, "default", level, in, a);
-    size_t deferred = EncodeWithLevel(registry_, "filtered", level, in, b);
+    size_t deferred = EncodeWithLevel(registry_, "lazy", level, in, b);
     EXPECT_LT(deferred, plain)
-        << "level " << level << ": filtered " << deferred << " vs default "
+        << "level " << level << ": lazy " << deferred << " vs default "
         << plain;
   }
 }
@@ -1718,13 +1729,13 @@ TEST_F(DeflateEncoderTest, FilteredDefersWhereDefaultDoesNotAtTheFastLevels) {
 // put chain depth at 0.1 points across a factor of eight and deferral at 1.7 -
 // so it is recorded here rather than left to be discovered.  What FILTERED
 // means is levels 1 to 3, where it defers and DEFAULT does not.
-TEST_F(DeflateEncoderTest, FilteredMatchesDefaultAtTheSlowLevels) {
-  std::vector<uint8_t> in = FilteredLookingBytes(200000);
+TEST_F(DeflateEncoderTest, LazyMatchesDefaultAtTheSlowLevels) {
+  std::vector<uint8_t> in = LazyLookingBytes(200000);
   for (int level = 4; level <= 9; level++) {
     std::vector<uint8_t> a;
     std::vector<uint8_t> b;
     size_t plain = EncodeWithLevel(registry_, "default", level, in, a);
-    size_t lazy = EncodeWithLevel(registry_, "filtered", level, in, b);
+    size_t lazy = EncodeWithLevel(registry_, "lazy", level, in, b);
     ASSERT_EQ(plain, lazy) << "level " << level;
     EXPECT_EQ(memcmp(a.data(), b.data(), plain), 0) << "level " << level;
   }
@@ -1733,7 +1744,7 @@ TEST_F(DeflateEncoderTest, FilteredMatchesDefaultAtTheSlowLevels) {
 // Deferring is what a higher level buys here, so the levels that defer have to
 // come out smaller than the levels that do not.
 TEST_F(DeflateEncoderTest, DefaultImprovesWhenDeferralTurnsOn) {
-  std::vector<uint8_t> in = FilteredLookingBytes(200000);
+  std::vector<uint8_t> in = LazyLookingBytes(200000);
   std::vector<uint8_t> fast;
   std::vector<uint8_t> slow;
   size_t at3 = EncodeWithLevel(registry_, "default", 3, in, fast);
@@ -1744,12 +1755,12 @@ TEST_F(DeflateEncoderTest, DefaultImprovesWhenDeferralTurnsOn) {
 // A match held back must be emitted exactly once, whether the stream ends
 // while it is held or another match displaces it. Every length here is a
 // different place for the stream to end relative to a held match.
-TEST_F(DeflateEncoderTest, FilteredRoundTripsAtEveryTailLength) {
-  std::vector<uint8_t> base = FilteredLookingBytes(4096);
+TEST_F(DeflateEncoderTest, LazyRoundTripsAtEveryTailLength) {
+  std::vector<uint8_t> base = LazyLookingBytes(4096);
   for (size_t n = 0; n <= 600; n++) {
     std::vector<uint8_t> in(base.begin(), base.begin() + n);
     std::vector<uint8_t> enc;
-    EncodeWith(registry_, "filtered", in, enc);
+    EncodeWith(registry_, "lazy", in, enc);
 
     std::vector<uint8_t> back;
     ASSERT_EQ(decode_data(enc.data(), enc.size(), back, n), GCOMP_OK)
@@ -1765,12 +1776,12 @@ TEST_F(DeflateEncoderTest, FilteredRoundTripsAtEveryTailLength) {
 
 // The deferral lives in the encoder state so that it survives a call boundary.
 // Reusing an encoder must not carry a held match into the next stream.
-TEST_F(DeflateEncoderTest, FilteredResetDropsAHeldMatch) {
-  std::vector<uint8_t> in = FilteredLookingBytes(50000);
+TEST_F(DeflateEncoderTest, LazyResetDropsAHeldMatch) {
+  std::vector<uint8_t> in = LazyLookingBytes(50000);
   std::vector<uint8_t> first;
   std::vector<uint8_t> second;
-  size_t a = EncodeWith(registry_, "filtered", in, first);
-  size_t b = EncodeWith(registry_, "filtered", in, second);
+  size_t a = EncodeWith(registry_, "lazy", in, first);
+  size_t b = EncodeWith(registry_, "lazy", in, second);
   ASSERT_EQ(a, b);
   EXPECT_EQ(memcmp(first.data(), second.data(), a), 0);
 }
@@ -1853,7 +1864,7 @@ TEST_F(DeflateEncoderTest, CodeLengthAlphabetIsAlwaysComplete) {
   for (size_t n = 120000; n <= 120040; n++) {
     std::vector<uint8_t> in = SkewedRunData(n);
     std::vector<uint8_t> enc;
-    EncodeWith(registry_, "filtered", in, enc);
+    EncodeWith(registry_, "lazy", in, enc);
     unsigned kraft = CodeLengthKraftSum(enc);
     if (kraft == 0) {
       continue; // stored or fixed block, nothing to check
@@ -1869,7 +1880,7 @@ TEST_F(DeflateEncoderTest, SkewedRunDataRoundTrips) {
   for (size_t n = 120000; n <= 120020; n++) {
     std::vector<uint8_t> in = SkewedRunData(n);
     std::vector<uint8_t> enc;
-    EncodeWith(registry_, "filtered", in, enc);
+    EncodeWith(registry_, "lazy", in, enc);
     std::vector<uint8_t> back;
     ASSERT_EQ(decode_data(enc.data(), enc.size(), back, n), GCOMP_OK)
         << "length " << n;

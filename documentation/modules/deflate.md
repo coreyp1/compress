@@ -44,7 +44,7 @@ Limits are enforced by the core; the decoder returns `GCOMP_ERR_LIMIT` when any 
 | Strategy | Description |
 |----------|-------------|
 | `"default"` | Standard LZ77 + Huffman compression. Best for most data types. |
-| `"filtered"` | Optimized for pre-filtered data (e.g., PNG filter output). Uses longer hash chains and more aggressive lazy matching to find better matches in data with specific statistical properties. |
+| `"lazy"` | Defers every match one byte to see whether the next position starts a longer one, at every level rather than from level 4 up. Good for PNG filter output, where a match one byte later is often longer, and worth about 2.7% on general data at level 1. Identical to `"default"` from level 4 up. |
 | `"huffman_only"` | Skip LZ77 matching entirely; emit all bytes as literals. Very fast encoding, minimal compression. Useful for already-compressed or high-entropy data where LZ77 would find few matches. |
 | `"rle"` | Run-length encoding mode: only find matches at distance 1. Very fast, limited compression. Best for data with long runs of repeated bytes. |
 | `"fixed"` | Always use fixed Huffman tables (skip dynamic tree building). Faster encoding at the cost of compression ratio. Equivalent to low compression levels but can be combined with any level. |
@@ -55,8 +55,8 @@ Limits are enforced by the core; the decoder returns `GCOMP_ERR_LIMIT` when any 
 gcomp_options_t *opts = NULL;
 gcomp_options_create(&opts);
 
-// For PNG image data (pre-filtered)
-gcomp_options_set_string(opts, "deflate.strategy", "filtered");
+// For PNG filter output, or any data where deferring a match pays
+gcomp_options_set_string(opts, "deflate.strategy", "lazy");
 gcomp_options_set_int64(opts, "deflate.level", 9);
 
 // For already-compressed data (JPEG inside a container)
@@ -72,7 +72,7 @@ gcomp_encoder_create(registry, "deflate", opts, &enc);
 **Strategy selection guidelines:**
 
 - **General data**: Use `"default"` (or omit the option).
-- **PNG images**: Use `"filtered"` with high compression level for best results.
+- **PNG images**: Use `"lazy"` with a high compression level for best results.
 - **Pre-compressed data**: Use `"huffman_only"` to avoid wasting CPU on futile LZ77 searches.
 - **Simple patterns**: Use `"rle"` for data dominated by repeated byte runs.
 - **Speed-critical**: Use `"fixed"` or `"huffman_only"` to minimize encoding time.
@@ -199,7 +199,7 @@ Higher levels spend more effort searching for matches and build optimal Huffman 
 **Level and strategy interaction:** The `deflate.strategy` option modifies how matching works at each level:
 
 - `"default"`: Uses the standard LZ77 algorithm with hash chain length determined by level.
-- `"filtered"`: Uses longer hash chains than default at each level (16/128/256 vs 8/32/64).
+- `"lazy"`: Same hash chains as default; it differs only in deferring matches at levels 1 to 3, where default takes the first match it finds.
 - `"huffman_only"`: Ignores level for matching (no LZ77), but level still affects Huffman mode.
 - `"rle"`: Ignores hash chains entirely; only checks distance-1 matches.
 - `"fixed"`: Forces fixed Huffman codes regardless of level (skips dynamic tree building).

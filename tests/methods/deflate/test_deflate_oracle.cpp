@@ -408,7 +408,7 @@ std::vector<uint8_t> singleRun(size_t n) {
 }
 
 // PNG-shaped: small deltas around zero, which is what a filtered image row
-// looks like and what deflate.strategy "filtered" exists for.
+// looks like and what deflate.strategy "lazy" exists for.
 std::vector<uint8_t> filterShaped(size_t n, uint32_t seed) {
   std::vector<uint8_t> out(n);
   uint32_t x = seed | 3u;
@@ -471,7 +471,7 @@ TEST_F(DeflateOracleTest, OurEncoder_ZlibDecoder_Sweep) {
   // only a reference decoder objects to it.
   static const int kLevels[] = {0, 1, 2, 4, 6, 9};
   static const char * kStrategies[] = {
-      "default", "filtered", "huffman_only", "rle", "fixed"};
+      "default", "lazy", "huffman_only", "rle", "fixed"};
 
   struct Case {
     std::string label;
@@ -569,7 +569,7 @@ TEST_F(DeflateOracleTest, OurEncoder_ZlibDecoder_DenseSmallSizeSweep) {
   // dense rather than representative.  Flat random data is the shape that gets
   // there: many symbols, near-uniform frequencies, so the code depths run long.
   static const int kLevels[] = {6, 9};
-  static const char * kStrategies[] = {"default", "filtered"};
+  static const char * kStrategies[] = {"default", "lazy"};
 
   struct Case {
     std::string label;

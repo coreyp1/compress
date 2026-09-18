@@ -162,7 +162,7 @@ static void fuzz_encoder_buffer(
 static void fuzz_encoder_strategies(
     const uint8_t * input, size_t input_size, uint8_t * output) {
   const char * strategies[] = {
-      "default", "filtered", "huffman_only", "rle", "fixed"};
+      "default", "lazy", "huffman_only", "rle", "fixed"};
   const int num_strategies = sizeof(strategies) / sizeof(strategies[0]);
 
   // Use first byte of input to select strategy (deterministic based on input)

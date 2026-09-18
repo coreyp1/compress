@@ -258,7 +258,7 @@ TEST_F(GzipOptionsTest, DeflateStrategyPassThrough) {
   const char * data = "strategy test data";
   size_t len = strlen(data);
 
-  const char * strategies[] = {"default", "filtered", "huffman_only"};
+  const char * strategies[] = {"default", "lazy", "huffman_only"};
   for (auto strategy : strategies) {
     gcomp_options_t * opts = nullptr;
     gcomp_options_create(&opts);

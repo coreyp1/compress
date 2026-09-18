@@ -90,7 +90,7 @@ typedef enum {
 // ---------------------------------------------
 // Standard LZ77 with hash-chain match finding, suitable for most data.
 // - Uses hash chains to find repeated byte sequences in the sliding window
-// - Chain length varies by compression level (8/32/64 at L1-3/L4-6/L7-9)
+// - Chain length varies by compression level (4/32/128 at L1-3/L4-6/L7-9)
 // - Levels 4 and up defer a match one byte to see whether the next position
 //   starts a longer one; levels 1 to 3 take what they find.  This is where
 //   zlib switches from deflate_fast to deflate_slow, and it is the same
@@ -100,13 +100,9 @@ typedef enum {
 // - Chooses fixed or dynamic Huffman based on compression level
 // - Good balance of speed and compression for general-purpose data
 //
-// DEFLATE_STRATEGY_FILTERED (strategy="filtered")
-// -----------------------------------------------
-// Optimized for pre-filtered data like PNG filter output.
-// PNG filters (Sub, Up, Average, Paeth) produce data where:
-// - Values cluster around zero (differences between adjacent pixels)
-// - Short runs of the same value are common, broken by occasional outliers
-// - A match at one position is often beaten by a longer one a byte later
+// DEFLATE_STRATEGY_LAZY (strategy="lazy")
+// ---------------------------------------
+// DEFAULT, with match deferral at every level instead of from level 4.
 //
 // Implementation differences from DEFAULT:
 // - Defers a match at every level, including 1 to 3: a match is held back one
@@ -118,15 +114,45 @@ typedef enum {
 // - Nothing else.  It searches exactly as hard as DEFAULT: same hash chain
 //   lengths, same everything.
 //
-// Since DEFAULT defers from level 4 up, FILTERED is identical to it at levels
-// 4 to 9 and differs only at levels 1 to 3.  What it offers there is the fast
-// levels' search effort with the slow levels' deferral: on 2 MB of
+// Since DEFAULT defers from level 4 up, this is identical to DEFAULT at
+// levels 4 to 9 and differs only at levels 1 to 3.  What it offers there is
+// the fast levels' search effort with the slow levels' deferral: on 2 MB of
 // filter-shaped bytes it reaches 22.428% against DEFAULT's 25.065%, and on
 // 12 MB of source, prose, XML and binaries 25.954% against 26.680%, for about
-// 10% of the encode throughput on general data and none of it on filtered.
+// 10% of the encode throughput on general data and none of it on filter output.
+//
+// WHY IT IS NOT CALLED "FILTERED"
+// -------------------------------
+// It was, until the name was measured against what it does.  RFC 1951 has no
+// notion of a strategy at all -- it defines the stream and leaves the encoder
+// free, and nothing in a DEFLATE stream records which strategy produced it.
+// "Filtered" is zlib's word, from Z_FILTERED, and zlib gives it a specific
+// meaning:
+//
+//     The effect of Z_FILTERED is to force more Huffman coding and less
+//     string matching; it is somewhat intermediate between
+//     Z_DEFAULT_STRATEGY and Z_HUFFMAN_ONLY.
+//
+// This strategy does the opposite: more string matching, at the cost of
+// speed.  zlib's Z_FILTERED is faster than its default; this was slower than
+// ours.  Borrowing the word and inverting the meaning is a worse trap than an
+// unfamiliar name, because a caller who knows zlib would get the opposite of
+// what they asked for -- and the other three names here (huffman_only, rle,
+// fixed) do match zlib's meanings, so this one was the odd one out.
+//
+// zlib's actual rule was measured here and is not worth having: discarding
+// matches shorter than six bytes costs 0.3% on filter-shaped data and 6.1%
+// on general data.
+//
+// "Lazy" is the term of art for what this does -- zlib's own source calls the
+// path deflate_slow and the threshold lazy_match -- so the name now says the
+// mechanism rather than a use case it was never tuned for.
+//
+// It remains a good choice for PNG filter output, which is what the image
+// library uses it for; it is simply not the only thing it is good for.
 //
 // It used to search four times as deep as DEFAULT as well - 16/128/256
-// against 4/32/128 - on the reasoning that filtered data hides longer
+// against 4/32/128 - on the reasoning that filter output hides longer
 // patterns behind short chains.  Measured across 52 files of real PNG
 // filtered rows, 7.3 MB, that is not where the win is:
 //
@@ -137,16 +163,7 @@ typedef enum {
 //       256      31.12%       33.40%
 //
 // Chain length is worth 0.1 points across a factor of eight.  Deferral is
-// worth 1.7.  So the chains came back down and the strategy is DEFAULT plus
-// deferral, which is the same relationship zlib's levels 4-9 have to its
-// levels 1-3.
-//
-// Note that this is still not what zlib's Z_FILTERED does.  zlib *reduces*
-// effort there - it discards matches shorter than six bytes and leans on
-// Huffman coding - so Z_FILTERED is faster than its default.  This one is
-// slower than its default.  The name is shared; the meaning is not.  That
-// rule was measured here too and is not worth having: it costs 0.3% on
-// filter-shaped data and 6.1% on general data.
+// worth 1.7.  So the chains came back down.
 //
 // DEFLATE_STRATEGY_HUFFMAN_ONLY (strategy="huffman_only")
 // -------------------------------------------------------
@@ -198,7 +215,7 @@ typedef enum {
 
 typedef enum {
   DEFLATE_STRATEGY_DEFAULT = 0,
-  DEFLATE_STRATEGY_FILTERED,
+  DEFLATE_STRATEGY_LAZY,
   DEFLATE_STRATEGY_HUFFMAN_ONLY,
   DEFLATE_STRATEGY_RLE,
   DEFLATE_STRATEGY_FIXED,
@@ -1995,8 +2012,8 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
       if (strcmp(strategy_str, "default") == 0) {
         st->strategy = DEFLATE_STRATEGY_DEFAULT;
       }
-      else if (strcmp(strategy_str, "filtered") == 0) {
-        st->strategy = DEFLATE_STRATEGY_FILTERED;
+      else if (strcmp(strategy_str, "lazy") == 0) {
+        st->strategy = DEFLATE_STRATEGY_LAZY;
       }
       else if (strcmp(strategy_str, "huffman_only") == 0) {
         st->strategy = DEFLATE_STRATEGY_HUFFMAN_ONLY;
@@ -2007,7 +2024,15 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
       else if (strcmp(strategy_str, "fixed") == 0) {
         st->strategy = DEFLATE_STRATEGY_FIXED;
       }
-      // Invalid strategy values silently fall back to default
+      else {
+        // A name this encoder does not know is a mistake worth hearing
+        // about.  Falling back to the default silently, which is what this
+        // did, turns a typo -- or a name that has been renamed out from
+        // under the caller -- into output that is merely different, and
+        // nothing says which strategy actually ran.
+        gcomp_free(alloc, st);
+        return GCOMP_ERR_INVALID_ARG;
+      }
     }
   }
 
@@ -2383,7 +2408,7 @@ static gcomp_status_t deflate_encode_batch(
     //
     // Strategy affects match finding and Huffman mode:
     // - DEFAULT: Standard LZ77 with chain length based on level
-    // - FILTERED: Longer chains, favors longer matches (PNG-optimized)
+    // - LAZY: defers matches at every level, not only from 4 up
     // - HUFFMAN_ONLY: No LZ77, emit all bytes as literals
     // - RLE: Only find matches at distance 1
     // - FIXED: Standard LZ77 but always use fixed Huffman codes
@@ -2403,14 +2428,14 @@ static gcomp_status_t deflate_encode_batch(
     // the search that settles a held match is the one the next position was
     // going to perform anyway.
     //
-    // FILTERED keeps deferring at every level: asking for it by name is
-    // asking for the effort, and its levels 1 to 3 were already spending it.
+    // The lazy strategy keeps deferring at every level: asking for it by
+    // name is asking for the effort.
     //
     // A match already at or above max_lazy is taken as it stands: the search
     // that would test it costs as much as the search that found it, and a
     // match that long has little room to improve.  The thresholds follow
     // zlib's, which spends more of this at higher levels.
-    int use_lazy = (st->strategy == DEFLATE_STRATEGY_FILTERED) ||
+    int use_lazy = (st->strategy == DEFLATE_STRATEGY_LAZY) ||
         ((st->strategy == DEFLATE_STRATEGY_DEFAULT ||
              st->strategy == DEFLATE_STRATEGY_FIXED) &&
             st->level >= 4);
@@ -2428,7 +2453,7 @@ static gcomp_status_t deflate_encode_batch(
     // displaces it is four bytes at best, and the sequence it replaces would
     // have been found at the next position anyway.  Each deferral traded one
     // match for one literal and saved no symbols at all.  On filter-shaped
-    // bytes FILTERED came out *larger* than DEFAULT -- 507,624 against
+    // bytes the lazy strategy came out *larger* than DEFAULT -- 507,624 against
     // 501,304 - which is the opposite of what the strategy is for, and it is
     // what led to this being written off as a strategy that had outlived its
     // reason.
@@ -2437,14 +2462,14 @@ static gcomp_status_t deflate_encode_batch(
     // 448,562: 10.5% smaller than DEFAULT rather than 1.3% larger.  Over a
     // 12 MB corpus of source, prose, XML and binaries it is 25.954% against
     // DEFAULT's 26.680%, for about 15% of the encode throughput.
-    if (st->strategy == DEFLATE_STRATEGY_FILTERED && st->level <= 3) {
+    if (st->strategy == DEFLATE_STRATEGY_LAZY && st->level <= 3) {
       max_lazy = 16u;
     }
 
     // Determine hash chain length based on level.
     //
-    // FILTERED used to quadruple this - 16/128/256 against 4/32/128 - on the
-    // reasoning that filtered data hides longer patterns behind short hash
+    // The lazy strategy used to quadruple this - 16/128/256 against 4/32/128 - on the
+    // reasoning that filter output hides longer patterns behind short hash
     // chains. Measured across 52 files of real PNG filtered rows, 7.3 MB, it
     // does not pay:
     //
@@ -2455,7 +2480,7 @@ static gcomp_status_t deflate_encode_batch(
     //     256        31.12%           33.40%
     //
     // Chain length is worth 0.1 points across a factor of eight. Lazy matching
-    // is worth 1.7. So FILTERED now searches exactly as hard as DEFAULT and
+    // is worth 1.7. So it now searches exactly as hard as DEFAULT and
     // differs from it only by holding matches back, which is the same
     // relationship zlib's levels 4-9 have to its levels 1-3. On that corpus
     // this is 2.2x the throughput of the old setting for 0.25% more bytes,
@@ -2634,7 +2659,7 @@ static gcomp_status_t deflate_encode_batch(
           }
         }
         else if (st->lookahead >= DEFLATE_MIN_MATCH_LENGTH) {
-          // DEFAULT/FILTERED/FIXED: Standard LZ77 match finding
+          // DEFAULT/LAZY/FIXED: Standard LZ77 match finding
           match = deflate_find_match(st, pos, stream_pos, max_chain);
 
           // A three-byte match far away is not worth its distance code.  The

@@ -75,7 +75,7 @@
 //
 // - `deflate.strategy` (string): Compression strategy.
 //   - "default": Standard LZ77 + Huffman (recommended for most data)
-//   - "filtered": Optimized for pre-processed/filtered data (e.g., PNG)
+//   - "lazy": Defers matches at every level, not only from level 4 up
 //   - "huffman_only": Skip LZ77, emit literals only (fast, poor compression)
 //   - "rle": Run-length encoding only (distance 1 matches)
 //   - "fixed": Always use fixed Huffman codes (simpler, slightly faster)
@@ -132,7 +132,7 @@ static const gcomp_option_schema_t g_deflate_option_schemas[] = {
         0,                                 // max_int
         0,                                 // min_uint
         0,                                 // max_uint
-        "Strategy: default, filtered, huffman_only, rle, fixed", // help
+        "Strategy: default, lazy, huffman_only, rle, fixed", // help
     },
     // Core limit options.  Declared here because this method honours them --
     // a schema that omits what the method accepts cannot be used to validate
