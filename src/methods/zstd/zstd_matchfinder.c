@@ -557,13 +557,18 @@ void zstd_mf_slide(zstd_match_finder_t * mf, size_t shift) {
     memset(mf->chain_table, 0, mf->chain_size * sizeof(uint32_t));
     return;
   }
+  // Moving the entries down and rebasing them are one pass, not two.  Done
+  // separately -- a memmove and then a loop over what it had just written --
+  // the chain table was read and written twice over, and it is the larger of
+  // the two tables: a window plus a block, four bytes an entry.  Entry i of
+  // the result depends only on entry i + shift of the input and i < i + shift,
+  // so a forward pass reads each entry before anything overwrites it.
   size_t kept = mf->chain_size - shift;
-  memmove(mf->chain_table, mf->chain_table + shift, kept * sizeof(uint32_t));
-  memset(mf->chain_table + kept, 0, shift * sizeof(uint32_t));
   for (size_t i = 0; i < kept; i++) {
-    uint32_t v = mf->chain_table[i];
+    uint32_t v = mf->chain_table[i + shift];
     mf->chain_table[i] = (v > shift) ? (uint32_t)(v - shift) : 0u;
   }
+  memset(mf->chain_table + kept, 0, shift * sizeof(uint32_t));
 }
 
 void zstd_mf_index_range(zstd_match_finder_t * mf, const uint8_t * data,
