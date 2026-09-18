@@ -126,75 +126,80 @@ static inline uint32_t zstd_mf_hash5(const uint8_t * data, unsigned hash_log) {
 }
 
 //
-// Search Depth by Level
+// Effort by Level
 //
 
-static unsigned zstd_mf_get_search_depth(int level) {
-  if (level <= 1) {
-    return 4;
-  }
-  if (level <= 3) {
-    return 16;
-  }
-  if (level <= 6) {
-    return 64;
-  }
-  if (level <= 12) {
-    return 256;
-  }
-  if (level <= 16) {
-    return 512;
-  }
-  return 1024; // Levels 17-22
-}
+/**
+ * @brief How hard one compression level searches.
+ *
+ * RFC 8878 says nothing about levels.  It describes the frame, not how to
+ * choose what goes in it, so a level is a promise about how much work the
+ * encoder will spend and the only way to set one is to measure.
+ *
+ * TWENTY-TWO LEVELS THAT WERE FIVE
+ * ================================
+ *
+ * These were set by range tests -- level <= 3, level <= 6, level <= 12 -- and
+ * the ranges made levels into aliases of one another.  Compressing 11 MB of
+ * source, manuals, XML and an ELF binary at each level in turn produced byte
+ * for byte identical output from levels 2 and 3; from 4, 5 and 6; from 7, 8, 9
+ * and 10; and from 11 and 12.  Twelve levels, five behaviours.  A caller who
+ * asked for 9 got 7.
+ *
+ * This is the same defect the deflate encoder had, found the same way and
+ * fixed the same way: a table with one row per level, because there are
+ * twenty-two levels.
+ *
+ * `search_depth` is how many hash chain candidates a position considers,
+ * `lazy_depth` how many times a match may be deferred in favour of a better
+ * one at the next position (zero is a greedy parse), and `nice_length` the
+ * match length at which the chain walk stops looking for something better.
+ */
+typedef struct {
+  unsigned search_depth; ///< Maximum chain search depth.
+  unsigned lazy_depth;   ///< Positions a match may be deferred through.
+  uint32_t nice_length;  ///< Length at which a match is taken as it stands.
+  unsigned hash_log;     ///< Log2 of the hash table size.
+} zstd_effort_t;
+
+/// Indexed by compression level; entry 0 is unused (level 0 means "default").
+static const zstd_effort_t k_zstd_effort[23] = {
+    {0, 0, 0, 0},       // 0: unused
+    {4, 0, 128, 14},    // 1: greedy, and fast because of it
+    {8, 1, 128, 14},    // 2
+    {16, 1, 128, 15},   // 3
+    {24, 1, 128, 16},   // 4
+    {48, 1, 128, 16},   // 5
+    {64, 1, 128, 16},   // 6
+    {128, 2, 192, 17},  // 7
+    {192, 2, 192, 17},  // 8
+    {256, 2, 192, 17},  // 9
+    {320, 2, 192, 17},  // 10
+    {384, 2, 192, 17},  // 11
+    {448, 2, 192, 17},  // 12
+    {512, 2, 256, 18},  // 13
+    {640, 2, 256, 18},  // 14
+    {768, 2, 256, 18},  // 15
+    {896, 2, 256, 18},  // 16
+    {1024, 2, 256, 18}, // 17
+    {1280, 2, 256, 18}, // 18
+    {1536, 2, 256, 18}, // 19
+    {1792, 2, 256, 18}, // 20
+    {2048, 2, 256, 18}, // 21
+    {2560, 2, 256, 18}, // 22
+};
 
 /**
- * @brief How many positions a match may be deferred through, by level.
- *
- * Zero is a greedy parse.  Level 1 keeps it: level 1's whole purpose is to be
- * the fast one, and each deferral step is another walk down a hash chain.
- * Every level above it defers, and the slow levels walk forward twice.
- *
- * Measured on a 11 MB corpus of source, manuals, XML and an ELF binary,
- * against the greedy parse this replaced:
- *
- * | Level | Size       | Encode speed   |
- * |-------|------------|----------------|
- * | 1     | unchanged  | unchanged      |
- * | 3     | -2.6%      | -17%           |
- * | 9     | -3.1%      | -33%           |
- *
- * A third deferral step was measured on the same corpus and gained 0.02%,
- * which is why there is not one.  That is what the cost model predicts: each
- * step has to beat the one before it by a whole literal, and three positions
- * in a row that each clear that bar are rare enough not to repay the searches
- * spent failing to find them.
+ * @brief The effort settings for @p level, clamped to the table.
  */
-static unsigned zstd_mf_get_lazy_depth(int level) {
-  if (level <= 1) {
-    return 0;
+static const zstd_effort_t * zstd_mf_effort(int level) {
+  if (level < 1) {
+    level = 3;
   }
-  if (level <= 6) {
-    return 1;
+  if (level > 22) {
+    level = 22;
   }
-  return 2;
-}
-
-/**
- * @brief Length at which a match is taken without searching further, by level.
- *
- * This bounds the work spent on input that matches trivially -- long runs, or
- * a file that repeats itself -- where the chain is deep, every candidate is a
- * hit, and the parse is not improved by grinding through them.
- */
-static uint32_t zstd_mf_get_nice_length(int level) {
-  if (level <= 6) {
-    return 128;
-  }
-  if (level <= 12) {
-    return 192;
-  }
-  return 256;
+  return &k_zstd_effort[level];
 }
 
 //
@@ -260,22 +265,11 @@ gcomp_status_t zstd_mf_init(zstd_match_finder_t * mf,
 
   memset(mf, 0, sizeof(*mf));
 
-  // Determine hash log based on window size and level
-  unsigned hash_log = MF_HASH_LOG_DEFAULT;
-  if (level <= 3) {
-    hash_log = 14; // 16K entries for fast levels
-  }
-  else if (level <= 6) {
-    hash_log = 16; // 64K entries
-  }
-  else if (level <= 12) {
-    hash_log = 17; // 128K entries
-  }
-  else {
-    hash_log = 18; // 256K entries for high levels
-  }
+  const zstd_effort_t * effort = zstd_mf_effort(level);
 
-  // Clamp to window size (no point having more hash entries than positions)
+  // Clamp the hash table to the window size: there is no point having more
+  // hash entries than there are positions to put in them.
+  unsigned hash_log = effort->hash_log;
   while (hash_log > MF_HASH_LOG_MIN && ((size_t)1 << hash_log) > window_size) {
     hash_log--;
   }
@@ -283,9 +277,9 @@ gcomp_status_t zstd_mf_init(zstd_match_finder_t * mf,
   mf->hash_log = hash_log;
   mf->hash_size = (size_t)1 << hash_log;
   mf->window_size = window_size;
-  mf->search_depth = zstd_mf_get_search_depth(level);
-  mf->lazy_depth = zstd_mf_get_lazy_depth(level);
-  mf->nice_length = zstd_mf_get_nice_length(level);
+  mf->search_depth = effort->search_depth;
+  mf->lazy_depth = effort->lazy_depth;
+  mf->nice_length = effort->nice_length;
 
   // The chain table is indexed by position in the match finder's window, and
   // that window now holds the history carried across blocks as well as the

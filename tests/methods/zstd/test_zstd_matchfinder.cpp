@@ -34,6 +34,7 @@
 
 #include "../common/test_helpers.h"
 #include <ghoti.io/compress/allocator.h>
+#include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
@@ -192,6 +193,46 @@ size_t bytes_covered(const Parse & parse) {
   return covered;
 }
 
+/// Text-shaped bytes: words from a small vocabulary, with punctuation.
+std::vector<uint8_t> TextLikeBytes(size_t n) {
+  static const char * words[] = {"the", "quick", "brown", "fox", "jumps",
+      "over", "lazy", "dog", "and", "then", "returns", "home", "with",
+      "another", "message", "for", "everyone", "who", "waited"};
+  const size_t count = sizeof(words) / sizeof(words[0]);
+  std::vector<uint8_t> v;
+  v.reserve(n + 16);
+  uint32_t seed = 4242u;
+  while (v.size() < n) {
+    seed = seed * 1103515245u + 12345u;
+    const char * w = words[(seed >> 16) % count];
+    while (*w) {
+      v.push_back(static_cast<uint8_t>(*w++));
+    }
+    v.push_back((seed & 0x1Fu) == 0 ? '\n' : ' ');
+  }
+  v.resize(n);
+  return v;
+}
+
+/// Compress @p in at @p level and return the stream.
+std::vector<uint8_t> EncodeAtLevel(const std::vector<uint8_t> & in, int level) {
+  gcomp_options_t * options = nullptr;
+  if (gcomp_options_create(&options) != GCOMP_OK) {
+    return {};
+  }
+  gcomp_options_set_int64(options, "zstd.level", level);
+  std::vector<uint8_t> out(in.size() * 2 + 4096);
+  size_t written = 0;
+  gcomp_status_t status = gcomp_encode_buffer(gcomp_registry_default(), "zstd",
+      options, in.data(), in.size(), out.data(), out.size(), &written);
+  gcomp_options_destroy(options);
+  if (status != GCOMP_OK) {
+    return {};
+  }
+  out.resize(written);
+  return out;
+}
+
 } // namespace
 
 class ZstdMatchFinderTest : public ::testing::Test {};
@@ -247,6 +288,59 @@ TEST_F(ZstdMatchFinderTest, NoPositionIsChainedToItself) {
           << "position " << i << " is chained to itself at deferral depth "
           << depth;
     }
+  }
+}
+
+// Twenty-two levels must be twenty-two levels.
+//
+// They were not.  The search depth, the deferral depth, the nice length and
+// the hash table size were each set by a range test -- level <= 3, level <= 6,
+// level <= 12 -- and the ranges made levels into aliases of one another.
+// Compressing 11 MB of source, manuals, XML and an ELF binary at each level in
+// turn produced byte for byte identical output from levels 2 and 3; from 4, 5
+// and 6; from 7, 8, 9 and 10; and from 11 and 12.  Twelve levels, five
+// behaviours.  A caller who asked for 9 got 7.
+//
+// Real text is used rather than the deep-chain shape the other tests use,
+// because on input where every match is long the nice_length cutoff stops the
+// chain walk immediately and the deep levels genuinely cannot differ -- the
+// input never asks them to.
+TEST_F(ZstdMatchFinderTest, EveryLevelDiffersFromTheOneBelowIt) {
+  std::vector<uint8_t> in = TextLikeBytes(400000);
+
+  std::vector<std::vector<uint8_t>> streams;
+  for (int level = 1; level <= 22; level++) {
+    streams.push_back(EncodeAtLevel(in, level));
+    ASSERT_FALSE(streams.back().empty()) << "level " << level;
+  }
+
+  for (size_t i = 1; i < streams.size(); i++) {
+    EXPECT_NE(streams[i], streams[i - 1])
+        << "level " << (i + 1) << " encodes exactly as level " << i
+        << ", so one of the two is not a level";
+  }
+}
+
+// And through the levels callers actually reach for, a higher level must not
+// produce a larger file.
+//
+// The bound is 12 and not 22 on purpose.  Above it the remaining levels differ
+// by a couple of bytes in a hundred thousand and the ordering is not reliable:
+// a deeper search finds longer matches at odder distances, and the offsets it
+// then has to encode can cost more than the match length saves.  That is a
+// property of a parse that decides one match at a time, not a fault in the
+// table, and asserting an order that the algorithm does not guarantee would
+// make this test a source of noise rather than a check.
+TEST_F(ZstdMatchFinderTest, HigherLevelsDoNotProduceLargerOutput) {
+  std::vector<uint8_t> in = TextLikeBytes(400000);
+
+  size_t previous = SIZE_MAX;
+  for (int level = 1; level <= 12; level++) {
+    size_t size = EncodeAtLevel(in, level).size();
+    EXPECT_LE(size, previous)
+        << "level " << level << " produced " << size
+        << " bytes, more than level " << (level - 1) << "'s " << previous;
+    previous = size;
   }
 }
 
