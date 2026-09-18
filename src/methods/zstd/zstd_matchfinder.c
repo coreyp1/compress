@@ -169,6 +169,9 @@ typedef struct {
   uint32_t nice_length;  ///< Length at which a match is taken as it stands.
   unsigned hash_log;     ///< Log2 of the hash table size.
   unsigned use_bt;       ///< Search a binary tree rather than a hash chain.
+  unsigned use_opt;      ///< Parse by shortest path rather than greedily.
+  uint32_t opt_segment;  ///< Positions one shortest-path sweep covers.
+  uint32_t opt_budget;   ///< Shortened matches one position may try.
 } zstd_effort_t;
 
 /// Indexed by compression level; entry 0 is unused (level 0 means "default").
@@ -192,29 +195,29 @@ typedef struct {
 // 4096 took the output from 1,602,010 bytes to 1,527,249, while depth beyond
 // about 24 was worth almost nothing.
 static const zstd_effort_t k_zstd_effort[23] = {
-    {0, 0, 0, 0, 0},          // 0: unused
-    {4, 0, 128, 14, 0},       // 1: greedy, and fast because of it
-    {8, 1, 128, 14, 0},       // 2
-    {16, 1, 128, 15, 0},      // 3
-    {24, 1, 128, 16, 0},      // 4
-    {48, 1, 128, 16, 0},      // 5
-    {64, 1, 128, 16, 0},      // 6
-    {128, 2, 192, 17, 0},     // 7
-    {192, 2, 192, 17, 0},     // 8
-    {256, 2, 192, 17, 0},     // 9
-    {320, 2, 192, 17, 0},     // 10: last of the chain levels
-    {18, 2, 768, 17, 1},      // 11: first of the tree levels
-    {20, 2, 1024, 17, 1},     // 12
-    {22, 2, 1280, 18, 1},     // 13
-    {24, 2, 1536, 18, 1},     // 14
-    {26, 2, 2048, 18, 1},     // 15
-    {28, 2, 2560, 18, 1},     // 16
-    {32, 2, 3072, 18, 1},     // 17
-    {36, 2, 3584, 18, 1},     // 18
-    {40, 3, 4096, 18, 1},     // 19: one more deferral is what is left
-    {44, 3, 5120, 18, 1},     // 20
-    {52, 3, 8192, 18, 1},     // 21
-    {64, 3, 12288, 18, 1}     // 22
+    {0, 0, 0, 0, 0, 0, 0, 0},              // 0: unused
+    {4, 0, 128, 14, 0, 0, 0, 0},           // 1: greedy, and fast because of it
+    {8, 1, 128, 14, 0, 0, 0, 0},           // 2
+    {16, 1, 128, 15, 0, 0, 0, 0},          // 3
+    {24, 1, 128, 16, 0, 0, 0, 0},          // 4
+    {48, 1, 128, 16, 0, 0, 0, 0},          // 5
+    {64, 1, 128, 16, 0, 0, 0, 0},          // 6
+    {128, 2, 192, 17, 0, 0, 0, 0},         // 7
+    {192, 2, 192, 17, 0, 0, 0, 0},         // 8
+    {256, 2, 192, 17, 0, 0, 0, 0},         // 9
+    {320, 2, 192, 17, 0, 0, 0, 0},         // 10: last of the chain levels
+    {18, 2, 768, 17, 1, 0, 0, 0},          // 11: first of the tree levels
+    {20, 2, 1024, 17, 1, 0, 0, 0},         // 12
+    {22, 2, 1280, 18, 1, 0, 0, 0},         // 13
+    {24, 2, 1536, 18, 1, 0, 0, 0},         // 14
+    {26, 2, 2048, 18, 1, 0, 0, 0},         // 15: last of the deferred levels
+    {28, 0, 2560, 18, 1, 1, 1024, 16},     // 16: first of the optimal levels
+    {32, 0, 3072, 18, 1, 1, 2048, 32},     // 17
+    {36, 0, 3584, 18, 1, 1, 4096, 64},     // 18
+    {40, 0, 4096, 18, 1, 1, 8192, 128},    // 19
+    {44, 0, 5120, 18, 1, 1, 16384, 192},   // 20
+    {52, 0, 8192, 18, 1, 1, 32768, 320},   // 21
+    {64, 0, 12288, 18, 1, 1, 65536, 512}   // 22
 };
 
 /**
@@ -336,6 +339,9 @@ gcomp_status_t zstd_mf_init(zstd_match_finder_t * mf,
   // 3.1.1.1.2), not an undertaking to search all of it, so the tree searches
   // what fits in its budget and the frame stays exactly as valid.
   mf->use_bt = effort->use_bt;
+  mf->use_opt = effort->use_opt;
+  mf->opt_segment = effort->opt_segment;
+  mf->opt_budget = effort->opt_budget;
   if (mf->use_bt) {
     size_t n = 1;
     while (n < mf->chain_size && n < MF_BT_MAX_ENTRIES) {
@@ -367,6 +373,16 @@ gcomp_status_t zstd_mf_init(zstd_match_finder_t * mf,
     if (mem_tracker) {
       gcomp_memory_track_alloc(
           mem_tracker, mf->bt_size * 2u * sizeof(uint32_t));
+    }
+    if (mf->use_opt) {
+      gcomp_status_t status = zstd_opt_init(mf, alloc, mem_tracker);
+      if (status != GCOMP_OK) {
+        gcomp_free(alloc, mf->bt_table);
+        mf->bt_table = NULL;
+        gcomp_free(alloc, mf->hash_table);
+        mf->hash_table = NULL;
+        return status;
+      }
     }
     return GCOMP_OK;
   }
@@ -418,6 +434,8 @@ void zstd_mf_destroy(zstd_match_finder_t * mf, const gcomp_allocator_t * alloc,
     gcomp_free(alloc, mf->bt_table);
     mf->bt_table = NULL;
   }
+
+  zstd_opt_destroy(mf, alloc, mem_tracker);
 }
 
 /**
@@ -440,6 +458,10 @@ void zstd_mf_reset(zstd_match_finder_t * mf) {
   // Nothing refers to any position any more, so where data[0] sits in the
   // stream stops mattering and counting can start again.
   mf->base_pos = 0;
+
+  // The cost model describes a stream that is being thrown away with the
+  // tables, so it goes back to its prior too.
+  zstd_opt_reset(mf);
 }
 
 //
@@ -930,6 +952,15 @@ gcomp_status_t zstd_mf_generate_sequences(zstd_match_finder_t * mf,
   if (!mf || !data || !sequences || !num_sequences_out || !literals_out ||
       !literals_size_out) {
     return GCOMP_ERR_INVALID_ARG;
+  }
+
+  // Levels that parse by shortest path do it in zstd_optimal.c.  Everything
+  // below -- finding matches, keeping the tables, sliding the window -- is
+  // the same; only the choice of which matches to emit differs.
+  if (mf->use_opt && mf->opt) {
+    return zstd_opt_generate_sequences(mf, data, data_size, start_pos,
+        sequences, max_sequences, num_sequences_out, literals_out,
+        literals_size_out, rep_offset_1, rep_offset_2, rep_offset_3);
   }
 
   // The tables are not reset here and the history before start_pos is not

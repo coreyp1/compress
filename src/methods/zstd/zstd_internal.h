@@ -236,6 +236,15 @@ typedef struct {
   size_t bt_mask;         ///< bt_size - 1.
   size_t base_pos;        ///< Absolute position of data[0].
   unsigned use_bt;        ///< Non-zero when this level uses the tree.
+
+  // Optimal parse, used instead of the deferred one at the levels whose
+  // effort entry asks for it.  It needs the tree -- it prices candidates
+  // against one another and the chain cannot produce a list to price -- so
+  // use_opt implies use_bt.  See zstd_optimal.c.
+  struct zstd_opt_state_s * opt; ///< Cost model and parse table, or NULL.
+  unsigned use_opt;              ///< Non-zero when this level parses optimally.
+  uint32_t opt_segment;          ///< Positions one sweep covers.
+  uint32_t opt_budget;           ///< Shortened matches one position may try.
 } zstd_match_finder_t;
 
 //
@@ -1111,6 +1120,18 @@ gcomp_status_t zstd_literals_encode_compressed(
 #define ZSTD_SEQ_LL_CODES 36
 #define ZSTD_SEQ_ML_CODES 53
 #define ZSTD_SEQ_OF_CODES 32
+
+// The distributions RFC 8878 section 3.1.1.3.2.2 fixes for Predefined mode,
+// as normalized counts over a table of 2^6, 2^6 and 2^5 states.  A count of
+// -1 is the spec's "less likely than one state in the table".
+//
+// The decoder builds tables from these.  The optimal parse reads them as a
+// prior instead: before a block has been parsed there is nothing to measure,
+// and the spec's own guess at what sequence statistics look like is a better
+// starting point than assuming every code equally likely.
+extern const int16_t zstd_ll_predefined_norm[ZSTD_SEQ_LL_CODES];
+extern const int16_t zstd_ml_predefined_norm[ZSTD_SEQ_ML_CODES];
+extern const int16_t zstd_of_predefined_norm[29];
 
 /**
  * @brief Encode a block's sequences section.

@@ -981,17 +981,17 @@ gcomp_status_t zstd_fse_build_decoding_table(const uint8_t * src,
 // These are the default FSE tables when mode = Predefined
 
 // Literal Length predefined distribution (accuracy log = 6)
-static const int16_t zstd_ll_predefined_norm[36] = {4, 3, 2, 2, 2, 2, 2, 2, 2,
+const int16_t zstd_ll_predefined_norm[36] = {4, 3, 2, 2, 2, 2, 2, 2, 2,
     2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1, -1, -1,
     -1, -1};
 
 // Match Length predefined distribution (accuracy log = 6)
-static const int16_t zstd_ml_predefined_norm[53] = {1, 4, 3, 2, 2, 2, 2, 2, 2,
+const int16_t zstd_ml_predefined_norm[53] = {1, 4, 3, 2, 2, 2, 2, 2, 2,
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1};
 
 // Offset predefined distribution (accuracy log = 5)
-static const int16_t zstd_of_predefined_norm[29] = {1, 1, 1, 1, 1, 1, 2, 2, 2,
+const int16_t zstd_of_predefined_norm[29] = {1, 1, 1, 1, 1, 1, 2, 2, 2,
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1};
 
 gcomp_status_t zstd_fse_build_predefined_ll_table(

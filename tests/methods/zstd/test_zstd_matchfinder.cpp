@@ -39,7 +39,9 @@
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
 #include "../../../src/methods/zstd/zstd_internal.h"
+#include "../../../src/methods/zstd/zstd_matchfinder_private.h"
 #include <gtest/gtest.h>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -420,6 +422,110 @@ TEST_F(ZstdMatchFinderTest, TheTreeIsATreeAndItIsSorted) {
   }
 }
 
+// The same structural check, at a level that parses by shortest path rather
+// than by deferral.  That parse reaches the tree differently: it searches
+// every position of a sweep in turn, and when a match is long enough to be
+// taken as it stands it jumps past the positions that match covers and has
+// to put them into the tree itself.  Getting that wrong -- skipping a
+// position, or inserting one twice -- corrupts the tree, and nothing about
+// the output would say so.
+TEST_F(ZstdMatchFinderTest, TheTreeIsStillATreeWhenTheParseIsOptimal) {
+  std::vector<uint8_t> data = TextWithDistantRepeats(400u * 1024u, 8u, 16u * 1024u);
+
+  Parse parse = run_parse(data, 19, 0, false);
+  ASSERT_EQ(parse.use_bt, 1u) << "level 19 is meant to search a tree";
+  ASSERT_GT(parse.bt_size, 0u);
+
+  std::vector<int> parents(parse.bt_size, 0);
+  for (size_t i = 0; i < parse.bt_size; i++) {
+    for (unsigned side = 0; side < 2; side++) {
+      uint32_t child = parse.bt[2u * i + side];
+      if (child == 0u) {
+        continue;
+      }
+      size_t c = static_cast<size_t>(child) - 1u;
+      ASSERT_LT(c, parse.bt_size) << "child out of range";
+      ASSERT_NE(c, i) << "node " << i << " is its own child";
+      parents[c]++;
+      ASSERT_LE(parents[c], 1)
+          << "node " << c << " hangs off more than one parent";
+
+      size_t n = data.size();
+      size_t len = 0;
+      while (i + len < n && c + len < n && data[i + len] == data[c + len]) {
+        len++;
+      }
+      if (i + len < n && c + len < n) {
+        bool child_is_smaller = data[c + len] < data[i + len];
+        EXPECT_EQ(child_is_smaller, side == 0u)
+            << "node " << c << " is on the wrong side of " << i;
+      }
+    }
+  }
+}
+
+// A parse says how to rebuild the input, so between them its literals and its
+// matches must account for every byte of it and no more.  The optimal parse
+// assembles its answer by walking a chosen path backwards and then forwards
+// again; dropping or repeating a step there would show up here first, and a
+// round-trip test would only say "mismatch".
+TEST_F(ZstdMatchFinderTest, TheOptimalParseAccountsForEveryByte) {
+  std::vector<uint8_t> data = TextWithDistantRepeats(400u * 1024u, 8u, 16u * 1024u);
+
+  for (int level = 16; level <= 22; level++) {
+    Parse parse = run_parse(data, level, 0, false);
+    EXPECT_EQ(bytes_covered(parse), data.size()) << "level " << level;
+
+    // And every match must point at data that is actually behind it.
+    size_t at = 0;
+    for (const zstd_sequence_t & seq : parse.sequences) {
+      at += seq.lit_length;
+      // Offset codes 1 to 3 name a repeat offset rather than a distance;
+      // anything above them is the distance plus three.
+      if (seq.match_offset > 3u) {
+        EXPECT_LE(seq.match_offset - 3u, at)
+            << "level " << level << ": a match reaches before the start of "
+            << "the stream";
+      }
+      EXPECT_GE(seq.match_length, 3u) << "level " << level;
+      at += seq.match_length;
+    }
+  }
+}
+
+// A distance that has just been used is written as a one-symbol code instead
+// of as a distance (RFC 8878 section 3.1.1.3.2.1.1), and it is a large enough
+// saving that the parse tries all three repeat offsets at every position
+// rather than waiting for the match finder to turn one up.  On input with a
+// fixed stride, that should happen constantly.
+TEST_F(ZstdMatchFinderTest, TheOptimalParseReachesForRepeatOffsets) {
+  // Records of a fixed width whose fields repeat down the file: matching the
+  // previous record is the same distance every time.
+  constexpr size_t kRecord = 64;
+  std::vector<uint8_t> data;
+  Noise noise(0xC0FFEEu);
+  std::vector<uint8_t> record;
+  noise.append(record, kRecord);
+  for (size_t r = 0; r < 4096; r++) {
+    std::vector<uint8_t> copy = record;
+    copy[r % kRecord] = static_cast<uint8_t>(r);
+    copy[(r * 7u) % kRecord] = static_cast<uint8_t>(r >> 8);
+    data.insert(data.end(), copy.begin(), copy.end());
+  }
+
+  Parse parse = run_parse(data, 19, 0, false);
+  size_t repeats = 0;
+  for (const zstd_sequence_t & seq : parse.sequences) {
+    if (seq.match_offset >= 1u && seq.match_offset <= 3u) {
+      repeats++;
+    }
+  }
+  EXPECT_GT(repeats, parse.sequences.size() / 2u)
+      << "of " << parse.sequences.size() << " sequences only " << repeats
+      << " used a repeat offset on input whose every match is the same "
+      << "distance back";
+}
+
 // Twenty-two levels must be twenty-two levels.
 //
 // They were not.  The search depth, the deferral depth, the nice length and
@@ -544,13 +650,79 @@ TEST_F(ZstdMatchFinderTest, LevelOneIsGreedyAndTheRestAreNot) {
   ASSERT_EQ(zstd_mf_init(&mf, alloc, 1, 1u << 20, nullptr), GCOMP_OK);
   EXPECT_EQ(mf.lazy_depth, 0u) << "level 1 is the fast level and must not "
                                   "spend extra searches deferring";
+  EXPECT_EQ(mf.use_opt, 0u) << "level 1 must not parse optimally either";
   zstd_mf_destroy(&mf, alloc, nullptr);
 
+  // There are two ways to be better than greedy, and every level above the
+  // first has to use one of them.  Naming which one, per level, would make
+  // this test a copy of the table it is checking; what matters is that no
+  // level is left doing the fast thing under a slow level's name.
   for (int level = 2; level <= 22; level++) {
     ASSERT_EQ(zstd_mf_init(&mf, alloc, level, 1u << 20, nullptr), GCOMP_OK);
-    EXPECT_GE(mf.lazy_depth, 1u) << "level " << level << " does not defer";
+    EXPECT_TRUE(mf.lazy_depth >= 1u || mf.use_opt != 0u)
+        << "level " << level << " neither defers nor parses optimally";
     EXPECT_GT(mf.nice_length, 0u) << "level " << level;
+    // The optimal parse prices candidate matches against one another, and
+    // only the tree can produce a list of candidates to price.
+    if (mf.use_opt) {
+      EXPECT_NE(mf.use_bt, 0u) << "level " << level
+                               << " parses optimally without a tree to search";
+      EXPECT_GT(mf.opt_segment, 0u) << "level " << level;
+      EXPECT_NE(mf.opt, nullptr) << "level " << level;
+    }
     zstd_mf_destroy(&mf, alloc, nullptr);
+  }
+}
+
+// A level that parses optimally must not sit below one that does not: the
+// levels are a ladder, and a caller who asks for more effort and gets a
+// cheaper algorithm has been given the wrong thing.
+TEST_F(ZstdMatchFinderTest, TheOptimalLevelsAreTheTopOfTheLadder) {
+  const gcomp_allocator_t * alloc = gcomp_allocator_default();
+  int first_optimal = 0;
+
+  for (int level = 1; level <= 22; level++) {
+    zstd_match_finder_t mf;
+    ASSERT_EQ(zstd_mf_init(&mf, alloc, level, 1u << 20, nullptr), GCOMP_OK);
+    if (mf.use_opt) {
+      if (!first_optimal) {
+        first_optimal = level;
+      }
+    }
+    else {
+      EXPECT_EQ(first_optimal, 0)
+          << "level " << level << " does not parse optimally, but level "
+          << first_optimal << " below it does";
+    }
+    zstd_mf_destroy(&mf, alloc, nullptr);
+  }
+  EXPECT_GT(first_optimal, 0) << "no level parses optimally";
+}
+
+// Everything the parse prices is a difference of two of these, so an error
+// here does not fail anything -- it quietly makes every parse worse.  The
+// reference is the real logarithm; the tolerance is the last place the fixed
+// point format can represent.
+TEST_F(ZstdMatchFinderTest, TheFixedPointLogarithmIsTheRealOne) {
+  EXPECT_EQ(zstd_opt_log2(1u), 0u) << "log2(1) is zero";
+  EXPECT_EQ(zstd_opt_log2(256u), 8u * 256u) << "an exact power of two";
+  EXPECT_EQ(zstd_opt_log2(1u << 31), 31u * 256u);
+  // Zero has no logarithm; the model never has a count of zero, and asking
+  // for one must still give a usable number rather than wrapping.
+  EXPECT_EQ(zstd_opt_log2(0u), 0u);
+
+  for (uint32_t x = 1; x < 4096; x++) {
+    double want = std::log2(static_cast<double>(x)) * 256.0;
+    double got = static_cast<double>(zstd_opt_log2(x));
+    EXPECT_LE(std::fabs(got - want), 1.0) << "log2(" << x << ")";
+  }
+  for (uint32_t bit = 12; bit < 32; bit++) {
+    for (uint32_t k = 0; k < 64; k++) {
+      uint32_t x = (1u << bit) + k * ((1u << bit) / 64u) + k;
+      double want = std::log2(static_cast<double>(x)) * 256.0;
+      double got = static_cast<double>(zstd_opt_log2(x));
+      EXPECT_LE(std::fabs(got - want), 1.0) << "log2(" << x << ")";
+    }
   }
 }
 

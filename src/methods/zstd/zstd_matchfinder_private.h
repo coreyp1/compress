@@ -26,6 +26,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define MF_MIN_MATCH 3           ///< Minimum match length
 #define MF_HASH_READ_SIZE 4      ///< Bytes read by hash function (must be >= 4)
 #define MF_MAX_DISTANCE 0x7FFFFF ///< Maximum match distance (~8MB for blocks)
@@ -132,6 +136,36 @@ void zstd_mf_insert_one(
     size_t data_size);
 
 /**
+ * @brief Allocate the optimal parse's cost model and table.
+ *
+ * Reads mf->nice_length, which must already be set: it fixes how far a
+ * match leaving the last position of a sweep can reach, and so how large
+ * the table has to be.
+ */
+gcomp_status_t zstd_opt_init(zstd_match_finder_t * mf,
+    const gcomp_allocator_t * alloc, gcomp_memory_tracker_t * mem_tracker);
+
+/**
+ * @brief Release what zstd_opt_init() allocated.
+ */
+void zstd_opt_destroy(zstd_match_finder_t * mf, const gcomp_allocator_t * alloc,
+    gcomp_memory_tracker_t * mem_tracker);
+
+/**
+ * @brief Put the cost model back to its prior, forgetting the stream.
+ */
+void zstd_opt_reset(zstd_match_finder_t * mf);
+
+/**
+ * @brief log2(@p x) in 256ths of a bit, for x >= 1.
+ *
+ * Every price in the optimal parse is a difference of two of these, so it is
+ * exposed for its own test: an error here does not fail, it quietly makes
+ * every parse a little worse.
+ */
+uint32_t zstd_opt_log2(uint32_t x);
+
+/**
  * @brief The optimal parse; see zstd_optimal.c.
  *
  * Signature matches zstd_mf_generate_sequences(), which dispatches to this
@@ -143,5 +177,9 @@ gcomp_status_t zstd_opt_generate_sequences(zstd_match_finder_t * mf,
     size_t * num_sequences_out, uint8_t * literals_out,
     size_t * literals_size_out, uint32_t * rep_offset_1,
     uint32_t * rep_offset_2, uint32_t * rep_offset_3);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* GHOTI_IO_GCOMP_SRC_METHODS_ZSTD_ZSTD_MATCHFINDER_PRIVATE_H */
