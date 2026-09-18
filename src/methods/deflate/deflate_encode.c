@@ -922,19 +922,32 @@ static gcomp_status_t deflate_build_fixed_codes(
  * @param pos Position in circular window buffer
  * @param stream_pos Current position in the total input stream
  * @param max_chain Maximum hash chain length to search
+ * @param avail Bytes ahead of @p pos that may be matched.  The greedy parse
+ *        passes the whole lookahead; a parse that searches ahead of where it
+ *        has committed passes what is left from that position.
+ * @param out Receives every improving match, in increasing length order, or
+ *        NULL for a caller that only wants the longest.
+ * @param out_cap Entries @p out can hold.
+ * @param found_out Receives how many were written to @p out.
  * @return Match with length >= 3, or length == 0 if no match found
  */
-static deflate_match_t deflate_find_match(gcomp_deflate_encoder_state_t * st,
-    size_t pos, size_t stream_pos, int max_chain) {
+static deflate_match_t deflate_find_match_list(
+    gcomp_deflate_encoder_state_t * st, size_t pos, size_t stream_pos,
+    int max_chain, size_t avail, deflate_match_t * out, size_t out_cap,
+    size_t * found_out) {
   deflate_match_t result = {0, 0};
+  size_t found = 0;
+  if (found_out) {
+    *found_out = 0;
+  }
 
-  if (!st || !st->window || st->lookahead < DEFLATE_MIN_MATCH_LENGTH) {
+  if (!st || !st->window || avail < DEFLATE_MIN_MATCH_LENGTH) {
     return result;
   }
 
   size_t scan = pos & st->window_mask;
   const uint8_t * data = st->window;
-  size_t max_len = st->lookahead;
+  size_t max_len = avail;
   if (max_len > DEFLATE_MAX_MATCH_LENGTH) {
     max_len = DEFLATE_MAX_MATCH_LENGTH;
   }
@@ -1078,18 +1091,40 @@ static deflate_match_t deflate_find_match(gcomp_deflate_encoder_state_t * st,
     if (len >= DEFLATE_MIN_MATCH_LENGTH && len > result.length) {
       result.length = (uint32_t)len;
       result.distance = (uint32_t)stream_dist;
-      probe_byte = data[(scan + len) & st->window_mask];
+      // Every improvement is a match worth reporting, not only the last.  A
+      // parse that prices candidates against one another needs the short and
+      // near ones too: a longer match at a greater distance can cost more
+      // bits than a shorter one close by, because the distance code carries
+      // up to thirteen extra bits (RFC 1951 section 3.2.5).  A caller that
+      // wants only the longest passes no list and this folds away.
+      if (out && found < out_cap) {
+        out[found] = result;
+        found++;
+      }
 
       if (len >= max_len) {
         break; // Max length found
       }
+      probe_byte = data[(scan + len) & st->window_mask];
     }
 
     cur = st->hash_prev[cur];
     chain_count++;
   }
 
+  if (found_out) {
+    *found_out = found;
+  }
   return result;
+}
+
+/**
+ * @brief The chain walk, reporting only the longest match it met.
+ */
+static deflate_match_t deflate_find_match(gcomp_deflate_encoder_state_t * st,
+    size_t pos, size_t stream_pos, int max_chain) {
+  return deflate_find_match_list(
+      st, pos, stream_pos, max_chain, st ? st->lookahead : 0u, NULL, 0, NULL);
 }
 
 /**
