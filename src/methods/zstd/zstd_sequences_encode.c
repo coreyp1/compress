@@ -379,6 +379,11 @@ static uint8_t zstd_enc_get_of_code(uint32_t offset) {
 #define ZSTD_SEQ_MAX_TABLE_SIZE (1u << 9)
 #define ZSTD_SEQ_MAX_CODES ZSTD_SEQ_ML_CODES
 
+// One symbol of normalized count n needs fewer than 2n state-block slots in
+// the index below, so every symbol together needs fewer than twice the
+// table size.  The derivation is with zstd_seq_index_table().
+#define ZSTD_SEQ_ENC_MAP_SIZE (2u * ZSTD_SEQ_MAX_TABLE_SIZE)
+
 typedef struct {
   const zstd_fse_entry_t * entries;
   size_t size;
@@ -388,40 +393,91 @@ typedef struct {
   const int16_t * norm; ///< Normalized counts, mode 2 only.
   unsigned max_symbol;  ///< Highest symbol in `norm`, mode 2 only.
 
-  // Index over `entries` for the encoder's reverse state search: entry
-  // indices grouped by symbol, and sorted by new_state within a group.  The
-  // ranges [new_state, new_state + 2^nb_bits) of one symbol's entries
-  // partition [0, size), so the entry covering a given target state can be
-  // found by bisection instead of by scanning the whole table -- which, at
-  // 512 entries and three lookups per sequence, dominated encoding.
-  uint16_t order[ZSTD_SEQ_MAX_TABLE_SIZE];
-  uint16_t group_start[ZSTD_SEQ_MAX_CODES + 2];
+  // Index over `entries` for the encoder's reverse state search, described
+  // in full above zstd_seq_index_table().  `map` names the covering entry
+  // for every aligned block of states, `map_start` and `map_shift` say
+  // where one symbol's blocks begin and how wide they are, and `count` is
+  // zero for a symbol the table does not carry at all.
+  uint16_t map[ZSTD_SEQ_ENC_MAP_SIZE];
+  uint16_t map_start[ZSTD_SEQ_MAX_CODES + 1];
+  uint16_t count[ZSTD_SEQ_MAX_CODES + 1];
+  uint8_t map_shift[ZSTD_SEQ_MAX_CODES + 1];
 } zstd_seq_enc_table_t;
 
 // Fill in the per-symbol index described above.
+//
+// WHY A PLAIN ARRAY IS ENOUGH
+// ===========================
+//
+// The decoding table gives each state entry a symbol, an nb_bits and a
+// new_state, built (zstd_fse.c, and RFC 8878 4.1.1) as
+//
+//   nb_bits   = table_log - floor(log2(next))
+//   new_state = (next << nb_bits) - table_size
+//
+// where `next` counts a symbol's occurrences and runs over [n, 2n-1] for a
+// symbol of normalized count n.  The encoder has to run that backwards: given
+// the state the decoder must end up in, which entry of this symbol takes it
+// there?  That entry is the one whose range [new_state, new_state + 2^nb_bits)
+// contains the target, and those ranges tile [0, table_size) exactly.
+//
+// Two facts about the formula make the search unnecessary.  First, table_size
+// is 2^table_log and nb_bits <= table_log, so table_size is a multiple of
+// 2^nb_bits -- and so, therefore, is new_state.  Every range is a power-of-two
+// block *aligned* to its own width.  Second, floor(log2(next)) takes only two
+// values across [n, 2n-1], so one symbol's ranges have only two widths, the
+// wider being twice the narrower.
+//
+// Aligned blocks of one of two widths tile the state space, so indexing by
+// the narrower width lands in exactly one block: the covering entry for a
+// target state is map[map_start[sym] + (target >> map_shift[sym])], where
+// 2^map_shift is that symbol's narrowest range.  A wide block simply fills
+// two adjacent slots.
+//
+// The cost is bounded.  With h = floor(log2(n)), a symbol whose count is a
+// power of two has one width and takes n slots; any other takes 2^(h+1) < 2n.
+// Summed over the symbols that is under 2 * table_size, which is the size of
+// `map`.
+//
+// This replaced a bisection over the symbol's entries sorted by new_state,
+// which in turn had replaced a scan of the whole table.  At three lookups per
+// sequence the bisection was still the single largest cost in encoding --
+// 45% of it, with the midpoint calculation alone at 6.5%.
 static void zstd_seq_index_table(zstd_seq_enc_table_t * t) {
-  unsigned counts[ZSTD_SEQ_MAX_CODES + 2];
-  memset(counts, 0, sizeof(counts));
+  memset(t->count, 0, sizeof(t->count));
+
+  // Narrowest range per symbol, as a shift.  A symbol absent from the table
+  // keeps count 0 and is never indexed.
+  uint8_t min_bits[ZSTD_SEQ_MAX_CODES + 1];
+  memset(min_bits, 0xFF, sizeof(min_bits));
 
   for (size_t i = 0; i < t->size; i++) {
     unsigned sym = t->entries[i].symbol;
     if (sym > ZSTD_SEQ_MAX_CODES) {
       sym = ZSTD_SEQ_MAX_CODES;
     }
-    counts[sym]++;
+    t->count[sym]++;
+    if (t->entries[i].nb_bits < min_bits[sym]) {
+      min_bits[sym] = t->entries[i].nb_bits;
+    }
   }
 
   unsigned running = 0;
-  for (unsigned sym = 0; sym <= ZSTD_SEQ_MAX_CODES + 1; sym++) {
-    t->group_start[sym] = (uint16_t)running;
-    if (sym <= ZSTD_SEQ_MAX_CODES) {
-      running += counts[sym];
+  for (unsigned sym = 0; sym <= ZSTD_SEQ_MAX_CODES; sym++) {
+    t->map_start[sym] = (uint16_t)running;
+    if (t->count[sym] == 0) {
+      t->map_shift[sym] = 0;
+      continue;
     }
-  }
-
-  unsigned cursor[ZSTD_SEQ_MAX_CODES + 2];
-  for (unsigned sym = 0; sym <= ZSTD_SEQ_MAX_CODES + 1; sym++) {
-    cursor[sym] = t->group_start[sym];
+    t->map_shift[sym] = min_bits[sym];
+    unsigned slots = (unsigned)(t->size >> min_bits[sym]);
+    if (running + slots > ZSTD_SEQ_ENC_MAP_SIZE) {
+      // Unreachable given the bound derived above; the table is left short
+      // rather than written past, and the lookup reports the miss.
+      t->count[sym] = 0;
+      continue;
+    }
+    running += slots;
   }
 
   for (size_t i = 0; i < t->size; i++) {
@@ -429,23 +485,14 @@ static void zstd_seq_index_table(zstd_seq_enc_table_t * t) {
     if (sym > ZSTD_SEQ_MAX_CODES) {
       sym = ZSTD_SEQ_MAX_CODES;
     }
-    t->order[cursor[sym]++] = (uint16_t)i;
-  }
-
-  // Sort each group by new_state.  Groups are short and nearly ordered
-  // already, so insertion sort is the right shape here.
-  for (unsigned sym = 0; sym <= ZSTD_SEQ_MAX_CODES; sym++) {
-    unsigned lo = t->group_start[sym];
-    unsigned hi = t->group_start[sym + 1];
-    for (unsigned i = lo + 1; i < hi; i++) {
-      uint16_t v = t->order[i];
-      uint16_t key = t->entries[v].new_state;
-      unsigned j = i;
-      while (j > lo && t->entries[t->order[j - 1]].new_state > key) {
-        t->order[j] = t->order[j - 1];
-        j--;
-      }
-      t->order[j] = v;
+    if (t->count[sym] == 0) {
+      continue;
+    }
+    unsigned shift = t->map_shift[sym];
+    unsigned base = t->map_start[sym] + (t->entries[i].new_state >> shift);
+    unsigned slots = 1u << (t->entries[i].nb_bits - shift);
+    for (unsigned k = 0; k < slots; k++) {
+      t->map[base + k] = (uint16_t)i;
     }
   }
 }
@@ -455,42 +502,25 @@ static uint16_t zstd_seq_lookup_encode_state(const zstd_seq_enc_table_t * t,
     uint8_t symbol, uint16_t next_state, uint16_t * bits_out,
     uint8_t * nb_bits_out) {
   unsigned sym = (symbol > ZSTD_SEQ_MAX_CODES) ? ZSTD_SEQ_MAX_CODES : symbol;
-  unsigned lo = t->group_start[sym];
-  unsigned hi = t->group_start[sym + 1];
-
-  while (lo < hi) {
-    unsigned mid = lo + (hi - lo) / 2;
-    uint16_t idx = t->order[mid];
-    uint32_t base = t->entries[idx].new_state;
-    uint32_t range = 1u << t->entries[idx].nb_bits;
-
-    if (next_state < base) {
-      hi = mid;
-    }
-    else if (next_state >= base + range) {
-      lo = mid + 1;
-    }
-    else {
-      *bits_out = (uint16_t)(next_state - base);
-      *nb_bits_out = t->entries[idx].nb_bits;
-      return idx;
-    }
+  if (t->count[sym] == 0) {
+    *bits_out = 0;
+    *nb_bits_out = 0;
+    return 0xFFFF;
   }
 
-  *bits_out = 0;
-  *nb_bits_out = 0;
-  return 0xFFFF;
+  uint16_t idx = t->map[t->map_start[sym] + (next_state >> t->map_shift[sym])];
+  *bits_out = (uint16_t)(next_state - t->entries[idx].new_state);
+  *nb_bits_out = t->entries[idx].nb_bits;
+  return idx;
 }
 
 // Any state carrying `symbol`; used for the last sequence, which has no
-// transition out of it.
+// transition out of it.  One symbol's ranges tile [0, size), so the first
+// slot of its map is the entry whose range starts at state zero.
 static uint16_t zstd_seq_lookup_any_state(
     const zstd_seq_enc_table_t * t, uint8_t symbol) {
   unsigned sym = (symbol > ZSTD_SEQ_MAX_CODES) ? ZSTD_SEQ_MAX_CODES : symbol;
-  if (t->group_start[sym] >= t->group_start[sym + 1]) {
-    return 0;
-  }
-  return t->order[t->group_start[sym]];
+  return (t->count[sym] == 0) ? 0 : t->map[t->map_start[sym]];
 }
 
 /**

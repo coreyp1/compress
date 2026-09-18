@@ -1249,3 +1249,169 @@ TEST_F(ZstdEntropyTest, TheLiteralCodeIsTheCheapestOneUnderTheCap) {
 
   EXPECT_LT(cost, clamped_cost);
 }
+
+//
+// The property the sequence encoder's state index rests on
+//
+
+// The encoder has to run the decoder's state machine backwards: given the
+// state the decoder must arrive in, which entry of this symbol sends it
+// there?  zstd_sequences_encode.c answers that with a plain indexed load
+// rather than a search, and that is only correct because of a property of
+// the table the decoder builds (RFC 8878 4.1.1, and zstd_fse.c):
+//
+//   For each symbol the table carries, the ranges
+//   [new_state, new_state + 2^nb_bits) of that symbol's entries are
+//   power-of-two blocks, each ALIGNED to its own width, and together they
+//   tile [0, table_size) exactly once.
+//
+// Nothing in the decoder would notice if that stopped being true -- it only
+// ever adds bits to new_state and moves on.  The encoder would silently
+// choose wrong states.  So the property is checked here, against tables
+// built the way real blocks build them.
+class ZstdFseTilingTest : public ::testing::Test {
+protected:
+  // Build a table from `norm` and assert the tiling property for every
+  // symbol present in it.
+  static void ExpectTiles(const std::vector<int16_t> & norm,
+      unsigned table_log, const char * what) {
+    SCOPED_TRACE(what);
+    const size_t table_size = static_cast<size_t>(1u) << table_log;
+    std::vector<zstd_fse_entry_t> table(table_size);
+    unsigned max_symbol = static_cast<unsigned>(norm.size() - 1);
+    ASSERT_EQ(zstd_fse_build_table_from_norm(norm.data(), max_symbol,
+                  table_log, table.data()),
+        GCOMP_OK);
+
+    // Cover counts per symbol: every state must be claimed exactly once by
+    // the symbol's own entries.
+    for (unsigned sym = 0; sym <= max_symbol; sym++) {
+      if (norm[sym] == 0) {
+        continue;
+      }
+      std::vector<int> covered(table_size, 0);
+      size_t entries_seen = 0;
+      for (size_t i = 0; i < table_size; i++) {
+        if (table[i].symbol != sym) {
+          continue;
+        }
+        entries_seen++;
+        const unsigned nb = table[i].nb_bits;
+        const unsigned base = table[i].new_state;
+        const unsigned width = 1u << nb;
+
+        // Aligned to its own width, and inside the table.
+        ASSERT_EQ(base % width, 0u)
+            << "symbol " << sym << " entry " << i << " base " << base
+            << " is not aligned to its width " << width;
+        ASSERT_LE(base + width, table_size)
+            << "symbol " << sym << " entry " << i << " runs past the table";
+
+        for (unsigned s = base; s < base + width; s++) {
+          covered[s]++;
+        }
+      }
+      ASSERT_GT(entries_seen, 0u) << "symbol " << sym << " has no entries";
+      for (size_t s = 0; s < table_size; s++) {
+        ASSERT_EQ(covered[s], 1)
+            << "symbol " << sym << " covers state " << s << " " << covered[s]
+            << " times, not once";
+      }
+
+      // Two widths at most, the wider twice the narrower.  This is what
+      // bounds the index at two slots per entry.
+      unsigned lo = 64, hi = 0;
+      for (size_t i = 0; i < table_size; i++) {
+        if (table[i].symbol != sym) {
+          continue;
+        }
+        lo = std::min<unsigned>(lo, table[i].nb_bits);
+        hi = std::max<unsigned>(hi, table[i].nb_bits);
+      }
+      ASSERT_LE(hi - lo, 1u) << "symbol " << sym << " spans nb_bits " << lo
+                             << ".." << hi << ", more than two widths";
+    }
+  }
+
+  // Normalize a histogram the way a real block does, then check the table.
+  static void ExpectTilesFromFreq(
+      const std::vector<uint32_t> & freq, const char * what) {
+    unsigned max_symbol = static_cast<unsigned>(freq.size() - 1);
+    uint64_t total = 0;
+    for (uint32_t f : freq) {
+      total += f;
+    }
+    ASSERT_GT(total, 0u);
+    unsigned table_log = zstd_fse_optimal_table_log(9, total, max_symbol);
+    std::vector<int16_t> norm(freq.size(), 0);
+    ASSERT_EQ(zstd_fse_normalize_counts(freq.data(), max_symbol, total,
+                  table_log, norm.data()),
+        GCOMP_OK);
+    ExpectTiles(norm, table_log, what);
+  }
+};
+
+// The narrowest interesting case: one symbol owning the whole table.
+TEST_F(ZstdFseTilingTest, SingleSymbolTilesTheTable) {
+  for (unsigned log = 5; log <= 9; log++) {
+    std::vector<int16_t> norm(1, static_cast<int16_t>(1u << log));
+    ExpectTiles(norm, log, "one symbol");
+  }
+}
+
+// Counts that are powers of two give a symbol exactly one range width; counts
+// that are not give it two.  Both shapes have to tile.
+TEST_F(ZstdFseTilingTest, PowerOfTwoAndOddCountsBothTile) {
+  // 512 = 256 + 128 + 64 + 32 + 16 + 8 + 4 + 2 + 1 + 1: all powers of two.
+  ExpectTiles({256, 128, 64, 32, 16, 8, 4, 2, 1, 1}, 9, "powers of two");
+  // 512 = 200 + 173 + 91 + 41 + 5 + 1 + 1: none of them powers of two.
+  ExpectTiles({200, 173, 91, 41, 5, 1, 1}, 9, "odd counts");
+}
+
+// A "less than one" symbol is given the count -1 (RFC 8878 4.1.1) and lands
+// in a single high state, which is the one-entry case.
+TEST_F(ZstdFseTilingTest, LowProbabilitySymbolsTile) {
+  ExpectTiles({500, -1, -1, -1, -1, -1, -1, -1, -1, 4}, 9, "minus ones");
+}
+
+// Every accuracy log the sequence tables can use, with a distribution that
+// is not a neat power of two at any of them.
+TEST_F(ZstdFseTilingTest, EveryAccuracyLogTiles) {
+  for (unsigned log = 5; log <= 9; log++) {
+    const unsigned size = 1u << log;
+    // Roughly geometric, remainder to the last symbol, so counts are ragged.
+    std::vector<int16_t> norm;
+    unsigned left = size;
+    unsigned take = size / 3;
+    while (take > 1 && left > take) {
+      norm.push_back(static_cast<int16_t>(take));
+      left -= take;
+      take = take / 2 + 1;
+    }
+    norm.push_back(static_cast<int16_t>(left));
+    ExpectTiles(norm, log, "geometric");
+  }
+}
+
+// The distributions real inputs actually produce, normalized the way the
+// encoder normalizes them.
+TEST_F(ZstdFseTilingTest, DistributionsFromRealHistogramsTile) {
+  // Skewed: a few very common codes and a long tail, the usual shape of
+  // literal-length and match-length codes.
+  std::vector<uint32_t> skewed(36, 0);
+  for (unsigned i = 0; i < 36; i++) {
+    skewed[i] = 40000u / (i + 1) + (i % 3);
+  }
+  ExpectTilesFromFreq(skewed, "skewed");
+
+  // Nearly flat, which pushes counts away from powers of two.
+  std::vector<uint32_t> flat(32, 1000);
+  flat[7] = 1001;
+  ExpectTilesFromFreq(flat, "flat");
+
+  // Two symbols dominating everything else.
+  std::vector<uint32_t> bimodal(29, 1);
+  bimodal[3] = 90000;
+  bimodal[11] = 70000;
+  ExpectTilesFromFreq(bimodal, "bimodal");
+}
