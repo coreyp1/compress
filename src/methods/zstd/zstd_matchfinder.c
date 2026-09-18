@@ -464,33 +464,58 @@ static bool zstd_mf_find_match(zstd_match_finder_t * mf, const uint8_t * data,
   const uint8_t * const limit = data + data_size;
   unsigned depth = mf->search_depth;
 
-  while (depth > 0 && chain_pos < pos) {
-    size_t offset = pos - chain_pos;
+  // Everything the walk tests that does not change while it walks, worked out
+  // once.  This loop is two thirds of encoding at the middle levels, and it
+  // was recomputing all of this per candidate.
+  //
+  // How far back a sequence may reach is fixed for the whole search: the
+  // window the frame header declares is a promise to the decoder about how
+  // much history it must keep (RFC 8878 section 3.1.1.1.2), and a sequence
+  // reaching past it is not decodable.  The chain walks strictly backwards,
+  // so rather than measuring each candidate's offset against that limit, the
+  // limit becomes the earliest position worth looking at.
+  //
+  // The test that the offset does not exceed `pos` is gone with it.  The loop
+  // runs only while chain_pos < pos, so pos - chain_pos is at most pos and
+  // that comparison could never have been true.
+  size_t max_offset = mf->window_size;
+  if (max_offset > MF_MAX_DISTANCE) {
+    max_offset = MF_MAX_DISTANCE;
+  }
+  const size_t min_chain_pos = (pos > max_offset) ? (pos - max_offset) : 0u;
 
-    // Check if offset is too large.  The window the frame header declares is
-    // a promise to the decoder about how far back it must keep data (RFC 8878
-    // section 3.1.1.1.2); a sequence that reaches further is not decodable.
-    if (offset > MF_MAX_DISTANCE || offset > pos ||
-        offset > mf->window_size) {
+  // The first byte of the position being matched never changes.  The byte one
+  // past the best match so far, and whether it is inside the buffer at all,
+  // change only when the best match does -- which is rare, and is where they
+  // are worked out again.
+  const uint8_t cur_byte = data[pos];
+  bool probe_ok = (pos + best_len < data_size);
+  uint8_t probe_byte = probe_ok ? data[pos + best_len] : 0u;
+
+  while (depth > 0 && chain_pos < pos) {
+    if (chain_pos < min_chain_pos) {
       break;
     }
 
-    // Quick check: compare first and last bytes before full comparison
-    // Ensure we don't read past the end of the buffer
-    if (pos + best_len < data_size && data[chain_pos] == data[pos] &&
-        data[chain_pos + best_len] == data[pos + best_len]) {
+    // Quick check: compare first and last bytes before full comparison.
+    // chain_pos < pos and pos + best_len < data_size together keep the
+    // second read inside the buffer.
+    if (probe_ok && data[chain_pos] == cur_byte &&
+        data[chain_pos + best_len] == probe_byte) {
       // Count matching bytes
       size_t match_len =
           zstd_mf_count_match(data + pos, data + chain_pos, limit);
 
       if (match_len > best_len) {
         best_len = match_len;
-        best_offset = offset;
+        best_offset = pos - chain_pos;
 
         // A match this long is taken as it stands; see nice_length.
         if (match_len >= mf->nice_length) {
           break;
         }
+        probe_ok = (pos + best_len < data_size);
+        probe_byte = probe_ok ? data[pos + best_len] : 0u;
       }
     }
 
