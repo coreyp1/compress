@@ -1539,6 +1539,67 @@ TEST_F(DeflateDecoderTest, FinishStillReportsATruncatedStream) {
   gcomp_decoder_destroy(dec);
 }
 
+// An output buffer sized to exactly the decoded length must still finish.
+//
+// This is the ordinary case for anyone who knows how big the result is -- a
+// PNG decoder, for instance, knows its dimensions -- and it is the one that
+// breaks if the decoder stops as soon as the output is full.  Not every
+// symbol needs output space: end-of-block needs none, and it is the symbol
+// that marks the stream complete.  Stopping on a full buffer leaves it unread,
+// and finish() then insists for ever that there is more to come.
+//
+// Every PNG the image library wrote failed this way, and nothing here caught
+// it, because every test in this suite gave the decoder more room than it
+// needed.
+TEST_F(DeflateDecoderTest, DecodesIntoABufferOfExactlyTheRightSize) {
+  for (size_t size : {size_t(1), size_t(2), size_t(3), size_t(17),
+           size_t(1000), size_t(4096), size_t(65535)}) {
+    std::vector<uint8_t> input;
+    input.reserve(size);
+    uint32_t x = 0x3141592u ^ static_cast<uint32_t>(size);
+    while (input.size() < size) {
+      x ^= x << 13;
+      x ^= x >> 17;
+      x ^= x << 5;
+      // Mixed runs and noise, so blocks end in different states.
+      input.push_back(static_cast<uint8_t>((x >> 19) % 11u));
+    }
+
+    for (int level : {1, 6, 9}) {
+      gcomp_options_t * opts = nullptr;
+      ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+      gcomp_options_set_int64(opts, "deflate.level", level);
+      std::vector<uint8_t> encoded(input.size() * 2 + 4096);
+      size_t encoded_len = 0;
+      ASSERT_EQ(gcomp_encode_buffer(registry_, "deflate", opts, input.data(),
+                    input.size(), encoded.data(), encoded.size(),
+                    &encoded_len),
+          GCOMP_OK);
+      gcomp_options_destroy(opts);
+
+      gcomp_decoder_t * dec = nullptr;
+      ASSERT_EQ(
+          gcomp_decoder_create(registry_, "deflate", nullptr, &dec), GCOMP_OK);
+
+      // Not one byte more than the answer needs.
+      std::vector<uint8_t> decoded(input.size());
+      gcomp_buffer_t in = {encoded.data(), encoded_len, 0};
+      gcomp_buffer_t ob = {decoded.data(), decoded.size(), 0};
+      ASSERT_EQ(gcomp_decoder_update(dec, &in, &ob), GCOMP_OK)
+          << "size " << size << " level " << level;
+
+      gcomp_buffer_t fb = {decoded.data(), 0, 0};
+      EXPECT_EQ(gcomp_decoder_finish(dec, &fb), GCOMP_OK)
+          << "size " << size << " level " << level
+          << ": the stream is complete and finish must say so";
+      gcomp_decoder_destroy(dec);
+
+      EXPECT_EQ(ob.used, input.size()) << "size " << size;
+      EXPECT_EQ(decoded, input) << "size " << size << " level " << level;
+    }
+  }
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

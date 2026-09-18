@@ -1751,19 +1751,25 @@ static gcomp_status_t deflate_huffman_step(
  * and the next one can be of a different type -- but it now runs once per
  * block rather than once per symbol.
  *
- * Stopping conditions, in the order they are tested: no output space left, an
- * error, the block ended (which changes the stage and belongs to the caller),
- * or a step that neither consumed input nor produced output, which means it
- * is waiting for one or the other.
+ * Stopping conditions: an error, the block ended (which changes the stage and
+ * belongs to the caller), or a step that neither consumed input nor produced
+ * output, which means it is waiting for one or the other.
+ *
+ * A full output buffer is deliberately NOT one of them, and must not be.  Not
+ * every symbol needs output space: end-of-block needs none, and it is what
+ * moves the stage to DONE.  Returning early because the output was full left
+ * that symbol unread on a stream whose decoded size exactly filled the
+ * caller's buffer -- so finish() found the stream unfinished and reported
+ * GCOMP_ERR_LIMIT for ever.  Every PNG the image library wrote decoded into a
+ * buffer of exactly the right size, and every one of them failed.
+ *
+ * A step that cannot make progress against a full buffer stashes its state and
+ * changes nothing, which the progress check below catches on the next pass.
  */
 static gcomp_status_t deflate_process_huffman_data(
     gcomp_deflate_decoder_state_t * st, gcomp_buffer_t * input,
     gcomp_buffer_t * output) {
   for (;;) {
-    if (output->used >= output->size) {
-      return GCOMP_OK;
-    }
-
     const size_t in_before = input->used;
     const size_t out_before = output->used;
 
