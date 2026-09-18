@@ -11,6 +11,7 @@
 #include <ghoti.io/compress/registry.h>
 #include <ghoti.io/compress/stream.h>
 #include <ghoti.io/compress/zstd.h>
+#include "../../../src/methods/zstd/zstd_internal.h"
 #include <gtest/gtest.h>
 #include <vector>
 
@@ -766,3 +767,58 @@ TEST_P(ZstdTightOutputTest, EveryCapacityAroundTheCompressedSizeIsHonest) {
 
 INSTANTIATE_TEST_SUITE_P(Levels, ZstdTightOutputTest,
     ::testing::Values(1, 3, 6, 9, 19));
+
+// The encoder above never gives the sequence writer a tight buffer: blocks
+// are built in a staging buffer that is always at least a whole block wide
+// (zstd_encoder.c), and a block whose bitstream came close to filling it
+// would lose to a raw block and be thrown away.  So the writer's own bounds
+// handling -- the byte-at-a-time tail it falls back to within eight bytes of
+// the end, and the overflow it reports when even that runs out -- is not
+// reachable from the outside, and the test above does not reach it.
+//
+// It is still a writer that takes a size and must honour it.  These call it
+// directly, with the buffer deliberately too small.
+TEST(ZstdSequencesEncodeBounds, RefusesEveryBufferTooSmallToHoldTheStream) {
+  // Enough sequences for a bitstream of a few hundred bytes, with varied
+  // codes so the tables are real rather than RLE.
+  std::vector<zstd_sequence_t> seqs;
+  uint32_t r = 987654321u;
+  for (int i = 0; i < 600; i++) {
+    r = r * 1103515245u + 12345u;
+    zstd_sequence_t s;
+    s.lit_length = (r >> 3) % 40u;
+    s.match_length = 3u + ((r >> 11) % 60u);
+    s.match_offset = 1u + ((r >> 17) % 5000u);
+    seqs.push_back(s);
+  }
+
+  std::vector<uint8_t> roomy(64 * 1024);
+  size_t exact = 0;
+  ASSERT_EQ(zstd_sequences_encode(seqs.data(), seqs.size(), roomy.data(),
+                roomy.size(), &exact),
+      GCOMP_OK);
+  ASSERT_GT(exact, 64u);
+
+  // Every capacity below the true size must be refused, not truncated.  A
+  // heap buffer of exactly `cap` is what lets the sanitizer build see a
+  // write past the end; the eight-byte store must give way to the tail loop
+  // before that can happen.
+  for (size_t cap = 1; cap < exact; cap++) {
+    std::vector<uint8_t> tight(cap);
+    size_t used = 12345u;
+    gcomp_status_t st = zstd_sequences_encode(
+        seqs.data(), seqs.size(), tight.data(), cap, &used);
+    ASSERT_NE(st, GCOMP_OK) << "capacity " << cap << " of " << exact
+                            << " reported success";
+  }
+
+  // And the exact size still works, so the refusals above are about room
+  // and not about the sequences.
+  std::vector<uint8_t> snug(exact);
+  size_t used = 0;
+  EXPECT_EQ(zstd_sequences_encode(
+                seqs.data(), seqs.size(), snug.data(), exact, &used),
+      GCOMP_OK);
+  EXPECT_EQ(used, exact);
+  EXPECT_EQ(memcmp(snug.data(), roomy.data(), exact), 0);
+}

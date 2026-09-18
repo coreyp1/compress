@@ -116,9 +116,17 @@ static void zstd_enc_bw_flush(zstd_enc_bit_writer_t * bw) {
       if (bw->byte_pos >= bw->buf_size) {
         // Out of room.  Record it: the caller decides whether to fall back,
         // and must not be handed a silently truncated bitstream.
+        //
+        // The container is emptied rather than left holding the bits that
+        // did not fit, because writing carries on after this returns -- the
+        // caller is not told until it asks -- and bits that cannot be
+        // flushed would otherwise accumulate.  Once bits_used passed 64 the
+        // shift in zstd_enc_bw_add_bits() was undefined, which the
+        // sanitizer build reports as a shift exponent of 66.  Nothing
+        // written from here on is part of a stream anyone will use.
         bw->overflow = true;
-        bw->bit_container >>= (i * 8u);
-        bw->bits_used -= (i * 8u);
+        bw->bit_container = 0;
+        bw->bits_used = 0;
         return;
       }
       bw->buf[bw->byte_pos] = (uint8_t)(bw->bit_container >> (i * 8u));
