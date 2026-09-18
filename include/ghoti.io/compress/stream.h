@@ -174,6 +174,30 @@ GCOMP_API gcomp_status_t gcomp_encoder_reset(gcomp_encoder_t * encoder);
  * Processes compressed input data and produces decompressed output.
  * This function may be called multiple times with partial input.
  *
+ * ## Output buffer too small
+ *
+ * One call does not necessarily consume all of @p input. Decompression
+ * expands, so a small output buffer fills long before the input is used up,
+ * and the call returns having consumed only part of it. Keep calling with the
+ * same input buffer and a drained output buffer until @p input is used up:
+ * `input->used` and `output->used` both say what happened.
+ *
+ * A call that neither consumes input nor produces output has nothing left to
+ * do with what it holds. That is the signal to stop, not `input->used`
+ * reaching `input->size`: the decoder can still be holding bits it has read
+ * but not yet turned into bytes.
+ *
+ * @code
+ * for (;;) {
+ *   gcomp_buffer_t out = {buf, sizeof(buf), 0};
+ *   size_t before = in.used;
+ *   gcomp_status_t s = gcomp_decoder_update(decoder, &in, &out);
+ *   if (s != GCOMP_OK) return s;
+ *   write_out(buf, out.used);
+ *   if (out.used == 0 && in.used == before) break;
+ * }
+ * @endcode
+ *
  * @param decoder The decoder
  * @param input Input buffer
  * @param output Output buffer
@@ -193,9 +217,32 @@ GCOMP_API gcomp_status_t gcomp_decoder_update(
  * finish calls are safe and return GCOMP_OK without writing output again
  * and without leaking or double-freeing.
  *
+ * ## Output buffer too small
+ *
+ * As with the encoder, `GCOMP_OK` is reserved for a complete stream. If
+ * @p output cannot hold what remains, finish writes what fits and returns
+ * `GCOMP_ERR_LIMIT`; drain the buffer and call again until it returns
+ * `GCOMP_OK`.
+ *
+ * `GCOMP_ERR_LIMIT` and `GCOMP_ERR_CORRUPT` mean different things here and
+ * are worth keeping apart: the first says the decoder has more to give and
+ * nowhere to put it, the second says the input ended part way through the
+ * stream.
+ *
+ * @code
+ * for (;;) {
+ *   gcomp_buffer_t out = {buf, sizeof(buf), 0};
+ *   gcomp_status_t s = gcomp_decoder_finish(decoder, &out);
+ *   write_out(buf, out.used);
+ *   if (s == GCOMP_OK) break;
+ *   if (s != GCOMP_ERR_LIMIT) return s;
+ * }
+ * @endcode
+ *
  * @param decoder The decoder
  * @param output Output buffer
- * @return Status code
+ * @return GCOMP_OK when the stream is complete, GCOMP_ERR_LIMIT when more
+ *         output space is needed, otherwise an error code
  */
 GCOMP_API gcomp_status_t gcomp_decoder_finish(
     gcomp_decoder_t * decoder, gcomp_buffer_t * output);

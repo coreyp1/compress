@@ -10,6 +10,7 @@
 #include "data/golden_vectors.h"
 #include "test_helpers.h"
 #include <cstring>
+#include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/deflate.h>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/options.h>
@@ -1003,6 +1004,539 @@ TEST_F(DeflateDecoderTest, GoldenVector_RepeatedHelloWorld260) {
     EXPECT_EQ(output[i], (uint8_t)phrase[i % phrase_len])
         << "Mismatch at position " << i << " for repeated hello world vector";
   }
+}
+
+//
+// Match copying
+//
+// deflate_copy_match() moves bytes from the sliding window to the output.  It
+// used to do that one byte at a time and was over half of a decode; it now
+// copies in runs, and a run may not cross any of five boundaries -- the end of
+// the match, the end of the output, either wrap of the circular window, or
+// the point at which the reading and writing cursors run into one another.
+//
+// Every one of those is an off-by-one away from producing wrong bytes while
+// reporting success, and a round trip of ordinary data exercises almost none
+// of them.  These tests aim at them directly.
+//
+
+namespace {
+
+/// Compress with this library, decompress through an output buffer of exactly
+/// @p chunk bytes, and return what came back.
+std::vector<uint8_t> RoundTripThroughChunks(gcomp_registry_t * registry,
+    const std::vector<uint8_t> & input, int level, size_t chunk,
+    int window_bits = 0) {
+  gcomp_options_t * opts = nullptr;
+  if (gcomp_options_create(&opts) != GCOMP_OK) {
+    return {};
+  }
+  gcomp_options_set_int64(opts, "deflate.level", level);
+  if (window_bits != 0) {
+    gcomp_options_set_uint64(opts, "deflate.window_bits",
+        static_cast<uint64_t>(window_bits));
+  }
+
+  std::vector<uint8_t> encoded(input.size() * 2 + 4096);
+  size_t encoded_len = 0;
+  gcomp_status_t s = gcomp_encode_buffer(registry, "deflate", opts,
+      input.data(), input.size(), encoded.data(), encoded.size(),
+      &encoded_len);
+  gcomp_options_destroy(opts);
+  if (s != GCOMP_OK) {
+    return {};
+  }
+  encoded.resize(encoded_len);
+
+  gcomp_options_t * dopts = nullptr;
+  if (window_bits != 0) {
+    if (gcomp_options_create(&dopts) != GCOMP_OK) {
+      return {};
+    }
+    gcomp_options_set_uint64(dopts, "deflate.window_bits",
+        static_cast<uint64_t>(window_bits));
+  }
+  gcomp_decoder_t * dec = nullptr;
+  gcomp_status_t dc = gcomp_decoder_create(registry, "deflate", dopts, &dec);
+  gcomp_options_destroy(dopts);
+  if (dc != GCOMP_OK) {
+    return {};
+  }
+  std::vector<uint8_t> out_buf(chunk);
+  std::vector<uint8_t> decoded;
+  gcomp_buffer_t in = {encoded.data(), encoded.size(), 0};
+  for (;;) {
+    gcomp_buffer_t ob = {out_buf.data(), out_buf.size(), 0};
+    size_t before_in = in.used;
+    gcomp_status_t u = gcomp_decoder_update(dec, &in, &ob);
+    if (u != GCOMP_OK) {
+      ADD_FAILURE() << "update returned " << (int)u << " at chunk " << chunk;
+      gcomp_decoder_destroy(dec);
+      return {};
+    }
+    decoded.insert(decoded.end(), out_buf.data(), out_buf.data() + ob.used);
+    if (ob.used == 0 && in.used == before_in) {
+      break;
+    }
+  }
+  for (;;) {
+    gcomp_buffer_t ob = {out_buf.data(), out_buf.size(), 0};
+    gcomp_status_t f = gcomp_decoder_finish(dec, &ob);
+    decoded.insert(decoded.end(), out_buf.data(), out_buf.data() + ob.used);
+    if (f == GCOMP_OK) {
+      break;
+    }
+    if (f != GCOMP_ERR_LIMIT) {
+      ADD_FAILURE() << "finish returned " << (int)f << " at chunk " << chunk;
+      gcomp_decoder_destroy(dec);
+      return {};
+    }
+  }
+  gcomp_decoder_destroy(dec);
+  return decoded;
+}
+
+/// Bytes that produce matches at a chosen distance, over and over.
+///
+/// A phrase is written, then repeated `distance` bytes later, so the encoder
+/// has a match of exactly that distance available.  Interleaved noise keeps
+/// the whole thing from collapsing into one enormous match.
+std::vector<uint8_t> BytesWithMatchDistance(size_t total, size_t distance) {
+  std::vector<uint8_t> v;
+  v.reserve(total + 512);
+  uint32_t x = 99137u ^ static_cast<uint32_t>(distance);
+  auto noise = [&x]() {
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    return static_cast<uint8_t>(x >> 19);
+  };
+  while (v.size() < total) {
+    size_t start = v.size();
+    for (size_t i = 0; i < 24; i++) {
+      v.push_back(noise());
+    }
+    // Pad out to the requested distance, then repeat the phrase.
+    while (v.size() - start < distance && v.size() < total + distance) {
+      v.push_back(noise());
+    }
+    for (size_t i = 0; i < 24 && start + i < v.size(); i++) {
+      v.push_back(v[start + i]);
+    }
+  }
+  v.resize(total);
+  return v;
+}
+
+/// A block of @p period distinct bytes, repeated to fill @p total.
+///
+/// Every position past the first period begins a match at exactly that
+/// distance, and the match runs as long as the decoder will let it -- up to
+/// the 258 byte maximum of RFC 1951 section 3.2.5.  Long matches are the
+/// point: a run only reaches the boundary where the writing cursor would
+/// overtake the reading cursor when the match is longer than the gap between
+/// them, which is `window_size - distance`.
+std::vector<uint8_t> RepeatedBlock(size_t total, size_t period) {
+  std::vector<uint8_t> block;
+  block.reserve(period);
+  uint32_t x = 0xC0FFEEu ^ static_cast<uint32_t>(period);
+  for (size_t i = 0; i < period; i++) {
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    block.push_back(static_cast<uint8_t>(x >> 19));
+  }
+  std::vector<uint8_t> v;
+  v.reserve(total + period);
+  while (v.size() < total) {
+    v.insert(v.end(), block.begin(), block.end());
+  }
+  v.resize(total);
+  return v;
+}
+
+/// Builds a raw DEFLATE stream by hand.
+///
+/// A decoder has to be right for every stream the format permits, not only
+/// for the ones this library's encoder happens to emit.  Some of the cases
+/// that matter most are ones our encoder will not produce on request -- a
+/// match long enough to reach most of the way round a small window, say --
+/// so those are written out directly here, as RFC 1951 section 3.2.6 defines
+/// the fixed Huffman code.
+class FixedBlockWriter {
+public:
+  /// Start a single final block using the fixed code.
+  FixedBlockWriter() {
+    bits(1, 1); // BFINAL
+    bits(1, 2); // BTYPE = 01, fixed Huffman
+  }
+
+  void literal(uint8_t b) {
+    if (b < 144u) {
+      code(0x30u + b, 8); // 00110000 through 10111111
+    }
+    else {
+      code(0x190u + (b - 144u), 9); // 110010000 through 111111111
+    }
+  }
+
+  /// A length/distance pair.  @p length is 3..258 and @p distance is 1..32768.
+  void match(uint32_t length, uint32_t distance) {
+    static const uint32_t len_base[] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15,
+        17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195,
+        227, 258};
+    static const uint32_t len_extra[] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2,
+        2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+    uint32_t ls = 28;
+    while (ls > 0 && len_base[ls] > length) {
+      ls--;
+    }
+    uint32_t sym = 257u + ls;
+    if (sym <= 279u) {
+      code(sym - 256u, 7);
+    }
+    else {
+      code(0xC0u + (sym - 280u), 8);
+    }
+    bits(length - len_base[ls], (int)len_extra[ls]);
+
+    static const uint32_t dist_base[] = {1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33,
+        49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073,
+        4097, 6145, 8193, 12289, 16385, 24577};
+    static const uint32_t dist_extra[] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4,
+        5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+    uint32_t ds = 29;
+    while (ds > 0 && dist_base[ds] > distance) {
+      ds--;
+    }
+    code(ds, 5); // Fixed distance codes are five bits, MSB first.
+    bits(distance - dist_base[ds], (int)dist_extra[ds]);
+  }
+
+  std::vector<uint8_t> finish() {
+    code(0, 7); // End of block: symbol 256.
+    if (count_ > 0) {
+      out_.push_back(static_cast<uint8_t>(buf_));
+      buf_ = 0;
+      count_ = 0;
+    }
+    return out_;
+  }
+
+private:
+  /// Plain bits, least significant first: headers and extra bits.
+  void bits(uint32_t value, int n) {
+    for (int i = 0; i < n; i++) {
+      put((value >> i) & 1u);
+    }
+  }
+
+  /// A Huffman code, most significant bit first, as DEFLATE writes them.
+  void code(uint32_t value, int n) {
+    for (int i = n - 1; i >= 0; i--) {
+      put((value >> i) & 1u);
+    }
+  }
+
+  void put(uint32_t bit) {
+    buf_ |= bit << count_;
+    if (++count_ == 8) {
+      out_.push_back(static_cast<uint8_t>(buf_));
+      buf_ = 0;
+      count_ = 0;
+    }
+  }
+
+  std::vector<uint8_t> out_;
+  uint32_t buf_ = 0;
+  int count_ = 0;
+};
+
+/// Decode @p stream with a window of @p window_bits, through @p chunk buffers.
+std::vector<uint8_t> DecodeRaw(gcomp_registry_t * registry,
+    const std::vector<uint8_t> & stream, int window_bits, size_t chunk,
+    gcomp_status_t * status_out) {
+  gcomp_options_t * opts = nullptr;
+  if (gcomp_options_create(&opts) != GCOMP_OK) {
+    return {};
+  }
+  gcomp_options_set_uint64(
+      opts, "deflate.window_bits", static_cast<uint64_t>(window_bits));
+  gcomp_decoder_t * dec = nullptr;
+  gcomp_status_t dc = gcomp_decoder_create(registry, "deflate", opts, &dec);
+  gcomp_options_destroy(opts);
+  if (dc != GCOMP_OK) {
+    return {};
+  }
+
+  std::vector<uint8_t> out_buf(chunk), decoded;
+  gcomp_buffer_t in = {const_cast<uint8_t *>(stream.data()), stream.size(), 0};
+  gcomp_status_t last = GCOMP_OK;
+  for (;;) {
+    gcomp_buffer_t ob = {out_buf.data(), out_buf.size(), 0};
+    size_t before = in.used;
+    last = gcomp_decoder_update(dec, &in, &ob);
+    if (last != GCOMP_OK) {
+      break;
+    }
+    decoded.insert(decoded.end(), out_buf.data(), out_buf.data() + ob.used);
+    if (ob.used == 0 && in.used == before) {
+      break;
+    }
+  }
+  if (last == GCOMP_OK) {
+    for (;;) {
+      gcomp_buffer_t ob = {out_buf.data(), out_buf.size(), 0};
+      last = gcomp_decoder_finish(dec, &ob);
+      decoded.insert(decoded.end(), out_buf.data(), out_buf.data() + ob.used);
+      if (last != GCOMP_ERR_LIMIT) {
+        break;
+      }
+    }
+  }
+  gcomp_decoder_destroy(dec);
+  if (status_out) {
+    *status_out = last;
+  }
+  return decoded;
+}
+
+} // namespace
+
+// A match that reaches nearly the whole way round the window.
+//
+// The run that copies a match cannot be longer than the gap between the
+// writing cursor and the reading cursor, which is `window_size - distance`
+// going forward.  A longer run would overwrite window bytes the same run has
+// not read yet.
+//
+// With the default 32 KB window that needs a distance above 32,510, because a
+// match is at most 258 bytes; with a small window it needs very little.  Our
+// encoder will not produce these on request -- it has no reason to choose a
+// far match when a near one is available -- but they are valid DEFLATE and a
+// decoder has to be right for them, so the streams are written by hand.
+TEST_F(DeflateDecoderTest, MatchCopy_LongMatchNearlyRoundTheWindow) {
+  for (int window_bits : {8, 9, 10}) {
+    const uint32_t window = 1u << window_bits;
+    for (uint32_t distance = window / 2; distance <= window; distance += 17u) {
+      for (uint32_t length : {uint32_t(3), uint32_t(64), uint32_t(200),
+               uint32_t(258)}) {
+        // Fill the window with distinct bytes, then reach back into it.
+        FixedBlockWriter w;
+        std::vector<uint8_t> expected;
+        for (uint32_t i = 0; i < window; i++) {
+          uint8_t b = static_cast<uint8_t>((i * 37u + 11u) & 0xFFu);
+          w.literal(b);
+          expected.push_back(b);
+        }
+        w.match(length, distance);
+        for (uint32_t i = 0; i < length; i++) {
+          expected.push_back(expected[expected.size() - distance]);
+        }
+        std::vector<uint8_t> stream = w.finish();
+
+        for (size_t chunk : {size_t(1), size_t(23), size_t(4096)}) {
+          gcomp_status_t s = GCOMP_OK;
+          std::vector<uint8_t> got =
+              DecodeRaw(registry_, stream, window_bits, chunk, &s);
+          EXPECT_EQ(s, GCOMP_OK)
+              << "window " << window << " distance " << distance << " length "
+              << length << " chunk " << chunk;
+          EXPECT_EQ(got, expected)
+              << "window " << window << " distance " << distance << " length "
+              << length << " chunk " << chunk;
+        }
+      }
+    }
+  }
+}
+
+// A run of one repeated byte is copied with memset rather than a memcpy per
+// byte, which is a separate code path and gets its own case.  Runs like this
+// are what a row of identical pixels looks like after PNG filtering.
+TEST_F(DeflateDecoderTest, MatchCopy_RepeatedByteRuns) {
+  for (size_t run : {size_t(1), size_t(2), size_t(257), size_t(258),
+           size_t(259), size_t(5000)}) {
+    std::vector<uint8_t> input;
+    for (int block = 0; block < 12; block++) {
+      input.insert(input.end(), run, static_cast<uint8_t>('a' + block));
+      input.push_back(static_cast<uint8_t>(0x80 + block));
+    }
+    for (int level : {1, 6, 9}) {
+      EXPECT_EQ(RoundTripThroughChunks(registry_, input, level, 4096), input)
+          << "run of " << run << " at level " << level;
+    }
+  }
+}
+
+// Matches at distances that sit either side of the boundaries the run length
+// is clamped against, including one byte, the whole 32 KB window, and half of
+// it -- the point past which the writing cursor, not the reading cursor, is
+// what bounds the run.
+TEST_F(DeflateDecoderTest, MatchCopy_DistancesAcrossTheClampBoundaries) {
+  const size_t kWindow = 32768;
+  for (size_t distance : {size_t(1), size_t(2), size_t(3), size_t(7),
+           size_t(8), size_t(255), size_t(256), size_t(4096),
+           kWindow / 2 - 1, kWindow / 2, kWindow / 2 + 1, kWindow - 1,
+           kWindow}) {
+    std::vector<uint8_t> input =
+        BytesWithMatchDistance(distance * 3 + 40000, distance);
+    std::vector<uint8_t> back =
+        RoundTripThroughChunks(registry_, input, 9, 1u << 16);
+    EXPECT_EQ(back, input) << "distance " << distance;
+  }
+}
+
+// A match whose distance is within one maximum match length of the whole
+// window is the case where the writing cursor would run into the reading
+// cursor part way through a run.
+//
+// With the default 32 KB window that band is distances above 32,510 -- a
+// match is at most 258 bytes (RFC 1951 section 3.2.5), so a run cannot reach
+// any further back than that -- and an encoder has to be coaxed into emitting
+// one.  With a small window the band is most of the window, and every
+// distance below lands in it.
+TEST_F(DeflateDecoderTest, MatchCopy_DistancesNearTheEndOfASmallWindow) {
+  for (int window_bits : {8, 9, 10, 11}) {
+    const size_t window = size_t(1) << window_bits;
+    for (size_t distance = window - 40; distance <= window; distance++) {
+      // Repeating a block of exactly `distance` bytes makes every match run
+      // to the maximum length, which is what reaches the boundary.
+      std::vector<uint8_t> input = RepeatedBlock(window * 12, distance);
+      for (size_t chunk : {size_t(1), size_t(97), size_t(1u << 14)}) {
+        EXPECT_EQ(
+            RoundTripThroughChunks(registry_, input, 9, chunk, window_bits),
+            input)
+            << "window " << window << " distance " << distance << " chunk "
+            << chunk;
+      }
+    }
+  }
+}
+
+// The same data driven through output buffers of many consecutive sizes, so
+// that a match is cut at a different offset every time and the resume path is
+// entered in every state it can be in.
+TEST_F(DeflateDecoderTest, MatchCopy_SurvivesAnyOutputBufferSize) {
+  std::vector<uint8_t> input = BytesWithMatchDistance(30000, 300);
+  // A long repeat as well, so that a single match spans many output buffers.
+  input.insert(input.end(), 4000, 0x5A);
+  input.insert(input.end(), 64, 0x11);
+
+  for (size_t chunk = 1; chunk <= 40; chunk++) {
+    EXPECT_EQ(RoundTripThroughChunks(registry_, input, 9, chunk), input)
+        << "output buffer of " << chunk;
+  }
+  for (size_t chunk : {size_t(63), size_t(64), size_t(65), size_t(255),
+           size_t(256), size_t(257), size_t(4095), size_t(4096)}) {
+    EXPECT_EQ(RoundTripThroughChunks(registry_, input, 9, chunk), input)
+        << "output buffer of " << chunk;
+  }
+}
+
+// Enough data to wrap the 32 KB window several times over, with matches that
+// reach back across the wrap.
+TEST_F(DeflateDecoderTest, MatchCopy_AcrossWindowWraps) {
+  std::vector<uint8_t> input = BytesWithMatchDistance(300000, 30000);
+  for (size_t chunk : {size_t(1), size_t(37), size_t(4096), size_t(1u << 18)}) {
+    EXPECT_EQ(RoundTripThroughChunks(registry_, input, 9, chunk), input)
+        << "output buffer of " << chunk;
+  }
+}
+
+// Decoding driven the obvious way: update() until the input is gone, then
+// finish() until it says the stream is complete.
+//
+// This is the shape the header's own example uses for the encoder, and it is
+// what any caller would write.  The decoder used to answer it with
+// GCOMP_ERR_CORRUPT -- not because anything was corrupt, but because the last
+// output buffer had been too small to hold the tail, and finish() reported
+// "I need more room" and "your stream is truncated" as the same thing.
+TEST_F(DeflateDecoderTest, FinishCompletesAStreamThroughASmallOutputBuffer) {
+  std::vector<uint8_t> input = BytesWithMatchDistance(30000, 300);
+  input.insert(input.end(), 4000, 0x5A);
+
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  gcomp_options_set_int64(opts, "deflate.level", 9);
+  std::vector<uint8_t> encoded(input.size() * 2 + 4096);
+  size_t encoded_len = 0;
+  ASSERT_EQ(gcomp_encode_buffer(registry_, "deflate", opts, input.data(),
+                input.size(), encoded.data(), encoded.size(), &encoded_len),
+      GCOMP_OK);
+  gcomp_options_destroy(opts);
+  encoded.resize(encoded_len);
+
+  for (size_t chunk : {size_t(1), size_t(2), size_t(7), size_t(64),
+           size_t(1000), size_t(4096)}) {
+    gcomp_decoder_t * dec = nullptr;
+    ASSERT_EQ(gcomp_decoder_create(registry_, "deflate", nullptr, &dec),
+        GCOMP_OK);
+
+    std::vector<uint8_t> out_buf(chunk), decoded;
+    gcomp_buffer_t in = {encoded.data(), encoded.size(), 0};
+
+    // update() only while there is input left, exactly as a caller would.
+    while (in.used < in.size) {
+      gcomp_buffer_t ob = {out_buf.data(), out_buf.size(), 0};
+      ASSERT_EQ(gcomp_decoder_update(dec, &in, &ob), GCOMP_OK)
+          << "chunk " << chunk;
+      decoded.insert(decoded.end(), out_buf.data(), out_buf.data() + ob.used);
+    }
+
+    // Then finish() until it reports the stream complete.
+    size_t guard = 0;
+    for (;;) {
+      ASSERT_LT(++guard, input.size() + 10000u) << "chunk " << chunk;
+      gcomp_buffer_t ob = {out_buf.data(), out_buf.size(), 0};
+      gcomp_status_t f = gcomp_decoder_finish(dec, &ob);
+      decoded.insert(decoded.end(), out_buf.data(), out_buf.data() + ob.used);
+      if (f == GCOMP_OK) {
+        break;
+      }
+      ASSERT_EQ(f, GCOMP_ERR_LIMIT)
+          << "chunk " << chunk << ": finish reported " << (int)f;
+    }
+
+    // And once complete, it stays complete and writes nothing more.
+    std::vector<uint8_t> spare(4096);
+    gcomp_buffer_t ob = {spare.data(), spare.size(), 0};
+    EXPECT_EQ(gcomp_decoder_finish(dec, &ob), GCOMP_OK) << "chunk " << chunk;
+    EXPECT_EQ(ob.used, 0u) << "chunk " << chunk;
+
+    gcomp_decoder_destroy(dec);
+    EXPECT_EQ(decoded, input) << "chunk " << chunk;
+  }
+}
+
+// A stream that really is cut short must still be reported as corrupt, with
+// room to spare in the output buffer so that the two cases are distinguished
+// by the decoder's state and not by the caller's buffer size.
+TEST_F(DeflateDecoderTest, FinishStillReportsATruncatedStream) {
+  std::vector<uint8_t> input = BytesWithMatchDistance(20000, 250);
+
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  gcomp_options_set_int64(opts, "deflate.level", 6);
+  std::vector<uint8_t> encoded(input.size() * 2 + 4096);
+  size_t encoded_len = 0;
+  ASSERT_EQ(gcomp_encode_buffer(registry_, "deflate", opts, input.data(),
+                input.size(), encoded.data(), encoded.size(), &encoded_len),
+      GCOMP_OK);
+  gcomp_options_destroy(opts);
+
+  // Feed only the first half of the stream.
+  gcomp_decoder_t * dec = nullptr;
+  ASSERT_EQ(
+      gcomp_decoder_create(registry_, "deflate", nullptr, &dec), GCOMP_OK);
+  std::vector<uint8_t> out_buf(input.size() + 4096);
+  gcomp_buffer_t in = {encoded.data(), encoded_len / 2, 0};
+  gcomp_buffer_t ob = {out_buf.data(), out_buf.size(), 0};
+  ASSERT_EQ(gcomp_decoder_update(dec, &in, &ob), GCOMP_OK);
+
+  gcomp_buffer_t fb = {out_buf.data(), out_buf.size(), 0};
+  EXPECT_EQ(gcomp_decoder_finish(dec, &fb), GCOMP_ERR_CORRUPT);
+  gcomp_decoder_destroy(dec);
 }
 
 int main(int argc, char ** argv) {

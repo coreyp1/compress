@@ -501,30 +501,138 @@ static gcomp_status_t deflate_copy_stored(gcomp_deflate_decoder_state_t * st,
   return GCOMP_OK;
 }
 
+/**
+ * @brief Copy the pending match from the window to the output.
+ *
+ * WHY THIS IS NOT A BYTE LOOP
+ * ===========================
+ *
+ * It was, and it was 51.8% of a gzip decode.  Every byte of every match paid
+ * for a distance validation, two null checks, a masked address computation, a
+ * call to deflate_emit_byte(), an output-space test, an output limit check, an
+ * expansion-ratio check carrying a 64-bit division, and a second masked store
+ * into the window.  Roughly twenty operations to move one byte that a memcpy
+ * moves in a fraction of one.
+ *
+ * None of that work is per-byte work.  The distance describes the match, the
+ * null checks describe the decoder, and the limits describe a count.  So they
+ * are done once per run and the bytes are moved with memcpy.
+ *
+ * HOW LONG A RUN CAN BE
+ * =====================
+ *
+ * The window is circular and the match reads from it while writing to it, so a
+ * flat copy is only valid for as long as none of five things happen partway
+ * through: the match ends, the output fills, the write cursor wraps, the read
+ * cursor wraps, or the two cursors run into each other.  The last one has two
+ * directions and both are bounded:
+ *
+ * - The read cursor is `distance` bytes behind the write cursor, so a run of
+ *   at most `distance` bytes cannot read anything this run has written.  This
+ *   is what makes a three-byte-distance match copy three bytes at a time; that
+ *   is inherent to reading and writing one buffer, and three bytes per memcpy
+ *   is still far cheaper than three trips through the old loop.
+ *
+ * - Going the other way the two can overlap, when the match reaches far
+ *   enough back that the writing cursor would pass the reading cursor before
+ *   the run ends.  The reading cursor is ahead in that case, so every byte is
+ *   still read before anything overwrites it -- which is exactly what memmove
+ *   is defined to do, and why the window copy uses it.  A clamp that kept the
+ *   run short enough for memcpy was tried first and removed: it made the runs
+ *   smaller for no gain, and its absence could not be detected by any test,
+ *   because overlapping memcpy is undefined rather than wrong and this libc
+ *   happens to copy forward.  Correctness belongs in the call, not in a guard
+ *   nothing can check.
+ *
+ * A distance of one is a run of one byte repeated, which is common enough --
+ * it is what a row of identical pixels looks like after PNG filtering -- to be
+ * worth memset rather than a memcpy per byte.
+ */
 static gcomp_status_t deflate_copy_match(
     gcomp_deflate_decoder_state_t * st, gcomp_buffer_t * output) {
   if (!st || !output) {
     return GCOMP_ERR_INVALID_ARG;
   }
+  if (st->match_remaining == 0u) {
+    return GCOMP_OK;
+  }
 
-  while (st->match_remaining > 0 && deflate_out_available(output)) {
-    if (st->match_distance == 0 ||
-        st->match_distance > (uint32_t)st->window_filled ||
-        st->match_distance > (uint32_t)st->window_size) {
-      return GCOMP_ERR_CORRUPT;
+  // Checked once, because the distance belongs to the match and not to the
+  // byte.  A distance that reaches past what the window holds is a corrupt
+  // stream, not a short read.
+  if (st->match_distance == 0u ||
+      (size_t)st->match_distance > st->window_filled ||
+      (size_t)st->match_distance > st->window_size) {
+    return GCOMP_ERR_CORRUPT;
+  }
+
+  // The window is allocated when the decoder is created and update() refuses
+  // an output buffer that is NULL with a non-zero size, so neither of these
+  // can happen.  They are an error rather than a silent substitution of zero
+  // bytes, which is what the old loop did: producing zeros for a match would
+  // be corruption reported as success.
+  if (!st->window || st->window_size == 0u || !output->data) {
+    return GCOMP_ERR_INTERNAL;
+  }
+
+  uint8_t * const win = st->window;
+  uint8_t * const out = (uint8_t *)output->data;
+  const size_t mask = st->window_mask;
+  const size_t window_size = st->window_size;
+  const size_t distance = (size_t)st->match_distance;
+
+  while (st->match_remaining > 0u && output->used < output->size) {
+    const size_t src_pos = (st->window_pos + window_size - distance) & mask;
+
+    size_t run = (size_t)st->match_remaining;
+    const size_t out_room = output->size - output->used;
+    if (run > out_room) {
+      run = out_room;
+    }
+    if (run > distance) {
+      run = distance;
+    }
+    if (run > window_size - st->window_pos) {
+      run = window_size - st->window_pos;
+    }
+    if (run > window_size - src_pos) {
+      run = window_size - src_pos;
+    }
+    if (run == 0u) {
+      return GCOMP_ERR_INTERNAL; // Cannot happen; refuse to spin if it does.
     }
 
-    size_t src_pos =
-        (st->window_pos + st->window_size - (size_t)st->match_distance) &
-        st->window_mask;
-    uint8_t b = st->window ? st->window[src_pos] : 0u;
-
-    gcomp_status_t st_out = deflate_emit_byte(st, output, b);
-    if (st_out != GCOMP_OK) {
-      return st_out;
+    gcomp_status_t lim = deflate_check_output_limit(st, run);
+    if (lim != GCOMP_OK) {
+      return lim;
     }
 
-    st->match_remaining -= 1u;
+    if (distance == 1u) {
+      memset(out + output->used, win[src_pos], run);
+      memset(win + st->window_pos, win[src_pos], run);
+    }
+    else {
+      // The output never overlaps the window, so that one is a memcpy.
+      memcpy(out + output->used, win + src_pos, run);
+
+      // The window copy reads and writes the same buffer, so it is a memmove.
+      // Choosing memcpy when the two ranges happen to be disjoint was measured
+      // and is not worth it: 39,879,730 instructions against memmove's
+      // 39,582,801 on the same 800 KB, because the test costs more than the
+      // cheaper call saves.
+      memmove(win + st->window_pos, win + src_pos, run);
+    }
+
+    output->used += run;
+    st->total_output_bytes += (uint64_t)run;
+    st->window_pos = (st->window_pos + run) & mask;
+    if (st->window_filled < window_size) {
+      st->window_filled += run;
+      if (st->window_filled > window_size) {
+        st->window_filled = window_size;
+      }
+    }
+    st->match_remaining -= (uint32_t)run;
   }
 
   return GCOMP_OK;
@@ -1746,23 +1854,60 @@ gcomp_status_t gcomp_deflate_decoder_finish(
         decoder, GCOMP_ERR_INTERNAL, "decoder state is NULL");
   }
 
-  // Drain any pending match with the provided output space.
-  if (st->match_remaining > 0) {
+  if (output->size > 0 && !output->data) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  // Already complete: say so without writing anything, as the header promises.
+  if (st->stage == DEFLATE_STAGE_DONE && st->match_remaining == 0u) {
+    return GCOMP_OK;
+  }
+
+  // Drain any pending match with the output space provided.
+  if (st->match_remaining > 0u) {
     gcomp_status_t s = deflate_copy_match(st, output);
     if (s != GCOMP_OK) {
       return gcomp_decoder_set_error(decoder, s,
           "error draining pending match (%u bytes remaining)",
           st->match_remaining);
     }
+    if (st->match_remaining > 0u) {
+      // The buffer filled part way through the match.  More to come.
+      return GCOMP_ERR_LIMIT;
+    }
   }
 
-  if (st->stage != DEFLATE_STAGE_DONE) {
-    return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
-        "incomplete deflate stream (stage '%s', expected final block)",
-        deflate_stage_name(st->stage));
+  // Everything the decoder still owes the caller comes out of state it
+  // already holds -- bits read out of the input but not yet turned into
+  // symbols -- so finishing is one more turn of the loop update() runs, with
+  // nothing new to read.  Without this, a caller who called update() once per
+  // input chunk and then finish() -- which is the obvious way to drive it,
+  // and the way the header's own example drives the encoder -- was told the
+  // stream was corrupt whenever the last output buffer had been too small to
+  // hold the tail.
+  gcomp_buffer_t no_more_input = {NULL, 0, 0};
+  gcomp_status_t s =
+      gcomp_deflate_decoder_update(decoder, &no_more_input, output);
+  if (s != GCOMP_OK) {
+    return s;
   }
 
-  return GCOMP_OK;
+  if (st->stage == DEFLATE_STAGE_DONE && st->match_remaining == 0u) {
+    return GCOMP_OK;
+  }
+
+  // Not finished, and there are two very different reasons why.  This used to
+  // report both of them as corruption.
+  if (output->used >= output->size) {
+    // The output buffer filled.  Drain it and call again.
+    return GCOMP_ERR_LIMIT;
+  }
+
+  // Room to spare and it still could not finish: the input really did end
+  // part way through the stream.
+  return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+      "incomplete deflate stream (stage '%s', expected final block)",
+      deflate_stage_name(st->stage));
 }
 
 int gcomp_deflate_decoder_is_done(gcomp_decoder_t * decoder) {
