@@ -187,7 +187,9 @@ typedef struct {
 /// Indexed by compression level; entry 0 is unused (level 0 means "default").
 // `search_depth` counts candidates examined, and what a candidate costs
 // changes at level 9 where the chain gives way to the tree -- so the numbers
-// change scale there too, and the two halves are not comparable.
+// change scale there too, and the two halves are not comparable.  From 11 up
+// the parse changes as well: those levels ask for every match at a position
+// rather than the longest one, and price them against each other.
 //
 // A chain step crosses off one position and learns nothing for the next, so
 // the only way to search harder is to walk further and the counts run into
@@ -219,6 +221,26 @@ typedef struct {
 // the chain had one, 16 MiB against 8.5 over the 2 MB window these levels
 // declare.
 //
+// WHERE THE SHORTEST-PATH PARSE STARTS
+// ====================================
+//
+// It used to start at 16, and that left seven levels doing nothing.  On
+// 8.8 MB of XML, manuals, C source and an ELF binary, levels 9 through 15
+// bought 2.0% between them -- 1,888,351 bytes down to 1,855,775 -- while
+// costing a quarter of the encode rate, and then level 16 took 7.94% in a
+// single step.  Seven levels of deferred parsing were being asked to do
+// what one level of shortest path does, and could not.
+//
+// The parse is now what separates 11 from 10, at the level where the window
+// steps to 8 MB.  Over the same files levels 11 to 15 became 4.9% to 8.2%
+// smaller; over the 19 MB corpus they went from a little behind libzstd at
+// the same level to 6.4% to 7.8% ahead of it.  The cost is real and is the
+// point of a level: 11 fell from 6.3 MB/s to 5.4.
+//
+// Levels 16 to 22 were re-tuned to follow on rather than restart, because
+// 16's old settings are now 15's neighbourhood: each step above 15 raises
+// the segment and the budget rather than the depth alone.
+//
 // `nice_length` turned out to be the knob that matters for the tree, far
 // more than the depth.  Reaching it stops the descent, and stopping the
 // descent closes off whatever was still below -- so it does not only end
@@ -238,14 +260,14 @@ static const zstd_effort_t k_zstd_effort[23] = {
     {112, 2, 192, 17, 0, 0, 0, 0},         // 8: last of the chain levels
     {14, 2, 256, 17, 1, 0, 0, 0},          // 9: first of the tree levels
     {16, 2, 512, 17, 1, 0, 0, 0},          // 10
-    {18, 2, 768, 17, 1, 0, 0, 0},          // 11: the window steps to 8 MB
-    {20, 2, 1024, 17, 1, 0, 0, 0},         // 12
-    {22, 2, 1280, 18, 1, 0, 0, 0},         // 13
-    {24, 2, 1536, 18, 1, 0, 0, 0},         // 14
-    {26, 2, 2048, 18, 1, 0, 0, 0},         // 15: last of the deferred levels
-    {28, 0, 2560, 18, 1, 1, 1024, 16},     // 16: first of the optimal levels
-    {32, 0, 3072, 18, 1, 1, 2048, 32},     // 17
-    {36, 0, 3584, 18, 1, 1, 3072, 64},     // 18
+    {16, 0, 512, 17, 1, 1, 512, 0},        // 11: first of the optimal levels
+    {18, 0, 768, 17, 1, 1, 768, 4},        // 12
+    {20, 0, 1024, 18, 1, 1, 1024, 8},      // 13
+    {22, 0, 1536, 18, 1, 1, 1024, 16},     // 14
+    {24, 0, 2048, 18, 1, 1, 1536, 24},     // 15
+    {28, 0, 2560, 18, 1, 1, 2048, 32},     // 16
+    {32, 0, 3072, 18, 1, 1, 2560, 48},     // 17
+    {36, 0, 3584, 18, 1, 1, 3072, 80},     // 18
     {40, 0, 4096, 18, 1, 1, 4096, 128},    // 19
     {44, 0, 5120, 18, 1, 1, 6144, 192},    // 20
     {52, 0, 8192, 18, 1, 1, 8192, 320},    // 21
