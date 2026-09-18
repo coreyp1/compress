@@ -111,6 +111,35 @@ uint32_t zstd_window_log_to_size(uint8_t window_log) {
 //
 
 /**
+ * @brief Copy a run of staged bytes into the output buffer.
+ *
+ * The encoder stages whole things -- a frame header, a compressed block, a
+ * finished parallel job -- and hands each out across however many calls it
+ * takes to fit.  Every one of those hand-offs is a straight copy of a run,
+ * and each was written as a loop moving one byte with its own bounds test.
+ *
+ * @param src Staged bytes.
+ * @param pos In/out: how much of them has already gone to the caller.
+ * @param len Total staged.
+ * @param output Where they go.
+ * @return true once the staged bytes have been handed out in full.
+ */
+static bool zstd_emit_staged(const uint8_t * src, size_t * pos, size_t len,
+    gcomp_buffer_t * output) {
+  size_t pending = len - *pos;
+  if (pending > 0u) {
+    size_t space = output->size - output->used;
+    size_t n = (pending < space) ? pending : space;
+    if (n > 0u) {
+      memcpy((uint8_t *)output->data + output->used, src + *pos, n);
+      output->used += n;
+      *pos += n;
+    }
+  }
+  return *pos >= len;
+}
+
+/**
  * @brief Drain pending parallel output to the output buffer.
  *
  * Copies data from the internal parallel output buffer to the caller's output.
@@ -121,13 +150,8 @@ uint32_t zstd_window_log_to_size(uint8_t window_log) {
  */
 static bool zstd_encoder_drain_parallel_output(
     zstd_encoder_state_t * state, gcomp_buffer_t * output) {
-  uint8_t * out_ptr = (uint8_t *)output->data;
-  while (state->parallel_output_buf_pos < state->parallel_output_buf_len &&
-      output->used < output->size) {
-    out_ptr[output->used++] =
-        state->parallel_output_buf[state->parallel_output_buf_pos++];
-  }
-  return state->parallel_output_buf_pos >= state->parallel_output_buf_len;
+  return zstd_emit_staged(state->parallel_output_buf,
+      &state->parallel_output_buf_pos, state->parallel_output_buf_len, output);
 }
 
 /**
@@ -882,7 +906,6 @@ gcomp_status_t zstd_encoder_update(gcomp_encoder_t * encoder,
 
   zstd_encoder_state_t * state = encoder->method_state;
   const uint8_t * in_ptr = (const uint8_t *)input->data;
-  uint8_t * out_ptr = (uint8_t *)output->data;
 
   if (state->stage == ZSTD_ENC_STAGE_ERROR) {
     gcomp_encoder_set_error(
@@ -900,10 +923,8 @@ gcomp_status_t zstd_encoder_update(gcomp_encoder_t * encoder,
 
   // Single-threaded mode: write header if needed
   if (state->stage == ZSTD_ENC_STAGE_HEADER) {
-    while (
-        state->header_pos < state->header_len && output->used < output->size) {
-      out_ptr[output->used++] = state->header_buf[state->header_pos++];
-    }
+    (void)zstd_emit_staged(
+        state->header_buf, &state->header_pos, state->header_len, output);
     if (state->header_pos >= state->header_len) {
       state->stage = ZSTD_ENC_STAGE_BLOCKS;
     }
@@ -915,11 +936,8 @@ gcomp_status_t zstd_encoder_update(gcomp_encoder_t * encoder,
   // Process input in BLOCKS stage
   if (state->stage == ZSTD_ENC_STAGE_BLOCKS) {
     // First, drain any pending compressed output
-    while (state->compressed_buffer_pos < state->compressed_buffer_len &&
-        output->used < output->size) {
-      out_ptr[output->used++] =
-          state->compressed_buffer[state->compressed_buffer_pos++];
-    }
+    (void)zstd_emit_staged(state->compressed_buffer,
+        &state->compressed_buffer_pos, state->compressed_buffer_len, output);
     if (state->compressed_buffer_pos < state->compressed_buffer_len) {
       return GCOMP_OK; // Need more output space
     }
@@ -969,11 +987,9 @@ gcomp_status_t zstd_encoder_update(gcomp_encoder_t * encoder,
         state->compressed_buffer_pos = 0;
 
         // Output compressed block
-        while (state->compressed_buffer_pos < state->compressed_buffer_len &&
-            output->used < output->size) {
-          out_ptr[output->used++] =
-              state->compressed_buffer[state->compressed_buffer_pos++];
-        }
+        (void)zstd_emit_staged(state->compressed_buffer,
+            &state->compressed_buffer_pos, state->compressed_buffer_len,
+            output);
 
         state->block_buffer_pos = 0;
 
@@ -1026,10 +1042,8 @@ gcomp_status_t zstd_encoder_finish(
 
   // Single-threaded mode: drain any remaining header
   if (state->stage == ZSTD_ENC_STAGE_HEADER) {
-    while (
-        state->header_pos < state->header_len && output->used < output->size) {
-      out_ptr[output->used++] = state->header_buf[state->header_pos++];
-    }
+    (void)zstd_emit_staged(
+        state->header_buf, &state->header_pos, state->header_len, output);
     if (state->header_pos >= state->header_len) {
       state->stage = ZSTD_ENC_STAGE_BLOCKS;
     }
@@ -1045,11 +1059,8 @@ gcomp_status_t zstd_encoder_finish(
   // Flush remaining buffered data as final block
   if (state->stage == ZSTD_ENC_STAGE_BLOCKS) {
     // Drain pending compressed output
-    while (state->compressed_buffer_pos < state->compressed_buffer_len &&
-        output->used < output->size) {
-      out_ptr[output->used++] =
-          state->compressed_buffer[state->compressed_buffer_pos++];
-    }
+    (void)zstd_emit_staged(state->compressed_buffer,
+        &state->compressed_buffer_pos, state->compressed_buffer_len, output);
     if (state->compressed_buffer_pos < state->compressed_buffer_len) {
       return GCOMP_ERR_LIMIT; // Need more output space; call finish again.
     }
@@ -1096,11 +1107,8 @@ gcomp_status_t zstd_encoder_finish(
     }
 
     // Output final block
-    while (state->compressed_buffer_pos < state->compressed_buffer_len &&
-        output->used < output->size) {
-      out_ptr[output->used++] =
-          state->compressed_buffer[state->compressed_buffer_pos++];
-    }
+    (void)zstd_emit_staged(state->compressed_buffer,
+        &state->compressed_buffer_pos, state->compressed_buffer_len, output);
     if (state->compressed_buffer_pos < state->compressed_buffer_len) {
       return GCOMP_ERR_LIMIT; // Need more output space; call finish again.
     }
