@@ -277,12 +277,25 @@ static gcomp_status_t zstd_seq_bit_reader_init(
 }
 
 /**
- * @brief Read the next @p nb_bits bits, most significant first.
+ * @brief Take the next @p nb_bits bits, most significant first, without
+ *        refilling.
+ *
+ * The caller is responsible for having refilled recently enough that the bits
+ * are in the container.  How much can be taken between refills is fifty-seven
+ * bits: a refill leaves `used` below eight, and the container holds
+ * sixty-four.  zstd_sequences_execute() spends that budget deliberately;
+ * see the note above its loop.
  *
  * Returns zero when the stream does not hold that many bits, which is how the
  * callers detect the end.
+ *
+ * `used + nb_bits` cannot exceed 64.  Once the window has reached the start of
+ * the stream and can slide no further, the bounds check below is what holds
+ * that: it refuses any read reaching past the first bit of the stream, and
+ * that bit sits at container bit `bit_offset`.  Everywhere else it is the
+ * refill budget.
  */
-static inline uint32_t zstd_seq_bit_reader_read(
+static inline uint32_t zstd_seq_bit_reader_take(
     zstd_seq_bit_reader_t * br, unsigned nb_bits) {
   if (nb_bits == 0) {
     return 0;
@@ -290,19 +303,31 @@ static inline uint32_t zstd_seq_bit_reader_read(
   if (br->bits_consumed + nb_bits > br->total_bits) {
     return 0;
   }
+  // The budget is reasoned about rather than enforced, so it is also checked:
+  // a table or a table log that got past validation would otherwise shift by
+  // more than sixty-three, which is undefined rather than merely wrong.  One
+  // predictable comparison.
+  if (br->used + nb_bits > 64u) {
+    return 0;
+  }
 
-  // `used + nb_bits` cannot exceed 64.  Away from the start of the stream the
-  // refill leaves `used` below eight and no caller asks for more than 31 bits
-  // (RFC 8878 section 3.1.1.3.2.1.1 caps an offset code there, and the FSE
-  // table logs are smaller still).  At the start, where the window can no
-  // longer slide, the bounds check above is what holds it: it refuses any read
-  // that would reach below the first bit of the stream, and that bit sits at
-  // container bit `bit_offset`.
   uint32_t value = (uint32_t)((br->container >> (64u - br->used - nb_bits)) &
       (((uint64_t)1u << nb_bits) - 1u));
 
   br->used += nb_bits;
   br->bits_consumed += nb_bits;
+  return value;
+}
+
+/**
+ * @brief Take the next @p nb_bits bits and refill.
+ *
+ * For the few reads that are not inside the sequence loop, where one refill
+ * per read costs nothing.
+ */
+static inline uint32_t zstd_seq_bit_reader_read(
+    zstd_seq_bit_reader_t * br, unsigned nb_bits) {
+  uint32_t value = zstd_seq_bit_reader_take(br, nb_bits);
   zstd_seq_bit_reader_refill(br);
   return value;
 }
@@ -588,7 +613,30 @@ static gcomp_status_t zstd_sequences_execute(zstd_decoder_state_t * state,
   size_t lit_pos = 0;
   size_t out_pos = 0;
 
+  // HOW THE BITS ARE SPENT
+  // ======================
+  //
+  // Each pass took six separate reads, and each read refilled the container
+  // afterwards -- a shift, a comparison and, one time in seven, a load.  Six
+  // refills per sequence to consume bits that arrive fifty-six at a time.
+  //
+  // A refill leaves `used` below eight and the container holds sixty-four, so
+  // fifty-seven bits can be taken before the next one is needed.  What a
+  // sequence spends is bounded:
+  //
+  //   offset extra bits    at most 31  (the of_code > 31 check below)
+  //   match length extra   at most 16  (zstd_seq_ml_extra_bits)
+  //   literal length extra at most 16  (zstd_seq_ll_extra_bits)
+  //   three state moves    at most 27  (FSE accuracy log is capped at 9)
+  //
+  // Splitting that as 31+16 then 16+27 keeps both halves inside the budget --
+  // 47 and 43 against 57 -- so two refills per sequence do the work of six.
+  // The three state moves also become one read rather than three: they are
+  // adjacent in the stream, so their bits can be taken together and split,
+  // which is what the shifts below do.
   for (uint32_t i = 0; i < num_sequences; i++) {
+    zstd_seq_bit_reader_refill(&br);
+
     // Decode sequence codes from FSE states
     uint8_t ll_code = state->fse_lit_table[seq_state.ll_state].symbol;
     uint8_t of_code = state->fse_offset_table[seq_state.of_state].symbol;
@@ -602,7 +650,7 @@ static gcomp_status_t zstd_sequences_execute(zstd_decoder_state_t * state,
     }
     uint32_t offset;
     if (of_code > 0) {
-      uint32_t extra = zstd_seq_bit_reader_read(&br, of_code);
+      uint32_t extra = zstd_seq_bit_reader_take(&br, of_code);
       offset = (1U << of_code) + extra;
     }
     else {
@@ -613,49 +661,55 @@ static gcomp_status_t zstd_sequences_execute(zstd_decoder_state_t * state,
     uint32_t match_length;
     if (ml_code < 53) {
       uint32_t extra =
-          zstd_seq_bit_reader_read(&br, zstd_seq_ml_extra_bits[ml_code]);
+          zstd_seq_bit_reader_take(&br, zstd_seq_ml_extra_bits[ml_code]);
       match_length = zstd_seq_ml_baseline[ml_code] + extra;
     }
     else {
       return GCOMP_ERR_CORRUPT;
     }
 
+    // 47 of the 57 bits may be gone by here; the rest of this sequence needs
+    // another 43 at most.
+    zstd_seq_bit_reader_refill(&br);
+
     // Read extra bits for literal length
     uint32_t literal_length;
     if (ll_code < 36) {
       uint32_t extra =
-          zstd_seq_bit_reader_read(&br, zstd_seq_ll_extra_bits[ll_code]);
+          zstd_seq_bit_reader_take(&br, zstd_seq_ll_extra_bits[ll_code]);
       literal_length = zstd_seq_ll_baseline[ll_code] + extra;
     }
     else {
       return GCOMP_ERR_CORRUPT;
     }
 
-    // Update FSE states (unless last sequence)
+    // Update FSE states (unless last sequence).
+    //
+    // The three moves read literal-length bits, then match-length bits, then
+    // offset bits, from adjacent positions in the stream; and none of the
+    // three tables is indexed by a state the others change.  So all three
+    // entries are looked up first and all three sets of bits taken at once,
+    // most significant first, which puts literal length's share at the top.
     if (i < num_sequences - 1) {
-      // Update LL state
-      {
-        const zstd_fse_entry_t * entry =
-            &state->fse_lit_table[seq_state.ll_state];
-        uint32_t bits = zstd_seq_bit_reader_read(&br, entry->nb_bits);
-        seq_state.ll_state = entry->new_state + bits;
-      }
+      const zstd_fse_entry_t * ll_entry =
+          &state->fse_lit_table[seq_state.ll_state];
+      const zstd_fse_entry_t * ml_entry =
+          &state->fse_match_table[seq_state.ml_state];
+      const zstd_fse_entry_t * of_entry =
+          &state->fse_offset_table[seq_state.of_state];
 
-      // Update ML state
-      {
-        const zstd_fse_entry_t * entry =
-            &state->fse_match_table[seq_state.ml_state];
-        uint32_t bits = zstd_seq_bit_reader_read(&br, entry->nb_bits);
-        seq_state.ml_state = entry->new_state + bits;
-      }
+      const unsigned ll_nb = ll_entry->nb_bits;
+      const unsigned ml_nb = ml_entry->nb_bits;
+      const unsigned of_nb = of_entry->nb_bits;
 
-      // Update OF state
-      {
-        const zstd_fse_entry_t * entry =
-            &state->fse_offset_table[seq_state.of_state];
-        uint32_t bits = zstd_seq_bit_reader_read(&br, entry->nb_bits);
-        seq_state.of_state = entry->new_state + bits;
-      }
+      uint32_t bits = zstd_seq_bit_reader_take(&br, ll_nb + ml_nb + of_nb);
+
+      seq_state.ll_state =
+          (uint16_t)(ll_entry->new_state + (bits >> (ml_nb + of_nb)));
+      seq_state.ml_state = (uint16_t)(ml_entry->new_state +
+          ((bits >> of_nb) & ((1u << ml_nb) - 1u)));
+      seq_state.of_state =
+          (uint16_t)(of_entry->new_state + (bits & ((1u << of_nb) - 1u)));
     }
 
     // RFC 8878 section 3.1.1.5 (Repeat Offsets).  Offset_Value selects an
