@@ -344,13 +344,32 @@ static void deflate_align_to_byte(gcomp_deflate_decoder_state_t * st) {
 // Bit reversal (needed because DEFLATE transmits Huffman codes LSB-first)
 //
 
-static uint32_t reverse_bits(uint32_t v, uint32_t nbits) {
-  uint32_t r = 0;
-  for (uint32_t i = 0; i < nbits; i++) {
-    r = (r << 1u) | (v & 1u);
-    v >>= 1u;
+/**
+ * @brief Reverse the low @p nbits of @p v.
+ *
+ * DEFLATE writes Huffman codes least significant bit first, while canonical
+ * codes are defined most significant bit first, so a peeked code has to be
+ * turned around before it can index a table built from canonical codes.  That
+ * happens at least once for every symbol decoded, which makes this one of the
+ * hottest few lines in the decoder.
+ *
+ * It used to shift one bit at a time, nine times per symbol.  This does all
+ * sixteen at once by swapping neighbouring pairs, then pairs of pairs, and so
+ * on, and then drops the bits that were not asked for.  RFC 1951 section 3.2.7
+ * caps a code at fifteen bits, so sixteen is always enough.
+ *
+ * @param nbits Must be 16 or fewer.
+ */
+static inline uint32_t reverse_bits(uint32_t v, uint32_t nbits) {
+  if (nbits == 0u) {
+    return 0u;
   }
-  return r;
+  v &= 0xFFFFu;
+  v = ((v >> 1u) & 0x5555u) | ((v & 0x5555u) << 1u);
+  v = ((v >> 2u) & 0x3333u) | ((v & 0x3333u) << 2u);
+  v = ((v >> 4u) & 0x0F0Fu) | ((v & 0x0F0Fu) << 4u);
+  v = ((v >> 8u) & 0x00FFu) | ((v & 0x00FFu) << 8u);
+  return v >> (16u - nbits);
 }
 
 //
@@ -1561,7 +1580,13 @@ static gcomp_status_t deflate_decode_distance(
   return deflate_copy_match(st, output);
 }
 
-static gcomp_status_t deflate_process_huffman_data(
+/**
+ * @brief Decode one symbol's worth of a Huffman block.
+ *
+ * Returns after a single literal, a single length/distance pair, or the end
+ * of the block; the loop that calls it is deflate_process_huffman_data().
+ */
+static gcomp_status_t deflate_huffman_step(
     gcomp_deflate_decoder_state_t * st, gcomp_buffer_t * input,
     gcomp_buffer_t * output) {
   if (!st->cur_litlen || !st->cur_dist) {
@@ -1706,6 +1731,53 @@ static gcomp_status_t deflate_process_huffman_data(
 
   // Now decode distance
   return deflate_decode_distance(st, input, output, length);
+}
+
+/**
+ * @brief Decode as much of a Huffman block as the buffers allow.
+ *
+ * WHY THIS LOOPS
+ * ==============
+ *
+ * It used to decode exactly one symbol and return to gcomp_deflate_decoder_
+ * update(), which meant every literal and every match paid for a full turn of
+ * that function's loop: a snapshot of seven pieces of decoder state, a switch
+ * on the stage, a call, and then seven comparisons to work out whether
+ * anything had happened.  About thirty-four instructions of bookkeeping to
+ * decode one symbol, and 23.6% of a decode.
+ *
+ * Staying here instead costs a comparison or two per symbol.  The outer loop
+ * still exists and still does its check -- it has to, because a block can end
+ * and the next one can be of a different type -- but it now runs once per
+ * block rather than once per symbol.
+ *
+ * Stopping conditions, in the order they are tested: no output space left, an
+ * error, the block ended (which changes the stage and belongs to the caller),
+ * or a step that neither consumed input nor produced output, which means it
+ * is waiting for one or the other.
+ */
+static gcomp_status_t deflate_process_huffman_data(
+    gcomp_deflate_decoder_state_t * st, gcomp_buffer_t * input,
+    gcomp_buffer_t * output) {
+  for (;;) {
+    if (output->used >= output->size) {
+      return GCOMP_OK;
+    }
+
+    const size_t in_before = input->used;
+    const size_t out_before = output->used;
+
+    gcomp_status_t s = deflate_huffman_step(st, input, output);
+    if (s != GCOMP_OK) {
+      return s;
+    }
+    if (st->stage != DEFLATE_STAGE_HUFFMAN_DATA) {
+      return GCOMP_OK; // The block ended; the caller decides what follows.
+    }
+    if (input->used == in_before && output->used == out_before) {
+      return GCOMP_OK; // Waiting for more input, or for room to write.
+    }
+  }
 }
 
 // Helper to get stage name for error messages
