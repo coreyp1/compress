@@ -503,6 +503,71 @@ TEST_F(ZstdDecoderTest, DoesNotReadPastTheInputItWasGiven) {
   }
 }
 
+// Sequence bitstreams of every small length, including the ones that do not
+// fill the reader's 64-bit window.
+//
+// The reader loads sixty-four bits at a time.  A stream of eight bytes or more
+// can be loaded straight out of the caller's buffer; a shorter one is copied
+// into eight bytes of the reader's own, right-aligned, so that the same load
+// does not read past the end of what the caller owns.  That padding shifts
+// every bit position by a constant, and the arithmetic either agrees with
+// itself or it does not.
+//
+// Short inputs produce short bitstreams, so sweeping the input size sweeps
+// the bitstream length across that boundary and either side of it.
+TEST_F(ZstdDecoderTest, BitstreamsOfEverySmallLength) {
+  // How short the bitstream comes out depends far more on the shape of the
+  // input than on its length: a mixed input of a few hundred bytes still
+  // produces nine or more bytes of sequences.  These four shapes are the ones
+  // measured to produce the shortest -- a small repeating cycle, long runs, a
+  // two symbol alphabet, and one byte throughout -- and between them they
+  // reach bitstream lengths of one, three, four and seven bytes as well as
+  // every length from eight upwards.
+  for (int shape = 0; shape < 4; shape++) {
+    for (size_t size = 1; size <= 300; size++) {
+      std::vector<uint8_t> input;
+      input.reserve(size);
+      uint32_t x = 0x51ED5EEDu ^ static_cast<uint32_t>(size);
+      for (size_t i = 0; i < size; i++) {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        switch (shape) {
+        case 0:
+          input.push_back(static_cast<uint8_t>('a' + (i % 3)));
+          break;
+        case 1:
+          input.push_back(static_cast<uint8_t>((i / 8) % 2 ? 'z' : 'q'));
+          break;
+        case 2:
+          input.push_back(static_cast<uint8_t>('a' + (x % 2)));
+          break;
+        default:
+          input.push_back(static_cast<uint8_t>('k'));
+          break;
+        }
+      }
+
+    for (int level : {1, 3, 9}) {
+      gcomp_options_t * opts = nullptr;
+      ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+      gcomp_options_set_int64(opts, "zstd.level", level);
+      std::vector<uint8_t> enc = compress(input.data(), input.size(), opts);
+      gcomp_options_destroy(opts);
+      ASSERT_FALSE(enc.empty()) << "size " << size << " level " << level;
+
+      gcomp_status_t st = GCOMP_OK;
+      std::vector<uint8_t> back =
+          ZstdDecodeExpecting(registry_, enc, input.size(), &st);
+      EXPECT_EQ(st, GCOMP_OK)
+          << "shape " << shape << " size " << size << " level " << level;
+      EXPECT_EQ(back, input)
+          << "shape " << shape << " size " << size << " level " << level;
+    }
+    }
+  }
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

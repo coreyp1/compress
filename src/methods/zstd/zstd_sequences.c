@@ -145,102 +145,90 @@ typedef struct {
 //
 // Bit Reader for Sequences (backward bitstream)
 //
-// FSE bitstreams in zstd are written in reverse order. The last byte contains
-// a marker bit (the highest set bit) followed by padding zeros. We read bits
+// FSE bitstreams in zstd are written in reverse order.  The last byte contains
+// a marker bit (the highest set bit) followed by padding zeros.  Reading runs
 // from the marker downward toward bit 0.
+//
+// HOW THIS READS, AND WHY IT CHANGED
+// ==================================
+//
+// The obvious way to write this is to keep a count of bits consumed, and for
+// each read work out the absolute bit position wanted, find the eight bytes
+// containing it, and extract.  That is what this did, and it meant every read
+// -- six per sequence, three FSE states and three sets of extra bits --
+// recomputed where it was in the stream from scratch.  Even after the loads
+// were cached and the arithmetic reduced to a single subtraction, it was the
+// single most expensive function in a Zstandard decode.
+//
+// It now works the way a bitstream reader is normally built.  The container
+// holds sixty-four bits of the stream, `used` counts how many of them have
+// been taken starting from the top, and a read is one shift and one mask with
+// nothing to look up.  Consuming bits costs an addition.  Only when whole
+// bytes have been used up does the window slide down over them, and that is
+// one 64-bit load covering the next fifty-six bits -- so the stream is read in
+// gulps rather than a field at a time.
+//
+// THE MAPPING
+// ===========
+//
+// Container bit i is stream bit (byte_pos * 8 + i - bit_offset), so the bits
+// waiting to be read sit immediately below bit (64 - used).  The invariant
+// tying the two counters together is
+//
+//   byte_pos * 8 + 64 - used  ==  total_bits - consumed + bit_offset
+//
+// `bit_offset` is zero for any stream of eight bytes or more.  A shorter one
+// is copied into `pad` right-aligned, so that the same 64-bit load works
+// without reading past the end of the caller's buffer, and `bit_offset`
+// counts the zero bits that padding put in front of it.
 //
 
 typedef struct {
-  const uint8_t * src;        ///< Source data pointer
-  size_t src_size;            ///< Total source size
-  uint64_t bit_container;     ///< Loaded bits
-  unsigned bits_in_container; ///< Valid bits currently in container
-  unsigned total_bits;        ///< Total valid bits in stream (excluding marker)
-  unsigned bits_consumed;     ///< Total bits consumed from stream
+  /// Sixty-four bits of the stream; see the mapping above.
+  uint64_t container;
   /**
-   * First source byte the container currently holds, and whether it holds
-   * anything at all.
+   * Where the container was loaded from.
    *
-   * The container is eight bytes of the stream, and which eight depends only
-   * on how far the reader has got.  Remembering which ones are loaded turns
-   * the reload below into a comparison for every read that stays inside them,
-   * which is nearly all of them: a sequence reads its three FSE states and
-   * its extra bits from a handful of adjacent bytes.
-   *
-   * Without this the reader rebuilt the container from the source, one byte
-   * at a time, on every single read -- about forty instructions to extract as
-   * few as one bit -- and was 38.4% of a Zstandard decode.
+   * This points into @ref pad for a stream shorter than eight bytes, so the
+   * reader is not copyable.  It is a local of zstd_sequences_execute() and is
+   * only ever used through a pointer.
    */
-  size_t container_start_byte;
-  int container_loaded;
+  const uint8_t * base;
+  size_t base_size;       ///< Bytes of @ref base; at least 8.
+  size_t byte_pos;        ///< container == gcomp_read_le64(base + byte_pos).
+  unsigned used;          ///< Bits of the container taken, from bit 63 down.
+  unsigned bit_offset;    ///< Padding bits in front of a short stream.
+  unsigned total_bits;    ///< Data bits in the stream, below the marker.
+  unsigned bits_consumed; ///< Data bits read so far; bounds the stream.
+  uint8_t pad[8];         ///< A stream shorter than eight bytes, right-aligned.
 } zstd_seq_bit_reader_t;
 
 /**
- * @brief Reload the bit container from the source stream.
+ * @brief Slide the container down over the bits that come next.
  *
- * For backward bitstreams, we read from high bit positions to low.
- * The container holds a window of bits, and we reload when needed.
- */
-/**
- * @brief The source byte the container must begin at to cover the next bits.
+ * Whole bytes that have been consumed are dropped and the window moves back
+ * towards the start of the stream, which is the direction this bitstream is
+ * read in.  One 64-bit load refills fifty-six usable bits, so this does real
+ * work about once every seven reads rather than on every one.
  *
- * The stream is read backwards, so the bits wanted next are the highest ones
- * not yet consumed.  The container holds the eight bytes ending with the one
- * those bits live in -- or starts at the beginning of the stream when there
- * are fewer than eight bytes before it.
+ * At the start of the stream the window cannot move any further; `used` then
+ * grows past eight, which is correct -- the container already holds every bit
+ * that is left.
  */
-static inline size_t zstd_seq_bit_reader_window(unsigned bits_remaining) {
-  unsigned top_byte = (bits_remaining - 1u) / 8u;
-  return (top_byte >= 7u) ? (size_t)(top_byte - 7u) : (size_t)0u;
-}
-
-/**
- * @brief Put the eight bytes beginning at @p start_byte into the container.
- *
- * Does nothing when they are already there, which is most of the time: a
- * sequence reads its three FSE states and its extra bits out of a handful of
- * adjacent bytes.
- */
-static void zstd_seq_bit_reader_load(
-    zstd_seq_bit_reader_t * br, size_t start_byte) {
-  if (br->container_loaded && br->container_start_byte == start_byte) {
+static inline void zstd_seq_bit_reader_refill(zstd_seq_bit_reader_t * br) {
+  size_t shift = br->used >> 3;
+  if (shift == 0u) {
     return;
   }
-
-  size_t bytes_to_load = br->src_size - start_byte;
-  if (bytes_to_load > 8) {
-    bytes_to_load = 8;
-  }
-
-  if (bytes_to_load == 8u) {
-    // Byte i of the source at bit i*8 is a little-endian 64-bit read, which
-    // every compiler here folds into a single load.  This used to be an
-    // eight-iteration byte loop and was worth about a sixth of the decode.
-    br->bit_container = gcomp_read_le64(br->src + start_byte);
-  }
-  else {
-    // Fewer than eight bytes left in the stream; the tail goes a byte at a
-    // time so that nothing past the end is read.
-    br->bit_container = 0;
-    for (size_t i = 0; i < bytes_to_load; i++) {
-      br->bit_container |= (uint64_t)br->src[start_byte + i] << (i * 8);
+  if (shift > br->byte_pos) {
+    shift = br->byte_pos;
+    if (shift == 0u) {
+      return;
     }
   }
-
-  br->bits_in_container = (unsigned)(bytes_to_load * 8);
-  br->container_start_byte = start_byte;
-  br->container_loaded = 1;
-}
-
-/**
- * @brief Reload the bit container from the source stream.
- */
-static void zstd_seq_bit_reader_reload(zstd_seq_bit_reader_t * br) {
-  unsigned bits_remaining = br->total_bits - br->bits_consumed;
-  if (bits_remaining == 0) {
-    return;
-  }
-  zstd_seq_bit_reader_load(br, zstd_seq_bit_reader_window(bits_remaining));
+  br->byte_pos -= shift;
+  br->used -= (unsigned)(shift * 8u);
+  br->container = gcomp_read_le64(br->base + br->byte_pos);
 }
 
 static gcomp_status_t zstd_seq_bit_reader_init(
@@ -249,35 +237,41 @@ static gcomp_status_t zstd_seq_bit_reader_init(
     return GCOMP_ERR_INVALID_ARG;
   }
 
-  br->src = src;
-  br->src_size = src_size;
-  br->bit_container = 0;
-  br->bits_in_container = 0;
-  br->container_start_byte = 0;
-  br->container_loaded = 0;
-
-  // Find initialization marker (highest set bit in last byte)
+  // The marker is the highest set bit of the last byte; everything below it
+  // is data, and the byte cannot be zero.
   uint8_t last_byte = src[src_size - 1];
   if (last_byte == 0) {
     return GCOMP_ERR_CORRUPT;
   }
-
-  // Find position of highest set bit
   unsigned marker_bit_in_byte = 7;
   while (
       marker_bit_in_byte > 0 && ((last_byte >> marker_bit_in_byte) & 1) == 0) {
     marker_bit_in_byte--;
   }
 
-  // Total data bits = (src_size - 1) * 8 + marker_bit_in_byte
-  // The marker itself is at bit (src_size - 1) * 8 + marker_bit_in_byte
-  // Valid data bits are from 0 to marker_bit - 1
   br->total_bits = (unsigned)((src_size - 1) * 8 + marker_bit_in_byte);
   br->bits_consumed = 0;
-  br->bits_in_container = 0;
 
-  // Initial load
-  zstd_seq_bit_reader_reload(br);
+  if (src_size >= 8) {
+    br->base = src;
+    br->base_size = src_size;
+    br->bit_offset = 0;
+  }
+  else {
+    // Right-aligned in eight bytes, so that the 64-bit load below reads only
+    // memory this reader owns.
+    memset(br->pad, 0, sizeof(br->pad));
+    memcpy(br->pad + (8u - src_size), src, src_size);
+    br->base = br->pad;
+    br->base_size = 8;
+    br->bit_offset = (unsigned)((8u - src_size) * 8u);
+  }
+
+  br->byte_pos = br->base_size - 8u;
+  br->container = gcomp_read_le64(br->base + br->byte_pos);
+  // Satisfies the invariant in the comment above; works out to 8 minus the
+  // marker's bit position, so between one and eight.
+  br->used = (unsigned)(br->base_size * 8u) - (br->total_bits + br->bit_offset);
 
   return GCOMP_OK;
 }
@@ -285,39 +279,31 @@ static gcomp_status_t zstd_seq_bit_reader_init(
 /**
  * @brief Read the next @p nb_bits bits, most significant first.
  *
- * This is the hottest function in a Zstandard decode -- six calls per
- * sequence, three for the FSE states and three for the extra bits -- so
- * everything it needs is worked out exactly once.  It used to compute where
- * the container starts twice, once here and once inside the reload, and then
- * find the bit offset within it with a division, a modulo, a multiply and an
- * add.  The offset is just the distance from the container's first bit:
- * (p/8 - start)*8 + p%8 is p - start*8.
+ * Returns zero when the stream does not hold that many bits, which is how the
+ * callers detect the end.
  */
-static uint32_t zstd_seq_bit_reader_read(
+static inline uint32_t zstd_seq_bit_reader_read(
     zstd_seq_bit_reader_t * br, unsigned nb_bits) {
   if (nb_bits == 0) {
     return 0;
   }
-
-  // Not enough bits left to satisfy this read.
   if (br->bits_consumed + nb_bits > br->total_bits) {
     return 0;
   }
 
-  const unsigned bits_remaining = br->total_bits - br->bits_consumed;
-  const size_t start_byte = zstd_seq_bit_reader_window(bits_remaining);
-  zstd_seq_bit_reader_load(br, start_byte);
+  // `used + nb_bits` cannot exceed 64.  Away from the start of the stream the
+  // refill leaves `used` below eight and no caller asks for more than 31 bits
+  // (RFC 8878 section 3.1.1.3.2.1.1 caps an offset code there, and the FSE
+  // table logs are smaller still).  At the start, where the window can no
+  // longer slide, the bounds check above is what holds it: it refuses any read
+  // that would reach below the first bit of the stream, and that bit sits at
+  // container bit `bit_offset`.
+  uint32_t value = (uint32_t)((br->container >> (64u - br->used - nb_bits)) &
+      (((uint64_t)1u << nb_bits) - 1u));
 
-  // The bits wanted run from next_bit_pos upwards, counting from the bottom
-  // of the stream; the container starts at start_byte * 8 of that same count.
-  const unsigned next_bit_pos = bits_remaining - nb_bits;
-  const unsigned container_bit_pos =
-      next_bit_pos - (unsigned)(start_byte * 8u);
-
-  uint32_t value = (uint32_t)(br->bit_container >> container_bit_pos) &
-      ((1U << nb_bits) - 1u);
-
+  br->used += nb_bits;
   br->bits_consumed += nb_bits;
+  zstd_seq_bit_reader_refill(br);
   return value;
 }
 
