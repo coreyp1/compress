@@ -30,6 +30,23 @@
  * is reported.  A ratio for a stream that cannot be read back is not a
  * measurement of anything, and an encoder that drops data always looks good.
  *
+ * TIME IS MEASURED TOO
+ * ====================
+ *
+ * A ratio on its own says nothing about whether it was worth having, so every
+ * case is also timed: compressing, and decompressing what was compressed, for
+ * both this library and the reference.  Each measurement repeats the work
+ * until at least BENCH_MIN_SECONDS of wall time has gone by (up to
+ * BENCH_MAX_REPEATS times) and keeps the *fastest* run, because interference
+ * from the rest of the machine can only ever make a run slower.
+ *
+ * Times are reported as throughput over the uncompressed size, which is the
+ * number that stays comparable across inputs of different sizes, and the
+ * decompression side is charged the same way -- bytes produced per second.
+ *
+ * The round trip that validates the output is timed as the decompression
+ * measurement, so nothing is compressed or decompressed merely to be timed.
+ *
  * USAGE
  * =====
  *
@@ -42,6 +59,9 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
+// clock_gettime and CLOCK_MONOTONIC; -std=c17 alone does not declare them.
+#define _POSIX_C_SOURCE 200809L
+
 #include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
@@ -51,6 +71,48 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+//
+// Timing
+//
+
+/// Repeat a measurement until this much wall time has been spent on it.
+#define BENCH_MIN_SECONDS 0.35
+
+/// ...but never more than this many times, so a slow case still finishes.
+#define BENCH_MAX_REPEATS 25
+
+/// A measurement that produced nothing has no time worth reporting.
+#define BENCH_NO_TIME 0.0
+
+static double bench_now(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+/**
+ * @brief Throughput in MB/s over the uncompressed size.
+ *
+ * Zero seconds means the measurement did not happen (the reference is not
+ * installed, or the case failed), not that it was infinitely fast.
+ */
+static double bench_mb_s(size_t bytes, double seconds) {
+  if (seconds <= 0.0) {
+    return 0.0;
+  }
+  return ((double)bytes / (1024.0 * 1024.0)) / seconds;
+}
+
+static void bench_print_speed(double mb_s) {
+  if (mb_s <= 0.0) {
+    printf(" %9s", "-");
+  }
+  else {
+    printf(" %9.1f", mb_s);
+  }
+}
 
 //
 // Reference implementations, opened at run time
@@ -91,6 +153,20 @@ static size_t (*lz4_compressFrame)(
 static size_t (*lz4_compressFrameBound)(size_t, const void *);
 static unsigned (*lz4_isError)(size_t);
 
+// Decompression, so that the reference's read-back speed can be reported
+// beside ours.  liblz4's frame decoder is the only one that is not a single
+// call: it is fed until it says the frame is complete.
+static int (*zlib_uncompress)(
+    uint8_t *, unsigned long *, const uint8_t *, unsigned long);
+static size_t (*zstd_decompress)(void *, size_t, const void *, size_t);
+static size_t (*lz4_createDecompressionContext)(void **, unsigned);
+static size_t (*lz4_freeDecompressionContext)(void *);
+static size_t (*lz4_decompress)(
+    void *, void *, size_t *, const void *, size_t *, const void *);
+
+/// The version liblz4 expects from LZ4F_createDecompressionContext.
+#define BENCH_LZ4F_VERSION 100
+
 static void * bench_dlopen(const char * name) {
   return dlopen(name, RTLD_NOW);
 }
@@ -100,18 +176,25 @@ static void bench_load_references(void) {
   if (z) {
     *(void **)&zlib_compress2 = dlsym(z, "compress2");
     *(void **)&zlib_compressBound = dlsym(z, "compressBound");
+    *(void **)&zlib_uncompress = dlsym(z, "uncompress");
   }
   void * zs = bench_dlopen("libzstd.so.1");
   if (zs) {
     *(void **)&zstd_compress = dlsym(zs, "ZSTD_compress");
     *(void **)&zstd_compressBound = dlsym(zs, "ZSTD_compressBound");
     *(void **)&zstd_isError = dlsym(zs, "ZSTD_isError");
+    *(void **)&zstd_decompress = dlsym(zs, "ZSTD_decompress");
   }
   void * l4 = bench_dlopen("liblz4.so.1");
   if (l4) {
     *(void **)&lz4_compressFrame = dlsym(l4, "LZ4F_compressFrame");
     *(void **)&lz4_compressFrameBound = dlsym(l4, "LZ4F_compressFrameBound");
     *(void **)&lz4_isError = dlsym(l4, "LZ4F_isError");
+    *(void **)&lz4_createDecompressionContext =
+        dlsym(l4, "LZ4F_createDecompressionContext");
+    *(void **)&lz4_freeDecompressionContext =
+        dlsym(l4, "LZ4F_freeDecompressionContext");
+    *(void **)&lz4_decompress = dlsym(l4, "LZ4F_decompress");
   }
 }
 
@@ -144,15 +227,37 @@ static const bench_case_t k_cases[] = {
 #define BENCH_CASE_COUNT (sizeof(k_cases) / sizeof(k_cases[0]))
 
 //
+// A measured case
+//
+
+typedef struct {
+  size_t size;    ///< Compressed size, or 0 if the case produced nothing.
+  double encode;  ///< Seconds for the fastest compression run.
+  double decode;  ///< Seconds for the fastest decompression run.
+} bench_result_t;
+
+/**
+ * @brief Whether a repeated measurement should go round again.
+ *
+ * @param iterations How many runs have been done.
+ * @param spent Seconds spent on them.
+ */
+static bool bench_repeat_again(int iterations, double spent) {
+  return iterations < BENCH_MAX_REPEATS && spent < BENCH_MIN_SECONDS;
+}
+
+//
 // Ours, round-tripped
 //
 
-static size_t bench_ours(gcomp_registry_t * registry, const bench_case_t * c,
-    const uint8_t * in, size_t n, const char ** error_out) {
+static bench_result_t bench_ours(gcomp_registry_t * registry,
+    const bench_case_t * c, const uint8_t * in, size_t n,
+    const char ** error_out) {
+  bench_result_t result = {0, BENCH_NO_TIME, BENCH_NO_TIME};
   gcomp_options_t * options = NULL;
   if (gcomp_options_create(&options) != GCOMP_OK) {
     *error_out = "options";
-    return 0;
+    return result;
   }
   if (c->level_key) {
     gcomp_options_set_int64(options, c->level_key, c->level);
@@ -169,27 +274,59 @@ static size_t bench_ours(gcomp_registry_t * registry, const bench_case_t * c,
   uint8_t * back = (uint8_t *)malloc(n + 64);
   size_t out_len = 0;
   size_t back_len = 0;
-  size_t result = 0;
+  double best_encode = 0.0;
+  double best_decode = 0.0;
 
   if (!out || !back) {
     *error_out = "memory";
     goto done;
   }
-  if (gcomp_encode_buffer(registry, c->method, options, in, n, out, capacity,
-          &out_len) != GCOMP_OK) {
-    *error_out = "encode";
-    goto done;
+
+  // Compression.  The buffers are allocated above so that the loop times the
+  // encoder and not the allocator.
+  {
+    double spent = 0.0;
+    for (int i = 0; bench_repeat_again(i, spent); i++) {
+      double t0 = bench_now();
+      if (gcomp_encode_buffer(registry, c->method, options, in, n, out,
+              capacity, &out_len) != GCOMP_OK) {
+        *error_out = "encode";
+        goto done;
+      }
+      double elapsed = bench_now() - t0;
+      spent += elapsed;
+      if (i == 0 || elapsed < best_encode) {
+        best_encode = elapsed;
+      }
+    }
   }
-  if (gcomp_decode_buffer(registry, c->method, NULL, out, out_len, back, n + 64,
-          &back_len) != GCOMP_OK) {
-    *error_out = "decode";
-    goto done;
+
+  // Decompression, which is also the check that the stream is worth reporting
+  // a size for at all.
+  {
+    double spent = 0.0;
+    for (int i = 0; bench_repeat_again(i, spent); i++) {
+      double t0 = bench_now();
+      if (gcomp_decode_buffer(registry, c->method, NULL, out, out_len, back,
+              n + 64, &back_len) != GCOMP_OK) {
+        *error_out = "decode";
+        goto done;
+      }
+      double elapsed = bench_now() - t0;
+      spent += elapsed;
+      if (i == 0 || elapsed < best_decode) {
+        best_decode = elapsed;
+      }
+      if (back_len != n || (n > 0 && memcmp(back, in, n) != 0)) {
+        *error_out = "MISMATCH";
+        goto done;
+      }
+    }
   }
-  if (back_len != n || (n > 0 && memcmp(back, in, n) != 0)) {
-    *error_out = "MISMATCH";
-    goto done;
-  }
-  result = out_len;
+
+  result.size = out_len;
+  result.encode = best_encode;
+  result.decode = best_decode;
 
 done:
   free(out);
@@ -202,55 +339,158 @@ done:
 // Reference
 //
 
-static size_t bench_reference(
+/**
+ * @brief Decompress one liblz4 frame, which takes a loop rather than a call.
+ *
+ * @return true if the whole frame was read back.
+ */
+static bool bench_lz4_read_back(
+    const uint8_t * src, size_t src_size, uint8_t * dst, size_t dst_capacity) {
+  void * dctx = NULL;
+  if (lz4_createDecompressionContext(&dctx, BENCH_LZ4F_VERSION) != 0 || !dctx) {
+    return false;
+  }
+  size_t src_pos = 0;
+  size_t dst_pos = 0;
+  bool complete = false;
+  while (src_pos < src_size) {
+    size_t dst_room = dst_capacity - dst_pos;
+    size_t src_left = src_size - src_pos;
+    size_t hint = lz4_decompress(
+        dctx, dst + dst_pos, &dst_room, src + src_pos, &src_left, NULL);
+    if (lz4_isError(hint)) {
+      break;
+    }
+    dst_pos += dst_room;
+    src_pos += src_left;
+    if (hint == 0) {
+      complete = true;
+      break;
+    }
+    if (dst_room == 0 && src_left == 0) {
+      break; // No progress: refuse to spin.
+    }
+  }
+  lz4_freeDecompressionContext(dctx);
+  return complete;
+}
+
+static bench_result_t bench_reference(
     const bench_case_t * c, const uint8_t * in, size_t n) {
+  bench_result_t result = {0, BENCH_NO_TIME, BENCH_NO_TIME};
+
+  size_t capacity = 0;
   if (c->reference == 1) {
     if (!zlib_compress2 || !zlib_compressBound) {
-      return 0;
+      return result;
     }
-    unsigned long capacity = zlib_compressBound((unsigned long)n) + 64;
-    uint8_t * out = (uint8_t *)malloc(capacity);
-    if (!out) {
-      return 0;
-    }
-    unsigned long out_len = capacity;
-    int rc = zlib_compress2(out, &out_len, in, (unsigned long)n, c->level);
-    free(out);
-    // Subtract the zlib container: two header bytes and a four byte Adler-32,
-    // so that this is deflate against deflate.
-    return (rc == 0 && out_len > 6) ? (size_t)out_len - 6 : 0;
+    capacity = (size_t)zlib_compressBound((unsigned long)n) + 64;
   }
-  if (c->reference == 2) {
+  else if (c->reference == 2) {
     if (!zstd_compress || !zstd_compressBound || !zstd_isError) {
-      return 0;
+      return result;
     }
-    size_t capacity = zstd_compressBound(n);
-    uint8_t * out = (uint8_t *)malloc(capacity);
-    if (!out) {
-      return 0;
-    }
-    size_t out_len = zstd_compress(out, capacity, in, n, c->level);
-    free(out);
-    return zstd_isError(out_len) ? 0 : out_len;
+    capacity = zstd_compressBound(n);
   }
-  if (c->reference == 3) {
+  else if (c->reference == 3) {
     if (!lz4_compressFrame || !lz4_compressFrameBound || !lz4_isError) {
-      return 0;
+      return result;
     }
-    bench_lz4_prefs_t prefs;
-    memset(&prefs, 0, sizeof(prefs));
-    prefs.frameInfo.blockSizeID = c->lz4_block_id;
-    prefs.frameInfo.blockMode = c->lz4_linked ? 0u : 1u;
-    size_t capacity = lz4_compressFrameBound(n, NULL);
-    uint8_t * out = (uint8_t *)malloc(capacity);
-    if (!out) {
-      return 0;
-    }
-    size_t out_len = lz4_compressFrame(out, capacity, in, n, &prefs);
-    free(out);
-    return lz4_isError(out_len) ? 0 : out_len;
+    capacity = lz4_compressFrameBound(n, NULL);
   }
-  return 0;
+  else {
+    return result;
+  }
+
+  uint8_t * out = (uint8_t *)malloc(capacity);
+  uint8_t * back = (uint8_t *)malloc(n + 64);
+  if (!out || !back) {
+    free(out);
+    free(back);
+    return result;
+  }
+
+  bench_lz4_prefs_t prefs;
+  memset(&prefs, 0, sizeof(prefs));
+  prefs.frameInfo.blockSizeID = c->lz4_block_id;
+  prefs.frameInfo.blockMode = c->lz4_linked ? 0u : 1u;
+
+  // Compression, timed the same way ours is.
+  size_t out_len = 0;
+  double best_encode = 0.0;
+  bool ok = true;
+  double spent = 0.0;
+  for (int i = 0; ok && bench_repeat_again(i, spent); i++) {
+    double t0 = bench_now();
+    if (c->reference == 1) {
+      unsigned long len = (unsigned long)capacity;
+      ok = zlib_compress2(out, &len, in, (unsigned long)n, c->level) == 0;
+      out_len = (size_t)len;
+    }
+    else if (c->reference == 2) {
+      out_len = zstd_compress(out, capacity, in, n, c->level);
+      ok = !zstd_isError(out_len);
+    }
+    else {
+      out_len = lz4_compressFrame(out, capacity, in, n, &prefs);
+      ok = !lz4_isError(out_len);
+    }
+    double elapsed = bench_now() - t0;
+    spent += elapsed;
+    if (i == 0 || elapsed < best_encode) {
+      best_encode = elapsed;
+    }
+  }
+  if (!ok) {
+    free(out);
+    free(back);
+    return result;
+  }
+
+  // Decompression.  A reference that cannot be read back is reported without
+  // a decompression time rather than dropped: its size is still a fact.
+  double best_decode = 0.0;
+  bool readable = true;
+  spent = 0.0;
+  for (int i = 0; readable && bench_repeat_again(i, spent); i++) {
+    double t0 = bench_now();
+    if (c->reference == 1) {
+      unsigned long len = (unsigned long)(n + 64);
+      readable = zlib_uncompress &&
+          zlib_uncompress(back, &len, out, (unsigned long)out_len) == 0 &&
+          (size_t)len == n;
+    }
+    else if (c->reference == 2) {
+      readable = zstd_decompress != NULL;
+      if (readable) {
+        size_t len = zstd_decompress(back, n + 64, out, out_len);
+        readable = !zstd_isError(len) && len == n;
+      }
+    }
+    else {
+      readable = lz4_decompress && lz4_createDecompressionContext &&
+          lz4_freeDecompressionContext &&
+          bench_lz4_read_back(out, out_len, back, n + 64);
+    }
+    double elapsed = bench_now() - t0;
+    spent += elapsed;
+    if (i == 0 || elapsed < best_decode) {
+      best_decode = elapsed;
+    }
+  }
+
+  // Subtract the zlib container: two header bytes and a four byte Adler-32,
+  // so that this is deflate against deflate.
+  if (c->reference == 1) {
+    out_len = out_len > 6 ? out_len - 6 : 0;
+  }
+
+  result.size = out_len;
+  result.encode = best_encode;
+  result.decode = readable ? best_decode : BENCH_NO_TIME;
+  free(out);
+  free(back);
+  return result;
 }
 
 //
@@ -346,12 +586,29 @@ int main(int argc, char ** argv) {
   size_t raw_total[BENCH_CASE_COUNT];
   size_t ours_total[BENCH_CASE_COUNT];
   size_t ref_total[BENCH_CASE_COUNT];
+  // Throughput is aggregated as total bytes over total seconds rather than by
+  // averaging the per-file rates, so that a large file counts for more than a
+  // small one -- an average of rates would let data.csv outvote code.c.txt.
+  size_t timed_bytes[BENCH_CASE_COUNT];
+  size_t ref_timed_bytes[BENCH_CASE_COUNT];
+  size_t ref_dec_bytes[BENCH_CASE_COUNT];
+  double ours_encode_s[BENCH_CASE_COUNT];
+  double ours_decode_s[BENCH_CASE_COUNT];
+  double ref_encode_s[BENCH_CASE_COUNT];
+  double ref_decode_s[BENCH_CASE_COUNT];
   memset(raw_total, 0, sizeof(raw_total));
   memset(ours_total, 0, sizeof(ours_total));
   memset(ref_total, 0, sizeof(ref_total));
+  memset(timed_bytes, 0, sizeof(timed_bytes));
+  memset(ref_timed_bytes, 0, sizeof(ref_timed_bytes));
+  memset(ref_dec_bytes, 0, sizeof(ref_dec_bytes));
+  memset(ours_encode_s, 0, sizeof(ours_encode_s));
+  memset(ours_decode_s, 0, sizeof(ours_decode_s));
+  memset(ref_encode_s, 0, sizeof(ref_encode_s));
+  memset(ref_decode_s, 0, sizeof(ref_decode_s));
 
-  printf("%-16s %-16s %10s %10s %10s %9s\n", "input", "case", "raw", "ours",
-      "reference", "delta");
+  printf("%-16s %-16s %10s %10s %10s %9s %9s %9s\n", "input", "case", "raw",
+      "ours", "reference", "delta", "enc MB/s", "ref MB/s");
 
   int inputs = argc > 1 ? argc - 1 : 3;
   for (int a = 0; a < inputs; a++) {
@@ -389,25 +646,43 @@ int main(int argc, char ** argv) {
 
     for (size_t c = 0; c < BENCH_CASE_COUNT; c++) {
       const char * error = NULL;
-      size_t ours = bench_ours(registry, &k_cases[c], data, n, &error);
-      size_t reference = bench_reference(&k_cases[c], data, n);
-      if (ours == 0) {
+      bench_result_t ours = bench_ours(registry, &k_cases[c], data, n, &error);
+      bench_result_t reference = bench_reference(&k_cases[c], data, n);
+      if (ours.size == 0) {
         printf("%-16s %-16s %10zu %10s\n", name, k_cases[c].label, n,
             error ? error : "FAIL");
         continue;
       }
-      if (reference == 0) {
-        printf("%-16s %-16s %10zu %10zu %10s\n", name, k_cases[c].label, n,
-            ours, "-");
+      if (reference.size == 0) {
+        printf("%-16s %-16s %10zu %10zu %10s %9s", name, k_cases[c].label, n,
+            ours.size, "-", "-");
       }
       else {
-        printf("%-16s %-16s %10zu %10zu %10zu %+8.2f%%\n", name,
-            k_cases[c].label, n, ours, reference,
-            100.0 * ((double)ours - (double)reference) / (double)reference);
-        ref_total[c] += reference;
+        printf("%-16s %-16s %10zu %10zu %10zu %+8.2f%%", name,
+            k_cases[c].label, n, ours.size, reference.size,
+            100.0 * ((double)ours.size - (double)reference.size) /
+                (double)reference.size);
+        ref_total[c] += reference.size;
       }
+      bench_print_speed(bench_mb_s(n, ours.encode));
+      bench_print_speed(bench_mb_s(n, reference.encode));
+      printf("\n");
+
       raw_total[c] += n;
-      ours_total[c] += ours;
+      ours_total[c] += ours.size;
+      if (ours.encode > 0.0) {
+        timed_bytes[c] += n;
+        ours_encode_s[c] += ours.encode;
+        ours_decode_s[c] += ours.decode;
+      }
+      if (reference.encode > 0.0) {
+        ref_timed_bytes[c] += n;
+        ref_encode_s[c] += reference.encode;
+      }
+      if (reference.decode > 0.0) {
+        ref_dec_bytes[c] += n;
+        ref_decode_s[c] += reference.decode;
+      }
     }
     free(data);
   }
@@ -427,6 +702,39 @@ int main(int argc, char ** argv) {
         k_cases[c].label, raw_total[c], ours_total[c], ref_total[c],
         100.0 * ((double)ours_total[c] - (double)ref_total[c]) /
             (double)ref_total[c]);
+  }
+
+  // Throughput, in MB of *uncompressed* data per second, so that the
+  // compression and decompression columns are charged the same way.
+  printf("\n%-16s %-16s %9s %9s %9s %9s %9s %9s\n", "SPEED", "case",
+      "enc MB/s", "ref enc", "enc x", "dec MB/s", "ref dec", "dec x");
+  for (size_t c = 0; c < BENCH_CASE_COUNT; c++) {
+    if (timed_bytes[c] == 0) {
+      continue;
+    }
+    double ours_enc = bench_mb_s(timed_bytes[c], ours_encode_s[c]);
+    double ours_dec = bench_mb_s(timed_bytes[c], ours_decode_s[c]);
+    double ref_enc = bench_mb_s(ref_timed_bytes[c], ref_encode_s[c]);
+    double ref_dec = bench_mb_s(ref_dec_bytes[c], ref_decode_s[c]);
+
+    printf("%-16s %-16s", "SPEED", k_cases[c].label);
+    bench_print_speed(ours_enc);
+    bench_print_speed(ref_enc);
+    if (ref_enc > 0.0 && ours_enc > 0.0) {
+      printf(" %8.2fx", ours_enc / ref_enc);
+    }
+    else {
+      printf(" %9s", "-");
+    }
+    bench_print_speed(ours_dec);
+    bench_print_speed(ref_dec);
+    if (ref_dec > 0.0 && ours_dec > 0.0) {
+      printf(" %8.2fx", ours_dec / ref_dec);
+    }
+    else {
+      printf(" %9s", "-");
+    }
+    printf("\n");
   }
   return 0;
 }
