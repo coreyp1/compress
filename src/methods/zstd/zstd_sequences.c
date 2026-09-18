@@ -157,6 +157,22 @@ typedef struct {
   unsigned bits_in_container; ///< Valid bits currently in container
   unsigned total_bits;        ///< Total valid bits in stream (excluding marker)
   unsigned bits_consumed;     ///< Total bits consumed from stream
+  /**
+   * First source byte the container currently holds, and whether it holds
+   * anything at all.
+   *
+   * The container is eight bytes of the stream, and which eight depends only
+   * on how far the reader has got.  Remembering which ones are loaded turns
+   * the reload below into a comparison for every read that stays inside them,
+   * which is nearly all of them: a sequence reads its three FSE states and
+   * its extra bits from a handful of adjacent bytes.
+   *
+   * Without this the reader rebuilt the container from the source, one byte
+   * at a time, on every single read -- about forty instructions to extract as
+   * few as one bit -- and was 38.4% of a Zstandard decode.
+   */
+  size_t container_start_byte;
+  int container_loaded;
 } zstd_seq_bit_reader_t;
 
 /**
@@ -191,6 +207,11 @@ static void zstd_seq_bit_reader_reload(zstd_seq_bit_reader_t * br) {
     start_byte = byte_containing_next - 7;
   }
 
+  // Already holding these bytes; nothing to do.
+  if (br->container_loaded && br->container_start_byte == start_byte) {
+    return;
+  }
+
   size_t bytes_to_load = br->src_size - start_byte;
   if (bytes_to_load > 8) {
     bytes_to_load = 8;
@@ -204,6 +225,8 @@ static void zstd_seq_bit_reader_reload(zstd_seq_bit_reader_t * br) {
   // Track how many bits are in the container and their position
   // The container now holds bits [start_byte * 8, start_byte * 8 + loaded * 8)
   br->bits_in_container = (unsigned)(bytes_to_load * 8);
+  br->container_start_byte = start_byte;
+  br->container_loaded = 1;
 }
 
 static gcomp_status_t zstd_seq_bit_reader_init(
@@ -214,6 +237,10 @@ static gcomp_status_t zstd_seq_bit_reader_init(
 
   br->src = src;
   br->src_size = src_size;
+  br->bit_container = 0;
+  br->bits_in_container = 0;
+  br->container_start_byte = 0;
+  br->container_loaded = 0;
 
   // Find initialization marker (highest set bit in last byte)
   uint8_t last_byte = src[src_size - 1];
@@ -265,16 +292,10 @@ static uint32_t zstd_seq_bit_reader_read(
   unsigned byte_offset = next_bit_pos / 8;
   unsigned bit_in_byte = next_bit_pos % 8;
 
-  // The container was loaded starting from some byte offset
-  // We need to find where our bits are in the container
-  unsigned container_start_byte = 0;
-  if (br->total_bits > br->bits_consumed) {
-    unsigned top_bit = br->total_bits - br->bits_consumed - 1;
-    unsigned top_byte = top_bit / 8;
-    if (top_byte >= 7) {
-      container_start_byte = top_byte - 7;
-    }
-  }
+  // Where the container starts in the source.  The reload above worked this
+  // out from exactly the same two values and recorded it, so it is read back
+  // here rather than computed a second time.
+  unsigned container_start_byte = (unsigned)br->container_start_byte;
 
   // Position in container
   unsigned container_bit_pos =

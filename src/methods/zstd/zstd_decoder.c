@@ -551,6 +551,31 @@ static gcomp_status_t zstd_parse_frame_header(
 // Update
 //
 
+/**
+ * @brief Hand already-decompressed bytes to the caller.
+ *
+ * A block is decompressed into state->output_buffer whole and then copied out
+ * as the caller's buffer allows.  That copy was three byte-at-a-time loops --
+ * the same shape, and the same cost, as the ones the LZ4 decoder had.
+ *
+ * @return Non-zero once everything buffered has been delivered.
+ */
+static int zstd_drain_output(
+    zstd_decoder_state_t * state, gcomp_buffer_t * output) {
+  size_t pending = state->output_buffer_len - state->output_buffer_pos;
+  if (pending > 0u) {
+    size_t space = output->size - output->used;
+    size_t n = (pending < space) ? pending : space;
+    if (n > 0u) {
+      memcpy((uint8_t *)output->data + output->used,
+          state->output_buffer + state->output_buffer_pos, n);
+      output->used += n;
+      state->output_buffer_pos += n;
+    }
+  }
+  return state->output_buffer_pos >= state->output_buffer_len;
+}
+
 gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
     gcomp_buffer_t * input, gcomp_buffer_t * output) {
   if (!decoder || !decoder->method_state || !input || !output) {
@@ -571,7 +596,6 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
 
   zstd_decoder_state_t * state = decoder->method_state;
   const uint8_t * in_ptr = (const uint8_t *)input->data;
-  uint8_t * out_ptr = (uint8_t *)output->data;
 
   if (state->stage == ZSTD_DEC_STAGE_ERROR) {
     gcomp_decoder_set_error(
@@ -609,11 +633,7 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
   gcomp_status_t status = GCOMP_OK;
 
   // Drain any buffered output first
-  while (state->output_buffer_pos < state->output_buffer_len &&
-      output->used < output->size) {
-    out_ptr[output->used++] = state->output_buffer[state->output_buffer_pos++];
-  }
-  if (state->output_buffer_pos < state->output_buffer_len) {
+  if (!zstd_drain_output(state, output)) {
     return GCOMP_OK; // Need more output space
   }
 
@@ -897,11 +917,7 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
     }
 
     // Output decompressed data
-    while (state->output_buffer_pos < state->output_buffer_len &&
-        output->used < output->size) {
-      out_ptr[output->used++] =
-          state->output_buffer[state->output_buffer_pos++];
-    }
+    (void)zstd_drain_output(state, output);
 
     // Determine next stage
     if (state->current_block_last) {
@@ -992,7 +1008,6 @@ gcomp_status_t zstd_decoder_finish(
   }
 
   zstd_decoder_state_t * state = decoder->method_state;
-  uint8_t * out_ptr = (uint8_t *)output->data;
 
   if (state->stage == ZSTD_DEC_STAGE_ERROR) {
     gcomp_decoder_set_error(
@@ -1001,10 +1016,7 @@ gcomp_status_t zstd_decoder_finish(
   }
 
   // Drain any remaining buffered output
-  while (state->output_buffer_pos < state->output_buffer_len &&
-      output->used < output->size) {
-    out_ptr[output->used++] = state->output_buffer[state->output_buffer_pos++];
-  }
+  (void)zstd_drain_output(state, output);
 
   if (state->stage == ZSTD_DEC_STAGE_DONE) {
     return GCOMP_OK;
