@@ -254,6 +254,179 @@ TEST_F(ZstdDecoderTest, Decode1ByteOutputBuffer) {
   EXPECT_EQ(memcmp(out.data(), data, strlen(data)), 0);
 }
 
+//
+// Match copying
+//
+// A Zstandard match reads from one of two places: the window, which holds
+// what earlier blocks decoded, or the block's own output.  One match can
+// start in the window and finish in the output, and inside the window it can
+// wrap the circular buffer.  That is three flat runs, and the copy now works
+// out which apply once per match rather than once per byte.
+//
+// Each of those boundaries is an off-by-one away from producing wrong bytes
+// while reporting success, and ordinary data barely touches them.
+//
+
+namespace {
+
+/// A block of @p period distinct bytes repeated to fill @p total, so that
+/// every match has exactly that offset.  A period shorter than a match is
+/// what makes the copy overlap its own source.
+std::vector<uint8_t> RepeatingBytes(size_t total, size_t period) {
+  std::vector<uint8_t> block;
+  uint32_t x = 0x9E3779Bu ^ static_cast<uint32_t>(period);
+  for (size_t i = 0; i < period; i++) {
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    block.push_back(static_cast<uint8_t>(x >> 19));
+  }
+  std::vector<uint8_t> v;
+  v.reserve(total + period);
+  while (v.size() < total) {
+    v.insert(v.end(), block.begin(), block.end());
+  }
+  v.resize(total);
+  return v;
+}
+
+// Decode into a buffer sized from the answer we already know, with the
+// decompression-bomb guard lifted.
+//
+// Two things get in the way of testing a match copy with deliberately
+// repetitive data.  The shared decode() helper sizes its output buffer at a
+// hundred times the compressed length, which is a fine guess for ordinary
+// data and far too small here -- 300 KB of one repeated byte compresses to a
+// few dozen.  And that same ratio trips the expansion limit, which defaults
+// to 1000x and exists to stop a decompression bomb: this input *is* one, on
+// purpose, because a match that repeats one byte for a long way is exactly
+// what the copy has to get right.
+std::vector<uint8_t> ZstdDecodeExpecting(gcomp_registry_t * registry,
+    const std::vector<uint8_t> & encoded, size_t expected_size,
+    gcomp_status_t * status_out) {
+  gcomp_options_t * opts = nullptr;
+  if (gcomp_options_create(&opts) != GCOMP_OK) {
+    return {};
+  }
+  gcomp_options_set_uint64(opts, "limits.max_expansion_ratio", 0u);
+  gcomp_decoder_t * dec = nullptr;
+  gcomp_status_t dc = gcomp_decoder_create(registry, "zstd", opts, &dec);
+  gcomp_options_destroy(opts);
+  if (dc != GCOMP_OK) {
+    return {};
+  }
+  std::vector<uint8_t> out(expected_size + 4096);
+  gcomp_buffer_t in = {
+      const_cast<uint8_t *>(encoded.data()), encoded.size(), 0};
+  gcomp_buffer_t ob = {out.data(), out.size(), 0};
+  gcomp_status_t st = gcomp_decoder_update(dec, &in, &ob);
+  if (st == GCOMP_OK) {
+    st = gcomp_decoder_finish(dec, &ob);
+  }
+  gcomp_decoder_destroy(dec);
+  if (status_out) {
+    *status_out = st;
+  }
+  if (st != GCOMP_OK) {
+    return {};
+  }
+  out.resize(ob.used);
+  return out;
+}
+
+} // namespace
+
+// Offsets shorter than the match they serve, which is where source and
+// destination overlap.  An offset of one is a single byte repeated and takes
+// a separate path.
+TEST_F(ZstdDecoderTest, MatchCopy_OverlappingMatches) {
+  for (size_t period : {size_t(1), size_t(2), size_t(3), size_t(4), size_t(7),
+           size_t(8), size_t(15), size_t(16), size_t(17), size_t(31),
+           size_t(64), size_t(128), size_t(255), size_t(256)}) {
+    std::vector<uint8_t> input = RepeatingBytes(300000, period);
+    for (int level : {1, 3, 9}) {
+      gcomp_options_t * opts = nullptr;
+      ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+      gcomp_options_set_int64(opts, "zstd.level", level);
+      std::vector<uint8_t> enc = compress(input.data(), input.size(), opts);
+      gcomp_options_destroy(opts);
+      ASSERT_FALSE(enc.empty()) << "period " << period << " level " << level;
+
+      gcomp_status_t st = GCOMP_OK;
+      std::vector<uint8_t> back =
+          ZstdDecodeExpecting(registry_, enc, input.size(), &st);
+      EXPECT_EQ(st, GCOMP_OK) << "period " << period << " level " << level;
+      EXPECT_EQ(back, input) << "period " << period << " level " << level;
+    }
+  }
+}
+
+// Matches that reach back further than the block being decoded, so the copy
+// has to come out of the window -- and, with a window small enough to wrap
+// several times over, out of both ends of it.
+TEST_F(ZstdDecoderTest, MatchCopy_ReachesIntoTheWindowAndWraps) {
+  // Blocks are at most 128 KB (RFC 8878 section 3.1.1), so a repeat at a
+  // longer period than that can only be satisfied from the window.
+  for (uint64_t window_log : {(uint64_t)17, (uint64_t)18, (uint64_t)20}) {
+    const size_t window = (size_t)1 << window_log;
+    std::vector<uint8_t> input = RepeatingBytes(window * 5, window / 3 + 7);
+
+    gcomp_options_t * opts = nullptr;
+    ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+    gcomp_options_set_int64(opts, "zstd.level", 9);
+    gcomp_options_set_uint64(opts, "zstd.window_log", window_log);
+    std::vector<uint8_t> enc = compress(input.data(), input.size(), opts);
+    gcomp_options_destroy(opts);
+    ASSERT_FALSE(enc.empty()) << "window_log " << window_log;
+
+    gcomp_status_t st = GCOMP_OK;
+    std::vector<uint8_t> back =
+        ZstdDecodeExpecting(registry_, enc, input.size(), &st);
+    EXPECT_EQ(st, GCOMP_OK) << "window_log " << window_log;
+    EXPECT_EQ(back, input) << "window_log " << window_log;
+  }
+}
+
+// A phrase that recurs just under, at, and just over a block boundary, so
+// that a single match starts in the window and finishes in the output.
+TEST_F(ZstdDecoderTest, MatchCopy_CrossesFromWindowIntoOutput) {
+  const size_t kBlock = 128u * 1024u;
+  for (size_t gap : {kBlock - 600, kBlock - 1, kBlock, kBlock + 1,
+           kBlock + 600}) {
+    std::vector<uint8_t> phrase;
+    uint32_t x = 0xFEEDu ^ static_cast<uint32_t>(gap);
+    for (int i = 0; i < 1200; i++) {
+      x ^= x << 13;
+      x ^= x >> 17;
+      x ^= x << 5;
+      phrase.push_back(static_cast<uint8_t>(x >> 19));
+    }
+    std::vector<uint8_t> input;
+    for (int rep = 0; rep < 4; rep++) {
+      input.insert(input.end(), phrase.begin(), phrase.end());
+      while (input.size() % gap != 0) {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        input.push_back(static_cast<uint8_t>(x >> 19));
+      }
+    }
+
+    gcomp_options_t * opts = nullptr;
+    ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+    gcomp_options_set_int64(opts, "zstd.level", 9);
+    std::vector<uint8_t> enc = compress(input.data(), input.size(), opts);
+    gcomp_options_destroy(opts);
+    ASSERT_FALSE(enc.empty()) << "gap " << gap;
+
+    gcomp_status_t st = GCOMP_OK;
+    std::vector<uint8_t> back =
+        ZstdDecodeExpecting(registry_, enc, input.size(), &st);
+    EXPECT_EQ(st, GCOMP_OK) << "gap " << gap;
+    EXPECT_EQ(back, input) << "gap " << gap;
+  }
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

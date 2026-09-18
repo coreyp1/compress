@@ -576,7 +576,13 @@ static int zstd_drain_output(
   return state->output_buffer_pos >= state->output_buffer_len;
 }
 
-gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
+/**
+ * @brief One pass of the decoder: at most one frame header, one block, or one
+ *        checksum.
+ *
+ * The loop that calls it is zstd_decoder_update().
+ */
+static gcomp_status_t zstd_decoder_step(gcomp_decoder_t * decoder,
     gcomp_buffer_t * input, gcomp_buffer_t * output) {
   if (!decoder || !decoder->method_state || !input || !output) {
     return GCOMP_ERR_INVALID_ARG;
@@ -976,14 +982,53 @@ gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
     state->stage = ZSTD_DEC_STAGE_DONE;
   }
 
-  // If we reached DONE and concat is enabled and there's more input,
-  // continue processing (recursive call to handle next frame)
-  if (state->stage == ZSTD_DEC_STAGE_DONE && state->concat_enabled &&
-      input->used < input->size) {
-    return zstd_decoder_update(decoder, input, output);
+  return GCOMP_OK;
+}
+
+/**
+ * @brief Decode as much as the buffers allow.
+ *
+ * WHY THIS LOOPS
+ * ==============
+ *
+ * The step above is a straight run through the stages -- frame header, block
+ * header, block, checksum -- and it falls off the end after decoding a single
+ * block.  So one call returned at most 128 KB (RFC 8878 section 3.1.1) and
+ * left the rest of the input unread, even with the whole input in hand and
+ * room to write.
+ *
+ * That is legal by the contract -- a caller is told to keep calling until a
+ * call neither consumes nor produces -- but nobody writes that loop by
+ * instinct, and the obvious code fails in a way that names the wrong culprit:
+ * update() stops early, finish() finds the stream unfinished, and the error
+ * reads "truncated zstd stream" about a stream that is perfectly intact.  The
+ * DEFLATE decoder loops here, so this one now does too, and the two behave
+ * alike.
+ *
+ * It also replaces a recursive call that handled the next frame when
+ * concatenation is enabled: the same loop covers that, without putting a
+ * frame's worth of stack frame behind every frame in the file.
+ */
+gcomp_status_t zstd_decoder_update(gcomp_decoder_t * decoder,
+    gcomp_buffer_t * input, gcomp_buffer_t * output) {
+  if (!decoder || !input || !output) {
+    return GCOMP_ERR_INVALID_ARG;
   }
 
-  return GCOMP_OK;
+  for (;;) {
+    const size_t in_before = input->used;
+    const size_t out_before = output->used;
+
+    gcomp_status_t s = zstd_decoder_step(decoder, input, output);
+    if (s != GCOMP_OK) {
+      return s;
+    }
+    if (input->used == in_before && output->used == out_before) {
+      // Nothing left to do with what it has: out of input, out of room, or
+      // finished.
+      return GCOMP_OK;
+    }
+  }
 }
 
 //
