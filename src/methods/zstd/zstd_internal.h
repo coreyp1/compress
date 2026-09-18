@@ -263,12 +263,20 @@ typedef struct {
   size_t last_insert_abs;
 
   /**
-   * @brief Bytes this finder has compared, counted in test builds only.
+   * @brief Bytes the TREE has compared, counted in test builds only.
    *
    * The comparison is what the tree spends nearly all its time on, and the
    * only thing that has ever made it pathological is comparing far more
    * than the answer needed.  Counting it lets a test say "this input must
    * not cost more than so much work" without measuring a clock.
+   *
+   * The chain does not count, and adding it would not make this a measure
+   * of a level's cost: a chain candidate is a pointer chase and a compare
+   * from the first byte, a tree candidate is a compare that starts where
+   * the last one stopped, and the two are not the same unit.  Measured
+   * across the levels of one file, the chain levels compare about 2 bytes
+   * per input byte and the tree levels 44 to 127, while running at similar
+   * speeds.
    *
    * It is not counted in a release build.  One add per candidate sounds
    * free and is not: it measured 0.87% of encoding at level 19, which is

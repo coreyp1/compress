@@ -28,8 +28,8 @@
  * | Level | Searches   | Parses                     |
  * |-------|------------|----------------------------|
  * | 1     | hash chain | greedily                   |
- * | 2-10  | hash chain | deferring, one byte a time |
- * | 11-15 | binary tree| deferring, one byte a time |
+ * | 2-8   | hash chain | deferring, one byte a time |
+ * | 9-15  | binary tree| deferring, one byte a time |
  * | 16-22 | binary tree| by shortest path           |
  *
  * Within each band the effort table below sets how hard.  The tree is in
@@ -186,7 +186,7 @@ typedef struct {
 
 /// Indexed by compression level; entry 0 is unused (level 0 means "default").
 // `search_depth` counts candidates examined, and what a candidate costs
-// changes at level 11 where the chain gives way to the tree -- so the numbers
+// changes at level 9 where the chain gives way to the tree -- so the numbers
 // change scale there too, and the two halves are not comparable.
 //
 // A chain step crosses off one position and learns nothing for the next, so
@@ -196,6 +196,28 @@ typedef struct {
 // levels first moved to the tree, levels 11 through 22 became four encoders
 // wearing twelve numbers, because the only thing separating most of them
 // was a bound that no longer bound anything.
+//
+// WHERE THE TREE STARTS
+// =====================
+//
+// Levels 7 to 10 walked deep chains -- 128 to 320 candidates -- until it
+// became clear that every one of them was pointless.  On 9 MB of manuals,
+// C source and XML, level 10 produced 1544159 bytes at 3.9 MB/s while
+// level 11 produced 1535481 at 8.1: smaller AND faster, and the same held
+// for 7, 8 and 9.  A caller who asked for more effort and got less was
+// being given the wrong thing.
+//
+// What the chain is actually good at is the fast end, and what was wrong
+// was asking it to walk hundreds of candidates.  So 7 and 8 stay on it at
+// 80 and 112, where it is on the frontier -- at around 12 to 15 MB/s on
+// that file the chain beats the tree on ratio as well as speed -- and 9
+// and 10 move to the tree, where it takes over.  Each level from 5 to 12
+// is now both smaller and slower than the one below it, on 9 MB of mixed
+// files and on 400 KB of repetitive text alike.
+//
+// Levels 9 and 10 pay for the tree in memory: two slots a position where
+// the chain had one, 16 MiB against 8.5 over the 2 MB window these levels
+// declare.
 //
 // `nice_length` turned out to be the knob that matters for the tree, far
 // more than the depth.  Reaching it stops the descent, and stopping the
@@ -211,12 +233,12 @@ static const zstd_effort_t k_zstd_effort[23] = {
     {16, 1, 128, 15, 0, 0, 0, 0},          // 3
     {24, 1, 128, 16, 0, 0, 0, 0},          // 4
     {48, 1, 128, 16, 0, 0, 0, 0},          // 5
-    {64, 1, 128, 16, 0, 0, 0, 0},          // 6
-    {128, 2, 192, 17, 0, 0, 0, 0},         // 7
-    {192, 2, 192, 17, 0, 0, 0, 0},         // 8
-    {256, 2, 192, 17, 0, 0, 0, 0},         // 9
-    {320, 2, 192, 17, 0, 0, 0, 0},         // 10: last of the chain levels
-    {18, 2, 768, 17, 1, 0, 0, 0},          // 11: first of the tree levels
+    {64, 1, 128, 16, 0, 0, 0, 0},          // 6: the window steps to 2 MB next
+    {80, 1, 128, 17, 0, 0, 0, 0},          // 7
+    {112, 2, 192, 17, 0, 0, 0, 0},         // 8: last of the chain levels
+    {14, 2, 256, 17, 1, 0, 0, 0},          // 9: first of the tree levels
+    {16, 2, 512, 17, 1, 0, 0, 0},          // 10
+    {18, 2, 768, 17, 1, 0, 0, 0},          // 11: the window steps to 8 MB
     {20, 2, 1024, 17, 1, 0, 0, 0},         // 12
     {22, 2, 1280, 18, 1, 0, 0, 0},         // 13
     {24, 2, 1536, 18, 1, 0, 0, 0},         // 14
@@ -337,24 +359,25 @@ gcomp_status_t zstd_mf_init(zstd_match_finder_t * mf,
   // that is needed: inserting a position overwrites the slot of one at least
   // bt_size behind it, and that one is already too far back to be followed.
   //
-  // So bt_size is rounded DOWN to a power of two, not up.  Rounding up would
-  // very nearly double a table that is already two slots per position where
-  // the chain was one: at the top levels, which declare a 32 MB window, that
-  // asked for 536 MB against a 256 MiB budget and simply failed to encode.
-  // Rounding down spends no more than the chain did and gives up a little
-  // reach instead.
+  // So bt_size is rounded DOWN to a power of two, not up.  What is being
+  // rounded is a declared window -- itself a power of two -- plus one block,
+  // so rounding down lands exactly on the window and costs one byte of
+  // reach.  Rounding up doubles the table for that one byte: at level 7,
+  // where the window is 2 MB, 16 MiB against 32.
   //
   // The cap is the same trade taken further.  A declared window is a promise
   // to the decoder about how much history it must keep (RFC 8878 section
   // 3.1.1.1.2), not an undertaking to search all of it, so the tree searches
-  // what fits in its budget and the frame stays exactly as valid.
+  // what fits in its budget and the frame stays exactly as valid.  Without
+  // it the top levels, which declare a 32 MB window, asked for 536 MB
+  // against a 256 MiB budget and simply failed to encode.
   mf->use_bt = effort->use_bt;
   mf->use_opt = effort->use_opt;
   mf->opt_segment = effort->opt_segment;
   mf->opt_budget = effort->opt_budget;
   if (mf->use_bt) {
     size_t n = 1;
-    while (n < mf->chain_size && n < MF_BT_MAX_ENTRIES) {
+    while (n * 2u <= mf->chain_size && n * 2u <= MF_BT_MAX_ENTRIES) {
       n <<= 1;
     }
     mf->bt_size = n;

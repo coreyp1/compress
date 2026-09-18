@@ -909,16 +909,30 @@ TEST_F(ZstdMatchFinderTest, NoTwoLevelsAreConfiguredTheSame) {
 // property of a parse that decides one match at a time, not a fault in the
 // table, and asserting an order that the algorithm does not guarantee would
 // make this test a source of noise rather than a check.
+//
+// Two inputs, because they catch different things.  The small one fits
+// inside every window from level 4 up, so it says nothing about the two
+// places the declared window grows; the large one crosses both.  The half
+// of this that cannot be tested here is speed: a level that is slower than
+// the one above it is just as wrong as one that is larger -- levels 7 to 10
+// were both, once -- but a clock in a unit test is a source of noise.  That
+// half is measured, not asserted; see WHERE THE TREE STARTS in
+// zstd_matchfinder.c.
 TEST_F(ZstdMatchFinderTest, HigherLevelsDoNotProduceLargerOutput) {
-  std::vector<uint8_t> in = TextLikeBytes(400000);
+  std::vector<uint8_t> small = TextLikeBytes(400000);
+  std::vector<uint8_t> large =
+      TextWithDistantRepeats(3u * 1024u * 1024u, 12u, 64u * 1024u);
 
-  size_t previous = SIZE_MAX;
-  for (int level = 1; level <= 12; level++) {
-    size_t size = EncodeAtLevel(in, level).size();
-    EXPECT_LE(size, previous)
-        << "level " << level << " produced " << size
-        << " bytes, more than level " << (level - 1) << "'s " << previous;
-    previous = size;
+  for (const std::vector<uint8_t> * in : {&small, &large}) {
+    size_t previous = SIZE_MAX;
+    for (int level = 1; level <= 12; level++) {
+      size_t size = EncodeAtLevel(*in, level).size();
+      EXPECT_LE(size, previous)
+          << "over " << in->size() << " bytes, level " << level
+          << " produced " << size << " bytes, more than level "
+          << (level - 1) << "'s " << previous;
+      previous = size;
+    }
   }
 }
 
