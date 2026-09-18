@@ -133,6 +133,43 @@ std::vector<uint8_t> build_deferral_case(size_t * target_out) {
   return data;
 }
 
+/**
+ * @brief Noise with three phrases planted at three different periods.
+ *
+ * Each phrase recurs at its own fixed distance -- 100, 137 and 211 bytes --
+ * so a parse working through this meets the three distances over and over in
+ * changing order.  That is what puts all three repeat offset codes to work,
+ * and more to the point it makes one code follow another constantly, which
+ * is the only time a mistake in how the three rotate can show itself.
+ *
+ * Ordinary text does not do this.  With 400 KB of it, rotating the offsets
+ * wrongly for code 3 still decoded correctly end to end; with this, two
+ * thousand sequences resolve to the wrong bytes.
+ */
+std::vector<uint8_t> ThreePeriodNoise(size_t n) {
+  Noise noise(1234567u);
+  std::vector<uint8_t> v(n);
+  for (size_t i = 0; i < n; i++) {
+    v[i] = noise.next();
+  }
+
+  constexpr size_t kPhrase = 40;
+  uint8_t phrase[3][kPhrase];
+  for (auto & p : phrase) {
+    for (size_t j = 0; j < kPhrase; j++) {
+      p[j] = noise.next();
+    }
+  }
+
+  const size_t period[3] = {100, 137, 211};
+  for (size_t k = 0; k < 3; k++) {
+    for (size_t i = 0; i + kPhrase < n; i += period[k]) {
+      memcpy(v.data() + i, phrase[k], kPhrase);
+    }
+  }
+  return v;
+}
+
 /// One parse of a buffer, with the deferral depth forced to a chosen value.
 struct Parse {
   std::vector<zstd_sequence_t> sequences;
@@ -494,11 +531,17 @@ TEST_F(ZstdMatchFinderTest, TheOptimalParseAccountsForEveryByte) {
 }
 
 // A distance that has just been used is written as a one-symbol code instead
-// of as a distance (RFC 8878 section 3.1.1.3.2.1.1), and it is a large enough
-// saving that the parse tries all three repeat offsets at every position
-// rather than waiting for the match finder to turn one up.  On input with a
-// fixed stride, that should happen constantly.
-TEST_F(ZstdMatchFinderTest, TheOptimalParseReachesForRepeatOffsets) {
+// of as a distance (RFC 8878 section 3.1.1.3.2.1.1).  On input with a fixed
+// stride, where nearly every match is the same distance back as the last
+// one, nearly every sequence should be written that way.
+//
+// This checks the stream, not the search: the parse also probes all three
+// repeat offsets at every position rather than waiting for the match finder
+// to turn one up, and turning that probe off does not fail this test -- the
+// finder mostly finds the same distances by itself.  What the probe is worth
+// was measured instead: on 9 MB of manuals, C source and XML it takes level
+// 19 from 1395677 bytes to 1393482, about 0.16%, for some 5% of the time.
+TEST_F(ZstdMatchFinderTest, TheOptimalParseWritesRepeatOffsets) {
   // Records of a fixed width whose fields repeat down the file: matching the
   // previous record is the same distance every time.
   constexpr size_t kRecord = 64;
@@ -524,6 +567,136 @@ TEST_F(ZstdMatchFinderTest, TheOptimalParseReachesForRepeatOffsets) {
       << "of " << parse.sequences.size() << " sequences only " << repeats
       << " used a repeat offset on input whose every match is the same "
       << "distance back";
+}
+
+// A parse is a set of instructions for rebuilding the input, and this checks
+// that following them gives the input back -- reading the sequences the way
+// RFC 8878 section 3.1.1.3.2.1.1 says a decoder must, with its own copy of
+// the repeat offset rules rather than the encoder's.
+//
+// That independence is the point.  The parse keeps a running copy of the
+// three repeat offsets so it knows what a distance will cost, and the
+// encoder uses the same copy to decide which code to write; an assertion in
+// the parse checks the two agree, but it cannot catch a rule that is wrong
+// in the same way in both places.  Nor, it turns out, can a round trip:
+// rotating the offsets wrongly for code 3 still decoded 400 KB of text
+// correctly, because the mistake only shows when a later sequence looks up
+// the offset the rotation misplaced.  Checking each sequence against the
+// specification's rules catches it at the first one that is wrong.
+void CheckSequencesRebuildTheInput(
+    const std::vector<uint8_t> & data, const Parse & parse, int level) {
+  uint32_t rep[3] = {ZSTD_REP_OFFSET_1_INIT, ZSTD_REP_OFFSET_2_INIT,
+      ZSTD_REP_OFFSET_3_INIT};
+  size_t at = 0;       ///< Bytes of the input rebuilt so far.
+  size_t lit_at = 0;   ///< Bytes of the literals buffer consumed so far.
+
+  for (size_t i = 0; i < parse.sequences.size(); i++) {
+    const zstd_sequence_t & seq = parse.sequences[i];
+
+    ASSERT_LE(lit_at + seq.lit_length, parse.literals.size())
+        << "level " << level << " sequence " << i
+        << " wants more literals than the parse produced";
+    ASSERT_LE(at + seq.lit_length, data.size())
+        << "level " << level << " sequence " << i;
+    for (uint32_t b = 0; b < seq.lit_length; b++) {
+      ASSERT_EQ(parse.literals[lit_at + b], data[at + b])
+          << "level " << level << " sequence " << i << " literal " << b;
+    }
+    lit_at += seq.lit_length;
+    at += seq.lit_length;
+
+    // Resolve the offset exactly as a decoder does.  Codes 1 to 3 name one
+    // of the three most recently used distances, and which one they name
+    // shifts when the sequence has no literals before it.
+    uint32_t offset = 0;
+    if (seq.match_offset > 3u) {
+      offset = seq.match_offset - 3u;
+      rep[2] = rep[1];
+      rep[1] = rep[0];
+      rep[0] = offset;
+    }
+    else {
+      ASSERT_GE(seq.match_offset, 1u) << "level " << level << " sequence " << i
+                                      << ": offset zero is not a code";
+      unsigned slot = seq.match_offset - 1u;
+      if (seq.lit_length == 0u) {
+        slot++;
+      }
+      if (slot < 3u) {
+        offset = rep[slot];
+        // Everything the code passed over drops one place.
+        for (unsigned k = slot; k > 0; k--) {
+          rep[k] = rep[k - 1u];
+        }
+        rep[0] = offset;
+      }
+      else {
+        // Code 3 with no literals means "one less than the most recent".
+        offset = rep[0] - 1u;
+        ASSERT_GT(rep[0], 1u) << "level " << level << " sequence " << i;
+        rep[2] = rep[1];
+        rep[1] = rep[0];
+        rep[0] = offset;
+      }
+    }
+
+    ASSERT_GT(offset, 0u) << "level " << level << " sequence " << i;
+    ASSERT_LE(static_cast<size_t>(offset), at)
+        << "level " << level << " sequence " << i
+        << ": the match reaches before the start of the stream";
+    ASSERT_LE(at + seq.match_length, data.size())
+        << "level " << level << " sequence " << i;
+    for (uint32_t b = 0; b < seq.match_length; b++) {
+      ASSERT_EQ(data[at - offset + b], data[at + b])
+          << "level " << level << " sequence " << i << " byte " << b
+          << ": the offset the decoder resolves does not name these bytes";
+    }
+    at += seq.match_length;
+  }
+
+  // Whatever is left is trailing literals, and they must be the rest of it.
+  size_t trailing = data.size() - at;
+  ASSERT_EQ(parse.literals.size() - lit_at, trailing) << "level " << level;
+  for (size_t b = 0; b < trailing; b++) {
+    ASSERT_EQ(parse.literals[lit_at + b], data[at + b]) << "level " << level;
+  }
+}
+
+TEST_F(ZstdMatchFinderTest, EverySequenceResolvesToTheBytesItClaims) {
+  std::vector<uint8_t> data = ThreePeriodNoise(400u * 1024u);
+
+  // A parse that rarely reaches for a repeat offset would pass this without
+  // exercising the rules it is here to check.  What matters is not only that
+  // all three codes appear but that they follow one another, since a
+  // rotation is only wrong once something looks up what it misplaced.
+  size_t codes[4] = {0, 0, 0, 0};
+  size_t after_a_rotation = 0;
+  unsigned previous = 0;
+  Parse check = run_parse(data, 19, 0, false);
+  for (const zstd_sequence_t & seq : check.sequences) {
+    if (seq.match_offset >= 1u && seq.match_offset <= 3u) {
+      codes[seq.match_offset]++;
+      if (previous == 3u && seq.match_offset >= 2u) {
+        after_a_rotation++;
+      }
+      previous = seq.match_offset;
+    }
+    else {
+      previous = 0;
+    }
+  }
+  for (unsigned code = 1; code <= 3; code++) {
+    ASSERT_GT(codes[code], 0u)
+        << "this input never uses offset code " << code;
+  }
+  ASSERT_GT(after_a_rotation, 100u)
+      << "no code looks up an offset that a previous rotation moved, so a "
+      << "wrong rotation would not show";
+
+  for (int level = 1; level <= 22; level++) {
+    Parse parse = run_parse(data, level, 0, false);
+    CheckSequencesRebuildTheInput(data, parse, level);
+  }
 }
 
 // Twenty-two levels must be twenty-two levels.

@@ -245,6 +245,22 @@ typedef struct {
   unsigned use_opt;              ///< Non-zero when this level parses optimally.
   uint32_t opt_segment;          ///< Positions one sweep covers.
   uint32_t opt_budget;           ///< Shortened matches one position may try.
+
+  /**
+   * @brief The last position put into the tree, plus one; 0 before any.
+   *
+   * Positions must go into the tree in increasing order and once each, or a
+   * node becomes its own descendant.  The parses arrange that in different
+   * ways -- the deferred one tracks which positions its look-ahead already
+   * covered, the optimal one fills in the positions a forced match jumped
+   * over -- and neither arrangement is obviously right by inspection, so a
+   * test build checks the invariant itself on every insertion.
+   *
+   * Kept unconditionally so that the structure is the same shape whether or
+   * not GCOMP_TEST_BUILD is defined; one store per insertion is far cheaper
+   * than a layout that depends on a build flag.
+   */
+  size_t last_insert_abs;
 } zstd_match_finder_t;
 
 //
