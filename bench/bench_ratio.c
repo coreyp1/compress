@@ -219,8 +219,11 @@ static const bench_case_t k_cases[] = {
     {"zstd-1", "zstd", "zstd.level", 1, 2, 0, 0},
     {"zstd-3", "zstd", "zstd.level", 3, 2, 0, 0},
     {"zstd-9", "zstd", "zstd.level", 9, 2, 0, 0},
-    // Level 19 searches a binary tree rather than a hash chain; without a
-    // case above level 10 nothing here measures that half of the encoder.
+    // Levels 16 and up parse by shortest path rather than greedily, and the
+    // two cases below sit either side of what that costs and buys: 16 is the
+    // first level to do it, 19 one that spends more on it.  Without a case
+    // above level 10 nothing here measures that half of the encoder at all.
+    {"zstd-16", "zstd", "zstd.level", 16, 2, 0, 0},
     {"zstd-19", "zstd", "zstd.level", 19, 2, 0, 0},
     {"lz4-4M", "lz4", NULL, 0, 3, 0, 7},
     {"lz4-64K", "lz4", NULL, 0, 3, 0, 4},

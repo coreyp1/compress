@@ -22,15 +22,18 @@
  *
  * ## Compression Levels
  *
- * Higher levels search more chain entries for potentially longer matches:
+ * A level chooses both how the encoder searches and how it decides what to
+ * emit, and the two change at different places:
  *
- * | Level | Search Depth | Speed  | Compression |
- * |-------|--------------|--------|-------------|
- * | 1     | 4            | Fast   | Low         |
- * | 2-3   | 16           | Fast   | Low-Medium  |
- * | 4-6   | 64           | Medium | Medium      |
- * | 7-12  | 256          | Slow   | High        |
- * | 13-22 | 512+         | Slow   | Highest     |
+ * | Level | Searches   | Parses                     |
+ * |-------|------------|----------------------------|
+ * | 1     | hash chain | greedily                   |
+ * | 2-10  | hash chain | deferring, one byte a time |
+ * | 11-15 | binary tree| deferring, one byte a time |
+ * | 16-22 | binary tree| by shortest path           |
+ *
+ * Within each band the effort table below sets how hard.  The tree is in
+ * this file; the shortest-path parse is in zstd_optimal.c.
  *
  * ## Sequence Generation
  *
@@ -158,10 +161,17 @@ static inline uint32_t zstd_mf_hash5(const uint8_t * data, unsigned hash_log) {
  * fixed the same way: a table with one row per level, because there are
  * twenty-two levels.
  *
- * `search_depth` is how many hash chain candidates a position considers,
- * `lazy_depth` how many times a match may be deferred in favour of a better
- * one at the next position (zero is a greedy parse), and `nice_length` the
- * match length at which the chain walk stops looking for something better.
+ * `search_depth` is how many candidates a position considers, `lazy_depth`
+ * how many times a match may be deferred in favour of a better one at the
+ * next position (zero is a greedy parse), and `nice_length` the match length
+ * at which the search stops looking for something better.
+ *
+ * `use_bt` picks the binary tree over the hash chain.  `use_opt` picks the
+ * shortest-path parse over the deferred one, which needs the tree -- it
+ * prices candidates against one another and the chain cannot produce a list
+ * to price -- and makes `lazy_depth` meaningless, so those levels set it to
+ * zero rather than leave a number nothing reads.  `opt_segment` and
+ * `opt_budget` are that parse's two bounds; see zstd_optimal.c.
  */
 typedef struct {
   unsigned search_depth; ///< Candidates examined; see the table below.

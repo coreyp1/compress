@@ -53,7 +53,10 @@
  * - The repeat offsets.  A distance that matches one of the three offsets
  *   most recently used is written as the code 1, 2 or 3 instead of as a
  *   distance, which is a large saving, and the parse tracks the three along
- *   every path so it knows when it has one.
+ *   every path so it knows when it has one.  Which of the three a code names
+ *   shifts when a sequence has no literals before it, and a parse that
+ *   chooses by cost puts matches end to end constantly, so that shifted form
+ *   is the common case here rather than a corner of the specification.
  *
  * WHERE THE STATISTICS COME FROM
  * ==============================
@@ -63,9 +66,15 @@
  * inside matches will not end up as literals, but a far better one than
  * assuming eight bits each -- and the three sequence alphabets are primed
  * from the distributions the specification fixes for Predefined mode
- * (section 3.1.1.3.2.2).  After each block the counts of what was actually
- * emitted are folded in, halving what was there before, so the model tracks
- * the file as it goes and the most recent block weighs the most.
+ * (section 3.1.1.3.2.2).
+ *
+ * From there the model counts what it emits, as it emits it, and the prices
+ * are rebuilt at every sweep boundary.  So a block is priced not only by the
+ * blocks before it but by its own first half, which matters for a file that
+ * changes character part way through.  Every count is halved at the start of
+ * each block, which is what makes this a moving average rather than a
+ * running total: the block being parsed counts fully, the one before it half
+ * as much, the one before that a quarter.
  *
  * THE TWO BOUNDS
  * ==============
@@ -81,10 +90,14 @@
  *   starts there.  A boundary costs at most the few bits by which landing
  *   there is worse than landing nearby, once every few thousand bytes.
  *
- * - A match at least `nice_length` long ends the segment at once and is
- *   taken as it stands.  This is the same rule the match finder uses to stop
- *   searching, applied to parsing, and it is what stops a run of identical
- *   bytes from costing time quadratic in its length.
+ * - A match at least `nice_length` long, or one that would reach past the
+ *   end of the sweep, ends the sweep at once and is taken as it stands.  The
+ *   first half of that is the rule the match finder uses to stop searching,
+ *   applied to parsing, and it is what stops a run of identical bytes from
+ *   costing time quadratic in its length.  The second half is what keeps a
+ *   long match from being lost at a boundary rather than merely cut short by
+ *   one; without it, raising nice_length -- which should search harder --
+ *   made the output larger.
  *
  * Copyright 2026 by Corey Pennycuff
  */
