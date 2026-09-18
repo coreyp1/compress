@@ -1762,6 +1762,57 @@ TEST_F(DeflateEncoderTest, HigherLevelsDoNotProduceLargerOutput) {
   }
 }
 
+// A run of identical bytes must not cost the top levels more than it costs
+// the ones below them.
+//
+// This is where the shortest-path parse is easiest to get wrong.  The sweep
+// covers a fixed stretch of lookahead and the path has to land exactly on the
+// end of it, so the last match gets cut to whatever length fits.  For every
+// other step that is right -- the path continues from there -- but the last
+// step has nothing after it, and on a run, where every match is the full 258
+// bytes, one match in seven was being cut.  4 MB of zeroes came out 44%
+// larger at level 9 than at level 6, which is the wrong way round and is not
+// something a round-trip test can see.
+TEST_F(DeflateEncoderTest, RunsDoNotCostTheTopLevelsMore) {
+  // Long enough to cross many sweeps and several blocks.
+  std::vector<uint8_t> zeroes(600000, 0);
+  std::vector<uint8_t> alternating(600000);
+  for (size_t i = 0; i < alternating.size(); i++) {
+    alternating[i] = static_cast<uint8_t>(i & 1u);
+  }
+
+  for (const std::vector<uint8_t> * in : {&zeroes, &alternating}) {
+    std::vector<uint8_t> out;
+    size_t greedy = EncodeWithLevel(registry_, "default", 6, *in, out);
+    for (int level = 7; level <= 9; level++) {
+      size_t size = EncodeWithLevel(registry_, "default", level, *in, out);
+      EXPECT_LE(size, greedy)
+          << "level " << level << " produced " << size
+          << " bytes on a run where level 6 produced " << greedy;
+    }
+  }
+}
+
+// And the levels that parse by shortest path have to be worth the name.
+//
+// The bound is deliberately far below what it measures -- 3.7% on 9 MB of
+// manuals, C source and XML -- because what this is for is catching the
+// parse being switched off or wired up wrongly, not tracking its exact
+// value.  Without it, a table with use_opt cleared everywhere would leave
+// every other test passing.
+TEST_F(DeflateEncoderTest, TheOptimalLevelsBeatTheDeferringOnes) {
+  std::vector<uint8_t> in = TextLikeBytes(400000);
+
+  std::vector<uint8_t> out;
+  size_t deferred = EncodeWithLevel(registry_, "default", 6, in, out);
+  size_t optimal = EncodeWithLevel(registry_, "default", 7, in, out);
+
+  EXPECT_LT(optimal, deferred - deferred / 100u)
+      << "level 7 produced " << optimal << " bytes against level 6's "
+      << deferred << ", which is not the one percent this is meant to be "
+      << "worth at its very worst";
+}
+
 TEST_F(DeflateEncoderTest, LazyBeatsDefaultOnFilterShapedData) {
   std::vector<uint8_t> in = LazyLookingBytes(400000);
   for (int level = 1; level <= 3; level++) {
