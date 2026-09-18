@@ -101,25 +101,33 @@ typedef enum {
 //
 // DEFLATE_STRATEGY_FILTERED (strategy="filtered")
 // -----------------------------------------------
-// Named for pre-filtered data like PNG filter output.  It no longer earns
-// that name, and the honest description is: DEFAULT, with match deferral at
-// every level instead of from level 4.
+// Optimized for pre-filtered data like PNG filter output.
+// PNG filters (Sub, Up, Average, Paeth) produce data where:
+// - Values cluster around zero (differences between adjacent pixels)
+// - Short runs of the same value are common, broken by occasional outliers
+// - A match at one position is often beaten by a longer one a byte later
 //
 // Implementation differences from DEFAULT:
 // - Defers a match at every level, including 1 to 3: a match is held back one
 //   byte to see whether the next position starts a longer one, and the search
 //   that position performs anyway is what settles it.  See
 //   deflate_find_match()'s caller.
-// - Nothing else.  Same hash chain lengths, same everything.
+// - Uses the deferral threshold of the levels that defer, so that deferring
+//   at levels 1 to 3 is worth doing.  See max_lazy in that caller.
+// - Nothing else.  It searches exactly as hard as DEFAULT: same hash chain
+//   lengths, same everything.
 //
-// Since DEFAULT defers from level 4 up, that leaves FILTERED identical to
-// DEFAULT at levels 4 to 9 and different only at levels 1 to 3.
+// Since DEFAULT defers from level 4 up, FILTERED is identical to it at levels
+// 4 to 9 and differs only at levels 1 to 3.  What it offers there is the fast
+// levels' search effort with the slow levels' deferral: on 2 MB of
+// filter-shaped bytes it reaches 22.428% against DEFAULT's 25.065%, and on
+// 12 MB of source, prose, XML and binaries 25.954% against 26.680%, for about
+// 10% of the encode throughput on general data and none of it on filtered.
 //
-// WHY THE NAME NO LONGER FITS
-// ---------------------------
-// The strategy was measured, on 7.3 MB of real PNG filtered rows, to be worth
-// 1.7 points against DEFAULT, and chain depth to be worth 0.1 across a factor
-// of eight -- so deferral was the whole of it:
+// It used to search four times as deep as DEFAULT as well - 16/128/256
+// against 4/32/128 - on the reasoning that filtered data hides longer
+// patterns behind short chains.  Measured across 52 files of real PNG
+// filtered rows, 7.3 MB, that is not where the win is:
 //
 //     chain   with deferral   without
 //        32      31.22%       32.91%
@@ -127,18 +135,17 @@ typedef enum {
 //       128      31.13%       33.41%
 //       256      31.12%       33.40%
 //
-// Those numbers were taken when levels 1 to 3 emitted fixed Huffman blocks.
-// They now emit dynamic ones, and the coder recovers on its own most of what
-// deferral was recovering: on the filter-shaped bytes this file's tests
-// generate, deferring now *costs* 1.3% at level 1 (25.062% against 25.382%),
-// and zlib's own Z_FILTERED rule -- discard any match shorter than six bytes
-// -- costs 0.3% there and 6.1% on general data.  Neither is worth having.
+// Chain length is worth 0.1 points across a factor of eight.  Deferral is
+// worth 1.7.  So the chains came back down and the strategy is DEFAULT plus
+// deferral, which is the same relationship zlib's levels 4-9 have to its
+// levels 1-3.
 //
-// What FILTERED still offers is real but differently named: the fast levels'
-// search effort with the slow levels' deferral, which on 12 MB of source,
-// prose, XML and binaries is 1.9% smaller than DEFAULT at level 1 for about
-// 7% of the throughput.  Renaming or retiring the option is an API decision;
-// the tests pin both halves of what it does today so that neither can drift.
+// Note that this is still not what zlib's Z_FILTERED does.  zlib *reduces*
+// effort there - it discards matches shorter than six bytes and leans on
+// Huffman coding - so Z_FILTERED is faster than its default.  This one is
+// slower than its default.  The name is shared; the meaning is not.  That
+// rule was measured here too and is not worth having: it costs 0.3% on
+// filter-shaped data and 6.1% on general data.
 //
 // DEFLATE_STRATEGY_HUFFMAN_ONLY (strategy="huffman_only")
 // -------------------------------------------------------
@@ -2245,6 +2252,28 @@ static gcomp_status_t deflate_encode_batch(
         : (st->level <= 6)                  ? 16u
         : (st->level <= 8)                  ? 32u
                                             : 258u;
+
+    // A strategy that defers at levels 1 to 3 needs the threshold of the
+    // levels that defer, not the one those levels use.
+    //
+    // The level-based value of 4 means "hold a match back only if it is
+    // exactly three bytes long", and a three-byte match is the one case where
+    // deferring cannot pay: the byte given up is a literal, the match that
+    // displaces it is four bytes at best, and the sequence it replaces would
+    // have been found at the next position anyway.  Each deferral traded one
+    // match for one literal and saved no symbols at all.  On filter-shaped
+    // bytes FILTERED came out *larger* than DEFAULT -- 507,624 against
+    // 501,304 - which is the opposite of what the strategy is for, and it is
+    // what led to this being written off as a strategy that had outlived its
+    // reason.
+    //
+    // With the threshold the deferring levels use, the same file goes to
+    // 448,562: 10.5% smaller than DEFAULT rather than 1.3% larger.  Over a
+    // 12 MB corpus of source, prose, XML and binaries it is 25.954% against
+    // DEFAULT's 26.680%, for about 15% of the encode throughput.
+    if (st->strategy == DEFLATE_STRATEGY_FILTERED && st->level <= 3) {
+      max_lazy = 16u;
+    }
 
     // Determine hash chain length based on level.
     //

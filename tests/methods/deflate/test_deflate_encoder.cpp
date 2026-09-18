@@ -1677,21 +1677,29 @@ size_t EncodeWith(gcomp_registry_t * reg, const char * strategy,
 
 } // namespace
 
-// Deferring a match has to earn its cost.  DEFAULT defers from level 4 up,
-// the same place zlib switches from deflate_fast to deflate_slow, and
-// FILTERED defers at every level - so the two differ only at levels 1 to 3,
-// which is where this asks the question.
-//
-// The data here is text-shaped, not filter-shaped, and that is deliberate.
-// The strategy is named for PNG filter output, but it is no longer better on
-// it: once the fast levels started emitting dynamic Huffman blocks, the coder
-// captured what deferring used to recover there, and on this file's own
-// FilteredLookingBytes deferring now costs 1.3% at level 1 rather than
-// saving.  On general data it still pays - 1.9% over a 12 MB corpus of
-// source, prose, XML and binaries - so what the strategy now offers is the
-// fast levels' speed with the slow levels' deferral, under a name that no
-// longer describes it.  Whether to rename it is a decision for the API, not
-// for this test.
+// Deferring a match has to earn its cost, and on the data the strategy is
+// named for it does.  DEFAULT defers from level 4 up, the same place zlib
+// switches from deflate_fast to deflate_slow, and FILTERED defers at every
+// level - so the two differ only at levels 1 to 3, which is where these ask
+// the question.
+TEST_F(DeflateEncoderTest, FilteredBeatsDefaultOnFilterShapedData) {
+  std::vector<uint8_t> in = FilteredLookingBytes(400000);
+  for (int level = 1; level <= 3; level++) {
+    std::vector<uint8_t> a;
+    std::vector<uint8_t> b;
+    size_t plain = EncodeWithLevel(registry_, "default", level, in, a);
+    size_t deferred = EncodeWithLevel(registry_, "filtered", level, in, b);
+    // Measured at 10.5% smaller; asking for 5% leaves room to move without
+    // letting the strategy quietly stop earning its name.  It did stop, once:
+    // the deferral threshold at levels 1 to 3 was the one value that makes
+    // deferring pointless - hold a match only if it is exactly three bytes -
+    // and FILTERED came out larger than DEFAULT on this very data.
+    EXPECT_LT(deferred + deferred / 20, plain)
+        << "level " << level << ": filtered " << deferred << " vs default "
+        << plain;
+  }
+}
+
 TEST_F(DeflateEncoderTest, FilteredDefersWhereDefaultDoesNotAtTheFastLevels) {
   std::vector<uint8_t> in = TextLikeBytes(400000);
   for (int level = 1; level <= 3; level++) {
@@ -1708,9 +1716,8 @@ TEST_F(DeflateEncoderTest, FilteredDefersWhereDefaultDoesNotAtTheFastLevels) {
 // And from level 4 up they are the same encoder.  That is a consequence of
 // giving DEFAULT the only thing FILTERED had - this file's own measurements
 // put chain depth at 0.1 points across a factor of eight and deferral at 1.7 -
-// so it is recorded here rather than left to be discovered.  The option stays
-// because it still means something at levels 1 to 3, and because it is a
-// documented name that callers may already pass.
+// so it is recorded here rather than left to be discovered.  What FILTERED
+// means is levels 1 to 3, where it defers and DEFAULT does not.
 TEST_F(DeflateEncoderTest, FilteredMatchesDefaultAtTheSlowLevels) {
   std::vector<uint8_t> in = FilteredLookingBytes(200000);
   for (int level = 4; level <= 9; level++) {
