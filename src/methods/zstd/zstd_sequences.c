@@ -217,9 +217,21 @@ static void zstd_seq_bit_reader_reload(zstd_seq_bit_reader_t * br) {
     bytes_to_load = 8;
   }
 
-  br->bit_container = 0;
-  for (size_t i = 0; i < bytes_to_load; i++) {
-    br->bit_container |= (uint64_t)br->src[start_byte + i] << (i * 8);
+  if (bytes_to_load == 8u) {
+    // The loop below is byte i of the source at bit i*8, which is what a
+    // little-endian 64-bit read is; every compiler this library supports
+    // folds gcomp_read_le64 into a single load.  The window moves every
+    // eight bits consumed, so this runs several times per sequence and the
+    // eight-iteration version was worth about a sixth of the whole decode.
+    br->bit_container = gcomp_read_le64(br->src + start_byte);
+  }
+  else {
+    // Fewer than eight bytes left in the stream; the tail goes a byte at a
+    // time so that nothing past the end is read.
+    br->bit_container = 0;
+    for (size_t i = 0; i < bytes_to_load; i++) {
+      br->bit_container |= (uint64_t)br->src[start_byte + i] << (i * 8);
+    }
   }
 
   // Track how many bits are in the container and their position
@@ -729,33 +741,65 @@ static gcomp_status_t zstd_sequences_execute(zstd_decoder_state_t * state,
       return GCOMP_ERR_LIMIT;
     }
 
-    // Byte-by-byte copy for overlapping matches
-    // If offset <= out_pos, copy from current block's output
-    // If offset > out_pos, part or all comes from window buffer
-    for (uint32_t j = 0; j < match_length; j++) {
-      uint8_t byte;
-      if (actual_offset <= out_pos) {
-        // Source is within current block's output
-        byte = dst[out_pos - actual_offset];
+    // Copy the match.
+    //
+    // A match reads from one of two places: the window, which holds what
+    // earlier blocks decoded, or this block's own output.  It can start in
+    // the window and finish in the output, but it crosses between them at
+    // most once, and within the window it wraps at most once more.  So there
+    // are at most three flat runs, and asking which one applies per byte --
+    // as this used to, along with a circular index computation for every byte
+    // that came from the window -- was the largest single cost in a
+    // Zstandard decode.
+    size_t remaining_match = match_length;
+
+    // The part that predates this block, taken from the circular window.
+    // Everything here is already written, so these runs never overlap what
+    // they are writing.
+    while (remaining_match > 0u && actual_offset > out_pos) {
+      size_t win_offset = actual_offset - out_pos;
+      if (win_offset > state->window_size) {
+        return GCOMP_ERR_CORRUPT;
+      }
+      size_t win_idx = (state->window_pos >= win_offset)
+          ? (state->window_pos - win_offset)
+          : (state->window_capacity - (win_offset - state->window_pos));
+
+      // Stop at whichever comes first: the end of the match, the end of the
+      // window's history, or the wrap of the circular buffer.
+      size_t run = remaining_match;
+      if (run > win_offset) {
+        run = win_offset;
+      }
+      if (run > state->window_capacity - win_idx) {
+        run = state->window_capacity - win_idx;
+      }
+      if (run == 0u) {
+        return GCOMP_ERR_CORRUPT; // Cannot happen; refuse to spin if it does.
+      }
+
+      memcpy(dst + out_pos, state->window_buffer + win_idx, run);
+      out_pos += run;
+      remaining_match -= run;
+    }
+
+    // The rest comes from what this block has already written.  Source and
+    // destination are the same buffer, so a run stops at the distance between
+    // them; past that the copy would have to repeat what it just wrote.
+    while (remaining_match > 0u) {
+      if (actual_offset > out_pos) {
+        return GCOMP_ERR_CORRUPT; // Reaches back further than anything held.
+      }
+      size_t run = (actual_offset < remaining_match) ? (size_t)actual_offset
+                                                     : remaining_match;
+      if (actual_offset == 1u) {
+        memset(dst + out_pos, dst[out_pos - 1u], run);
       }
       else {
-        // Source is in window buffer (circular)
-        // Position in window = window_size - (actual_offset - out_pos)
-        size_t win_offset = actual_offset - out_pos;
-        if (win_offset > state->window_size) {
-          return GCOMP_ERR_CORRUPT;
-        }
-        size_t win_idx;
-        if (state->window_pos >= win_offset) {
-          win_idx = state->window_pos - win_offset;
-        }
-        else {
-          // Wrap around in circular buffer
-          win_idx = state->window_capacity - (win_offset - state->window_pos);
-        }
-        byte = state->window_buffer[win_idx];
+        memcpy(dst + out_pos, dst + out_pos - actual_offset, run);
       }
-      dst[out_pos++] = byte;
+      out_pos += run;
+      remaining_match -= run;
     }
   }
 
