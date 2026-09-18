@@ -3752,9 +3752,22 @@ gcomp_status_t gcomp_deflate_encoder_finish(
       s = deflate_flush_stored_block(st, 1);
     }
     else {
-      // Determine whether to use fixed or dynamic Huffman
-      int use_fixed_huffman =
-          (st->strategy == DEFLATE_STRATEGY_FIXED) || (st->level <= 3);
+      // The same rule as the streaming loop above: only the fixed strategy
+      // forces fixed codes.  Every other block goes to
+      // deflate_flush_dynamic_block(), which prices the dynamic coding
+      // against the fixed one and writes whichever is smaller.
+      //
+      // This condition used to carry `|| (st->level <= 3)` as well.  That is
+      // the assumption 44e963c removed from the loop -- a level cannot know
+      // whether a table will pay for itself, because that depends on the
+      // block -- and it was left behind here, so the blocks flushed at the
+      // end of the stream were still decided by the level.  It was worth
+      // 0.56% at level 1 over a 19 MB corpus, 0.74% at level 2 and 0.59% at
+      // level 3; and for a buffer small enough to be encoded in one call the
+      // final block is the whole output, where it is worth far more: 3,360
+      // bytes of English at level 1 came out 112 bytes forced fixed against
+      // the 96 a priced block gives.
+      int use_fixed_huffman = (st->strategy == DEFLATE_STRATEGY_FIXED);
 
       // A match held back by lazy matching has to go out before the tail is
       // flushed, or the byte it starts on is emitted twice: once as part of

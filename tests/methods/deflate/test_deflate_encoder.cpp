@@ -1813,6 +1813,46 @@ TEST_F(DeflateEncoderTest, TheOptimalLevelsBeatTheDeferringOnes) {
       << "worth at its very worst";
 }
 
+// No level decides the entropy coding.  Which of the two codings a block
+// gets is priced -- the dynamic block including its table description
+// against the same symbols under the fixed code of RFC 1951 section 3.2.6 --
+// and the cheaper one is written.
+//
+// Levels 1 to 3 used to force the fixed code, and the condition that did it
+// survived in the finish path after being removed from the streaming loop,
+// so the *last* blocks of a stream were still chosen by the level.  For a
+// buffer encoded in one call those are the only blocks there are.
+//
+// The check is against `"fixed"` at the same level rather than against a
+// size, because that isolates the coding: the two runs share a level, a
+// strategy's worth of matching and an input, and differ only in whether the
+// coding was chosen or assumed.  If the level ever decides again, the two
+// are equal and this fails.
+TEST_F(DeflateEncoderTest, TheFastLevelsPriceTheirLastBlockToo) {
+  std::vector<uint8_t> in = TextLikeBytes(4000);
+
+  for (int level = 1; level <= 3; level++) {
+    std::vector<uint8_t> priced;
+    std::vector<uint8_t> forced;
+    size_t priced_size = EncodeWithLevel(registry_, "default", level, in, priced);
+    size_t forced_size = EncodeWithLevel(registry_, "fixed", level, in, forced);
+
+    EXPECT_LT(priced_size, forced_size)
+        << "level " << level << " produced " << priced_size
+        << " bytes, the same as the " << forced_size
+        << " that forcing the fixed code gives, so the coding was not priced";
+
+    std::vector<uint8_t> back;
+    ASSERT_EQ(decode_data(priced.data(), priced_size, back, in.size()),
+        GCOMP_OK);
+    EXPECT_EQ(back, in) << "level " << level << " did not round-trip";
+
+    // Clean up decoder before next iteration
+    gcomp_decoder_destroy(decoder_);
+    decoder_ = nullptr;
+  }
+}
+
 TEST_F(DeflateEncoderTest, LazyBeatsDefaultOnFilterShapedData) {
   std::vector<uint8_t> in = LazyLookingBytes(400000);
   for (int level = 1; level <= 3; level++) {
