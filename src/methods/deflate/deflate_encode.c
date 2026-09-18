@@ -255,6 +255,15 @@ typedef struct gcomp_deflate_encoder_state_s {
    */
   gcomp_stepdown_tally_t stepdowns;
 
+  /**
+   * @brief Input bytes the buffered symbols stand for.
+   *
+   * Only used to decide when to close a block early so that a stored block
+   * stays reachable; deflate_block_input_length() is what the block writer
+   * trusts.  A drift here costs a block boundary, never a wrong block.
+   */
+  size_t block_input_len;
+
   //
   // State machine
   //
@@ -454,6 +463,95 @@ static uint32_t deflate_hash_3bytes_wrap(
 
 static gcomp_status_t deflate_build_fixed_codes(
     gcomp_deflate_encoder_state_t * st);
+/**
+ * @brief How many input bytes the buffered symbols stand for.
+ *
+ * Derived from the symbols rather than tracked alongside them, so it cannot
+ * drift out of step with what was actually recorded.
+ *
+ * @param st Encoder state.
+ * @return Total bytes the current block covers.
+ */
+static size_t deflate_block_input_length(
+    const gcomp_deflate_encoder_state_t * st) {
+  size_t total = 0;
+  for (size_t i = 0; i < st->sym_buf_used; i++) {
+    total += (st->dist_buf[i] != 0) ? (size_t)st->lit_buf[i] : 1u;
+  }
+  return total;
+}
+
+/**
+ * @brief Write the block as a stored block, taking the bytes from the window.
+ *
+ * RFC 1951 section 3.2.4: three header bits, padding to the next byte
+ * boundary, LEN and its complement, then the bytes themselves.  Nothing is
+ * compressed, so this is the ceiling on what a block can cost - about five
+ * bytes over its own length - and it is the answer whenever the coded forms
+ * would cost more.
+ *
+ * The bytes come from the sliding window.  They are the @p data_len bytes
+ * ending where the encoder has reached, which is @ref gcomp_deflate_encoder_state_t::lookahead
+ * bytes before the end of what has been read.  The caller checks that they
+ * are still in the window before asking.
+ *
+ * @param st Encoder state.
+ * @param final Non-zero if this is the last block in the stream.
+ * @param data_len Bytes to store; at most 65535.
+ * @return GCOMP_OK, or a bit writer error.
+ */
+static gcomp_status_t deflate_flush_stored_block_from_window(
+    gcomp_deflate_encoder_state_t * st, int final, size_t data_len) {
+  gcomp_status_t s = gcomp_deflate_bitwriter_write_bits(
+      &st->bitwriter, final ? 1u : 0u, 1);
+  if (s != GCOMP_OK) {
+    return s;
+  }
+  s = gcomp_deflate_bitwriter_write_bits(&st->bitwriter, 0u, 2); // BTYPE=00
+  if (s != GCOMP_OK) {
+    return s;
+  }
+  s = gcomp_deflate_bitwriter_flush_to_byte(&st->bitwriter);
+  if (s != GCOMP_OK) {
+    return s;
+  }
+
+  uint16_t len = (uint16_t)data_len;
+  uint16_t nlen = (uint16_t)(~len);
+  const uint16_t header[4] = {(uint16_t)(len & 0xFF),
+      (uint16_t)((len >> 8) & 0xFF), (uint16_t)(nlen & 0xFF),
+      (uint16_t)((nlen >> 8) & 0xFF)};
+  for (size_t i = 0; i < 4; i++) {
+    s = gcomp_deflate_bitwriter_write_bits(&st->bitwriter, header[i], 8);
+    if (s != GCOMP_OK) {
+      return s;
+    }
+  }
+
+  // The block ends at the encoder's position, which is `lookahead` bytes
+  // behind where the window has been filled to.
+  size_t end = (st->window_pos + st->window_size - st->lookahead) &
+      st->window_mask;
+  size_t start = (end + st->window_size - data_len) & st->window_mask;
+  for (size_t i = 0; i < data_len; i++) {
+    s = gcomp_deflate_bitwriter_write_bits(
+        &st->bitwriter, st->window[(start + i) & st->window_mask], 8);
+    if (s != GCOMP_OK) {
+      return s;
+    }
+  }
+
+  st->sym_buf_used = 0;
+  st->block_input_len = 0;
+  if (st->lit_freq) {
+    memset(st->lit_freq, 0, DEFLATE_MAX_LITLEN_SYMBOLS * sizeof(uint32_t));
+  }
+  if (st->dist_freq) {
+    memset(st->dist_freq, 0, DEFLATE_MAX_DIST_SYMBOLS * sizeof(uint32_t));
+  }
+  return GCOMP_OK;
+}
+
 static gcomp_status_t deflate_flush_stored_block(
     gcomp_deflate_encoder_state_t * st, int final);
 static gcomp_status_t deflate_flush_fixed_block(
@@ -1112,6 +1210,7 @@ static gcomp_status_t deflate_flush_fixed_block(
 
   // Reset for next block
   st->sym_buf_used = 0;
+  st->block_input_len = 0;
   if (st->lit_freq) {
     memset(st->lit_freq, 0, DEFLATE_MAX_LITLEN_SYMBOLS * sizeof(uint32_t));
   }
@@ -1650,6 +1749,38 @@ static gcomp_status_t deflate_flush_dynamic_block(
       fixed_bits += (uint64_t)st->dist_freq[i] * 5u;
     }
 
+    // And against storing the block uncompressed.  RFC 1951 section 3.2.4
+    // costs three header bits, up to seven more to reach a byte boundary,
+    // four bytes of LEN and its complement, and then the bytes themselves.
+    // That is the ceiling on what a block can cost, and without it an encoder
+    // can expand its input: level 1 used to make a JPEG 1.6% larger, and
+    // nothing prevented it in general.
+    //
+    // The bytes come from the sliding window, so they have to still be in it,
+    // and a stored block's length field is sixteen bits.  Neither bound binds
+    // in the case that matters - incompressible data is nearly all literals,
+    // so the block covers about one byte per symbol - but a block of long
+    // matches can exceed both, and then there is nothing to store from.
+    uint64_t stored_bits = 0;
+    size_t block_input = deflate_block_input_length(st);
+    size_t window_behind = (st->window_fill < st->window_size)
+        ? st->window_fill
+        : st->window_size;
+    window_behind = (window_behind > st->lookahead)
+        ? window_behind - st->lookahead
+        : 0u;
+    if (block_input > 0 && block_input <= 65535u &&
+        block_input <= window_behind) {
+      stored_bits = 3u + 7u + 32u + 8u * (uint64_t)block_input;
+    }
+
+    if (stored_bits > 0 && stored_bits < dynamic_bits &&
+        (!st->fixed_ready || stored_bits < fixed_bits)) {
+      gcomp_stepdown_note(&st->stepdowns, GCOMP_STEPDOWN_STORED_IS_SMALLER);
+      gcomp_free(st->allocator, all_lengths);
+      return deflate_flush_stored_block_from_window(st, final, block_input);
+    }
+
     if (fixed_bits <= dynamic_bits && st->fixed_ready) {
       gcomp_stepdown_note(&st->stepdowns, GCOMP_STEPDOWN_FIXED_IS_SMALLER);
       gcomp_free(st->allocator, all_lengths);
@@ -1781,6 +1912,7 @@ static gcomp_status_t deflate_flush_dynamic_block(
 
   // Reset for next block
   st->sym_buf_used = 0;
+  st->block_input_len = 0;
   memset(st->lit_freq, 0, DEFLATE_MAX_LITLEN_SYMBOLS * sizeof(uint32_t));
   memset(st->dist_freq, 0, DEFLATE_MAX_DIST_SYMBOLS * sizeof(uint32_t));
 
@@ -2069,6 +2201,7 @@ gcomp_status_t gcomp_deflate_encoder_reset(gcomp_encoder_t * encoder) {
   // A reset starts a new stream, so the record of what the previous one had
   // to settle for does not carry into it.
   memset(&st->stepdowns, 0, sizeof(st->stepdowns));
+  st->block_input_len = 0;
 
   memset(st->hash_head, 0, DEFLATE_HASH_SIZE * sizeof(uint16_t));
   memset(st->hash_prev, 0, st->window_size * sizeof(uint16_t));
@@ -2397,8 +2530,36 @@ static gcomp_status_t deflate_encode_batch(
             input->used < input->size) {
           break;
         }
-        // Check if symbol buffer needs flushing
-        if (st->sym_buf_used >= st->sym_buf_size - 2) {
+        // A block is closed when the symbol buffer fills, and also when it
+        // is nearly all literals and has grown to what the window can still
+        // hand back.
+        //
+        // A stored block's bytes come from the window, so they have to still
+        // be in it: the block may cover at most window_size minus the
+        // lookahead in front of it.  A literal-heavy block covers about one
+        // byte per symbol, so with a symbol buffer the size of the window it
+        // runs past that, and the stored form - the one thing that stops an
+        // encoder expanding its input - is never available where it is most
+        // wanted.
+        //
+        // Shortening every block instead costs real data real bytes: taking
+        // two refills' worth off the symbol buffer was 0.34% at level 1
+        // across the corpus.  The mean-coverage test keeps that cost off
+        // compressible data, where blocks cover three to fourteen bytes per
+        // symbol and a stored block could never have won anyway.
+        size_t stored_reach = (st->window_size > 4u * DEFLATE_REFILL_LOOKAHEAD)
+            ? st->window_size - 2u * DEFLATE_REFILL_LOOKAHEAD
+            : st->window_size;
+        // Within an eighth of one byte per symbol: essentially nothing is
+        // matching.  A looser test - twice a byte per symbol - also fires on
+        // data that compresses a little, such as a JPEG, where the extra
+        // block header costs more than the stored form could ever save.
+        int literal_heavy = st->block_input_len <
+            (size_t)st->sym_buf_used + (size_t)st->sym_buf_used / 8u;
+        int out_of_window_reach = literal_heavy && st->sym_buf_used > 0 &&
+            st->block_input_len + DEFLATE_MAX_MATCH_LENGTH >= stored_reach;
+
+        if (st->sym_buf_used >= st->sym_buf_size - 2 || out_of_window_reach) {
           if (use_fixed_huffman) {
             s = deflate_flush_fixed_block(st, 0);
           }
@@ -2528,6 +2689,7 @@ static gcomp_status_t deflate_encode_batch(
               st->lit_buf[st->sym_buf_used] = lit;
               st->dist_buf[st->sym_buf_used] = 0;
               st->sym_buf_used++;
+              st->block_input_len += 1u;
               if (st->lit_freq) {
                 st->lit_freq[lit]++;
               }
@@ -2539,6 +2701,7 @@ static gcomp_status_t deflate_encode_batch(
               st->lit_buf[st->sym_buf_used] = (uint16_t)held_length;
               st->dist_buf[st->sym_buf_used] = (uint16_t)held_distance;
               st->sym_buf_used++;
+              st->block_input_len += (size_t)held_length;
               if (st->lit_freq) {
                 st->lit_freq[gcomp_deflate_length_code(held_length)]++;
                 st->dist_freq[gcomp_deflate_distance_code(held_distance)]++;
@@ -2576,6 +2739,7 @@ static gcomp_status_t deflate_encode_batch(
           st->lit_buf[st->sym_buf_used] = (uint16_t)match.length;
           st->dist_buf[st->sym_buf_used] = (uint16_t)match.distance;
           st->sym_buf_used++;
+          st->block_input_len += (size_t)match.length;
 
           // Track frequencies for dynamic Huffman
           if (st->lit_freq) {
@@ -2601,6 +2765,7 @@ static gcomp_status_t deflate_encode_batch(
           st->lit_buf[st->sym_buf_used] = lit;
           st->dist_buf[st->sym_buf_used] = 0;
           st->sym_buf_used++;
+          st->block_input_len += 1u;
 
           // Track frequencies for dynamic Huffman
           if (st->lit_freq) {
@@ -2878,6 +3043,7 @@ gcomp_status_t gcomp_deflate_encoder_finish(
         st->lit_buf[st->sym_buf_used] = (uint16_t)held_length;
         st->dist_buf[st->sym_buf_used] = (uint16_t)held_distance;
         st->sym_buf_used++;
+        st->block_input_len += (size_t)held_length;
         if (st->lit_freq) {
           st->lit_freq[gcomp_deflate_length_code(held_length)]++;
           st->dist_freq[gcomp_deflate_distance_code(held_distance)]++;
@@ -2915,6 +3081,7 @@ gcomp_status_t gcomp_deflate_encoder_finish(
         st->lit_buf[st->sym_buf_used] = lit;
         st->dist_buf[st->sym_buf_used] = 0;
         st->sym_buf_used++;
+        st->block_input_len += 1u;
 
         // Track frequency for dynamic Huffman
         if (st->lit_freq) {

@@ -340,6 +340,62 @@ TEST_F(StepdownTest, Lz4IsNeverForcedIntoAWeakerEncoding) {
   }
 }
 
+// The stored block is what stops an encoder expanding its input.  RFC 1951
+// section 3.2.4 costs about five bytes over the block's own length, so a
+// stream of incompressible bytes should come out a hair larger and no more.
+//
+// Without it, DEFLATE wrote a dynamic Huffman code for data with no structure
+// to code and paid for the table: two megabytes of random bytes grew by
+// 0.131%.  With it, levels 6 and 9 grow by 0.016%, which is what zlib grows
+// by on the same input.
+TEST_F(StepdownTest, DeflateStoresBlocksItCannotCompress) {
+  std::vector<uint8_t> data;
+  data.reserve(2u * 1024u * 1024u);
+  uint32_t x = 88675123u;
+  while (data.size() < 2u * 1024u * 1024u) {
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    data.push_back((uint8_t)(x >> 19));
+  }
+
+  for (int level = 1; level <= 9; level++) {
+    gcomp_options_t * options = nullptr;
+    ASSERT_EQ(gcomp_options_create(&options), GCOMP_OK);
+    ASSERT_EQ(
+        gcomp_options_set_int64(options, "deflate.level", level), GCOMP_OK);
+
+    gcomp_encoder_t * encoder = nullptr;
+    ASSERT_EQ(gcomp_encoder_create(registry_, "deflate", options, &encoder),
+        GCOMP_OK);
+
+    std::vector<uint8_t> out(data.size() + 65536);
+    gcomp_buffer_t in_buf = {(void *)data.data(), data.size(), 0};
+    gcomp_buffer_t out_buf = {out.data(), out.size(), 0};
+    while (in_buf.used < in_buf.size) {
+      ASSERT_EQ(gcomp_encoder_update(encoder, &in_buf, &out_buf), GCOMP_OK);
+    }
+    ASSERT_EQ(gcomp_encoder_finish(encoder, &out_buf), GCOMP_OK);
+
+    // A tenth of a percent.  The old behaviour was 0.131% and the levels that
+    // defer now reach 0.016%; level 1, which does not defer, reaches 0.071%.
+    EXPECT_LE(out_buf.used, data.size() + data.size() / 1000u)
+        << "level " << level << ": " << out_buf.used << " from "
+        << data.size();
+
+    const gcomp_stepdown_tally_t * tally =
+        gcomp_deflate_encoder_stepdowns(encoder);
+    ASSERT_NE(tally, nullptr);
+    EXPECT_GT(tally->counts[GCOMP_STEPDOWN_STORED_IS_SMALLER], 0u)
+        << "level " << level << " never stored a block: " << Describe(*tally);
+    EXPECT_EQ(gcomp_stepdown_forced_total(tally), 0u)
+        << "level " << level << ": " << Describe(*tally);
+
+    gcomp_encoder_destroy(encoder);
+    gcomp_options_destroy(options);
+  }
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
