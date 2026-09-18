@@ -275,7 +275,26 @@ gcomp_status_t lz4_block_compress_linked(const uint8_t * window,
 
       // Extend forward, but not past match_limit.  The four bytes the hash
       // agreed on sit just after the bytes walked back over.
+      //
+      // Eight bytes at a time while eight remain inside match_limit.  The
+      // match source is always behind src, so its read is further inside the
+      // buffer than src's and needs no separate bound.  Where the two words
+      // differ, the first differing byte is the lowest differing bit of
+      // their exclusive-or over eight; reading both little-endian puts the
+      // earliest byte in memory in the low bits, so this counts forwards
+      // through memory on either byte order.
+      //
+      // One byte per iteration here was 18% of LZ4 encoding.
       size_t match_len = back + 4;
+      while (src + match_len + 8u <= match_limit) {
+        uint64_t a = gcomp_read_le64(src + match_len);
+        uint64_t b = gcomp_read_le64(match_ref + match_len);
+        if (a != b) {
+          match_len += (size_t)((unsigned)__builtin_ctzll(a ^ b) >> 3);
+          break;
+        }
+        match_len += 8u;
+      }
       while (
           src + match_len < match_limit && match_ref[match_len] == src[match_len]) {
         match_len++;
