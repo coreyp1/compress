@@ -108,6 +108,7 @@
 #ifdef GCOMP_TEST_BUILD
 #include <assert.h>
 #endif
+#include "../../core/bitcost.h"
 #include "zstd_internal.h"
 #include "zstd_matchfinder_private.h"
 #include "zstd_sequences_private.h"
@@ -117,9 +118,10 @@
 // Prices
 //
 
-/// Fractional bits a price carries.  A price of ZSTD_OPT_PRICE_ONE is one bit.
-#define ZSTD_OPT_PRICE_SHIFT 8
-#define ZSTD_OPT_PRICE_ONE (1u << ZSTD_OPT_PRICE_SHIFT)
+// Prices are in 256ths of a bit; see ../../core/bitcost.h, which both this
+// parse and the deflate one cost their symbols with.
+#define ZSTD_OPT_PRICE_SHIFT GCOMP_BITCOST_SHIFT
+#define ZSTD_OPT_PRICE_ONE GCOMP_BITCOST_ONE
 
 /// No path reaches here yet.  Large enough that adding any single edge to it
 /// cannot wrap: the dearest edge is well under a thousand bits.
@@ -211,56 +213,6 @@ struct zstd_opt_state_s {
   size_t node_cap; ///< Entries; one per position of a sweep, plus one.
 };
 
-/**
- * @brief log2(@p x) in 256ths, for x >= 1.
- *
- * The whole part is the position of the top set bit.  The fraction comes out
- * one bit at a time by repeatedly squaring what is left: squaring doubles a
- * logarithm, so whether the square has reached 2 is exactly the next bit of
- * the answer.  Eight rounds give eight fractional bits.
- *
- * The mantissa is held with 31 fraction bits, so the square fits a 64-bit
- * product with nothing to spare and nothing lost.
- */
-uint32_t zstd_opt_log2(uint32_t x) {
-  if (x < 1u) {
-    x = 1u;
-  }
-  unsigned hb = 31u - (unsigned)__builtin_clz(x);
-  uint32_t result = (uint32_t)hb << ZSTD_OPT_PRICE_SHIFT;
-  uint64_t m = ((uint64_t)x << 31) >> hb; // 1.0 <= m < 2.0, 31 fraction bits
-  for (unsigned i = 0; i < ZSTD_OPT_PRICE_SHIFT; i++) {
-    m = (m * m) >> 31;
-    if (m >= ((uint64_t)1 << 32)) {
-      m >>= 1;
-      result += 1u << (ZSTD_OPT_PRICE_SHIFT - 1u - i);
-    }
-  }
-  return result;
-}
-
-/**
- * @brief Turn counts into prices: -log2(count / total), floored.
- *
- * The floor is what the format can actually charge.  A literal is Huffman
- * coded, and no Huffman code is shorter than one bit, so pricing a very
- * common byte at a third of a bit would be a promise the encoder cannot
- * keep.  An FSE-coded sequence code genuinely can cost less than a bit, so
- * its floor is only there to keep an edge from being free.
- */
-static void zstd_opt_price_from_freq(const uint32_t * freq, uint32_t * price,
-    size_t count, uint32_t floor_price) {
-  uint32_t total = 0;
-  for (size_t i = 0; i < count; i++) {
-    total += freq[i];
-  }
-  uint32_t log_total = zstd_opt_log2(total);
-  for (size_t i = 0; i < count; i++) {
-    uint32_t p = log_total - zstd_opt_log2(freq[i]);
-    price[i] = (p < floor_price) ? floor_price : p;
-  }
-}
-
 static inline uint32_t zstd_opt_ll_price_slow(
     const struct zstd_opt_state_s * st, uint32_t litlen) {
   unsigned code = zstd_enc_get_ll_code(litlen);
@@ -276,13 +228,13 @@ static inline uint32_t zstd_opt_ml_price_slow(
 }
 
 static void zstd_opt_rebuild_prices(struct zstd_opt_state_s * st) {
-  zstd_opt_price_from_freq(
+  gcomp_bitcost_from_freq(
       st->lit_freq, st->lit_price, 256, ZSTD_OPT_PRICE_ONE);
-  zstd_opt_price_from_freq(st->ll_freq, st->ll_price, ZSTD_SEQ_LL_CODES,
+  gcomp_bitcost_from_freq(st->ll_freq, st->ll_price, ZSTD_SEQ_LL_CODES,
       ZSTD_OPT_PRICE_ONE / 8u);
-  zstd_opt_price_from_freq(st->ml_freq, st->ml_price, ZSTD_SEQ_ML_CODES,
+  gcomp_bitcost_from_freq(st->ml_freq, st->ml_price, ZSTD_SEQ_ML_CODES,
       ZSTD_OPT_PRICE_ONE / 8u);
-  zstd_opt_price_from_freq(st->of_freq, st->of_price, ZSTD_SEQ_OF_CODES,
+  gcomp_bitcost_from_freq(st->of_freq, st->of_price, ZSTD_SEQ_OF_CODES,
       ZSTD_OPT_PRICE_ONE / 8u);
 
   for (uint32_t n = 0; n < ZSTD_OPT_DIRECT_LEN; n++) {

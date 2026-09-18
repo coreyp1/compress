@@ -20,6 +20,7 @@
 
 #include <ghoti.io/compress/macros.h>
 
+#include "../../core/bitcost.h"
 #include "../../core/endian.h"
 #include "zstd_internal.h"
 
@@ -155,15 +156,6 @@ void zstd_opt_destroy(zstd_match_finder_t * mf, const gcomp_allocator_t * alloc,
  * @brief Put the cost model back to its prior, forgetting the stream.
  */
 void zstd_opt_reset(zstd_match_finder_t * mf);
-
-/**
- * @brief log2(@p x) in 256ths of a bit, for x >= 1.
- *
- * Every price in the optimal parse is a difference of two of these, so it is
- * exposed for its own test: an error here does not fail, it quietly makes
- * every parse a little worse.
- */
-uint32_t zstd_opt_log2(uint32_t x);
 
 /**
  * @brief The optimal parse; see zstd_optimal.c.

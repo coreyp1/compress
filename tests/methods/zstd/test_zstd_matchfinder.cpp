@@ -995,28 +995,29 @@ TEST_F(ZstdMatchFinderTest, TheOptimalLevelsAreTheTopOfTheLadder) {
   EXPECT_GT(first_optimal, 0) << "no level parses optimally";
 }
 
-// Everything the parse prices is a difference of two of these, so an error
-// here does not fail anything -- it quietly makes every parse worse.  The
+// Everything either parse prices is a difference of two of these -- the zstd
+// one and the deflate one both cost their symbols with it -- so an error
+// here does not fail anything, it quietly makes every parse worse.  The
 // reference is the real logarithm; the tolerance is the last place the fixed
 // point format can represent.
 TEST_F(ZstdMatchFinderTest, TheFixedPointLogarithmIsTheRealOne) {
-  EXPECT_EQ(zstd_opt_log2(1u), 0u) << "log2(1) is zero";
-  EXPECT_EQ(zstd_opt_log2(256u), 8u * 256u) << "an exact power of two";
-  EXPECT_EQ(zstd_opt_log2(1u << 31), 31u * 256u);
+  EXPECT_EQ(gcomp_bitcost_log2(1u), 0u) << "log2(1) is zero";
+  EXPECT_EQ(gcomp_bitcost_log2(256u), 8u * 256u) << "an exact power of two";
+  EXPECT_EQ(gcomp_bitcost_log2(1u << 31), 31u * 256u);
   // Zero has no logarithm; the model never has a count of zero, and asking
   // for one must still give a usable number rather than wrapping.
-  EXPECT_EQ(zstd_opt_log2(0u), 0u);
+  EXPECT_EQ(gcomp_bitcost_log2(0u), 0u);
 
   for (uint32_t x = 1; x < 4096; x++) {
     double want = std::log2(static_cast<double>(x)) * 256.0;
-    double got = static_cast<double>(zstd_opt_log2(x));
+    double got = static_cast<double>(gcomp_bitcost_log2(x));
     EXPECT_LE(std::fabs(got - want), 1.0) << "log2(" << x << ")";
   }
   for (uint32_t bit = 12; bit < 32; bit++) {
     for (uint32_t k = 0; k < 64; k++) {
       uint32_t x = (1u << bit) + k * ((1u << bit) / 64u) + k;
       double want = std::log2(static_cast<double>(x)) * 256.0;
-      double got = static_cast<double>(zstd_opt_log2(x));
+      double got = static_cast<double>(gcomp_bitcost_log2(x));
       EXPECT_LE(std::fabs(got - want), 1.0) << "log2(" << x << ")";
     }
   }
