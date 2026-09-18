@@ -105,8 +105,14 @@ Public headers and main entry points (all under `include/ghoti.io/compress/`):
 | `xxhash64.h` | XXH64 hash (zstd checksum) |
 | `method.h` | Method vtable interface (for custom methods) |
 | `macros.h` | Cross-compiler macros (e.g. GCOMP_API) |
+| `namespace.h` | Renames every symbol to its `ghotiio_compress_<branch>_` form |
+| `libver.h` | Version macros, generated at build time into `libver_gen.h` |
 
 Optional / build-time: `job_queue.h`, `thread_pool.h` (for parallel encode when used).
+
+Every header listed here is installed, `namespace.h` and `libver.h` included -
+`make install` copies the whole of `include/ghoti.io/` plus the generated
+headers, so anything in the tree above is part of what a consumer receives.
 
 ### Internal-Only Headers
 
@@ -492,6 +498,8 @@ compress/
 │   ├── errors.h                  # Status codes
 │   ├── allocator.h               # Memory allocation
 │   ├── limits.h                  # Safety limits
+│   ├── thread_pool.h             # Worker pool for parallel encoding
+│   ├── job_queue.h               # Bounded queue the pool feeds from
 │   ├── deflate.h                 # Deflate-specific API
 │   ├── gzip.h                    # Gzip-specific API
 │   ├── lz4.h                     # LZ4-specific API
@@ -501,7 +509,9 @@ compress/
 │   ├── crc32.h                   # CRC-32 (gzip)
 │   ├── xxhash32.h                # XXH32 (LZ4)
 │   ├── xxhash64.h                # XXH64 (zstd)
-│   └── macros.h                  # Cross-compiler utilities
+│   ├── macros.h                  # Cross-compiler utilities
+│   ├── namespace.h               # GHOTIIO_COMPRESS symbol prefixing
+│   └── libver.h                  # Generated version macros
 │
 ├── src/
 │   ├── compress.c                # Convenience functions
@@ -509,11 +519,25 @@ compress/
 │   │   ├── stream.c              # Encoder/decoder management
 │   │   ├── stream_cb.c           # Callback-based streaming
 │   │   ├── registry.c            # Method registry
+│   │   ├── method.c              # Vtable helpers and schema validation
 │   │   ├── options.c             # Options system
 │   │   ├── allocator.c           # Default allocator
 │   │   ├── limits.c              # Limit checking
 │   │   ├── errors.c              # Error utilities
 │   │   ├── buffer.c              # Buffer convenience functions
+│   │   ├── thread_pool.c         # Worker threads over cutil primitives
+│   │   ├── job_queue.c           # Bounded job queue (see the warning in
+│   │   │                         #   job_queue.h about blocking submits)
+│   │   ├── parallel_block.c      # Shared block-parallel driver (LZ4, zstd)
+│   │   ├── huffman_lengths.c     # Length-limited code lengths by
+│   │   │                         #   boundary package-merge (deflate, zstd)
+│   │   ├── crc32.c               # CRC-32 (gzip)
+│   │   ├── xxhash32.c            # XXH32 (LZ4)
+│   │   ├── xxhash64.c            # XXH64 (zstd)
+│   │   ├── bitcost.h             # Fixed-point log2 and symbol pricing
+│   │   │                         #   shared by both optimal parses
+│   │   ├── stepdown.h            # Why an encoder fell back, for tests
+│   │   ├── endian.h              # Unaligned little-endian load/store
 │   │   └── *_internal.h          # Internal headers
 │   │
 │   ├── autoreg/                  # Auto-registration support
@@ -521,7 +545,7 @@ compress/
 │   │
 │   └── methods/                  # Compression method implementations
 │       ├── deflate/
-│       │   ├── deflate_encode.c  # Encoder (LZ77 + Huffman)
+│       │   ├── deflate_encode.c  # Encoder: match finder, parses, blocks
 │       │   ├── deflate_decode.c  # Decoder
 │       │   ├── deflate_register.c# Vtable and registration
 │       │   ├── huffman.c         # Huffman table building
@@ -539,6 +563,14 @@ compress/
 │       │   ├── lz4_frame.c       # Frame header/trailer
 │       │   ├── lz4_parallel.c    # Parallel encoding support
 │       │   └── lz4_register.c    # Vtable and registration
+│       ├── lzw/
+│       │   ├── lzw_encoder.c     # LZW encoder (profile-driven)
+│       │   ├── lzw_decoder.c     # LZW decoder (profile-driven)
+│       │   ├── lzw_core.c        # Code table and string extension
+│       │   ├── lzw_hash.c        # Hash lookup; the default, and the fast one
+│       │   ├── lzw_bitio.c       # Variable-width code packing, both orders
+│       │   ├── lzw_profile.c     # GIF / TIFF / compress(1) grammars
+│       │   └── lzw_register.c    # Vtable and registration
 │       ├── rle/
 │       │   ├── rle_encoder.c     # RLE encoder (profile-driven)
 │       │   ├── rle_decoder.c     # RLE decoder (profile-driven)
@@ -549,8 +581,17 @@ compress/
 │       └── zstd/
 │           ├── zstd_encoder.c    # Zstd frame encoder
 │           ├── zstd_decoder.c    # Zstd frame decoder
+│           ├── zstd_frame.c      # Frame header and trailer
+│           ├── zstd_block.c      # Block framing and type choice
+│           ├── zstd_matchfinder.c# Hash chain and binary tree search
+│           ├── zstd_optimal.c    # Shortest-path parse (levels 16+)
+│           ├── zstd_literals.c   # Literals section, all four types
+│           ├── zstd_huf.c        # Huffman for literals
+│           ├── zstd_fse.c        # FSE tables, both directions
+│           ├── zstd_sequences.c  # Sequence decode
+│           ├── zstd_sequences_encode.c # Sequence encode and table choice
+│           ├── zstd_dict.c       # Dictionary parsing and priming
 │           ├── zstd_parallel.c   # Parallel encoding support
-│           ├── zstd_*.c          # Format, FSE, Huffman, sequences (decode + encode), etc.
 │           └── zstd_register.c   # Vtable and registration
 │
 ├── tests/                        # Unit tests (Google Test)
