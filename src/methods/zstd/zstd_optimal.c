@@ -309,15 +309,26 @@ static inline uint32_t zstd_opt_of_price(
 /**
  * @brief How @p offset would be written, given the path's repeat offsets.
  *
- * When there are literals before the match, a distance equal to one of the
- * three most recently used is written as 1, 2 or 3.  With no literals the
- * three codes mean something else (RFC 8878 section 3.1.1.3.2.1.1), and
- * rather than encode that shift this parse writes the distance out in full,
- * which is always legal and merely costs more.
+ * A distance equal to one of the three most recently used is written as the
+ * code 1, 2 or 3 rather than as a distance, which is a large saving.  Which
+ * of the three a code names depends on whether the sequence has literals
+ * before it: with none, the codes shift up by one and the third names the
+ * most recent distance less one (RFC 8878 section 3.1.1.3.2.1.1).
+ *
+ * That shifted form is not a curiosity here.  A parse that chooses matches
+ * by cost puts them end to end constantly: at level 19, 52% of the sequences
+ * over 400 KB of manual pages have no literals before them, and 64% over C
+ * source.  Declining the codes there, as the deferred parse still does,
+ * meant writing a full distance for most of the block.  Taking them is worth
+ * 0.44% of the output at level 22, and it is faster, because a cheaper
+ * offset makes a longer match worth taking and there are fewer sequences.
+ *
+ * Anything else is the distance plus three, since the first three values are
+ * spoken for.
  */
 static inline uint32_t zstd_opt_encode_offset(
     const uint32_t * rep, uint32_t litlen, uint32_t offset) {
-  if (litlen > 0) {
+  if (litlen > 0u) {
     if (offset == rep[0]) {
       return 1u;
     }
@@ -328,31 +339,57 @@ static inline uint32_t zstd_opt_encode_offset(
       return 3u;
     }
   }
+  else {
+    if (offset == rep[1]) {
+      return 1u;
+    }
+    if (offset == rep[2]) {
+      return 2u;
+    }
+    // Code 3 with no literals means one less than the most recent distance,
+    // and a distance of zero is not a distance.
+    if (rep[0] > 1u && offset == rep[0] - 1u) {
+      return 3u;
+    }
+  }
   return offset + 3u;
 }
 
 /**
  * @brief The three repeat offsets after a sequence written as @p encoded.
+ *
+ * Whichever of the three the sequence used comes to the front and everything
+ * it passed drops one place; a distance that was not in the list at all
+ * comes to the front and pushes the last one off.  Both cases are the same
+ * rule, and it is written once here so that the parse's idea of the list and
+ * the encoder's cannot drift apart.
  */
 static inline void zstd_opt_rep_after(const uint32_t * in, uint32_t encoded,
-    uint32_t offset, uint32_t * out) {
-  switch (encoded) {
-    case 1u: // Already the most recent; nothing moves.
+    uint32_t litlen, uint32_t offset, uint32_t * out) {
+  unsigned slot = 3u; // Not one of the three.
+  if (encoded <= 3u) {
+    slot = encoded - 1u + ((litlen == 0u) ? 1u : 0u);
+  }
+
+  switch (slot) {
+    case 0u:
       out[0] = in[0];
       out[1] = in[1];
       out[2] = in[2];
       break;
-    case 2u: // Promote the second past the first.
+    case 1u:
       out[0] = in[1];
       out[1] = in[0];
       out[2] = in[2];
       break;
-    case 3u: // Promote the third past both.
+    case 2u:
       out[0] = in[2];
       out[1] = in[0];
       out[2] = in[1];
       break;
-    default: // A distance not in the list; it becomes the most recent.
+    default:
+      // A distance from outside the list -- either written in full, or the
+      // "one less than the most recent" that code 3 means with no literals.
       out[0] = offset;
       out[1] = in[0];
       out[2] = in[1];
@@ -512,7 +549,7 @@ static inline void zstd_opt_relax_run(const struct zstd_opt_state_s * st,
   uint32_t fixed = here_price + zstd_opt_of_price(st, enc) +
       zstd_opt_ll_price(st, 0u);
   uint32_t next_rep[3];
-  zstd_opt_rep_after(here_rep, enc, offset, next_rep);
+  zstd_opt_rep_after(here_rep, enc, here_litlen, offset, next_rep);
 
   uint32_t span = hi - lo;
   if (span > *budget) {
@@ -635,21 +672,34 @@ gcomp_status_t zstd_opt_generate_sequences(zstd_match_finder_t * mf,
       size_t ncand = zstd_mf_find_matches(
           mf, data, p, data_size, cand, ZSTD_MF_MAX_CANDIDATES);
 
-      // The three repeat offsets are worth trying at every position, not
-      // only where the match finder happens to turn one up: they cost a code
-      // and no distance, so a short match through one can beat a longer
-      // match through a distance written out in full.
-      uint32_t rep_len[3] = {0u, 0u, 0u};
+      // The distances a one-symbol code can name from here are worth trying
+      // at every position, not only where the match finder happens to turn
+      // one up: they cost a code and no distance, so a short match through
+      // one can beat a longer match through a distance written out in full.
+      //
+      // Which three they are depends on whether a literal run is pending;
+      // see zstd_opt_encode_offset().
+      uint32_t probe_off[3];
       if (here_litlen > 0u) {
-        for (unsigned r = 0; r < 3u; r++) {
-          uint32_t off = here_rep[r];
-          if (off == 0u || (size_t)off > max_offset || (size_t)off > p) {
-            continue;
-          }
-          size_t rl = zstd_mf_count_match(data + p, data + p - off, limit);
-          if (rl >= MF_MIN_MATCH) {
-            rep_len[r] = (uint32_t)rl;
-          }
+        probe_off[0] = here_rep[0];
+        probe_off[1] = here_rep[1];
+        probe_off[2] = here_rep[2];
+      }
+      else {
+        probe_off[0] = here_rep[1];
+        probe_off[1] = here_rep[2];
+        probe_off[2] = (here_rep[0] > 1u) ? (here_rep[0] - 1u) : 0u;
+      }
+
+      uint32_t rep_len[3] = {0u, 0u, 0u};
+      for (unsigned r = 0; r < 3u; r++) {
+        uint32_t off = probe_off[r];
+        if (off == 0u || (size_t)off > max_offset || (size_t)off > p) {
+          continue;
+        }
+        size_t rl = zstd_mf_count_match(data + p, data + p - off, limit);
+        if (rl >= MF_MIN_MATCH) {
+          rep_len[r] = (uint32_t)rl;
         }
       }
 
@@ -669,13 +719,13 @@ gcomp_status_t zstd_opt_generate_sequences(zstd_match_finder_t * mf,
       for (unsigned r = 0; r < 3u; r++) {
         if (rep_len[r] >= force_at) {
           uint32_t enc =
-              zstd_opt_encode_offset(here_rep, here_litlen, here_rep[r]);
+              zstd_opt_encode_offset(here_rep, here_litlen, probe_off[r]);
           uint32_t price =
               zstd_opt_of_price(st, enc) + zstd_opt_ml_price(st, rep_len[r]);
           if (!forced_len || price < best_forced_price) {
             best_forced_price = price;
             forced_len = rep_len[r];
-            forced_off = here_rep[r];
+            forced_off = probe_off[r];
           }
         }
       }
@@ -704,7 +754,7 @@ gcomp_status_t zstd_opt_generate_sequences(zstd_match_finder_t * mf,
           continue;
         }
         zstd_opt_relax_run(st, nodes, j, MF_MIN_MATCH, rep_len[r], here_price,
-            here_rep, here_litlen, here_rep[r], &budget, &dirty);
+            here_rep, here_litlen, probe_off[r], &budget, &dirty);
       }
 
       // The match finder's candidates, shortest first.  Each one covers the
@@ -770,7 +820,7 @@ gcomp_status_t zstd_opt_generate_sequences(zstd_match_finder_t * mf,
 #endif
       uint32_t enc = zstd_opt_encode_offset(rep, lit_len, off);
       uint32_t next_rep[3];
-      zstd_opt_rep_after(rep, enc, off, next_rep);
+      zstd_opt_rep_after(rep, enc, lit_len, off, next_rep);
       rep[0] = next_rep[0];
       rep[1] = next_rep[1];
       rep[2] = next_rep[2];
@@ -815,7 +865,7 @@ gcomp_status_t zstd_opt_generate_sequences(zstd_match_finder_t * mf,
 #endif
       uint32_t enc = zstd_opt_encode_offset(rep, lit_len, forced_off);
       uint32_t next_rep[3];
-      zstd_opt_rep_after(rep, enc, forced_off, next_rep);
+      zstd_opt_rep_after(rep, enc, lit_len, forced_off, next_rep);
       rep[0] = next_rep[0];
       rep[1] = next_rep[1];
       rep[2] = next_rep[2];
