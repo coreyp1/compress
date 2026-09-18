@@ -135,9 +135,9 @@ picks from what it finds, and how large a window it declares.
 | 2-3 | hash chain, 8-16 | deferred | 128 KB | general purpose (**default: 3**) |
 | 4-6 | hash chain, 24-64 | deferred | 512 KB | |
 | 7-8 | hash chain, 80-112 | deferred | 2 MB | the fast end of the chain |
-| 9-10 | **binary tree**, 14-16 | deferred | 2 MB | where the tree takes over |
-| 11-15 | binary tree, 16-24 | **shortest path** | 8 MB | archival; where the parse takes over |
-| 16-22 | binary tree, 28-64 | shortest path | 8 MB at 16, 32 MB from 17 | maximum compression |
+| 9-10 | **binary tree**, 24-32 | deferred | 2 MB | where the tree takes over |
+| 11-15 | binary tree, 36-52 | **shortest path** | 8 MB | archival; where the parse takes over |
+| 16-22 | binary tree, 56-128 | shortest path | 8 MB at 16, 32 MB from 17 | maximum compression |
 
 **The candidate counts either side of level 9 are not comparable.** A hash-chain
 step crosses off one position and learns nothing about the next, so searching
@@ -147,8 +147,9 @@ at level 9 is *more* search than 112 at level 8, not less.
 
 The two bands that matter most are 8 to 9, where the search changes, and 10 to
 11, where the parse does. The second is the larger: on a 19 MB corpus level 11
-is 6.4% smaller than level 10, which is more than levels 11 through 22 together
-used to buy.
+is 8.0% smaller than level 10, which is more than levels 11 through 22 together
+used to buy. A level above 11 buys tenths of a percent; the step onto 11 buys
+the rest.
 
 **Deferred** parsing holds a match back to see whether the next position starts a
 longer one. **Shortest path** does not defer at all: it prices every candidate

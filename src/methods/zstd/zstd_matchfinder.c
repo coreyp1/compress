@@ -232,14 +232,26 @@ typedef struct {
 // what one level of shortest path does, and could not.
 //
 // The parse is now what separates 11 from 10, at the level where the window
-// steps to 8 MB.  Over the same files levels 11 to 15 became 4.9% to 8.2%
-// smaller; over the 19 MB corpus they went from a little behind libzstd at
-// the same level to 6.4% to 7.8% ahead of it.  The cost is real and is the
-// point of a level: 11 fell from 6.3 MB/s to 5.4.
+// steps to 8 MB.  Over the same files level 11 fell from 1,865,395 bytes to
+// 1,714,856, which is 8.0% below level 10 and smaller than level 22 used to
+// be; over the 19 MB corpus levels 11 to 15 went from roughly level with
+// libzstd at the same level to 8.3% to 8.6% ahead of it.  The cost is real
+// and is the point of a level: 11 runs at 4.9 MB/s against 10's 8.9.
 //
-// Levels 16 to 22 were re-tuned to follow on rather than restart, because
-// 16's old settings are now 15's neighbourhood: each step above 15 raises
-// the segment and the budget rather than the depth alone.
+// Two things were learned while tuning it, both the hard way:
+//
+//   - The first version gave level 11 a search_depth of 16, which was the
+//     same as level 10's at the time.  When levels 9 and 10 were deepened
+//     to 24 and 32, level 11 was left searching half as far as the level
+//     below it and came out LARGER -- 65,301 bytes against 63,244 on 400 KB
+//     of repetitive text.  A level that parses better still has to search at
+//     least as hard.  HigherLevelsDoNotProduceLargerOutput caught it.
+//
+//   - `opt_segment` matters more than the depth in this band.  Raising
+//     level 11's sweep from 512 positions to 1024 was worth another 3.4% on
+//     the four files, more than any depth change tried.  A sweep is where
+//     the parse can see; a bound on the candidates is only how many of the
+//     things it can see get priced.
 //
 // `nice_length` turned out to be the knob that matters for the tree, far
 // more than the depth.  Reaching it stops the descent, and stopping the
@@ -258,20 +270,20 @@ static const zstd_effort_t k_zstd_effort[23] = {
     {64, 1, 128, 16, 0, 0, 0, 0},          // 6: the window steps to 2 MB next
     {80, 1, 128, 17, 0, 0, 0, 0},          // 7
     {112, 2, 192, 17, 0, 0, 0, 0},         // 8: last of the chain levels
-    {14, 2, 256, 17, 1, 0, 0, 0},          // 9: first of the tree levels
-    {16, 2, 512, 17, 1, 0, 0, 0},          // 10
-    {16, 0, 512, 17, 1, 1, 512, 0},        // 11: first of the optimal levels
-    {18, 0, 768, 17, 1, 1, 768, 4},        // 12
-    {20, 0, 1024, 18, 1, 1, 1024, 8},      // 13
-    {22, 0, 1536, 18, 1, 1, 1024, 16},     // 14
-    {24, 0, 2048, 18, 1, 1, 1536, 24},     // 15
-    {28, 0, 2560, 18, 1, 1, 2048, 32},     // 16
-    {32, 0, 3072, 18, 1, 1, 2560, 48},     // 17
-    {36, 0, 3584, 18, 1, 1, 3072, 80},     // 18
-    {40, 0, 4096, 18, 1, 1, 4096, 128},    // 19
-    {44, 0, 5120, 18, 1, 1, 6144, 192},    // 20
-    {52, 0, 8192, 18, 1, 1, 8192, 320},    // 21
-    {64, 0, 12288, 18, 1, 1, 16384, 512}   // 22
+    {24, 2, 256, 17, 1, 0, 0, 0},          // 9: first of the tree levels
+    {32, 2, 512, 17, 1, 0, 0, 0},          // 10
+    {36, 0, 768, 17, 1, 1, 1024, 8},       // 11: first of the optimal levels
+    {40, 0, 1024, 17, 1, 1, 1280, 12},     // 12
+    {44, 0, 1280, 18, 1, 1, 1536, 16},     // 13
+    {48, 0, 1536, 18, 1, 1, 2048, 24},     // 14
+    {52, 0, 2048, 18, 1, 1, 2560, 32},     // 15
+    {56, 0, 2560, 18, 1, 1, 3072, 48},     // 16
+    {60, 0, 3072, 18, 1, 1, 4096, 64},     // 17
+    {64, 0, 3584, 18, 1, 1, 5120, 96},     // 18
+    {72, 0, 4096, 18, 1, 1, 6144, 128},    // 19
+    {80, 0, 5120, 18, 1, 1, 8192, 192},    // 20
+    {96, 0, 8192, 18, 1, 1, 12288, 320},   // 21
+    {128, 0, 12288, 18, 1, 1, 16384, 512}  // 22
 };
 
 /**
@@ -742,8 +754,9 @@ static bool zstd_mf_find_match(zstd_match_finder_t * mf, const uint8_t * data,
  * This is also why every position must be inserted exactly once and in
  * order.  Inserting one twice would make a node its own descendant.  The
  * caller does that already -- the chain wanted the same thing for a weaker
- * reason -- and positions skipped inside a match are inserted by the fill
- * loop in zstd_mf_generate_sequences().
+ * reason -- and the positions a match covers are put in by the fill loop in
+ * zstd_mf_generate_sequences(), every one of them for a short match and one
+ * every nice_length bytes inside a long one.
  *
  * POSITIONS ARE ABSOLUTE
  * ======================
@@ -1180,11 +1193,32 @@ gcomp_status_t zstd_mf_generate_sequences(zstd_match_finder_t * mf,
       size_t match_end = pos + match.length;
       size_t fill_from = (indexed > pos) ? indexed + 1 : pos + 1;
       size_t fill_to = match_end;
+      //
+      // A match at least nice_length long does not have every position it
+      // covers inserted: those positions are the tail of a match already
+      // taken, and putting each one in cost a fortune on periodic data --
+      // 425a258 measured 9.3 seconds for 4 MB of a 1500 byte pattern.
+      //
+      // Skipping them entirely, which is what that commit did, turned out to
+      // cost ratio at the two levels that search a tree without pricing what
+      // it finds.  Its reasoning was that "anything later that wants them
+      // will find the same source through its own hash", and on periodic
+      // input that is not so: after a long match every position that could
+      // have sourced the next one is inside a long match too, so the tree
+      // holds nothing but match starts, and the next block pays a full
+      // offset where it could have repeated one.  On 4 MB of a 1500 byte
+      // period, 13 of the 31 blocks came out at 73 bytes instead of 10.
+      //
+      // So they are sampled rather than skipped: one position every
+      // nice_length bytes, which is the same order as the bytes an insertion
+      // compares, so the cost stays linear in the input.  That input is back
+      // to 1,924 bytes from 2,795, and the encoder still reads it in 11 ms.
+      size_t stride = 1;
       if (mf->use_bt && match.length >= mf->nice_length) {
-        fill_to = fill_from;
+        stride = mf->nice_length;
       }
       for (size_t i = fill_from;
-           i < fill_to && i + MF_HASH_READ_SIZE <= data_size; i++) {
+           i < fill_to && i + MF_HASH_READ_SIZE <= data_size; i += stride) {
         zstd_mf_insert_one(mf, data, i, data_size);
       }
 
