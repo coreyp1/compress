@@ -591,6 +591,97 @@ static gcomp_status_t zstd_sequences_setup_tables(zstd_decoder_state_t * state,
 // Sequence Execution
 //
 
+/**
+ * @brief One sequence as the bitstream describes it, before the repeat offset
+ *        list has been consulted.
+ */
+typedef struct {
+  uint32_t literal_length;
+  uint32_t match_length;
+  uint32_t offset; ///< Offset_Value: 1-3 name repeat offsets, above that +3.
+} zstd_decoded_seq_t;
+
+/**
+ * @brief Read one sequence out of the bitstream and move the FSE states on.
+ *
+ * This is the half of a sequence that depends on nothing but the bitstream --
+ * three table lookups, the extra bits, and the state transition.  Nothing here
+ * touches the output, the window or the repeat offset list, which is what lets
+ * the caller run it a sequence ahead of the copying.
+ *
+ * @param last Non-zero for the final sequence, which does not move the states
+ *             on because nothing will read them.
+ */
+static inline gcomp_status_t zstd_decode_one_sequence(
+    zstd_decoder_state_t * state, zstd_seq_bit_reader_t * br,
+    zstd_seq_state_t * seq_state, zstd_decoded_seq_t * out, int last) {
+  zstd_seq_bit_reader_refill(br);
+
+  // Decode sequence codes from FSE states
+  uint8_t ll_code = state->fse_lit_table[seq_state->ll_state].symbol;
+  uint8_t of_code = state->fse_offset_table[seq_state->of_state].symbol;
+  uint8_t ml_code = state->fse_match_table[seq_state->ml_state].symbol;
+
+  // Read extra bits for offset first (important: offset extra bits read
+  // first). Per spec offset = 2^code + extra; code must be at most 31 to
+  // avoid undefined shift on 32-bit type.
+  if (of_code > 31) {
+    return GCOMP_ERR_CORRUPT;
+  }
+  if (of_code > 0) {
+    uint32_t extra = zstd_seq_bit_reader_take(br, of_code);
+    out->offset = (1U << of_code) + extra;
+  }
+  else {
+    out->offset = 1;
+  }
+
+  // Read extra bits for match length
+  if (ml_code >= 53) {
+    return GCOMP_ERR_CORRUPT;
+  }
+  out->match_length = zstd_seq_ml_baseline[ml_code] +
+      zstd_seq_bit_reader_take(br, zstd_seq_ml_extra_bits[ml_code]);
+
+  // Read extra bits for literal length
+  if (ll_code >= 36) {
+    return GCOMP_ERR_CORRUPT;
+  }
+  out->literal_length = zstd_seq_ll_baseline[ll_code] +
+      zstd_seq_bit_reader_take(br, zstd_seq_ll_extra_bits[ll_code]);
+
+  // Update FSE states (unless last sequence).
+  //
+  // The three moves read literal-length bits, then match-length bits, then
+  // offset bits, from adjacent positions in the stream; and none of the
+  // three tables is indexed by a state the others change.  So all three
+  // entries are looked up first and all three sets of bits taken at once,
+  // most significant first, which puts literal length's share at the top.
+  if (!last) {
+    const zstd_fse_entry_t * ll_entry =
+        &state->fse_lit_table[seq_state->ll_state];
+    const zstd_fse_entry_t * ml_entry =
+        &state->fse_match_table[seq_state->ml_state];
+    const zstd_fse_entry_t * of_entry =
+        &state->fse_offset_table[seq_state->of_state];
+
+    const unsigned ll_nb = ll_entry->nb_bits;
+    const unsigned ml_nb = ml_entry->nb_bits;
+    const unsigned of_nb = of_entry->nb_bits;
+
+    uint32_t bits = zstd_seq_bit_reader_take(br, ll_nb + ml_nb + of_nb);
+
+    seq_state->ll_state =
+        (uint16_t)(ll_entry->new_state + (bits >> (ml_nb + of_nb)));
+    seq_state->ml_state = (uint16_t)(ml_entry->new_state +
+        ((bits >> of_nb) & ((1u << ml_nb) - 1u)));
+    seq_state->of_state =
+        (uint16_t)(of_entry->new_state + (bits & ((1u << of_nb) - 1u)));
+  }
+
+  return GCOMP_OK;
+}
+
 static gcomp_status_t zstd_sequences_execute(zstd_decoder_state_t * state,
     const uint8_t * literals, size_t literals_size, const uint8_t * bitstream,
     size_t bitstream_size, uint32_t num_sequences, uint8_t * dst,
@@ -630,16 +721,16 @@ static gcomp_status_t zstd_sequences_execute(zstd_decoder_state_t * state,
   // HOW THE BITS ARE SPENT
   // ======================
   //
-  // Each pass took six separate reads, and every one of them refilled the
-  // container afterwards -- a shift, a comparison and, one time in seven, a
-  // load, sitting in the dependency chain between each read and the next.  Six
-  // refills per sequence to consume bits that arrive fifty-six at a time.
+  // Each pass used to take six separate bit reads, and every one refilled the
+  // container afterwards -- a branch, and one time in seven a load, sitting in
+  // the dependency chain between each read and the next.  Six refills per
+  // sequence to consume bits that arrive fifty-six at a time.
   //
   // A refill leaves `used` below eight and the container holds sixty-four, so
   // fifty-seven bits can be taken before another is needed.  What one sequence
   // can spend is bounded, but not by much:
   //
-  //   offset extra bits    at most 31  (the of_code > 31 check below)
+  //   offset extra bits    at most 31  (the of_code > 31 check)
   //   match length extra   at most 16  (zstd_seq_ml_extra_bits)
   //   literal length extra at most 16  (zstd_seq_ll_extra_bits)
   //   three state moves    at most 27  (FSE accuracy log is capped at 9)
@@ -647,92 +738,55 @@ static gcomp_status_t zstd_sequences_execute(zstd_decoder_state_t * state,
   // Ninety in the worst case, so a single refill per sequence cannot be shown
   // to be enough.  It does not have to be: zstd_seq_bit_reader_take() fetches
   // what it needs when it needs it, so correctness does not rest on this
-  // arithmetic about tables that arrive from outside.  The refill here is an
-  // optimisation -- it keeps `used` small enough that the check inside take()
-  // never fires on ordinary data, and that is all it is for.
+  // arithmetic about tables that arrive from outside.  The refill at the head
+  // of zstd_decode_one_sequence() is an optimisation -- it keeps `used` small
+  // enough that the check inside take() never fires on ordinary data.
   //
   // Placing a second refill part way through the sequence was tried, on the
-  // reasoning that 31+16 and 16+27 both fit.  It measured slower than this,
-  // 690 MB/s against 730, because it does work the take() check was going to
-  // skip anyway.  Removing this one as well is slower still, around 655.
+  // reasoning that 31+16 and 16+27 both fit.  It measured slower, 690 MB/s
+  // against 730, because it does work the take() check was going to skip.
+  // Removing the remaining one as well is slower still, around 655.
   //
-  // The three state moves also become one read rather than three: they sit at
-  // adjacent positions in the stream and none of the three tables is indexed
-  // by a state the others change, so their bits are taken together and split,
-  // which is what the shifts below do.
+  // READING ONE SEQUENCE AHEAD WAS TRIED, AND IS NOT HERE
+  // =====================================================
+  //
+  // Reading a sequence and writing one are nearly independent, which is why
+  // zstd_decode_one_sequence() is a function: the reading half walks the FSE
+  // tables and the bitstream, the writing half below consults the repeat
+  // offset list and moves bytes, and nothing the writing half touches feeds
+  // back into the tables.  Only the order the repeat offset list is updated in
+  // ties them together.
+  //
+  // That invites decoding sequence i+1 before writing sequence i, so that the
+  // FSE table walk -- a chain where a state indexes a table, the entry gives
+  // the bits, and the bits give the next state -- runs while a match copy is
+  // in flight.  It was written both ways, with a two-slot array and with two
+  // structs, and both were slower: 17,242,528 instructions against 15,746,658,
+  // and about 660 MB/s against 735.
+  //
+  // There is nothing for it to hide.  Decoding 2.5 MB of manual pages at level
+  // 9, where the window is 2 MB, misses L1 on 1.30% of data reads and the last
+  // level on 0.054%: the FSE tables are two kilobytes and the match sources
+  // are inside a window that fits several times over in this machine's 12 MB
+  // of last-level cache.  What the pipeline would overlap is a four-cycle L1
+  // load that the processor reorders around already, and the bookkeeping to
+  // arrange it costs more than that.
+  //
+  // libzstd does pipeline, but to prefetch the match source, which is a
+  // hundreds-of-cycles trip to memory when the window is tens of megabytes.
+  // At the window sizes this library uses it is not one.
+  zstd_decoded_seq_t cur;
+
   for (uint32_t i = 0; i < num_sequences; i++) {
-    zstd_seq_bit_reader_refill(&br);
-
-    // Decode sequence codes from FSE states
-    uint8_t ll_code = state->fse_lit_table[seq_state.ll_state].symbol;
-    uint8_t of_code = state->fse_offset_table[seq_state.of_state].symbol;
-    uint8_t ml_code = state->fse_match_table[seq_state.ml_state].symbol;
-
-    // Read extra bits for offset first (important: offset extra bits read
-    // first). Per spec offset = 2^code + extra; code must be at most 31 to
-    // avoid undefined shift on 32-bit type.
-    if (of_code > 31) {
-      return GCOMP_ERR_CORRUPT;
-    }
-    uint32_t offset;
-    if (of_code > 0) {
-      uint32_t extra = zstd_seq_bit_reader_take(&br, of_code);
-      offset = (1U << of_code) + extra;
-    }
-    else {
-      offset = 1;
+    gcomp_status_t seq_status = zstd_decode_one_sequence(
+        state, &br, &seq_state, &cur, (i + 1) >= num_sequences);
+    if (seq_status != GCOMP_OK) {
+      return seq_status;
     }
 
-    // Read extra bits for match length
-    uint32_t match_length;
-    if (ml_code < 53) {
-      uint32_t extra =
-          zstd_seq_bit_reader_take(&br, zstd_seq_ml_extra_bits[ml_code]);
-      match_length = zstd_seq_ml_baseline[ml_code] + extra;
-    }
-    else {
-      return GCOMP_ERR_CORRUPT;
-    }
-
-    // Read extra bits for literal length
-    uint32_t literal_length;
-    if (ll_code < 36) {
-      uint32_t extra =
-          zstd_seq_bit_reader_take(&br, zstd_seq_ll_extra_bits[ll_code]);
-      literal_length = zstd_seq_ll_baseline[ll_code] + extra;
-    }
-    else {
-      return GCOMP_ERR_CORRUPT;
-    }
-
-    // Update FSE states (unless last sequence).
-    //
-    // The three moves read literal-length bits, then match-length bits, then
-    // offset bits, from adjacent positions in the stream; and none of the
-    // three tables is indexed by a state the others change.  So all three
-    // entries are looked up first and all three sets of bits taken at once,
-    // most significant first, which puts literal length's share at the top.
-    if (i < num_sequences - 1) {
-      const zstd_fse_entry_t * ll_entry =
-          &state->fse_lit_table[seq_state.ll_state];
-      const zstd_fse_entry_t * ml_entry =
-          &state->fse_match_table[seq_state.ml_state];
-      const zstd_fse_entry_t * of_entry =
-          &state->fse_offset_table[seq_state.of_state];
-
-      const unsigned ll_nb = ll_entry->nb_bits;
-      const unsigned ml_nb = ml_entry->nb_bits;
-      const unsigned of_nb = of_entry->nb_bits;
-
-      uint32_t bits = zstd_seq_bit_reader_take(&br, ll_nb + ml_nb + of_nb);
-
-      seq_state.ll_state =
-          (uint16_t)(ll_entry->new_state + (bits >> (ml_nb + of_nb)));
-      seq_state.ml_state = (uint16_t)(ml_entry->new_state +
-          ((bits >> of_nb) & ((1u << ml_nb) - 1u)));
-      seq_state.of_state =
-          (uint16_t)(of_entry->new_state + (bits & ((1u << of_nb) - 1u)));
-    }
+    const uint32_t offset = cur.offset;
+    const uint32_t match_length = cur.match_length;
+    const uint32_t literal_length = cur.literal_length;
 
     // RFC 8878 section 3.1.1.5 (Repeat Offsets).  Offset_Value selects an
     // entry in the three-slot repeat list; a literals length of zero shifts
