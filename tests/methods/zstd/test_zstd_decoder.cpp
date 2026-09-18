@@ -427,6 +427,82 @@ TEST_F(ZstdDecoderTest, MatchCopy_CrossesFromWindowIntoOutput) {
   }
 }
 
+// The decoder must not read past the input it was handed.
+//
+// Feeding it small chunks is not enough to prove that: the usual way to write
+// that test leaves `data` pointing into the whole compressed stream and only
+// shrinks `size`, so a decoder that reads past `size` still finds exactly the
+// bytes it wanted and the test passes.  Every chunk here is copied into its
+// own allocation of exactly the right length, so reading one byte too far is
+// a heap overflow -- wrong data in an ordinary build, and a diagnostic under
+// AddressSanitizer.
+//
+// This is what a compressed block being copied in with the wrong length looks
+// like, and nothing else caught it.
+TEST_F(ZstdDecoderTest, DoesNotReadPastTheInputItWasGiven) {
+  std::vector<uint8_t> input = RepeatingBytes(200000, 61);
+  // Some incompressible tail, so blocks are not all the same shape.
+  uint32_t x = 0xBEEFu;
+  for (int i = 0; i < 40000; i++) {
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    input.push_back(static_cast<uint8_t>(x >> 19));
+  }
+
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  gcomp_options_set_int64(opts, "zstd.level", 3);
+  std::vector<uint8_t> enc = compress(input.data(), input.size(), opts);
+  gcomp_options_destroy(opts);
+  ASSERT_FALSE(enc.empty());
+
+  for (size_t chunk : {size_t(1), size_t(2), size_t(7), size_t(64),
+           size_t(1000)}) {
+    gcomp_options_t * dopts = nullptr;
+    ASSERT_EQ(gcomp_options_create(&dopts), GCOMP_OK);
+    gcomp_options_set_uint64(dopts, "limits.max_expansion_ratio", 0u);
+    gcomp_decoder_t * dec = nullptr;
+    ASSERT_EQ(gcomp_decoder_create(registry_, "zstd", dopts, &dec), GCOMP_OK);
+    gcomp_options_destroy(dopts);
+
+    std::vector<uint8_t> out(input.size() + 4096), decoded;
+    size_t fed = 0;
+    while (fed < enc.size()) {
+      size_t n = enc.size() - fed;
+      if (n > chunk) {
+        n = chunk;
+      }
+      // Exactly n bytes, in an allocation of exactly n bytes.
+      std::vector<uint8_t> piece(enc.begin() + (long)fed,
+          enc.begin() + (long)(fed + n));
+      gcomp_buffer_t in = {piece.data(), piece.size(), 0};
+      while (in.used < in.size) {
+        gcomp_buffer_t ob = {out.data(), out.size(), 0};
+        size_t before = in.used;
+        ASSERT_EQ(gcomp_decoder_update(dec, &in, &ob), GCOMP_OK)
+            << "chunk " << chunk;
+        decoded.insert(decoded.end(), out.data(), out.data() + ob.used);
+        if (in.used == before && ob.used == 0) {
+          break;
+        }
+      }
+      fed += n;
+    }
+    for (;;) {
+      gcomp_buffer_t ob = {out.data(), out.size(), 0};
+      gcomp_status_t f = gcomp_decoder_finish(dec, &ob);
+      decoded.insert(decoded.end(), out.data(), out.data() + ob.used);
+      if (f == GCOMP_OK) {
+        break;
+      }
+      ASSERT_EQ(f, GCOMP_ERR_LIMIT) << "chunk " << chunk;
+    }
+    gcomp_decoder_destroy(dec);
+    EXPECT_EQ(decoded, input) << "chunk " << chunk;
+  }
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
