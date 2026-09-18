@@ -216,6 +216,8 @@ typedef struct {
   size_t hash_size;       ///< Hash table size
   size_t chain_size;      ///< Chain table size (= window size)
   unsigned search_depth;  ///< Maximum chain search depth
+  unsigned lazy_depth;    ///< Positions a match may be deferred through (0 = greedy)
+  uint32_t nice_length;   ///< Length at which a match is taken without looking further
   size_t window_size;     ///< Window size for match offsets
 } zstd_match_finder_t;
 
