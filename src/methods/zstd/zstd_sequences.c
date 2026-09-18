@@ -90,6 +90,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <ghoti.io/compress/macros.h>
+#include "../../core/fastcopy.h"
 #include "zstd_internal.h"
 #include "zstd_sequences_private.h"
 #include <stdlib.h>
@@ -840,7 +841,7 @@ static gcomp_status_t zstd_sequences_execute(zstd_decoder_state_t * state,
     if (out_pos + literal_length > dst_capacity) {
       return GCOMP_ERR_LIMIT;
     }
-    memcpy(dst + out_pos, literals + lit_pos, literal_length);
+    gcomp_copy_short(dst + out_pos, literals + lit_pos, literal_length);
     out_pos += literal_length;
     lit_pos += literal_length;
 
@@ -895,7 +896,7 @@ static gcomp_status_t zstd_sequences_execute(zstd_decoder_state_t * state,
         return GCOMP_ERR_CORRUPT; // Cannot happen; refuse to spin if it does.
       }
 
-      memcpy(dst + out_pos, state->window_buffer + win_idx, run);
+      gcomp_copy_short(dst + out_pos, state->window_buffer + win_idx, run);
       out_pos += run;
       remaining_match -= run;
     }
@@ -913,7 +914,7 @@ static gcomp_status_t zstd_sequences_execute(zstd_decoder_state_t * state,
         memset(dst + out_pos, dst[out_pos - 1u], run);
       }
       else {
-        memcpy(dst + out_pos, dst + out_pos - actual_offset, run);
+        gcomp_copy_short(dst + out_pos, dst + out_pos - actual_offset, run);
       }
       out_pos += run;
       remaining_match -= run;
