@@ -56,12 +56,12 @@
  * - `zstd.window_log` (uint64, default 0/auto): Window log (10-31, 0=auto)
  * - `zstd.dictionary` (bytes, optional): Raw or formatted dictionary (RFC 8878
  * §5)
- * - `zstd.dictionary_id` (uint32, optional): Dictionary ID to write (encoder)
- * or validate (decoder)
+ * - `zstd.dictionary_id` (uint64, optional): Dictionary ID to write (encoder)
+ * or validate (decoder); the frame field itself is 32 bits
  * - `zstd.content_size` (uint64, optional): Content size for header
  * - `zstd.concat` (bool, default false): Decoder: support concatenated frames
- * - `zstd.job_size` (uint64, default 0/auto): Encoder: job size for parallel
- * compression (64KB–16MB)
+ * - `zstd.job_size` (uint64, default 0): Encoder: bytes per parallel job
+ * (64KB-16MB; 0 means 512 KB, whatever the level)
  *
  * Threading (encoder):
  * - `threads.count` (uint64, default 1): Worker threads (0 or 1 =

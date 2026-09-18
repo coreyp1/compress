@@ -54,8 +54,8 @@
  * ## Decoder Behavior
  *
  * The decoder handles all four literal types and supports:
- * - Single-stream Huffman decoding (literals section < 1024 bytes)
- * - Four-stream Huffman decoding (literals section >= 1024 bytes; jump
+ * - Single-stream Huffman decoding (Size_Format 0)
+ * - Four-stream Huffman decoding (Size_Format 1, 2 or 3; jump
  *   table + 4 concatenated streams; encoder uses this when appropriate)
  * - Treeless mode (reuse Huffman table from previous block)
  * - FSE-compressed Huffman weights (header_byte < 128; used when >127
@@ -653,10 +653,13 @@ gcomp_status_t zstd_literals_encode_compressed(
   // Total compressed size = weights + stream(s)
   size_t compressed_size = weights_size + stream_size;
 
-  // Check if compression is beneficial.
-  // The 10% savings requirement is a tunable heuristic, not a format
-  // requirement. This avoids marginal compression that adds decoder complexity
-  // for minimal benefit.
+  // Check if compression is beneficial: the weights, the bitstream and the
+  // largest literals header have to come to less than the literals did.
+  //
+  // There is no percentage threshold here, whatever the comment on this line
+  // used to say -- one byte saved is one byte kept.  Requiring a margin would
+  // mean choosing, for some block, to write the larger of two encodings the
+  // decoder reads identically.
   if (compressed_size + 5 >= literals_size) {
     // No savings (or negative savings), use raw encoding
     gcomp_stepdown_note(stepdowns, GCOMP_STEPDOWN_LITERALS_NOT_WORTH_CODING);

@@ -42,7 +42,7 @@ The Zstd method is a **standalone** compression method (not a wrapper). It imple
 │                      Zstd Frame Structure                          │
 │  ┌─────────────┐  ┌─────────────────────────┐  ┌─────────────────┐ │
 │  │   Header    │  │        Data Blocks      │  │    Trailer      │ │
-│  │  (6-14 B)   │  │                         │  │   (0-4 B)       │ │
+│  │  (6-18 B)   │  │                         │  │   (0-4 B)       │ │
 │  └─────────────┘  └─────────────────────────┘  └─────────────────┘ │
 │        │                    │                         │            │
 │        v                    v                         v            │
@@ -70,7 +70,8 @@ Compressed blocks contain two sections:
 
 1. **Literals Section**: The literal bytes (non-matched data)
    - Can be raw, RLE, or Huffman-compressed
-   - Huffman trees can be inline or reuse previous tree
+   - A Huffman table can be carried inline or reused from the previous block;
+     this encoder always writes its own, and reads either
 
 2. **Sequences Section**: LZ match instructions
    - Each sequence: (literal_length, match_offset, match_length)
@@ -97,7 +98,7 @@ Compressed blocks contain two sections:
 | `zstd.checksum` | bool | false | Enable content checksum (xxHash64, low 32 bits) |
 | `zstd.window_log` | uint64 | 0 (auto) | Window log size (10-31). 0 = auto from level |
 | `zstd.dictionary` | bytes | (none) | Optional dictionary (raw content or formatted per RFC 8878 §5) |
-| `zstd.dictionary_id` | uint32 | (none) | Dictionary ID to write (encoder) or validate (decoder); used when dictionary provided |
+| `zstd.dictionary_id` | uint64 | (none) | Dictionary ID to write (encoder) or validate (decoder); used when dictionary provided. The format carries at most 32 bits |
 | `zstd.content_size` | uint64 | (none) | Content size to write in header (optional) |
 | `zstd.concat` | bool | false | Decoder: support concatenated frames |
 | `zstd.job_size` | uint64 | 0 (auto) | Encoder: job size for parallel compression (64KB–16MB, 0=auto) |
@@ -115,7 +116,7 @@ When `threads.count > 1`, the encoder uses parallel compression where input is s
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `limits.max_output_bytes` | uint64 | 512 MiB | Maximum decompressed output (decoder) |
-| `limits.max_window_bytes` | uint64 | (derived) | Maximum window size |
+| `limits.max_window_bytes` | uint64 | 128 MiB | Maximum window a frame may declare |
 | `limits.max_memory_bytes` | uint64 | 256 MiB | Maximum working memory |
 | `limits.max_expansion_ratio` | uint64 | 1000 | Maximum output/input ratio (decoder) |
 
@@ -291,7 +292,7 @@ gcomp_encoder_create(registry, "zstd", opts, &enc);
 
 ### How it works
 
-1. Input data is accumulated until `zstd.job_size` bytes are buffered (default: auto-calculated based on compression level)
+1. Input data is accumulated until `zstd.job_size` bytes are buffered (512 KB when the option is left at 0)
 2. Each full job is submitted to a thread pool for compression
 3. Each job produces a complete, independent Zstd frame
 4. Compressed frames are collected in order and written to the output
@@ -319,9 +320,18 @@ gcomp_encoder_create(registry, "zstd", opts, &enc);
 
 | `zstd.job_size` | Behavior |
 |-----------------|----------|
-| 0 (default) | Auto-calculated: ~4× window size, minimum 64KB |
-| 64KB - 16MB | Use specified size |
-| < 64KB | Clamped to 64KB minimum |
+| 0 (default) | 512 KB, whatever the level is |
+| 64 KB - 16 MB | Used as given |
+| anything else | `gcomp_encoder_create()` returns `GCOMP_ERR_INVALID_ARG`, with an error detail naming the bounds |
+
+Out-of-range values are **rejected, not clamped**: `zstd.job_size = 1024`
+fails rather than quietly becoming 64 KB, so a caller who asked for something
+the encoder will not do hears about it.
+
+The default does not vary with the level or the window, which matters at the
+top of the ladder: level 19 declares a 32 MB window and still takes 512 KB
+jobs, so each job sees far less history than a single-threaded encode of the
+same input would.
 
 Larger job sizes provide better compression (more context for the match finder) but reduce parallelism. Smaller job sizes enable more parallelism but may reduce compression ratio slightly.
 
@@ -542,14 +552,16 @@ Huffman coding is used for literals (the non-matched bytes in compressed blocks)
 
 | Literals Encoding | When Used |
 |-------------------|-----------|
-| Raw | Small inputs (<32 bytes), or when compression provides <10% savings |
-| Huffman compressed | Skewed byte distribution where compression is beneficial |
+| Raw | Fewer than 32 literal bytes, or when the coded form does not come out smaller |
+| Huffman compressed | Anything else - the coded form is written whenever it fits in fewer bytes |
 
 **Encoder behavior:**
 1. Count symbol frequencies in the literal bytes
-2. Build optimal Huffman tree from frequencies
-3. Estimate compressed size (weights + bitstream)
-4. Use Huffman only if savings exceed 10%; otherwise use raw literals
+2. Build a Huffman code from those frequencies
+3. Write the weights and the bitstream, and measure what they came to
+4. Keep that only if `weights + bitstream + 5` is smaller than the literals
+   themselves - the 5 being the largest literals header - and fall back to raw
+   otherwise. There is no percentage threshold: one byte saved is kept.
 
 **Format requirements (RFC 8878 Section 4.2.1.2):**
 - Maximum code length: 11 bits
@@ -562,11 +574,15 @@ Huffman coding is used for literals (the non-matched bytes in compressed blocks)
 - When the literals section has **regenerated_size ≥ 1024**, the encoder uses four parallel Huffman streams: a 3×2-byte jump table (little-endian) followed by the concatenated streams. The decoder supports both single-stream and four-stream formats.
 
 **Implementation notes:**
-> The 32-byte minimum and 10% savings threshold are encoder heuristics in this implementation, not format requirements. The Zstd specification allows encoders complete freedom to choose raw, RLE, or Huffman for any literals section. Other Zstd encoders (e.g., the reference `libzstd`) may use different decision criteria.
+> The 32-byte minimum and the "must come out smaller" test are encoder heuristics in this implementation, not format requirements. The Zstd specification allows encoders complete freedom to choose raw, RLE, or Huffman for any literals section. Other Zstd encoders (e.g., the reference `libzstd`) may use different decision criteria.
 
-**Decoding:**
-- Single-stream mode: Sequential decoding (literals section < 1024 bytes)
-- Four-stream mode: Parallel decoding with jump table (literals section ≥ 1024 bytes); encoder and decoder both support this format
+**Decoding:** the decoder takes this from the literals header's `Size_Format`
+field, not from the size. Formats 1, 2 and 3 are four streams and carry the
+jump table; format 0 is one stream. That distinction matters: the reference
+encoder picks four streams well below 1024 regenerated bytes - 263 is enough -
+and a decoder that keys on the size instead reads the jump table as literal
+bits and produces garbage from a perfectly valid frame. This one did, until
+`zstd_literals.c` was corrected to follow the field.
 
 ## Interoperability
 
@@ -578,8 +594,18 @@ This implementation is fully compatible with:
 
 Files created by this library can be decompressed by standard tools, and files created by standard tools can be decompressed by this library.
 
-**Features not yet implemented:**
-- Dictionary compression (frame header dictionary ID field is parsed but dictionaries are not used)
+Dictionaries are used on both sides - see [Dictionary compression](#dictionary-compression)
+above. The pieces of the format this library **decodes but never writes** are:
+
+- `Treeless_Compressed` literals (type 3), which reuse the previous block's
+  Huffman table. Every compressed literals section this encoder writes carries
+  its own table.
+- FSE `Repeat_Mode` for sequences, which reuses the previous block's
+  distribution tables. The encoder chooses per block between the predefined
+  tables, RLE, and a table fitted to that block.
+
+Both cost bytes rather than correctness: a stream is valid without them, and
+anything that writes them is read correctly here.
 
 ## Comparison with other methods
 

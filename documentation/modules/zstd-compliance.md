@@ -30,8 +30,8 @@ Block type 3 (reserved) is explicitly rejected in the block/frame parsing path.
 
 ## Compressed blocks
 
-- **Literals section:** Raw, RLE, and Huffman-compressed formats implemented. Treeless_Compressed and repeat-mode tables are supported. Code paths: `zstd_literals.c`, `zstd_huf.c`.
-- **Sequences section:** FSE-encoded sequences with predefined and custom tables; repeat offsets and state updates. Code paths: `zstd_sequences.c` (decode), `zstd_sequences_encode.c` (encode), `zstd_fse.c`.
+- **Literals section:** Raw, RLE, Huffman-compressed and Treeless_Compressed are all **decoded**. The encoder writes raw, RLE and Huffman-compressed, always with the table inline; it never writes Treeless_Compressed, which would reuse the previous block's table. Code paths: `zstd_literals.c`, `zstd_huf.c`.
+- **Sequences section:** all four table modes - Predefined, RLE, FSE_Compressed and Repeat - are **decoded**. The encoder builds the first three per block and writes whichever prices smallest; it never writes Repeat_Mode. Repeat offsets and their zero-literal-length shift are implemented on both sides. Code paths: `zstd_sequences.c` (decode), `zstd_sequences_encode.c` (encode), `zstd_fse.c`.
 
 Spec edge cases (e.g. empty literals, single-symbol Huffman) are handled; invalid or truncated data returns `GCOMP_ERR_CORRUPT` where appropriate.
 
@@ -59,4 +59,16 @@ Spec edge cases (e.g. empty literals, single-symbol Huffman) are handled; invali
 
 ## Gaps and follow-up
 
-- None currently. Reserved bits and block type 3 are rejected. If new spec errata or extensions appear, they should be reviewed and either implemented or explicitly rejected and documented here.
+Reserved bits and block type 3 are rejected. Nothing in the format is
+mis-implemented as far as the interoperability tests reach - the `zstd` CLI
+reads every stream this library writes, and this library reads every stream
+the CLI writes.
+
+Two constructs are decoded but never written, both of them pure ratio rather
+than correctness, and both listed above: Treeless_Compressed literals and
+FSE Repeat_Mode for sequences. Each exists to avoid re-sending a table that
+has not changed since the previous block, so the cost of not writing them is
+paid once per block on data whose statistics are stable.
+
+If new spec errata or extensions appear, they should be reviewed and either
+implemented or explicitly rejected and documented here.
