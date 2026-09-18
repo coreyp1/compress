@@ -179,6 +179,7 @@ struct Parse {
   std::vector<uint32_t> bt;
   size_t bt_size = 0;
   unsigned use_bt = 0;
+  size_t compared_bytes = 0;
 };
 
 Parse run_parse(const std::vector<uint8_t> & data, int level,
@@ -211,6 +212,7 @@ Parse run_parse(const std::vector<uint8_t> & data, int level,
   // A level uses the chain or the tree, never both, and only the one it uses
   // is allocated.
   parse.use_bt = mf.use_bt;
+  parse.compared_bytes = mf.compared_bytes;
   if (mf.chain_table) {
     parse.chain_size = mf.chain_size;
     parse.chain.assign(mf.chain_table, mf.chain_table + mf.chain_size);
@@ -696,6 +698,113 @@ TEST_F(ZstdMatchFinderTest, EverySequenceResolvesToTheBytesItClaims) {
   for (int level = 1; level <= 22; level++) {
     Parse parse = run_parse(data, level, 0, false);
     CheckSequencesRebuildTheInput(data, parse, level);
+  }
+}
+
+// An insertion does not report what it finds, so it has no use for the exact
+// length of the matches it meets: anything at least nice_length long ends
+// the descent whatever it turns out to be.  It therefore stops comparing
+// there -- which is only allowed because it leaves the tree exactly as a
+// full comparison would have.
+//
+// This checks that directly, by building the same tree twice over the same
+// buffer, once with every position inserted and once with every position
+// searched, and comparing the two slot for slot.  The input has a repeating
+// period, which is the shape that made the difference visible: matches there
+// run to the end of the buffer, so every insertion used to compare tens of
+// kilobytes to learn something it discarded.
+TEST_F(ZstdMatchFinderTest, InsertingBuildsTheSameTreeAsSearching) {
+  // A period well under the level's nice_length, so the comparison limit is
+  // reached at nearly every position.
+  std::vector<uint8_t> data = ThreePeriodNoise(256u * 1024u);
+
+  const gcomp_allocator_t * alloc = gcomp_allocator_default();
+  for (int level : {11, 16, 19, 22}) {
+    zstd_match_finder_t inserted;
+    zstd_match_finder_t searched;
+    ASSERT_EQ(zstd_mf_init(&inserted, alloc, level, 1u << 20, nullptr),
+        GCOMP_OK);
+    ASSERT_EQ(
+        zstd_mf_init(&searched, alloc, level, 1u << 20, nullptr), GCOMP_OK);
+    ASSERT_EQ(inserted.use_bt, 1u) << "level " << level;
+
+    std::vector<zstd_mf_candidate_t> found(ZSTD_MF_MAX_CANDIDATES);
+    for (size_t pos = 0; pos < data.size(); pos++) {
+      zstd_mf_insert_one(&inserted, data.data(), pos, data.size());
+      (void)zstd_mf_find_matches(&searched, data.data(), pos, data.size(),
+          found.data(), found.size());
+    }
+
+    ASSERT_EQ(inserted.bt_size, searched.bt_size);
+    for (size_t i = 0; i < inserted.bt_size * 2u; i++) {
+      ASSERT_EQ(inserted.bt_table[i], searched.bt_table[i])
+          << "level " << level << ": slot " << i
+          << " differs, so stopping an insertion's comparison early changed "
+          << "the tree";
+    }
+    for (size_t i = 0; i < inserted.hash_size; i++) {
+      ASSERT_EQ(inserted.hash_table[i], searched.hash_table[i])
+          << "level " << level << ": hash slot " << i << " differs";
+    }
+
+    zstd_mf_destroy(&inserted, alloc, nullptr);
+    zstd_mf_destroy(&searched, alloc, nullptr);
+  }
+}
+
+// What a parse of periodic input is allowed to cost.
+//
+// Comparing is nearly all of what the tree does, and the way it goes wrong
+// is comparing far more than the answer needs.  On data with a repeating
+// period every match runs to the end of the buffer, and an insertion that
+// measured each one in full turned a linear job into a quadratic one: 4 MB
+// of a 1500 byte pattern took 9.3 seconds at every level from 11 up, where
+// the reference implementation took 0.02.
+//
+// The bound here is per input byte and deliberately loose -- it is aimed at
+// a factor of hundreds, not at the last ten percent -- and it is counted
+// rather than timed, so it says the same thing on a busy machine as on an
+// idle one.  Counting happens only in a sanitizer build, because one add
+// per candidate measured 0.87% of encoding and that is too much to charge
+// every caller for a test.
+TEST_F(ZstdMatchFinderTest, PeriodicInputDoesNotCostQuadraticWork) {
+  // A period well under every tree level's nice_length, so a full
+  // measurement would run to the end of the buffer at nearly every position.
+  constexpr size_t kPeriod = 1500;
+  std::vector<uint8_t> pattern;
+  Noise noise(0xABCDEFu);
+  noise.append(pattern, kPeriod);
+  std::vector<uint8_t> data;
+  while (data.size() < 512u * 1024u) {
+    data.insert(data.end(), pattern.begin(), pattern.end());
+  }
+
+  // The library only counts in a build that defines GCOMP_TEST_BUILD, which
+  // is the sanitizer one.  Asking the library rather than asking the
+  // preprocessor means the test cannot quietly stop checking because a
+  // build flag moved: a zero can only mean counting is off, and anything
+  // else is measured.
+  {
+    Parse probe = run_parse(data, 19, 0, false);
+    if (probe.compared_bytes == 0) {
+      GTEST_SKIP() << "this build does not count comparisons; run "
+                      "`make test-asan`";
+    }
+  }
+
+  for (int level : {11, 15, 19, 22}) {
+    Parse parse = run_parse(data, level, 0, false);
+    ASSERT_EQ(parse.use_bt, 1u) << "level " << level;
+    ASSERT_GT(parse.compared_bytes, 0u) << "level " << level;
+    // On this input the encoder now compares 0.997 bytes for every byte of
+    // input, at every level: it reads the thing once.  Before, level 22
+    // compared 12,110 bytes per input byte, and that figure rose with the
+    // size of the buffer.  A hundred leaves room for a different parse
+    // without leaving room for that.
+    EXPECT_LT(parse.compared_bytes, data.size() * 100u)
+        << "level " << level << ": compared " << parse.compared_bytes
+        << " bytes for " << data.size() << " of input, "
+        << (double)parse.compared_bytes / (double)data.size() << " per byte";
   }
 }
 

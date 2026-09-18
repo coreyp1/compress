@@ -750,6 +750,34 @@ static inline size_t zstd_mf_bt_descend(zstd_match_finder_t * mf,
   }
 
   const uint8_t * const limit = data + data_size;
+
+  // How far a comparison is worth carrying.
+  //
+  // A descent that reports nothing -- an insertion, which throws away
+  // whatever it meets -- has no use for the exact length of a match.  Any
+  // match at least nice_length long ends the descent on the spot, whatever
+  // it goes on to be, so measuring past that point answers a question
+  // nobody asked.  Stopping there leaves the tree byte for byte what it
+  // would have been and the output identical; it only stops paying for an
+  // answer that is thrown away.
+  //
+  // The cost of not stopping was quadratic.  On data with a repeating
+  // period the match at every position runs to the end of the block, so
+  // each of the thousands of insertions a single long match triggers
+  // compared a hundred kilobytes: 4 MB of a 1500 byte pattern took 9.3
+  // seconds at every level from 11 up, against 0.02 for the reference
+  // implementation.
+  //
+  // Most of that is now taken by not making those insertions at all -- see
+  // the fill loop in zstd_mf_generate_sequences() -- but the bound is worth
+  // having on its own: it holds whatever the parse decides to insert, and
+  // on 4 MB of a 4000 byte pattern at level 11 the two together are seven
+  // times faster than skipping alone.
+  const uint8_t * cmp_limit = limit;
+  if (!out && !best_out && (size_t)(limit - (data + pos)) > mf->nice_length) {
+    cmp_limit = data + pos + mf->nice_length;
+  }
+
   size_t best_len = MF_MIN_MATCH - 1;
   size_t best_offset = 0;
   size_t found = 0;
@@ -779,7 +807,10 @@ static inline size_t zstd_mf_bt_descend(zstd_match_finder_t * mf,
     assert(memcmp(data + pos, data + m, common) == 0);
 #endif
     size_t len = common +
-        zstd_mf_count_match(data + pos + common, data + m + common, limit);
+        zstd_mf_count_match(data + pos + common, data + m + common, cmp_limit);
+#ifdef GCOMP_TEST_BUILD
+    mf->compared_bytes += len - common;
+#endif
 
     if (len > best_len) {
       best_len = len;
@@ -1103,8 +1134,12 @@ gcomp_status_t zstd_mf_generate_sequences(zstd_match_finder_t * mf,
       // skipping any the deferral search above already inserted.
       size_t match_end = pos + match.length;
       size_t fill_from = (indexed > pos) ? indexed + 1 : pos + 1;
+      size_t fill_to = match_end;
+      if (mf->use_bt && match.length >= mf->nice_length) {
+        fill_to = fill_from;
+      }
       for (size_t i = fill_from;
-           i < match_end && i + MF_HASH_READ_SIZE <= data_size; i++) {
+           i < fill_to && i + MF_HASH_READ_SIZE <= data_size; i++) {
         zstd_mf_insert_one(mf, data, i, data_size);
       }
 

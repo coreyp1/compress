@@ -261,6 +261,24 @@ typedef struct {
    * than a layout that depends on a build flag.
    */
   size_t last_insert_abs;
+
+  /**
+   * @brief Bytes this finder has compared, counted in test builds only.
+   *
+   * The comparison is what the tree spends nearly all its time on, and the
+   * only thing that has ever made it pathological is comparing far more
+   * than the answer needed.  Counting it lets a test say "this input must
+   * not cost more than so much work" without measuring a clock.
+   *
+   * It is not counted in a release build.  One add per candidate sounds
+   * free and is not: it measured 0.87% of encoding at level 19, which is
+   * too much to charge every caller for the benefit of one test.
+   *
+   * Kept unconditionally so that the structure is the same shape whether or
+   * not GCOMP_TEST_BUILD is defined.
+   */
+  size_t compared_bytes;
+
 } zstd_match_finder_t;
 
 //

@@ -910,7 +910,8 @@ gcomp_status_t zstd_opt_generate_sequences(zstd_match_finder_t * mf,
       num_seq++;
 
       size_t match_end = pos + forced_len;
-      for (size_t f = pos + 1u; f < match_end; f++) {
+      size_t fill_to = (forced_len >= nice_length) ? (pos + 1u) : match_end;
+      for (size_t f = pos + 1u; f < fill_to; f++) {
         zstd_mf_insert_one(mf, data, f, data_size);
       }
       pos = match_end;
