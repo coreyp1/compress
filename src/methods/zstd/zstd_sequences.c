@@ -303,12 +303,26 @@ static inline uint32_t zstd_seq_bit_reader_take(
   if (br->bits_consumed + nb_bits > br->total_bits) {
     return 0;
   }
-  // The budget is reasoned about rather than enforced, so it is also checked:
-  // a table or a table log that got past validation would otherwise shift by
-  // more than sixty-three, which is undefined rather than merely wrong.  One
-  // predictable comparison.
+  // The refill budget the caller works to is an argument about the widths the
+  // format allows, and it is right; but it is an argument about tables that
+  // arrive from outside, so it is not what correctness rests on.  If the bits
+  // are not in the container, fetch them.
+  //
+  // On ordinary data this never fires -- the refill at the top of the sequence
+  // loop keeps it from firing, which is what that refill is for -- so it costs
+  // one predictable comparison.  Were it removed and the loop's budget wrong,
+  // the shift below would move by more than sixty-three, which is undefined
+  // rather than merely wrong; were it a bare rejection instead of a refill, a
+  // stream with a far offset, a long literal run and a long match in one
+  // sequence would decode to the wrong bytes and report success.
   if (br->used + nb_bits > 64u) {
-    return 0;
+    zstd_seq_bit_reader_refill(br);
+    if (br->used + nb_bits > 64u) {
+      // Unreachable: a refill leaves `used` below eight unless the window is
+      // already at the start of the stream, and there the bounds check above
+      // has already refused anything reaching past the first bit.
+      return 0;
+    }
   }
 
   uint32_t value = (uint32_t)((br->container >> (64u - br->used - nb_bits)) &
@@ -616,23 +630,35 @@ static gcomp_status_t zstd_sequences_execute(zstd_decoder_state_t * state,
   // HOW THE BITS ARE SPENT
   // ======================
   //
-  // Each pass took six separate reads, and each read refilled the container
-  // afterwards -- a shift, a comparison and, one time in seven, a load.  Six
+  // Each pass took six separate reads, and every one of them refilled the
+  // container afterwards -- a shift, a comparison and, one time in seven, a
+  // load, sitting in the dependency chain between each read and the next.  Six
   // refills per sequence to consume bits that arrive fifty-six at a time.
   //
   // A refill leaves `used` below eight and the container holds sixty-four, so
-  // fifty-seven bits can be taken before the next one is needed.  What a
-  // sequence spends is bounded:
+  // fifty-seven bits can be taken before another is needed.  What one sequence
+  // can spend is bounded, but not by much:
   //
   //   offset extra bits    at most 31  (the of_code > 31 check below)
   //   match length extra   at most 16  (zstd_seq_ml_extra_bits)
   //   literal length extra at most 16  (zstd_seq_ll_extra_bits)
   //   three state moves    at most 27  (FSE accuracy log is capped at 9)
   //
-  // Splitting that as 31+16 then 16+27 keeps both halves inside the budget --
-  // 47 and 43 against 57 -- so two refills per sequence do the work of six.
-  // The three state moves also become one read rather than three: they are
-  // adjacent in the stream, so their bits can be taken together and split,
+  // Ninety in the worst case, so a single refill per sequence cannot be shown
+  // to be enough.  It does not have to be: zstd_seq_bit_reader_take() fetches
+  // what it needs when it needs it, so correctness does not rest on this
+  // arithmetic about tables that arrive from outside.  The refill here is an
+  // optimisation -- it keeps `used` small enough that the check inside take()
+  // never fires on ordinary data, and that is all it is for.
+  //
+  // Placing a second refill part way through the sequence was tried, on the
+  // reasoning that 31+16 and 16+27 both fit.  It measured slower than this,
+  // 690 MB/s against 730, because it does work the take() check was going to
+  // skip anyway.  Removing this one as well is slower still, around 655.
+  //
+  // The three state moves also become one read rather than three: they sit at
+  // adjacent positions in the stream and none of the three tables is indexed
+  // by a state the others change, so their bits are taken together and split,
   // which is what the shifts below do.
   for (uint32_t i = 0; i < num_sequences; i++) {
     zstd_seq_bit_reader_refill(&br);
@@ -667,10 +693,6 @@ static gcomp_status_t zstd_sequences_execute(zstd_decoder_state_t * state,
     else {
       return GCOMP_ERR_CORRUPT;
     }
-
-    // 47 of the 57 bits may be gone by here; the rest of this sequence needs
-    // another 43 at most.
-    zstd_seq_bit_reader_refill(&br);
 
     // Read extra bits for literal length
     uint32_t literal_length;
