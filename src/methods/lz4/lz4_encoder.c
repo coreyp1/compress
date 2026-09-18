@@ -433,6 +433,10 @@ gcomp_status_t lz4_encoder_init(gcomp_registry_t * registry,
   state->finish_called = false;
   state->blocks_finished = false;
 
+  // A reset starts a new frame, so the record of what the previous one had to
+  // settle for does not carry into it.
+  memset(&state->stepdowns, 0, sizeof(state->stepdowns));
+
   // Success
   encoder->method_state = state;
   return GCOMP_OK;
@@ -447,6 +451,15 @@ cleanup:
     gcomp_free(alloc, state);
   }
   return status;
+}
+
+const gcomp_stepdown_tally_t * gcomp_lz4_encoder_stepdowns(
+    const gcomp_encoder_t * encoder) {
+  if (!encoder || !encoder->method_state) {
+    return NULL;
+  }
+  const lz4_encoder_state_t * state = (const lz4_encoder_state_t *)encoder->method_state;
+  return &state->stepdowns;
 }
 
 void lz4_encoder_destroy(gcomp_encoder_t * encoder) {
@@ -562,6 +575,14 @@ gcomp_status_t lz4_encoder_update(gcomp_encoder_t * encoder,
 
         if (status != GCOMP_OK || compressed_len >= state->block_buffer_pos) {
           // Compression didn't help, store uncompressed
+          // GCOMP_ERR_LIMIT here is not a failure: the block compressor is
+          // given a destination the size of the block, so running out of room
+          // in it *is* the discovery that the compressed form is larger than
+          // the raw one.  A bigger buffer would not produce a better block.
+          gcomp_stepdown_note(&state->stepdowns,
+              (status == GCOMP_OK || status == GCOMP_ERR_LIMIT)
+                  ? GCOMP_STEPDOWN_STORED_IS_SMALLER
+                  : GCOMP_STEPDOWN_ENCODE_FAILED);
           uint32_t block_size =
               (uint32_t)state->block_buffer_pos | LZ4_BLOCK_UNCOMPRESSED_FLAG;
           gcomp_write_le32(state->compressed_buffer, block_size);
@@ -677,6 +698,12 @@ gcomp_status_t lz4_encoder_finish(
 
       if (status != GCOMP_OK || compressed_len >= state->block_buffer_pos) {
         // Store uncompressed
+        // See the note on the other call: a full destination means the
+        // compressed form is larger, not that anything went wrong.
+        gcomp_stepdown_note(&state->stepdowns,
+            (status == GCOMP_OK || status == GCOMP_ERR_LIMIT)
+                ? GCOMP_STEPDOWN_STORED_IS_SMALLER
+                : GCOMP_STEPDOWN_ENCODE_FAILED);
         uint32_t block_size =
             (uint32_t)state->block_buffer_pos | LZ4_BLOCK_UNCOMPRESSED_FLAG;
         gcomp_write_le32(state->compressed_buffer, block_size);

@@ -34,6 +34,8 @@
 
 #include <ghoti.io/compress/macros.h>
 
+#include "../../core/stepdown.h"
+
 #include "../../core/alloc_internal.h"
 #include "../../core/endian.h"
 #include "../../core/registry_internal.h"
@@ -275,6 +277,14 @@ typedef struct {
   // Memory tracking
   gcomp_memory_tracker_t mem_tracker;
   uint64_t max_memory_bytes;
+
+  /**
+   * @brief Times this encoder settled for a weaker encoding, and why.
+   *
+   * Read by tests, which assert that nothing was forced.  See
+   * src/core/stepdown.h.
+   */
+  gcomp_stepdown_tally_t stepdowns;
 
   // Finish state
   bool finish_called;   ///< finish() has been called
@@ -594,6 +604,20 @@ gcomp_status_t lz4_block_compress_linked(const uint8_t * window,
 gcomp_status_t lz4_block_decompress(const uint8_t * input, size_t input_len,
     uint8_t * output, size_t output_cap, size_t * output_len_out,
     const uint8_t * history, size_t history_len);
+
+
+/**
+ * @brief The encoder's record of when it settled for a weaker encoding.
+ *
+ * Exists so that a test can assert nothing was forced - see
+ * src/core/stepdown.h for why that needs counting.  The tally accumulates
+ * over the encoder's life and is cleared by a reset.
+ *
+ * @param encoder Encoder to read; NULL returns NULL.
+ * @return The tally, owned by the encoder, or NULL if there is no state.
+ */
+const gcomp_stepdown_tally_t * gcomp_lz4_encoder_stepdowns(
+    const gcomp_encoder_t * encoder);
 
 #ifdef __cplusplus
 }

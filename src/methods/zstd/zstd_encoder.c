@@ -786,6 +786,15 @@ cleanup:
 // Destroy
 //
 
+const gcomp_stepdown_tally_t * gcomp_zstd_encoder_stepdowns(
+    const gcomp_encoder_t * encoder) {
+  if (!encoder || !encoder->method_state) {
+    return NULL;
+  }
+  const zstd_encoder_state_t * state = (const zstd_encoder_state_t *)encoder->method_state;
+  return &state->stepdowns;
+}
+
 void zstd_encoder_destroy(gcomp_encoder_t * encoder) {
   if (!encoder || !encoder->method_state) {
     return;
@@ -1184,6 +1193,10 @@ gcomp_status_t zstd_encoder_reset(gcomp_encoder_t * encoder) {
   else {
     // Single-threaded mode reset
     state->stage = ZSTD_ENC_STAGE_HEADER;
+
+    // A reset starts a new stream, so the record of what the previous one had
+    // to settle for does not carry into it.
+    memset(&state->stepdowns, 0, sizeof(state->stepdowns));
 
     // Reset positions (retain buffers)
     state->header_pos = 0;

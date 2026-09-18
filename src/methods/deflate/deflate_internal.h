@@ -14,6 +14,7 @@
 
 #include <ghoti.io/compress/macros.h>
 
+#include "../../core/stepdown.h"
 #include "../../core/stream_internal.h"
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/options.h>
@@ -149,6 +150,19 @@ gcomp_status_t gcomp_deflate_encoder_update(
  */
 gcomp_status_t gcomp_deflate_encoder_finish(
     gcomp_encoder_t * encoder, gcomp_buffer_t * output);
+
+/**
+ * @brief The encoder's record of when it settled for a weaker encoding.
+ *
+ * Exists so that a test can assert nothing was forced - see
+ * src/core/stepdown.h for why that needs counting.  The tally accumulates
+ * over the encoder's life and is cleared by a reset.
+ *
+ * @param encoder Encoder to read; NULL returns NULL.
+ * @return The tally, owned by the encoder, or NULL if there is no state.
+ */
+const gcomp_stepdown_tally_t * gcomp_deflate_encoder_stepdowns(
+    const gcomp_encoder_t * encoder);
 
 #ifdef __cplusplus
 }

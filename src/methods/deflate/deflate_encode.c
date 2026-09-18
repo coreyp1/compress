@@ -22,6 +22,7 @@
 #include <ghoti.io/compress/macros.h>
 #include "../../core/alloc_internal.h"
 #include "../../core/huffman_lengths.h"
+#include "../../core/stepdown.h"
 #include "../../core/registry_internal.h"
 #include "../../core/stream_internal.h"
 #include "bitwriter.h"
@@ -245,6 +246,14 @@ typedef struct gcomp_deflate_encoder_state_s {
   // Memory tracking
   //
   gcomp_memory_tracker_t mem_tracker;
+
+  /**
+   * @brief Times this encoder settled for a weaker encoding, and why.
+   *
+   * Read by tests, which assert that nothing was forced.  See
+   * src/core/stepdown.h for why a count is needed at all.
+   */
+  gcomp_stepdown_tally_t stepdowns;
 
   //
   // State machine
@@ -1479,7 +1488,9 @@ static void deflate_ensure_cl_kraft_complete(uint8_t * cl_lengths) {
 static gcomp_status_t deflate_flush_dynamic_block(
     gcomp_deflate_encoder_state_t * st, int final) {
   if (!st || !st->lit_freq) {
-    // Fall back to fixed if no frequency data
+    // No frequency histograms means no code to build from, which only
+    // happens if they could not be allocated.
+    gcomp_stepdown_note(st ? &st->stepdowns : NULL, GCOMP_STEPDOWN_NO_MEMORY);
     return deflate_flush_fixed_block(st, final);
   }
 
@@ -1496,6 +1507,7 @@ static gcomp_status_t deflate_flush_dynamic_block(
     // Without lengths there is no dynamic block to write.  The fixed code is
     // defined by RFC 1951 section 3.2.6 and needs no scratch memory, so it
     // remains available when this does not.
+    gcomp_stepdown_note(&st->stepdowns, GCOMP_STEPDOWN_NO_MEMORY);
     st->lit_freq[256]--;
     return deflate_flush_fixed_block(st, final);
   }
@@ -1510,6 +1522,7 @@ static gcomp_status_t deflate_flush_dynamic_block(
   s = build_code_lengths(
       st->allocator, st->dist_freq, DEFLATE_MAX_DIST_SYMBOLS, dist_lengths, 15);
   if (s != GCOMP_OK) {
+    gcomp_stepdown_note(&st->stepdowns, GCOMP_STEPDOWN_NO_MEMORY);
     st->lit_freq[256]--;
     return deflate_flush_fixed_block(st, final);
   }
@@ -1561,6 +1574,7 @@ static gcomp_status_t deflate_flush_dynamic_block(
   uint8_t * all_lengths = (uint8_t *)gcomp_malloc(st->allocator, total_codes);
   if (!all_lengths) {
     // Fall back to fixed on memory error
+    gcomp_stepdown_note(&st->stepdowns, GCOMP_STEPDOWN_NO_MEMORY);
     st->lit_freq[256]--;
     return deflate_flush_fixed_block(st, final);
   }
@@ -1584,6 +1598,7 @@ static gcomp_status_t deflate_flush_dynamic_block(
   uint8_t cl_lengths[19];
   s = build_code_lengths(st->allocator, cl_freq, 19, cl_lengths, 7);
   if (s != GCOMP_OK) {
+    gcomp_stepdown_note(&st->stepdowns, GCOMP_STEPDOWN_NO_MEMORY);
     gcomp_free(st->allocator, all_lengths);
     st->lit_freq[256]--;
     return deflate_flush_fixed_block(st, final);
@@ -1636,6 +1651,7 @@ static gcomp_status_t deflate_flush_dynamic_block(
     }
 
     if (fixed_bits <= dynamic_bits && st->fixed_ready) {
+      gcomp_stepdown_note(&st->stepdowns, GCOMP_STEPDOWN_FIXED_IS_SMALLER);
       gcomp_free(st->allocator, all_lengths);
       return deflate_flush_fixed_block(st, final);
     }
@@ -1645,6 +1661,7 @@ static gcomp_status_t deflate_flush_dynamic_block(
   uint16_t cl_codes[19];
   s = gcomp_deflate_huffman_build_codes(cl_lengths, 19, 7, cl_codes, NULL);
   if (s != GCOMP_OK) {
+    gcomp_stepdown_note(&st->stepdowns, GCOMP_STEPDOWN_CODE_REJECTED);
     gcomp_free(st->allocator, all_lengths);
     st->lit_freq[256]--;
     return deflate_flush_fixed_block(st, final);
@@ -1662,6 +1679,7 @@ static gcomp_status_t deflate_flush_dynamic_block(
   s = gcomp_deflate_huffman_build_codes(
       lit_lengths, DEFLATE_MAX_LITLEN_SYMBOLS, 15, lit_codes, NULL);
   if (s != GCOMP_OK) {
+    gcomp_stepdown_note(&st->stepdowns, GCOMP_STEPDOWN_CODE_REJECTED);
     gcomp_free(st->allocator, all_lengths);
     st->lit_freq[256]--;
     return deflate_flush_fixed_block(st, final);
@@ -1676,6 +1694,7 @@ static gcomp_status_t deflate_flush_dynamic_block(
   s = gcomp_deflate_huffman_build_codes(
       dist_lengths, DEFLATE_MAX_DIST_SYMBOLS, 15, dist_codes, NULL);
   if (s != GCOMP_OK) {
+    gcomp_stepdown_note(&st->stepdowns, GCOMP_STEPDOWN_CODE_REJECTED);
     gcomp_free(st->allocator, all_lengths);
     st->lit_freq[256]--;
     return deflate_flush_fixed_block(st, final);
@@ -1771,6 +1790,16 @@ static gcomp_status_t deflate_flush_dynamic_block(
 //
 // Public API
 //
+
+const gcomp_stepdown_tally_t * gcomp_deflate_encoder_stepdowns(
+    const gcomp_encoder_t * encoder) {
+  if (!encoder || !encoder->method_state) {
+    return NULL;
+  }
+  const gcomp_deflate_encoder_state_t * st =
+      (const gcomp_deflate_encoder_state_t *)encoder->method_state;
+  return &st->stepdowns;
+}
 
 gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
     gcomp_options_t * options, gcomp_encoder_t * encoder) {
@@ -2037,6 +2066,10 @@ gcomp_status_t gcomp_deflate_encoder_reset(gcomp_encoder_t * encoder) {
   st->lazy_distance = 0;
 
   // Reset hash tables (clear to zeros)
+  // A reset starts a new stream, so the record of what the previous one had
+  // to settle for does not carry into it.
+  memset(&st->stepdowns, 0, sizeof(st->stepdowns));
+
   memset(st->hash_head, 0, DEFLATE_HASH_SIZE * sizeof(uint16_t));
   memset(st->hash_prev, 0, st->window_size * sizeof(uint16_t));
   memset(st->hash_pos, 0, st->window_size * sizeof(size_t));

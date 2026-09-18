@@ -32,6 +32,8 @@
 
 #include <ghoti.io/compress/macros.h>
 
+#include "../../core/stepdown.h"
+
 #include "../../core/alloc_internal.h"
 #include "../../core/endian.h"
 #include "../../core/registry_internal.h"
@@ -335,6 +337,14 @@ typedef struct {
   size_t mf_window_max;        ///< Most history to keep; the declared window
 
   // Memory tracking
+  /**
+   * @brief Times this encoder settled for a weaker encoding, and why.
+   *
+   * Read by tests, which assert that nothing was forced.  See
+   * src/core/stepdown.h.
+   */
+  gcomp_stepdown_tally_t stepdowns;
+
   gcomp_memory_tracker_t mem_tracker;
   uint64_t max_memory_bytes;
 
@@ -1073,9 +1083,9 @@ gcomp_status_t zstd_literals_encode_raw(const uint8_t * literals,
  * @return GCOMP_OK on success
  */
 gcomp_status_t zstd_literals_encode_compressed(
-    const gcomp_allocator_t * alloc, const uint8_t * literals,
-    size_t literals_size, uint8_t * output, size_t output_cap,
-    size_t * output_len_out);
+    const gcomp_allocator_t * alloc, gcomp_stepdown_tally_t * stepdowns,
+    const uint8_t * literals, size_t literals_size, uint8_t * output,
+    size_t output_cap, size_t * output_len_out);
 
 // Symbol alphabet sizes for the three sequence code types
 // (RFC 8878 3.1.1.3.2.1 and the tables in 3.1.1.3.2.2).
@@ -1109,6 +1119,20 @@ GCOMP_INTERNAL_API gcomp_status_t zstd_sequences_encode(
 gcomp_status_t zstd_compress_block_full(zstd_encoder_state_t * state,
     const uint8_t * input, size_t input_len, uint8_t * output,
     size_t output_cap, size_t * output_len_out, uint8_t * type_out);
+
+
+/**
+ * @brief The encoder's record of when it settled for a weaker encoding.
+ *
+ * Exists so that a test can assert nothing was forced - see
+ * src/core/stepdown.h for why that needs counting.  The tally accumulates
+ * over the encoder's life and is cleared by a reset.
+ *
+ * @param encoder Encoder to read; NULL returns NULL.
+ * @return The tally, owned by the encoder, or NULL if there is no state.
+ */
+const gcomp_stepdown_tally_t * gcomp_zstd_encoder_stepdowns(
+    const gcomp_encoder_t * encoder);
 
 #ifdef __cplusplus
 }

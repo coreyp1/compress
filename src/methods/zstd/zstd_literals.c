@@ -546,9 +546,9 @@ gcomp_status_t zstd_literals_encode_raw(const uint8_t * literals,
  * @return GCOMP_OK on success, error code on failure
  */
 gcomp_status_t zstd_literals_encode_compressed(
-    const gcomp_allocator_t * alloc, const uint8_t * literals,
-    size_t literals_size, uint8_t * output, size_t output_cap,
-    size_t * output_len_out) {
+    const gcomp_allocator_t * alloc, gcomp_stepdown_tally_t * stepdowns,
+    const uint8_t * literals, size_t literals_size, uint8_t * output,
+    size_t output_cap, size_t * output_len_out) {
   if (!output || !output_len_out) {
     return GCOMP_ERR_INVALID_ARG;
   }
@@ -557,6 +557,7 @@ gcomp_status_t zstd_literals_encode_compressed(
   // The 32-byte threshold is a tunable heuristic, not a format requirement.
   // Huffman overhead (weights header) rarely pays off for tiny inputs.
   if (literals_size < 32 || !literals) {
+    gcomp_stepdown_note(stepdowns, GCOMP_STEPDOWN_LITERALS_NOT_WORTH_CODING);
     return zstd_literals_encode_raw(
         literals, literals_size, output, output_cap, output_len_out);
   }
@@ -573,6 +574,9 @@ gcomp_status_t zstd_literals_encode_compressed(
       zstd_huf_build_enc_table(alloc, freq, &huf_table);
   if (status != GCOMP_OK) {
     // Fall back to raw encoding
+    gcomp_stepdown_note(stepdowns,
+        status == GCOMP_ERR_MEMORY ? GCOMP_STEPDOWN_NO_MEMORY
+                                   : GCOMP_STEPDOWN_CODE_REJECTED);
     return zstd_literals_encode_raw(
         literals, literals_size, output, output_cap, output_len_out);
   }
@@ -580,6 +584,7 @@ gcomp_status_t zstd_literals_encode_compressed(
   // Check if compression is worthwhile (estimate compressed size)
   // If all symbols have same frequency, Huffman won't help
   if (huf_table.num_symbols <= 1 || huf_table.max_bits == 0) {
+    gcomp_stepdown_note(stepdowns, GCOMP_STEPDOWN_LITERALS_NOT_WORTH_CODING);
     return zstd_literals_encode_raw(
         literals, literals_size, output, output_cap, output_len_out);
   }
@@ -595,7 +600,19 @@ gcomp_status_t zstd_literals_encode_compressed(
   status = zstd_huf_write_weights(
       &huf_table, weights_buf, weights_cap, &weights_size);
   if (status != GCOMP_OK) {
-    // Fall back to raw encoding
+    // Fall back to raw encoding.
+    //
+    // GCOMP_ERR_UNSUPPORTED here is a decision, not a failure.  The only
+    // alphabets zstd_huf_write_weights() cannot describe are the ones where
+    // a Huffman code would buy nothing: every used symbol sharing one code
+    // length, which is a flat code costing exactly what storing costs, and a
+    // single-symbol alphabet, which belongs in an RLE literals block.  See
+    // the two GCOMP_ERR_UNSUPPORTED returns there.
+    gcomp_stepdown_note(stepdowns,
+        status == GCOMP_ERR_UNSUPPORTED
+            ? GCOMP_STEPDOWN_LITERALS_NOT_WORTH_CODING
+            : status == GCOMP_ERR_LIMIT ? GCOMP_STEPDOWN_NO_ROOM
+                                        : GCOMP_STEPDOWN_ENCODE_FAILED);
     return zstd_literals_encode_raw(
         literals, literals_size, output, output_cap, output_len_out);
   }
@@ -616,7 +633,19 @@ gcomp_status_t zstd_literals_encode_compressed(
         stream_buf, stream_cap, &stream_size);
   }
   if (status != GCOMP_OK) {
-    // Fall back to raw encoding
+    // Fall back to raw encoding.
+    //
+    // GCOMP_ERR_UNSUPPORTED here is a decision, not a failure.  The only
+    // alphabets zstd_huf_write_weights() cannot describe are the ones where
+    // a Huffman code would buy nothing: every used symbol sharing one code
+    // length, which is a flat code costing exactly what storing costs, and a
+    // single-symbol alphabet, which belongs in an RLE literals block.  See
+    // the two GCOMP_ERR_UNSUPPORTED returns there.
+    gcomp_stepdown_note(stepdowns,
+        status == GCOMP_ERR_UNSUPPORTED
+            ? GCOMP_STEPDOWN_LITERALS_NOT_WORTH_CODING
+            : status == GCOMP_ERR_LIMIT ? GCOMP_STEPDOWN_NO_ROOM
+                                        : GCOMP_STEPDOWN_ENCODE_FAILED);
     return zstd_literals_encode_raw(
         literals, literals_size, output, output_cap, output_len_out);
   }
@@ -630,6 +659,7 @@ gcomp_status_t zstd_literals_encode_compressed(
   // for minimal benefit.
   if (compressed_size + 5 >= literals_size) {
     // No savings (or negative savings), use raw encoding
+    gcomp_stepdown_note(stepdowns, GCOMP_STEPDOWN_LITERALS_NOT_WORTH_CODING);
     return zstd_literals_encode_raw(
         literals, literals_size, output, output_cap, output_len_out);
   }

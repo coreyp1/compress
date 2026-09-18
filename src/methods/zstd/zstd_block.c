@@ -54,6 +54,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <ghoti.io/compress/macros.h>
+#include "../../core/stepdown.h"
 #include "zstd_internal.h"
 #include <string.h>
 
@@ -229,9 +230,16 @@ gcomp_status_t zstd_block_compress(zstd_encoder_state_t * state,
     return GCOMP_OK;
   }
 
+  // Why this block ends up raw, if it does.  It starts as "did not try",
+  // becomes "something went wrong" the moment the compressed path is entered,
+  // and only a branch that has actually priced the alternatives may set it
+  // back to a chosen reason.  See src/core/stepdown.h.
+  gcomp_stepdown_t stepdown = GCOMP_STEPDOWN_TOO_SMALL_TO_TRY;
+
   // Try compressed block if we have a match finder and sufficient input
   if (state && state->match_finder && state->seq_buffer &&
       state->literals_buffer && input_len >= MIN_COMPRESSION_SIZE) {
+    stepdown = GCOMP_STEPDOWN_ENCODE_FAILED;
     size_t num_sequences = 0;
     size_t literals_size = 0;
     const uint8_t * mf_data = input;
@@ -307,8 +315,8 @@ gcomp_status_t zstd_block_compress(zstd_encoder_state_t * state,
       // Encode literals section (with Huffman compression when beneficial)
       size_t literals_encoded_size = 0;
       status = zstd_literals_encode_compressed(state->allocator,
-          state->literals_buffer, literals_size, output, output_cap,
-          &literals_encoded_size);
+          &state->stepdowns, state->literals_buffer, literals_size, output,
+          output_cap, &literals_encoded_size);
 
       if (status == GCOMP_OK) {
         // Encode sequences section
@@ -327,11 +335,30 @@ gcomp_status_t zstd_block_compress(zstd_encoder_state_t * state,
             *type_out = ZSTD_BLOCK_TYPE_COMPRESSED;
             return GCOMP_OK;
           }
+          // Priced, and the raw block won.
+          stepdown = GCOMP_STEPDOWN_STORED_IS_SMALLER;
         }
       }
     }
+
+    // Anything else that lands here is a failure, and `stepdown` still says
+    // so.  That default is the point: the branch that goes wrong is the one
+    // nobody thought to record, and requiring a branch to *claim* success
+    // catches the ones nobody wrote down.  The first version of this counter
+    // noted each branch instead, and the defect it was written to catch -
+    // requiring literals_size > 0, which sent every block that matched
+    // everything to a raw block - walked straight past it.
+    if (status == GCOMP_ERR_MEMORY) {
+      stepdown = GCOMP_STEPDOWN_NO_MEMORY;
+    }
+    else if (status == GCOMP_ERR_LIMIT) {
+      stepdown = GCOMP_STEPDOWN_NO_ROOM;
+    }
+
     // If compression failed or didn't help, fall through to raw block
   }
+
+  gcomp_stepdown_note(state ? &state->stepdowns : NULL, stepdown);
 
   // Use raw block (no compression or compression not beneficial)
   if (input_len > output_cap) {
