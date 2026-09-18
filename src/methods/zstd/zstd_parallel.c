@@ -197,16 +197,23 @@ static gcomp_status_t zstd_parallel_compress_frame(
         (remaining > ZSTD_BLOCK_SIZE_MAX) ? ZSTD_BLOCK_SIZE_MAX : remaining;
     bool is_last = (remaining - block_input_len == 0);
 
-    // Reset match finder before each block to avoid position confusion
-    // (each block is compressed independently)
+    // The finder's positions go, because it is given each block on its own
+    // with positions counted from that block's first byte and carrying them
+    // over would make every offset it reported wrong.  What the optimal
+    // parse has learned about the data stays: that describes the data, not
+    // where it sat, and a job's later blocks are the same kind of thing as
+    // its first.
     if (temp_state.match_finder) {
-      zstd_mf_reset(temp_state.match_finder);
+      zstd_mf_reset_positions(temp_state.match_finder);
     }
 
-    // Reset repeat offsets for each block
-    temp_state.rep_offset_1 = ZSTD_REP_OFFSET_1_INIT;
-    temp_state.rep_offset_2 = ZSTD_REP_OFFSET_2_INIT;
-    temp_state.rep_offset_3 = ZSTD_REP_OFFSET_3_INIT;
+    // The repeat offsets are NOT reset here, and resetting them was a bug
+    // that corrupted every job longer than one block.  RFC 8878 section
+    // 3.1.1.3.2.1.1 resets the three at the start of a FRAME; within one,
+    // every block continues from where the last left off, and a decoder
+    // does exactly that.  Starting each block from 1, 4 and 8 meant the
+    // encoder wrote code 1 meaning one distance while the decoder read it
+    // as another, from the second block of each job onwards.
 
     // Compress block
     uint8_t block_type;
@@ -564,13 +571,18 @@ void zstd_parallel_free_job(
   gcomp_free(ctx->allocator, job);
 }
 
-gcomp_status_t zstd_parallel_submit(
+gcomp_status_t zstd_parallel_try_submit(
     zstd_parallel_ctx_t * ctx, zstd_parallel_job_t * job) {
   if (!ctx || !job) {
     return GCOMP_ERR_INVALID_ARG;
   }
+  // A job is its own frame, so it starts from nothing: no positions, and no
+  // statistics carried over from whatever the finder last looked at.  Doing
+  // it before the try means a refused submit has still reset it, which is
+  // harmless -- nothing has looked at it in between and the caller tries
+  // again with the same job.
   zstd_mf_reset(job->match_finder);
-  return gcomp_parallel_block_submit(ctx->block_ctx, job,
+  return gcomp_parallel_block_try_submit(ctx->block_ctx, job,
       (gcomp_parallel_block_process_fn_t)zstd_parallel_process_job);
 }
 

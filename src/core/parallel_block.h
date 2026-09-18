@@ -76,6 +76,12 @@ void gcomp_parallel_block_destroy(gcomp_parallel_block_ctx_t * ctx);
  * @brief Submit a job. In inline mode runs process_fn immediately and queues
  * result; in threaded mode enqueues and runs on worker.
  *
+ * WARNING: in threaded mode this waits when the context already has
+ * max_in_flight jobs outstanding, and the only thing that reduces that count
+ * is gcomp_parallel_block_get_result().  A caller that collects its own
+ * results must therefore use gcomp_parallel_block_try_submit() instead:
+ * blocking here would be waiting for space that only this thread can free.
+ *
  * @param ctx Context.
  * @param job_ctx Job (must have gcomp_block_job_t as first member).
  * @param process_fn Method-specific process function.
@@ -83,6 +89,19 @@ void gcomp_parallel_block_destroy(gcomp_parallel_block_ctx_t * ctx);
  */
 gcomp_status_t gcomp_parallel_block_submit(gcomp_parallel_block_ctx_t * ctx,
     void * job_ctx, gcomp_parallel_block_process_fn_t process_fn);
+
+/**
+ * @brief Submit a job, reporting a full context rather than waiting for it.
+ *
+ * @param ctx Context.
+ * @param job_ctx Job (must have gcomp_block_job_t as first member).
+ * @param process_fn Method-specific process function.
+ * @return GCOMP_OK on success, GCOMP_ERR_LIMIT when max_in_flight jobs are
+ *         already outstanding and a result must be collected first.
+ */
+gcomp_status_t gcomp_parallel_block_try_submit(
+    gcomp_parallel_block_ctx_t * ctx, void * job_ctx,
+    gcomp_parallel_block_process_fn_t process_fn);
 
 /**
  * @brief Get the next completed job in submission order (blocks until ready).

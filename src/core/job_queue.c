@@ -209,8 +209,16 @@ void gcomp_job_queue_destroy(gcomp_job_queue_t * queue) {
   gcomp_free(queue->allocator, queue);
 }
 
-gcomp_status_t gcomp_job_queue_submit(
-    gcomp_job_queue_t * queue, gcomp_block_job_t * job) {
+/**
+ * @brief Add @p job to the queue, waiting for space only if @p blocking.
+ *
+ * Space is freed by gcomp_job_queue_get_next_result() and by nothing else,
+ * so waiting here is only safe when some OTHER thread collects results.  A
+ * caller that both submits and collects must not block: it would be waiting
+ * for itself.  See the warning on gcomp_job_queue_submit().
+ */
+static gcomp_status_t gcomp_job_queue_submit_internal(
+    gcomp_job_queue_t * queue, gcomp_block_job_t * job, bool blocking) {
   if (!queue || !job) {
     return GCOMP_ERR_INVALID_ARG;
   }
@@ -219,6 +227,10 @@ gcomp_status_t gcomp_job_queue_submit(
 
   // Check capacity (if bounded)
   while (queue->capacity > 0 && queue->active_count >= queue->capacity) {
+    if (!blocking) {
+      GCU_MUTEX_UNLOCK(queue->mutex);
+      return GCOMP_ERR_LIMIT;
+    }
     queue->waiting_for_space = true;
     GCU_MUTEX_UNLOCK(queue->mutex);
     gcu_semaphore_wait(&queue->space_available);
@@ -256,6 +268,16 @@ gcomp_status_t gcomp_job_queue_submit(
   GCU_MUTEX_UNLOCK(queue->mutex);
 
   return GCOMP_OK;
+}
+
+gcomp_status_t gcomp_job_queue_submit(
+    gcomp_job_queue_t * queue, gcomp_block_job_t * job) {
+  return gcomp_job_queue_submit_internal(queue, job, true);
+}
+
+gcomp_status_t gcomp_job_queue_try_submit(
+    gcomp_job_queue_t * queue, gcomp_block_job_t * job) {
+  return gcomp_job_queue_submit_internal(queue, job, false);
 }
 
 void gcomp_job_queue_complete(

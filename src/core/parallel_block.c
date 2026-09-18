@@ -143,8 +143,9 @@ void gcomp_parallel_block_destroy(gcomp_parallel_block_ctx_t * ctx) {
   gcomp_free(ctx->allocator, ctx);
 }
 
-gcomp_status_t gcomp_parallel_block_submit(gcomp_parallel_block_ctx_t * ctx,
-    void * job_ctx, gcomp_parallel_block_process_fn_t process_fn) {
+static gcomp_status_t gcomp_parallel_block_submit_internal(
+    gcomp_parallel_block_ctx_t * ctx, void * job_ctx,
+    gcomp_parallel_block_process_fn_t process_fn, bool blocking) {
   if (!ctx || !job_ctx || !process_fn) {
     return GCOMP_ERR_INVALID_ARG;
   }
@@ -172,7 +173,9 @@ gcomp_status_t gcomp_parallel_block_submit(gcomp_parallel_block_ctx_t * ctx,
     return GCOMP_OK;
   }
 
-  gcomp_status_t status = gcomp_job_queue_submit(ctx->queue, base);
+  gcomp_status_t status = blocking
+      ? gcomp_job_queue_submit(ctx->queue, base)
+      : gcomp_job_queue_try_submit(ctx->queue, base);
   if (status != GCOMP_OK) {
     return status;
   }
@@ -182,6 +185,17 @@ gcomp_status_t gcomp_parallel_block_submit(gcomp_parallel_block_ctx_t * ctx,
     gcomp_job_queue_complete(ctx->queue, base, status);
   }
   return GCOMP_OK;
+}
+
+gcomp_status_t gcomp_parallel_block_submit(gcomp_parallel_block_ctx_t * ctx,
+    void * job_ctx, gcomp_parallel_block_process_fn_t process_fn) {
+  return gcomp_parallel_block_submit_internal(ctx, job_ctx, process_fn, true);
+}
+
+gcomp_status_t gcomp_parallel_block_try_submit(
+    gcomp_parallel_block_ctx_t * ctx, void * job_ctx,
+    gcomp_parallel_block_process_fn_t process_fn) {
+  return gcomp_parallel_block_submit_internal(ctx, job_ctx, process_fn, false);
 }
 
 gcomp_status_t gcomp_parallel_block_get_result(

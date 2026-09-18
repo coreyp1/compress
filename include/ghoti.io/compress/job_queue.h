@@ -124,10 +124,18 @@ GCOMP_API gcomp_status_t gcomp_job_queue_create(
 GCOMP_API void gcomp_job_queue_destroy(gcomp_job_queue_t * queue);
 
 /**
- * @brief Submit a job to the queue.
+ * @brief Submit a job to the queue, waiting for space if the queue is full.
  *
- * The job is assigned a sequence number for ordering. If the queue is at
- * capacity, this call blocks until space is available.
+ * The job is assigned a sequence number for ordering.
+ *
+ * WARNING: space in a bounded queue is freed by
+ * gcomp_job_queue_get_next_result() and by nothing else.  Blocking here is
+ * therefore only safe when a DIFFERENT thread collects results.  A caller
+ * that both submits and collects -- which is the usual shape, since results
+ * must be consumed in order -- will deadlock the moment the queue fills: it
+ * ends up waiting for space that only it could free.  Such a caller wants
+ * gcomp_job_queue_try_submit() and should collect a result when told the
+ * queue is full.
  *
  * The job structure is owned by the caller but must remain valid until
  * retrieved via gcomp_job_queue_get_next_result().
@@ -137,6 +145,21 @@ GCOMP_API void gcomp_job_queue_destroy(gcomp_job_queue_t * queue);
  * @return GCOMP_OK on success, error code on failure.
  */
 GCOMP_API gcomp_status_t gcomp_job_queue_submit(
+    gcomp_job_queue_t * queue, gcomp_block_job_t * job);
+
+/**
+ * @brief Submit a job to the queue, refusing rather than waiting.
+ *
+ * As gcomp_job_queue_submit(), except that a full queue is reported instead
+ * of waited on.  A caller that collects its own results uses this, collects
+ * a result when it is told the queue is full, and tries again.
+ *
+ * @param queue Job queue.
+ * @param job Job to submit (must remain valid until retrieved).
+ * @return GCOMP_OK on success, GCOMP_ERR_LIMIT if the queue is at capacity,
+ *         other error codes on failure.
+ */
+GCOMP_API gcomp_status_t gcomp_job_queue_try_submit(
     gcomp_job_queue_t * queue, gcomp_block_job_t * job);
 
 /**

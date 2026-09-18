@@ -449,9 +449,14 @@ void zstd_mf_destroy(zstd_match_finder_t * mf, const gcomp_allocator_t * alloc,
 }
 
 /**
- * @brief Reset match finder for new block.
+ * @brief Forget every recorded position, keeping the cost model.
+ *
+ * Used where the finder is about to be handed a different buffer within the
+ * same frame: its tables name positions in the buffer it was given, so they
+ * have to go, but the statistics the optimal parse prices by describe the
+ * data rather than where it sat, and are still true.
  */
-void zstd_mf_reset(zstd_match_finder_t * mf) {
+void zstd_mf_reset_positions(zstd_match_finder_t * mf) {
   if (!mf) {
     return;
   }
@@ -468,9 +473,16 @@ void zstd_mf_reset(zstd_match_finder_t * mf) {
   // Nothing refers to any position any more, so where data[0] sits in the
   // stream stops mattering and counting can start again.
   mf->base_pos = 0;
+  mf->last_insert_abs = 0;
+}
 
-  // The cost model describes a stream that is being thrown away with the
-  // tables, so it goes back to its prior too.
+void zstd_mf_reset(zstd_match_finder_t * mf) {
+  if (!mf) {
+    return;
+  }
+  zstd_mf_reset_positions(mf);
+
+  // A new stream: the cost model describes something that is over.
   zstd_opt_reset(mf);
 }
 
@@ -711,6 +723,13 @@ static inline size_t zstd_mf_bt_descend(zstd_match_finder_t * mf,
   }
 
   const size_t cur_abs = mf->base_pos + pos;
+#ifdef GCOMP_TEST_BUILD
+  // See last_insert_abs in zstd_internal.h: inserting a position twice, or
+  // out of order, makes a node its own descendant and silently throws away
+  // everything under it.
+  assert(cur_abs + 1u > mf->last_insert_abs);
+#endif
+  mf->last_insert_abs = cur_abs + 1u;
   uint32_t hash = zstd_mf_hash4(data + pos, mf->hash_log);
   uint32_t cur = mf->hash_table[hash];
   mf->hash_table[hash] = (uint32_t)(cur_abs + 1u); // +1 so 0 means "no entry"

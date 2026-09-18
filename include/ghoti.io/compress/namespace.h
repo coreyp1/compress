@@ -76,6 +76,7 @@
 #define gcomp_job_queue_reset GHOTIIO_COMPRESS(gcomp_job_queue_reset)
 #define gcomp_job_queue_result_ready GHOTIIO_COMPRESS(gcomp_job_queue_result_ready)
 #define gcomp_job_queue_submit GHOTIIO_COMPRESS(gcomp_job_queue_submit)
+#define gcomp_job_queue_try_submit GHOTIIO_COMPRESS(gcomp_job_queue_try_submit)
 #define gcomp_limits_check_expansion_ratio GHOTIIO_COMPRESS(gcomp_limits_check_expansion_ratio)
 #define gcomp_limits_check_memory GHOTIIO_COMPRESS(gcomp_limits_check_memory)
 #define gcomp_limits_check_output GHOTIIO_COMPRESS(gcomp_limits_check_output)

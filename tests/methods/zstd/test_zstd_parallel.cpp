@@ -10,6 +10,7 @@
 
 #include "../common/test_helpers.h"
 #include <cstring>
+#include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
@@ -241,7 +242,7 @@ TEST_F(ZstdParallelTest, InlineSubmitGetResult) {
   job->base.input_size = strlen(test_data);
 
   // Submit
-  ASSERT_EQ(zstd_parallel_submit(ctx, job), GCOMP_OK);
+  ASSERT_EQ(zstd_parallel_try_submit(ctx, job), GCOMP_OK);
   EXPECT_EQ(zstd_parallel_pending_count(ctx), 1u);
   EXPECT_TRUE(zstd_parallel_result_ready(ctx));
 
@@ -286,7 +287,7 @@ TEST_F(ZstdParallelTest, InlineMultipleJobs) {
     ASSERT_EQ(zstd_parallel_alloc_job(ctx, &job), GCOMP_OK);
     memcpy((void *)job->base.input, test_strings[i], strlen(test_strings[i]));
     job->base.input_size = strlen(test_strings[i]);
-    ASSERT_EQ(zstd_parallel_submit(ctx, job), GCOMP_OK);
+    ASSERT_EQ(zstd_parallel_try_submit(ctx, job), GCOMP_OK);
     jobs.push_back(job);
   }
 
@@ -334,7 +335,7 @@ TEST_F(ZstdParallelTest, InlineWithChecksum) {
   memcpy((void *)job->base.input, test_data, strlen(test_data));
   job->base.input_size = strlen(test_data);
 
-  ASSERT_EQ(zstd_parallel_submit(ctx, job), GCOMP_OK);
+  ASSERT_EQ(zstd_parallel_try_submit(ctx, job), GCOMP_OK);
 
   zstd_parallel_job_t * result = nullptr;
   ASSERT_EQ(zstd_parallel_get_result(ctx, &result), GCOMP_OK);
@@ -376,7 +377,7 @@ TEST_F(ZstdParallelTest, ThreadedSubmitGetResult) {
   memcpy((void *)job->base.input, test_data, strlen(test_data));
   job->base.input_size = strlen(test_data);
 
-  ASSERT_EQ(zstd_parallel_submit(ctx, job), GCOMP_OK);
+  ASSERT_EQ(zstd_parallel_try_submit(ctx, job), GCOMP_OK);
 
   zstd_parallel_job_t * result = nullptr;
   ASSERT_EQ(zstd_parallel_get_result(ctx, &result), GCOMP_OK);
@@ -423,7 +424,7 @@ TEST_F(ZstdParallelTest, ThreadedMultipleJobsOrderPreserved) {
 
     memcpy((void *)job->base.input, data.data(), data.size());
     job->base.input_size = data.size();
-    ASSERT_EQ(zstd_parallel_submit(ctx, job), GCOMP_OK);
+    ASSERT_EQ(zstd_parallel_try_submit(ctx, job), GCOMP_OK);
     jobs.push_back(job);
   }
 
@@ -478,7 +479,7 @@ TEST_F(ZstdParallelTest, ConcatenatedFramesDecodable) {
 
     memcpy((void *)job->base.input, data.data(), data.size());
     job->base.input_size = data.size();
-    ASSERT_EQ(zstd_parallel_submit(ctx, job), GCOMP_OK);
+    ASSERT_EQ(zstd_parallel_try_submit(ctx, job), GCOMP_OK);
 
     zstd_parallel_job_t * result = nullptr;
     ASSERT_EQ(zstd_parallel_get_result(ctx, &result), GCOMP_OK);
@@ -587,7 +588,7 @@ TEST_F(ZstdParallelTest, ResetAfterAllJobsRetrieved) {
   ASSERT_EQ(zstd_parallel_alloc_job(ctx, &job), GCOMP_OK);
   job->base.input_size = 10;
   memset((void *)job->base.input, 'A', 10);
-  ASSERT_EQ(zstd_parallel_submit(ctx, job), GCOMP_OK);
+  ASSERT_EQ(zstd_parallel_try_submit(ctx, job), GCOMP_OK);
 
   zstd_parallel_job_t * result = nullptr;
   ASSERT_EQ(zstd_parallel_get_result(ctx, &result), GCOMP_OK);
@@ -621,7 +622,7 @@ TEST_F(ZstdParallelTest, ResetWithPendingJobsFails) {
   ASSERT_EQ(zstd_parallel_alloc_job(ctx, &job), GCOMP_OK);
   job->base.input_size = 10;
   memset((void *)job->base.input, 'A', 10);
-  ASSERT_EQ(zstd_parallel_submit(ctx, job), GCOMP_OK);
+  ASSERT_EQ(zstd_parallel_try_submit(ctx, job), GCOMP_OK);
 
   // Reset should fail with pending jobs
   EXPECT_EQ(zstd_parallel_reset(ctx), GCOMP_ERR_INVALID_ARG);
@@ -658,7 +659,7 @@ TEST_F(ZstdParallelTest, EmptyInput) {
 
   job->base.input_size = 0; // Empty input
 
-  ASSERT_EQ(zstd_parallel_submit(ctx, job), GCOMP_OK);
+  ASSERT_EQ(zstd_parallel_try_submit(ctx, job), GCOMP_OK);
 
   zstd_parallel_job_t * result = nullptr;
   ASSERT_EQ(zstd_parallel_get_result(ctx, &result), GCOMP_OK);
@@ -694,7 +695,7 @@ TEST_F(ZstdParallelTest, RLECompressibleInput) {
   memset((void *)job->base.input, 'X', 10000);
   job->base.input_size = 10000;
 
-  ASSERT_EQ(zstd_parallel_submit(ctx, job), GCOMP_OK);
+  ASSERT_EQ(zstd_parallel_try_submit(ctx, job), GCOMP_OK);
 
   zstd_parallel_job_t * result = nullptr;
   ASSERT_EQ(zstd_parallel_get_result(ctx, &result), GCOMP_OK);
@@ -735,7 +736,7 @@ TEST_F(ZstdParallelTest, LargeInputMultipleBlocks) {
   memcpy((void *)job->base.input, data.data(), data.size());
   job->base.input_size = data.size();
 
-  ASSERT_EQ(zstd_parallel_submit(ctx, job), GCOMP_OK);
+  ASSERT_EQ(zstd_parallel_try_submit(ctx, job), GCOMP_OK);
 
   zstd_parallel_job_t * result = nullptr;
   ASSERT_EQ(zstd_parallel_get_result(ctx, &result), GCOMP_OK);
@@ -754,7 +755,7 @@ TEST_F(ZstdParallelTest, LargeInputMultipleBlocks) {
 //
 
 TEST_F(ZstdParallelTest, SubmitNullCtxFails) {
-  EXPECT_EQ(zstd_parallel_submit(nullptr, nullptr), GCOMP_ERR_INVALID_ARG);
+  EXPECT_EQ(zstd_parallel_try_submit(nullptr, nullptr), GCOMP_ERR_INVALID_ARG);
 }
 
 TEST_F(ZstdParallelTest, GetResultNullCtxFails) {
@@ -852,6 +853,127 @@ TEST_F(ZstdParallelTest, JobSizeMaxEnforced) {
   EXPECT_EQ(zstd_parallel_get_job_size(ctx), 16 * 1024 * 1024u);
 
   zstd_parallel_destroy(ctx);
+}
+
+//
+// End to end: the encoder driven with threads.count, which is how a caller
+// reaches any of the above.  Nothing tested this, and two defects lived
+// behind that: the encoder deadlocked once it had handed over as many jobs
+// as the context would hold, and every job longer than one block decoded to
+// the wrong bytes.
+//
+
+namespace {
+
+/**
+ * @brief Words drawn from a small vocabulary: text-shaped bytes.
+ *
+ * Chosen because it is what actually catches a mis-carried repeat offset.
+ * Every match here is a word that has appeared before, so the same handful
+ * of distances recur constantly and a parse reaches for the one-symbol
+ * offset codes in every block.  Synthetic alternatives did not: noise with
+ * phrases planted at fixed periods, and fixed-width records, both
+ * round-tripped through the broken encoder without complaint.
+ */
+std::vector<uint8_t> WordyText(size_t n) {
+  static const char * words[] = {"the", "quick", "brown", "fox", "jumps",
+      "over", "lazy", "dog", "and", "then", "returns", "home", "with",
+      "another", "message", "for", "everyone", "who", "waited", "encoder",
+      "decoder", "window", "offset", "literal", "sequence"};
+  const size_t count = sizeof(words) / sizeof(words[0]);
+
+  std::vector<uint8_t> v;
+  v.reserve(n + 16);
+  uint32_t seed = 90210u;
+  while (v.size() < n) {
+    seed = seed * 1103515245u + 12345u;
+    const char * w = words[(seed >> 16) % count];
+    while (*w) {
+      v.push_back(static_cast<uint8_t>(*w++));
+    }
+    v.push_back((seed & 0x1Fu) == 0 ? '\n' : ' ');
+  }
+  v.resize(n);
+  return v;
+}
+
+} // namespace
+
+/**
+ * @brief Compress with threads and read it back.
+ */
+static void ExpectThreadedRoundTrip(gcomp_registry_t * registry,
+    const std::vector<uint8_t> & data, int level, uint64_t threads,
+    uint64_t job_size) {
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  gcomp_options_set_int64(opts, "zstd.level", level);
+  gcomp_options_set_uint64(opts, "threads.count", threads);
+  if (job_size) {
+    gcomp_options_set_uint64(opts, "zstd.job_size", job_size);
+  }
+
+  std::vector<uint8_t> out(data.size() + data.size() / 2 + 65536);
+  size_t out_len = 0;
+  gcomp_status_t status = gcomp_encode_buffer(registry, "zstd", opts,
+      data.data(), data.size(), out.data(), out.size(), &out_len);
+  gcomp_options_destroy(opts);
+  ASSERT_EQ(status, GCOMP_OK) << "level " << level << ", " << threads
+                              << " threads";
+  ASSERT_GT(out_len, 0u);
+
+  // Threaded output is a run of independent frames, one per job.
+  gcomp_options_t * dec_opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&dec_opts), GCOMP_OK);
+  gcomp_options_set_bool(dec_opts, "zstd.concat", true);
+  std::vector<uint8_t> back(data.size() + 1024);
+  size_t back_len = 0;
+  status = gcomp_decode_buffer(registry, "zstd", dec_opts, out.data(), out_len,
+      back.data(), back.size(), &back_len);
+  gcomp_options_destroy(dec_opts);
+  ASSERT_EQ(status, GCOMP_OK) << "level " << level;
+  ASSERT_EQ(back_len, data.size()) << "level " << level;
+  EXPECT_EQ(memcmp(back.data(), data.data(), data.size()), 0)
+      << "level " << level << ", " << threads << " threads";
+}
+
+// More jobs than the context will hold at once.
+//
+// The encoder used to wait for room to hand over the next one, and the only
+// thing that makes room is taking a result back -- which the same thread
+// does.  So it waited for itself: four workers idle, encoder asleep, forever.
+// At the defaults that was any input over max_in_flight * job_size, about
+// 4 MB with threads.count of 4.  A regression here does not fail this test,
+// it hangs it.
+TEST_F(ZstdParallelTest, MoreJobsThanTheContextHolds) {
+  // 64 KB jobs and two threads means the context holds four; sixteen jobs of
+  // input is four times over, without making the test slow.
+  std::vector<uint8_t> data = WordyText(16u * 64u * 1024u);
+  for (int level : {1, 3, 9, 16, 19}) {
+    ExpectThreadedRoundTrip(registry_, data, level, 2, 64u * 1024u);
+  }
+}
+
+// Every block of a job after the first.
+//
+// The three repeat offsets are reset at the start of a FRAME (RFC 8878
+// section 3.1.1.3.2.1.1); within one, each block continues from where the
+// last left off, and a decoder does exactly that.  The threaded encoder
+// reset them per block, so from the second block of every job onwards it
+// wrote a code meaning one distance and the decoder read another.
+//
+// It needs a job of more than one block, and data whose later blocks reach
+// for a repeat offset.  Not all data does: 2.97 MB of manual pages
+// round-tripped through the broken encoder while 4.69 MB of C source did
+// not, and two synthetic shapes that looked like they should catch it --
+// noise with phrases at fixed periods, and fixed-width records -- did not
+// either.  See WordyText().
+TEST_F(ZstdParallelTest, RepeatOffsetsCarryAcrossTheBlocksOfAJob) {
+  // 512 KB jobs are four blocks each; three jobs of input.
+  std::vector<uint8_t> data = WordyText(3u * 512u * 1024u);
+  for (int level : {3, 9, 16, 19}) {
+    ExpectThreadedRoundTrip(registry_, data, level, 2, 512u * 1024u);
+  }
 }
 
 int main(int argc, char ** argv) {

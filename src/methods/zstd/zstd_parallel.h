@@ -132,7 +132,7 @@ GCOMP_INTERNAL_API void zstd_parallel_free_job(
     zstd_parallel_ctx_t * ctx, zstd_parallel_job_t * job);
 
 /**
- * @brief Submit a block for compression.
+ * @brief Submit a block for compression, if the context has room for it.
  *
  * The job's input buffer must be filled before calling this function.
  * The job remains owned by the caller but must not be modified until
@@ -141,11 +141,18 @@ GCOMP_INTERNAL_API void zstd_parallel_free_job(
  * In parallel mode, each job produces a complete zstd frame. The output
  * of multiple jobs can be concatenated to form valid zstd stream.
  *
+ * There is deliberately no blocking form.  The only thing that makes room
+ * for another job is collecting a result, and the thread that collects is
+ * the thread that submits, so waiting for room here would be waiting for
+ * itself -- which is exactly what used to happen: compressing more than
+ * max_in_flight * job_size bytes with threads.count > 1 hung the encoder.
+ *
  * @param ctx Parallel context.
  * @param job Job to submit (input buffer must be filled).
- * @return GCOMP_OK on success, error code on failure.
+ * @return GCOMP_OK on success, GCOMP_ERR_LIMIT when the context is full and
+ *         a result must be collected first, other error codes on failure.
  */
-GCOMP_INTERNAL_API gcomp_status_t zstd_parallel_submit(
+GCOMP_INTERNAL_API gcomp_status_t zstd_parallel_try_submit(
     zstd_parallel_ctx_t * ctx, zstd_parallel_job_t * job);
 
 /**

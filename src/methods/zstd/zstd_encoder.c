@@ -164,11 +164,58 @@ static bool zstd_encoder_drain_parallel_output(
  * @param output Output buffer
  * @return GCOMP_OK on success, error code on failure
  */
+static gcomp_status_t zstd_encoder_take_parallel_result(
+    zstd_encoder_state_t * state, gcomp_buffer_t * output,
+    zstd_parallel_job_t * completed, bool * buffered_out) {
+  uint8_t * out_ptr = (uint8_t *)output->data;
+  *buffered_out = false;
+
+  // Check if job had an error
+  if (completed->base.status == GCOMP_JOB_ERROR ||
+      completed->base.result != GCOMP_OK) {
+    gcomp_status_t status = completed->base.result;
+    zstd_parallel_free_job(state->parallel_ctx, completed);
+    return status;
+  }
+
+  // Copy job output to our buffer or directly to output
+  size_t output_len = completed->base.output_size;
+  const uint8_t * output_data = completed->base.output;
+
+  // First, try to copy directly to output
+  size_t direct_copy = output->size - output->used;
+  if (direct_copy > output_len) {
+    direct_copy = output_len;
+  }
+  if (direct_copy > 0) {
+    memcpy(out_ptr + output->used, output_data, direct_copy);
+    output->used += direct_copy;
+  }
+
+  // If there's remaining data, buffer it
+  size_t remaining = output_len - direct_copy;
+  if (remaining > 0) {
+    // Ensure buffer has space
+    if (remaining > state->parallel_output_buf_cap) {
+      // Buffer too small - this shouldn't happen with proper sizing
+      zstd_parallel_free_job(state->parallel_ctx, completed);
+      return GCOMP_ERR_INTERNAL;
+    }
+    memcpy(state->parallel_output_buf, output_data + direct_copy, remaining);
+    state->parallel_output_buf_pos = 0;
+    state->parallel_output_buf_len = remaining;
+    *buffered_out = true;
+  }
+
+  zstd_parallel_free_job(state->parallel_ctx, completed);
+  return GCOMP_OK;
+}
+
+/**
+ * @brief Collect every result that is ready, without waiting for any.
+ */
 static gcomp_status_t zstd_encoder_collect_parallel_results(
     zstd_encoder_state_t * state, gcomp_buffer_t * output) {
-  uint8_t * out_ptr = (uint8_t *)output->data;
-
-  // Check if there are completed results
   while (zstd_parallel_result_ready(state->parallel_ctx)) {
     zstd_parallel_job_t * completed = NULL;
     gcomp_status_t status =
@@ -176,47 +223,15 @@ static gcomp_status_t zstd_encoder_collect_parallel_results(
     if (status != GCOMP_OK) {
       return status;
     }
-
-    // Check if job had an error
-    if (completed->base.status == GCOMP_JOB_ERROR ||
-        completed->base.result != GCOMP_OK) {
-      status = completed->base.result;
-      zstd_parallel_free_job(state->parallel_ctx, completed);
+    bool buffered = false;
+    status =
+        zstd_encoder_take_parallel_result(state, output, completed, &buffered);
+    if (status != GCOMP_OK) {
       return status;
     }
-
-    // Copy job output to our buffer or directly to output
-    size_t output_len = completed->base.output_size;
-    const uint8_t * output_data = completed->base.output;
-
-    // First, try to copy directly to output
-    size_t direct_copy = output->size - output->used;
-    if (direct_copy > output_len) {
-      direct_copy = output_len;
-    }
-    if (direct_copy > 0) {
-      memcpy(out_ptr + output->used, output_data, direct_copy);
-      output->used += direct_copy;
-    }
-
-    // If there's remaining data, buffer it
-    size_t remaining = output_len - direct_copy;
-    if (remaining > 0) {
-      // Ensure buffer has space
-      if (remaining > state->parallel_output_buf_cap) {
-        // Buffer too small - this shouldn't happen with proper sizing
-        zstd_parallel_free_job(state->parallel_ctx, completed);
-        return GCOMP_ERR_INTERNAL;
-      }
-      memcpy(state->parallel_output_buf, output_data + direct_copy, remaining);
-      state->parallel_output_buf_pos = 0;
-      state->parallel_output_buf_len = remaining;
-    }
-
-    zstd_parallel_free_job(state->parallel_ctx, completed);
-
-    // If we buffered data, stop collecting more results
-    if (remaining > 0) {
+    // Only one job's worth of output can be held back at a time, so once
+    // something is buffered there is nowhere to put the next result.
+    if (buffered) {
       break;
     }
   }
@@ -225,29 +240,81 @@ static gcomp_status_t zstd_encoder_collect_parallel_results(
 }
 
 /**
- * @brief Submit the current parallel job and allocate a new one.
+ * @brief Collect one result, waiting for it if it is not finished yet.
  *
- * @param state Encoder state
- * @return GCOMP_OK on success, error code on failure
+ * Used when the context has no room for another job: the only thing that
+ * frees a slot is taking a result back, so this is what unblocks a submit.
+ */
+static gcomp_status_t zstd_encoder_collect_one_parallel_result(
+    zstd_encoder_state_t * state, gcomp_buffer_t * output) {
+  zstd_parallel_job_t * completed = NULL;
+  gcomp_status_t status =
+      zstd_parallel_get_result(state->parallel_ctx, &completed);
+  if (status != GCOMP_OK) {
+    return status;
+  }
+  bool buffered = false;
+  return zstd_encoder_take_parallel_result(
+      state, output, completed, &buffered);
+}
+
+/**
+ * @brief Hand the current job to the parallel context.
+ *
+ * WAITING FOR YOURSELF
+ * ====================
+ *
+ * The context holds at most max_in_flight jobs, and the only thing that
+ * frees a slot is collecting a result.  The thread that collects is this
+ * one.  So when the context is full, the thing to do is collect -- never
+ * wait, because there is nobody else to wait for.
+ *
+ * Waiting is what this used to do, one level down, and it deadlocked every
+ * stream longer than max_in_flight * job_size: four workers idle with
+ * nothing left to do, and the encoder asleep waiting for room that only it
+ * could make.  At the defaults that was any input over 4 MB compressed with
+ * threads.count of 4.
+ *
+ * Collecting needs somewhere to put the result, and only one job's output
+ * can be held back at a time.  If the output buffer is full and something is
+ * already held back, there is nothing useful to do here: @p submitted_out is
+ * set false and the job stays filled and unsubmitted, to be offered again
+ * once the caller has drained.
+ *
+ * @param state Encoder state.
+ * @param output Where collected results go.
+ * @param submitted_out Receives whether the job was handed over.
+ * @return GCOMP_OK on success, error code on failure.
  */
 static gcomp_status_t zstd_encoder_submit_parallel_job(
-    zstd_encoder_state_t * state) {
+    zstd_encoder_state_t * state, gcomp_buffer_t * output,
+    bool * submitted_out) {
+  *submitted_out = false;
   if (!state->parallel_job) {
     return GCOMP_ERR_INTERNAL;
   }
 
-  // Submit the job
-  gcomp_status_t status =
-      zstd_parallel_submit(state->parallel_ctx, state->parallel_job);
-  if (status != GCOMP_OK) {
-    return status;
+  for (;;) {
+    gcomp_status_t status =
+        zstd_parallel_try_submit(state->parallel_ctx, state->parallel_job);
+    if (status == GCOMP_OK) {
+      break;
+    }
+    if (status != GCOMP_ERR_LIMIT) {
+      return status;
+    }
+    if (state->parallel_output_buf_pos < state->parallel_output_buf_len) {
+      return GCOMP_OK; // Nowhere to put a result; the caller must drain.
+    }
+    status = zstd_encoder_collect_one_parallel_result(state, output);
+    if (status != GCOMP_OK) {
+      return status;
+    }
   }
 
   state->parallel_job = NULL; // Job is now owned by parallel context
-
-  // Allocate a new job for the next chunk
-  status = zstd_parallel_alloc_job(state->parallel_ctx, &state->parallel_job);
-  return status;
+  *submitted_out = true;
+  return GCOMP_OK;
 }
 
 /**
@@ -315,9 +382,25 @@ static gcomp_status_t zstd_encoder_update_parallel(gcomp_encoder_t * encoder,
 
     // If job is full, submit it
     if (state->parallel_job->base.input_size >= job_size) {
-      status = zstd_encoder_submit_parallel_job(state);
+      bool submitted = false;
+      status = zstd_encoder_submit_parallel_job(state, output, &submitted);
       if (status != GCOMP_OK) {
         gcomp_encoder_set_error(encoder, status, "parallel job submit failed");
+        return status;
+      }
+      if (!submitted) {
+        // The context is full and its results have nowhere to go.  The job
+        // is still here, still full; it goes next time, once the caller has
+        // taken what is already staged.
+        return GCOMP_OK;
+      }
+
+      // The job that was just handed over needs a successor to fill.
+      status =
+          zstd_parallel_alloc_job(state->parallel_ctx, &state->parallel_job);
+      if (status != GCOMP_OK) {
+        gcomp_encoder_set_error(
+            encoder, status, "failed to allocate parallel job");
         return status;
       }
 
@@ -363,12 +446,18 @@ static gcomp_status_t zstd_encoder_finish_parallel(gcomp_encoder_t * encoder,
   if (!state->blocks_finished && state->parallel_job) {
     // Only submit if there's data in the job
     if (state->parallel_job->base.input_size > 0) {
-      status = zstd_parallel_submit(state->parallel_ctx, state->parallel_job);
+      bool submitted = false;
+      status = zstd_encoder_submit_parallel_job(state, output, &submitted);
       if (status != GCOMP_OK) {
         gcomp_encoder_set_error(encoder, status, "parallel job submit failed");
         return status;
       }
-      state->parallel_job = NULL; // Job is now owned by parallel context
+      if (!submitted) {
+        // Output is full with a result already staged.  finish() reports
+        // completion with GCOMP_OK, so this must not: the last job has not
+        // even been handed over yet.
+        return GCOMP_ERR_LIMIT;
+      }
     }
     else {
       // No data in job, just free it

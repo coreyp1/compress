@@ -1052,9 +1052,21 @@ void zstd_mf_destroy(zstd_match_finder_t * mf, const gcomp_allocator_t * alloc,
     gcomp_memory_tracker_t * mem_tracker);
 
 /**
- * @brief Reset match finder for new block.
+ * @brief Reset match finder for a new stream.
+ *
+ * Forgets both the positions it has recorded and everything the optimal
+ * parse has learned about what it is compressing.
  */
 void zstd_mf_reset(zstd_match_finder_t * mf);
+
+/**
+ * @brief Forget every recorded position, keeping the cost model.
+ *
+ * For a new buffer within the same frame: the tables name positions in the
+ * buffer they were given and have to go, but what the optimal parse has
+ * learned about the data is still true.
+ */
+void zstd_mf_reset_positions(zstd_match_finder_t * mf);
 
 /**
  * @brief Move every recorded position back by @p shift.
