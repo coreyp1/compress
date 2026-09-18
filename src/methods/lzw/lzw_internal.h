@@ -109,6 +109,19 @@ typedef struct {
   size_t stage_size;      ///< Allocated size of stage_buf.
   size_t stage_used;      ///< Bytes rendered into stage_buf.
   size_t stage_copied;    ///< Bytes of stage_buf already delivered.
+  /**
+   * 1 once finish() has rendered the tail of the stream into stage_buf.
+   *
+   * The tail -- any pending code, the CLEAR an empty input never emitted, the
+   * final prefix, and EOI -- used to be written straight into the caller's
+   * buffer, and the whole sequence was re-run on every finish() call.  A
+   * caller whose buffer ran out partway through got the tail written twice,
+   * and one whose buffer ended exactly on the boundary was told the stream
+   * was complete and stopped.  Rendering it once and draining it makes
+   * finish() resumable and repeatable, the same way staging does for
+   * update().
+   */
+  int finish_staged;
   /** 1 after we've emitted CLEAR at start */
   int header_emitted;
   /** Encoder lookup: 1 = hash, 0 = linear */

@@ -184,6 +184,116 @@ TEST(BoundedOutputTest, OutputIsIndependentOfBufferSize) {
   }
 }
 
+// finish() must not report completion while it still has bytes to hand over.
+//
+// The existing sweep uses chunk sizes of 256 and up, which are large enough
+// that gzip's eight byte trailer never straddled a call boundary.  When it
+// did, finish() wrote what fit, said GCOMP_OK, and the caller -- following the
+// loop the header documents -- stopped with the CRC32 and ISIZE cut in half.
+// No decoder accepts that stream, and nothing reported a problem.
+//
+// Sweeping consecutive sizes is what finds this: the failure depends on where
+// the trailer happens to land, so one or two sizes can pass while the size
+// between them does not.
+TEST(BoundedOutputTest, FinishCompletesTheStreamAtEverySmallBufferSize) {
+  std::vector<uint8_t> input = make_text(4096);
+
+  for (const MethodCase & m : kMethods) {
+    for (size_t chunk = m.min_chunk; chunk <= m.min_chunk + 48; chunk++) {
+      roundtrip_bounded(m.name, input, chunk);
+      if (::testing::Test::HasFatalFailure()) {
+        return;
+      }
+    }
+  }
+}
+
+// The same contract stated directly: once finish() has returned GCOMP_OK,
+// there is nothing left, so another finish() with room to spare must write
+// nothing.  A method that said GCOMP_OK early still has output staged and
+// hands it over here.
+TEST(BoundedOutputTest, NothingRemainsAfterFinishReportsCompletion) {
+  std::vector<uint8_t> input = make_text(4096);
+
+  for (const MethodCase & m : kMethods) {
+    for (size_t chunk = m.min_chunk; chunk <= m.min_chunk + 16; chunk++) {
+      gcomp_encoder_t * enc = nullptr;
+      ASSERT_EQ(gcomp_encoder_create(
+                    gcomp_registry_default(), m.name, nullptr, &enc),
+          GCOMP_OK);
+      std::vector<uint8_t> out_buf(chunk);
+      gcomp_buffer_t in = {
+          const_cast<uint8_t *>(input.data()), input.size(), 0};
+      while (in.used < in.size) {
+        gcomp_buffer_t ob = {out_buf.data(), out_buf.size(), 0};
+        ASSERT_EQ(gcomp_encoder_update(enc, &in, &ob), GCOMP_OK)
+            << m.name << " at chunk " << chunk;
+      }
+      for (;;) {
+        gcomp_buffer_t ob = {out_buf.data(), out_buf.size(), 0};
+        gcomp_status_t s = gcomp_encoder_finish(enc, &ob);
+        if (s == GCOMP_OK) {
+          break;
+        }
+        ASSERT_EQ(s, GCOMP_ERR_LIMIT) << m.name << " at chunk " << chunk;
+      }
+
+      // Room for anything a method could still be holding.
+      std::vector<uint8_t> spare(input.size() + 4096);
+      gcomp_buffer_t ob = {spare.data(), spare.size(), 0};
+      EXPECT_EQ(gcomp_encoder_finish(enc, &ob), GCOMP_OK)
+          << m.name << " at chunk " << chunk;
+      EXPECT_EQ(ob.used, 0u)
+          << m.name << " at chunk " << chunk
+          << ": finish reported the stream complete while still holding "
+          << ob.used << " bytes";
+      gcomp_encoder_destroy(enc);
+    }
+  }
+}
+
+// finish() on an encoder that update() never got to must also complete.
+//
+// This is the path where a format's header is still unwritten when finish()
+// is called -- an empty input, or a caller that goes straight to finish() --
+// and it is not reached by any test that feeds input first, because by then
+// update() has written the header.  gzip's finish() returned GCOMP_OK with a
+// half-written header for exactly as long as nothing looked.
+TEST(BoundedOutputTest, AnEmptyStreamCompletesThroughATinyBuffer) {
+  for (const MethodCase & m : kMethods) {
+    for (size_t chunk = 1; chunk <= 12; chunk++) {
+      gcomp_encoder_t * enc = nullptr;
+      ASSERT_EQ(gcomp_encoder_create(
+                    gcomp_registry_default(), m.name, nullptr, &enc),
+          GCOMP_OK);
+      std::vector<uint8_t> out_buf(chunk), encoded;
+      int guard = 0;
+      for (;;) {
+        gcomp_buffer_t ob = {out_buf.data(), out_buf.size(), 0};
+        gcomp_status_t s = gcomp_encoder_finish(enc, &ob);
+        encoded.insert(encoded.end(), out_buf.data(), out_buf.data() + ob.used);
+        if (s == GCOMP_OK) {
+          break;
+        }
+        ASSERT_EQ(s, GCOMP_ERR_LIMIT) << m.name << " at chunk " << chunk;
+        ASSERT_LT(++guard, 10000)
+            << m.name << " at chunk " << chunk << ": finish never completed";
+      }
+      gcomp_encoder_destroy(enc);
+
+      // An empty input must still produce a stream a decoder accepts.
+      std::vector<uint8_t> decoded(64);
+      size_t decoded_len = 0;
+      EXPECT_EQ(gcomp_decode_buffer(nullptr, m.name, nullptr, encoded.data(),
+                    encoded.size(), decoded.data(), decoded.size(),
+                    &decoded_len),
+          GCOMP_OK)
+          << m.name << " at chunk " << chunk;
+      EXPECT_EQ(decoded_len, 0u) << m.name << " at chunk " << chunk;
+    }
+  }
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

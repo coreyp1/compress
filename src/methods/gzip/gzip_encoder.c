@@ -520,23 +520,32 @@ gcomp_status_t gzip_encoder_finish(
       state->stage = GZIP_ENC_STAGE_BODY;
     }
     else {
-      // Need more output space
-      return GCOMP_OK;
+      // Part of the header is still unwritten.  GCOMP_ERR_LIMIT, not
+      // GCOMP_OK: gcomp_encoder_finish() reserves GCOMP_OK for a complete
+      // stream, and a caller following the documented loop stops at the first
+      // GCOMP_OK it sees.  Saying OK here ends that loop with the stream
+      // half-written.
+      return GCOMP_ERR_LIMIT;
     }
   }
 
   // BODY stage: finish deflate
   if (state->stage == GZIP_ENC_STAGE_BODY) {
     status = gcomp_encoder_finish(state->inner_encoder, output);
+    if (status == GCOMP_ERR_LIMIT) {
+      // Deflate has more to deliver.  This is not a failure -- it is the
+      // contract -- so it is passed straight back without an error message,
+      // and the stage stays at BODY so the next call resumes the same place.
+      return GCOMP_ERR_LIMIT;
+    }
     if (status != GCOMP_OK) {
       return gcomp_encoder_set_error(encoder, status,
           "deflate encoder finish failed: %s",
           gcomp_encoder_get_error_detail(state->inner_encoder));
     }
 
-    // Check if deflate is done (output buffer not full means complete)
-    // Note: We need a way to detect deflate completion
-    // For now, assume if finish returns OK and there's space, it's done
+    // GCOMP_OK from deflate's finish means the deflate stream is complete,
+    // so the trailer can be built and the CRC32 finalized.
     state->stage = GZIP_ENC_STAGE_TRAILER;
 
     // Build trailer
@@ -563,8 +572,12 @@ gcomp_status_t gzip_encoder_finish(
       state->stage = GZIP_ENC_STAGE_DONE;
     }
     else {
-      // Need more output space
-      return GCOMP_OK;
+      // Part of the eight byte trailer is still unwritten.  Same reason as
+      // the header above, and this is the one that bit: a caller whose output
+      // buffer happened to run out partway through the CRC32 or ISIZE was
+      // told the stream was complete and stopped, leaving a gzip stream that
+      // no decoder will accept.
+      return GCOMP_ERR_LIMIT;
     }
   }
 

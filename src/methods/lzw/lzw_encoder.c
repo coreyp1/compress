@@ -491,50 +491,75 @@ gcomp_status_t lzw_encoder_finish(
     }
   }
 
-  size_t output_avail = output->size - output->used;
-  uint8_t * out_base = (uint8_t *)output->data + output->used;
-  lzw_bitwriter_set_buffer(&state->writer, out_base, output_avail);
+  // The tail is rendered into the staging buffer once and then drained, for
+  // the same reason update() stages its output: written straight into the
+  // caller's buffer it could not survive running out of room.  Every step
+  // below mutates encoder state as it goes -- clearing the pending code,
+  // setting header_emitted -- so a second pass over it does not repeat the
+  // first, it writes a different and wrong tail.  See finish_staged.
+  if (!state->finish_staged) {
+    if (!state->stage_buf) {
+      state->stage_buf = gcomp_malloc(state->allocator, LZW_STAGE_SIZE);
+      if (!state->stage_buf) {
+        return gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
+            "failed to allocate LZW staging buffer (%u bytes)",
+            (unsigned)LZW_STAGE_SIZE);
+      }
+      state->stage_size = LZW_STAGE_SIZE;
+    }
+    state->stage_used = 0;
+    state->stage_copied = 0;
+    lzw_bitwriter_set_buffer(
+        &state->writer, state->stage_buf, state->stage_size);
 
-  /* Retry any pending code */
-  if (state->pending_bits != 0) {
-    gcomp_status_t s = lzw_bitwriter_write_bits(
-        &state->writer, state->pending_code, state->pending_bits);
+    /* Retry any pending code */
+    if (state->pending_bits != 0) {
+      gcomp_status_t s = lzw_bitwriter_write_bits(
+          &state->writer, state->pending_code, state->pending_bits);
+      if (s != GCOMP_OK) {
+        return gcomp_encoder_set_error(
+            encoder, s, "LZW encoder flush pending code failed");
+      }
+      state->pending_code = 0;
+      state->pending_bits = 0;
+    }
+
+    /* Emit CLEAR if we never did (empty input) */
+    if (!state->header_emitted) {
+      gcomp_status_t s = emit_code(state, encoder, state->clear_code);
+      if (s != GCOMP_OK) {
+        return s;
+      }
+      state->header_emitted = 1;
+    }
+
+    /* Emit current string then EOI */
+    if (state->prefix_code != LZW_NO_PREFIX) {
+      gcomp_status_t s = emit_code(state, encoder, state->prefix_code);
+      if (s != GCOMP_OK) {
+        return s;
+      }
+      state->prefix_code = LZW_NO_PREFIX;
+    }
+
+    gcomp_status_t s = emit_code(state, encoder, state->eoi_code);
+    if (s != GCOMP_OK) {
+      return s;
+    }
+
+    s = lzw_bitwriter_flush(&state->writer);
     if (s != GCOMP_OK) {
       return gcomp_encoder_set_error(
-          encoder, s, "LZW encoder flush pending code failed");
+          encoder, s, "LZW encoder bit flush failed");
     }
-    state->pending_code = 0;
-    state->pending_bits = 0;
+
+    state->stage_used = lzw_bitwriter_bytes_written(&state->writer);
+    state->finish_staged = 1;
   }
 
-  /* Emit CLEAR if we never did (empty input) */
-  if (!state->header_emitted) {
-    gcomp_status_t s = emit_code(state, encoder, state->clear_code);
-    if (s != GCOMP_OK) {
-      return s;
-    }
-    state->header_emitted = 1;
+  if (!lzw_drain_stage(state, output)) {
+    return GCOMP_ERR_LIMIT;
   }
-
-  /* Emit current string then EOI */
-  if (state->prefix_code != LZW_NO_PREFIX) {
-    gcomp_status_t s = emit_code(state, encoder, state->prefix_code);
-    if (s != GCOMP_OK) {
-      return s;
-    }
-  }
-
-  gcomp_status_t s = emit_code(state, encoder, state->eoi_code);
-  if (s != GCOMP_OK) {
-    return s;
-  }
-
-  s = lzw_bitwriter_flush(&state->writer);
-  if (s != GCOMP_OK) {
-    return gcomp_encoder_set_error(encoder, s, "LZW encoder bit flush failed");
-  }
-
-  output->used += lzw_bitwriter_bytes_written(&state->writer);
   return GCOMP_OK;
 }
 
@@ -554,9 +579,11 @@ gcomp_status_t lzw_encoder_reset(gcomp_encoder_t * encoder) {
   state->pending_code = 0;
   state->pending_bits = 0;
   state->header_emitted = 0;
-  // Discard anything update() had staged but not yet delivered.
+  // Discard anything update() had staged but not yet delivered, and the tail
+  // finish() may have rendered.
   state->stage_used = 0;
   state->stage_copied = 0;
+  state->finish_staged = 0;
   state->writer.bit_buffer = 0;
   state->writer.bit_count = 0;
   return GCOMP_OK;
