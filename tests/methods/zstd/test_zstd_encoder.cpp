@@ -15,6 +15,38 @@
 #include <gtest/gtest.h>
 #include <vector>
 
+/**
+ * @brief Destroys an encoder when the scope ends, however it ends.
+ *
+ * This matters more than it looks.  A gtest ASSERT returns from the test
+ * function on the spot, so an assertion between creating an encoder and
+ * destroying it leaks the encoder -- and when threads.count is set, that
+ * leaks a thread pool whose workers are parked on a semaphore with nothing
+ * left to set their shutdown flag.  The thread cleanup that runs at process
+ * exit then joins them and never returns.  The process hangs AFTER every
+ * test has finished, so a failing test reports as a timeout with no name
+ * attached instead of as a failure, which is the one thing a test suite must
+ * never do.
+ *
+ * Found as a twelve-hour-old process still sitting in pthread_join inside
+ * its own exit handler, with a failing status it never got to print.
+ */
+class EncoderGuard {
+public:
+  explicit EncoderGuard(gcomp_encoder_t *& enc) : enc_(enc) {}
+  ~EncoderGuard() {
+    if (enc_) {
+      gcomp_encoder_destroy(enc_);
+      enc_ = nullptr;
+    }
+  }
+  EncoderGuard(const EncoderGuard &) = delete;
+  EncoderGuard & operator=(const EncoderGuard &) = delete;
+
+private:
+  gcomp_encoder_t *& enc_;
+};
+
 class ZstdEncoderTest : public ::testing::Test {
 protected:
   void SetUp() override {
@@ -25,12 +57,13 @@ protected:
 
 TEST_F(ZstdEncoderTest, CreateSuccess) {
   gcomp_encoder_t * enc = nullptr;
+  EncoderGuard enc_guard(enc);
   EXPECT_EQ(gcomp_encoder_create(registry_, "zstd", nullptr, &enc), GCOMP_OK);
-  gcomp_encoder_destroy(enc);
 }
 
 TEST_F(ZstdEncoderTest, BasicEncode) {
   gcomp_encoder_t * enc = nullptr;
+  EncoderGuard enc_guard(enc);
   ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", nullptr, &enc), GCOMP_OK);
   const char data[] = "Hello, Zstd!";
   std::vector<uint8_t> out(256);
@@ -39,18 +72,17 @@ TEST_F(ZstdEncoderTest, BasicEncode) {
   EXPECT_EQ(gcomp_encoder_update(enc, &in, &ob), GCOMP_OK);
   EXPECT_EQ(gcomp_encoder_finish(enc, &ob), GCOMP_OK);
   EXPECT_GT(ob.used, 0u);
-  gcomp_encoder_destroy(enc);
 }
 
 TEST_F(ZstdEncoderTest, EncodeEmpty) {
   gcomp_encoder_t * enc = nullptr;
+  EncoderGuard enc_guard(enc);
   ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", nullptr, &enc), GCOMP_OK);
   std::vector<uint8_t> out(256);
   gcomp_buffer_t in = {nullptr, 0, 0};
   gcomp_buffer_t ob = {out.data(), out.size(), 0};
   EXPECT_EQ(gcomp_encoder_update(enc, &in, &ob), GCOMP_OK);
   EXPECT_EQ(gcomp_encoder_finish(enc, &ob), GCOMP_OK);
-  gcomp_encoder_destroy(enc);
 }
 
 TEST_F(ZstdEncoderTest, CreateWithInvalidLevel) {
@@ -58,6 +90,7 @@ TEST_F(ZstdEncoderTest, CreateWithInvalidLevel) {
   ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
   gcomp_options_set_int64(opts, "zstd.level", 0);
   gcomp_encoder_t * enc = nullptr;
+  EncoderGuard enc_guard(enc);
   EXPECT_EQ(gcomp_encoder_create(registry_, "zstd", opts, &enc),
       GCOMP_ERR_INVALID_ARG);
   gcomp_options_destroy(opts);
@@ -68,6 +101,7 @@ TEST_F(ZstdEncoderTest, EncodeWithChecksum) {
   ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
   gcomp_options_set_bool(opts, "zstd.checksum", true);
   gcomp_encoder_t * enc = nullptr;
+  EncoderGuard enc_guard(enc);
   ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", opts, &enc), GCOMP_OK);
   const char data[] = "Checksum test!";
   std::vector<uint8_t> out(256);
@@ -76,7 +110,6 @@ TEST_F(ZstdEncoderTest, EncodeWithChecksum) {
   EXPECT_EQ(gcomp_encoder_update(enc, &in, &ob), GCOMP_OK);
   EXPECT_EQ(gcomp_encoder_finish(enc, &ob), GCOMP_OK);
   EXPECT_TRUE(out[4] & 0x04) << "Checksum flag should be set";
-  gcomp_encoder_destroy(enc);
   gcomp_options_destroy(opts);
 }
 
@@ -88,6 +121,7 @@ TEST_F(ZstdEncoderTest, EncodeWithContentSizeInHeader) {
   gcomp_options_set_uint64(opts, "zstd.content_size", data_len);
 
   gcomp_encoder_t * enc = nullptr;
+  EncoderGuard enc_guard(enc);
   ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", opts, &enc), GCOMP_OK);
   std::vector<uint8_t> out(256);
   gcomp_buffer_t in = {(void *)data, data_len, 0};
@@ -108,12 +142,12 @@ TEST_F(ZstdEncoderTest, EncodeWithContentSizeInHeader) {
   EXPECT_EQ(memcmp(decoded.data(), data, data_len), 0);
 
   gcomp_decoder_destroy(dec);
-  gcomp_encoder_destroy(enc);
   gcomp_options_destroy(opts);
 }
 
 TEST_F(ZstdEncoderTest, ResetAndReuse) {
   gcomp_encoder_t * enc = nullptr;
+  EncoderGuard enc_guard(enc);
   ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", nullptr, &enc), GCOMP_OK);
   const char d1[] = "First";
   std::vector<uint8_t> o1(256);
@@ -128,22 +162,22 @@ TEST_F(ZstdEncoderTest, ResetAndReuse) {
   gcomp_buffer_t b2 = {o2.data(), o2.size(), 0};
   EXPECT_EQ(gcomp_encoder_update(enc, &i2, &b2), GCOMP_OK);
   EXPECT_EQ(gcomp_encoder_finish(enc, &b2), GCOMP_OK);
-  gcomp_encoder_destroy(enc);
 }
 
 TEST_F(ZstdEncoderTest, DestroyWithoutFinish) {
   gcomp_encoder_t * enc = nullptr;
+  EncoderGuard enc_guard(enc);
   ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", nullptr, &enc), GCOMP_OK);
   const char data[] = "Unfinished";
   std::vector<uint8_t> out(256);
   gcomp_buffer_t in = {(void *)data, strlen(data), 0};
   gcomp_buffer_t ob = {out.data(), out.size(), 0};
   gcomp_encoder_update(enc, &in, &ob);
-  gcomp_encoder_destroy(enc);
 }
 
 TEST_F(ZstdEncoderTest, EncodeRLE) {
   gcomp_encoder_t * enc = nullptr;
+  EncoderGuard enc_guard(enc);
   ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", nullptr, &enc), GCOMP_OK);
   std::vector<uint8_t> data(1000, 'A');
   std::vector<uint8_t> out(2000);
@@ -152,17 +186,16 @@ TEST_F(ZstdEncoderTest, EncodeRLE) {
   EXPECT_EQ(gcomp_encoder_update(enc, &in, &ob), GCOMP_OK);
   EXPECT_EQ(gcomp_encoder_finish(enc, &ob), GCOMP_OK);
   EXPECT_LT(ob.used, 50u) << "RLE should compress well";
-  gcomp_encoder_destroy(enc);
 }
 
 TEST_F(ZstdEncoderTest, NullInputWithSize) {
   gcomp_encoder_t * enc = nullptr;
+  EncoderGuard enc_guard(enc);
   ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", nullptr, &enc), GCOMP_OK);
   std::vector<uint8_t> out(256);
   gcomp_buffer_t in = {nullptr, 100, 0};
   gcomp_buffer_t ob = {out.data(), out.size(), 0};
   EXPECT_EQ(gcomp_encoder_update(enc, &in, &ob), GCOMP_ERR_INVALID_ARG);
-  gcomp_encoder_destroy(enc);
 }
 
 TEST_F(ZstdEncoderTest, EncodeWithVariousLevels) {
@@ -173,6 +206,7 @@ TEST_F(ZstdEncoderTest, EncodeWithVariousLevels) {
     ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
     gcomp_options_set_int64(opts, "zstd.level", level);
     gcomp_encoder_t * enc = nullptr;
+    EncoderGuard enc_guard(enc);
     ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", opts, &enc), GCOMP_OK);
     std::vector<uint8_t> out(512);
     gcomp_buffer_t in = {(void *)data, strlen(data), 0};
@@ -181,7 +215,6 @@ TEST_F(ZstdEncoderTest, EncodeWithVariousLevels) {
         << "level " << level;
     EXPECT_EQ(gcomp_encoder_finish(enc, &ob), GCOMP_OK) << "level " << level;
     EXPECT_GT(ob.used, 0u) << "level " << level;
-    gcomp_encoder_destroy(enc);
     gcomp_options_destroy(opts);
   }
 }
@@ -196,6 +229,7 @@ TEST_F(ZstdEncoderTest, EncodeWithVariousWindowSizes) {
     ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
     gcomp_options_set_uint64(opts, "zstd.window_log", wlog);
     gcomp_encoder_t * enc = nullptr;
+    EncoderGuard enc_guard(enc);
     ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", opts, &enc), GCOMP_OK);
     std::vector<uint8_t> out(data.size() + 256);
     gcomp_buffer_t in = {data.data(), data.size(), 0};
@@ -205,7 +239,6 @@ TEST_F(ZstdEncoderTest, EncodeWithVariousWindowSizes) {
     EXPECT_EQ(gcomp_encoder_finish(enc, &ob), GCOMP_OK)
         << "window_log " << wlog;
     EXPECT_GT(ob.used, 0u) << "window_log " << wlog;
-    gcomp_encoder_destroy(enc);
     gcomp_options_destroy(opts);
   }
 }
@@ -213,6 +246,7 @@ TEST_F(ZstdEncoderTest, EncodeWithVariousWindowSizes) {
 TEST_F(ZstdEncoderTest, Encode1ByteInputChunks) {
   const char data[] = "One byte at a time";
   gcomp_encoder_t * enc = nullptr;
+  EncoderGuard enc_guard(enc);
   ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", nullptr, &enc), GCOMP_OK);
   std::vector<uint8_t> out(strlen(data) + 256);
   gcomp_buffer_t ob = {out.data(), out.size(), 0};
@@ -225,12 +259,12 @@ TEST_F(ZstdEncoderTest, Encode1ByteInputChunks) {
   }
   EXPECT_EQ(gcomp_encoder_finish(enc, &ob), GCOMP_OK);
   EXPECT_GT(ob.used, 0u);
-  gcomp_encoder_destroy(enc);
 }
 
 TEST_F(ZstdEncoderTest, Encode1ByteOutputBuffer) {
   const char data[] = "Test";
   gcomp_encoder_t * enc = nullptr;
+  EncoderGuard enc_guard(enc);
   ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", nullptr, &enc), GCOMP_OK);
   std::vector<uint8_t> result;
   uint8_t one_byte[1];
@@ -257,7 +291,6 @@ TEST_F(ZstdEncoderTest, Encode1ByteOutputBuffer) {
     ASSERT_GT(ob.used, 0u) << "finish made no progress";
   }
   EXPECT_GT(result.size(), 0u);
-  gcomp_encoder_destroy(enc);
 }
 
 //
@@ -315,6 +348,7 @@ TEST_F(ZstdParallelEncoderTest, ParallelEncodeBasic) {
   gcomp_options_set_uint64(opts, "threads.count", 2);
 
   gcomp_encoder_t * enc = nullptr;
+  EncoderGuard enc_guard(enc);
   ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", opts, &enc), GCOMP_OK);
 
   const char data[] = "Hello, parallel zstd!";
@@ -332,7 +366,6 @@ TEST_F(ZstdParallelEncoderTest, ParallelEncodeBasic) {
   ASSERT_EQ(decoded.size(), strlen(data));
   EXPECT_EQ(memcmp(decoded.data(), data, strlen(data)), 0);
 
-  gcomp_encoder_destroy(enc);
   gcomp_options_destroy(opts);
 }
 
@@ -344,6 +377,7 @@ TEST_F(ZstdParallelEncoderTest, ParallelEncodeLarge) {
   gcomp_options_set_uint64(opts, "zstd.job_size", 64 * 1024);
 
   gcomp_encoder_t * enc = nullptr;
+  EncoderGuard enc_guard(enc);
   ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", opts, &enc), GCOMP_OK);
 
   // Create data larger than job size to force multiple jobs
@@ -371,7 +405,6 @@ TEST_F(ZstdParallelEncoderTest, ParallelEncodeLarge) {
   EXPECT_EQ(memcmp(decoded.data(), data.data(), data.size()), 0)
       << "Decoded content should match original data";
 
-  gcomp_encoder_destroy(enc);
   gcomp_options_destroy(opts);
 }
 
@@ -382,6 +415,7 @@ TEST_F(ZstdParallelEncoderTest, ParallelEncodeWithChecksum) {
   gcomp_options_set_bool(opts, "zstd.checksum", true);
 
   gcomp_encoder_t * enc = nullptr;
+  EncoderGuard enc_guard(enc);
   ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", opts, &enc), GCOMP_OK);
 
   const char data[] = "Parallel checksum test data!";
@@ -397,7 +431,6 @@ TEST_F(ZstdParallelEncoderTest, ParallelEncodeWithChecksum) {
   ASSERT_EQ(decoded.size(), strlen(data));
   EXPECT_EQ(memcmp(decoded.data(), data, strlen(data)), 0);
 
-  gcomp_encoder_destroy(enc);
   gcomp_options_destroy(opts);
 }
 
@@ -407,6 +440,7 @@ TEST_F(ZstdParallelEncoderTest, ParallelEncodeReset) {
   gcomp_options_set_uint64(opts, "threads.count", 2);
 
   gcomp_encoder_t * enc = nullptr;
+  EncoderGuard enc_guard(enc);
   ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", opts, &enc), GCOMP_OK);
 
   // First compression
@@ -434,7 +468,6 @@ TEST_F(ZstdParallelEncoderTest, ParallelEncodeReset) {
   ASSERT_EQ(decoded2.size(), strlen(data2));
   EXPECT_EQ(memcmp(decoded2.data(), data2, strlen(data2)), 0);
 
-  gcomp_encoder_destroy(enc);
   gcomp_options_destroy(opts);
 }
 
@@ -444,6 +477,7 @@ TEST_F(ZstdParallelEncoderTest, ParallelEncodeEmpty) {
   gcomp_options_set_uint64(opts, "threads.count", 2);
 
   gcomp_encoder_t * enc = nullptr;
+  EncoderGuard enc_guard(enc);
   ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", opts, &enc), GCOMP_OK);
 
   std::vector<uint8_t> out(4096);
@@ -456,7 +490,6 @@ TEST_F(ZstdParallelEncoderTest, ParallelEncodeEmpty) {
   // Empty input should produce empty or minimal output
   // (no jobs submitted, just finish returns OK with no output)
 
-  gcomp_encoder_destroy(enc);
   gcomp_options_destroy(opts);
 }
 
@@ -466,6 +499,7 @@ TEST_F(ZstdParallelEncoderTest, ParallelDestroyWithoutFinish) {
   gcomp_options_set_uint64(opts, "threads.count", 2);
 
   gcomp_encoder_t * enc = nullptr;
+  EncoderGuard enc_guard(enc);
   ASSERT_EQ(gcomp_encoder_create(registry_, "zstd", opts, &enc), GCOMP_OK);
 
   const char data[] = "Unfinished parallel data";
@@ -475,7 +509,6 @@ TEST_F(ZstdParallelEncoderTest, ParallelDestroyWithoutFinish) {
 
   gcomp_encoder_update(enc, &in, &ob);
   // Destroy without calling finish - should not crash or leak
-  gcomp_encoder_destroy(enc);
   gcomp_options_destroy(opts);
 }
 

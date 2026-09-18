@@ -24,6 +24,33 @@ extern "C" {
 #include "../../../src/methods/zstd/zstd_parallel.h"
 }
 
+/**
+ * @brief Destroys a parallel context when the scope ends, however it ends.
+ *
+ * A gtest ASSERT returns from the test function on the spot, so an assertion
+ * between creating a context and destroying it leaks the context -- and with
+ * more than one thread that leaks a thread pool whose workers are parked on
+ * a semaphore with nothing left to set their shutdown flag.  The thread
+ * cleanup that runs at process exit then joins them and never returns, so
+ * the process hangs AFTER every test has finished and a failing test reports
+ * as a timeout with no name attached.
+ */
+class ParallelCtxGuard {
+public:
+  explicit ParallelCtxGuard(zstd_parallel_ctx_t *& ctx) : ctx_(ctx) {}
+  ~ParallelCtxGuard() {
+    if (ctx_) {
+      zstd_parallel_destroy(ctx_);
+      ctx_ = nullptr;
+    }
+  }
+  ParallelCtxGuard(const ParallelCtxGuard &) = delete;
+  ParallelCtxGuard & operator=(const ParallelCtxGuard &) = delete;
+
+private:
+  zstd_parallel_ctx_t *& ctx_;
+};
+
 class ZstdParallelTest : public ::testing::Test {
 protected:
   void SetUp() override {
@@ -88,12 +115,12 @@ TEST_F(ZstdParallelTest, CreateInlineContext) {
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
+  ParallelCtxGuard ctx_guard(ctx);
   ASSERT_EQ(zstd_parallel_create(&config, &ctx), GCOMP_OK);
   ASSERT_NE(ctx, nullptr);
   EXPECT_TRUE(zstd_parallel_is_inline(ctx));
   EXPECT_EQ(zstd_parallel_pending_count(ctx), 0u);
 
-  zstd_parallel_destroy(ctx);
 }
 
 TEST_F(ZstdParallelTest, CreateThreadedContext) {
@@ -110,12 +137,12 @@ TEST_F(ZstdParallelTest, CreateThreadedContext) {
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
+  ParallelCtxGuard ctx_guard(ctx);
   ASSERT_EQ(zstd_parallel_create(&config, &ctx), GCOMP_OK);
   ASSERT_NE(ctx, nullptr);
   EXPECT_FALSE(zstd_parallel_is_inline(ctx));
   EXPECT_EQ(zstd_parallel_pending_count(ctx), 0u);
 
-  zstd_parallel_destroy(ctx);
 }
 
 TEST_F(ZstdParallelTest, CreateZeroThreadsIsInline) {
@@ -132,11 +159,11 @@ TEST_F(ZstdParallelTest, CreateZeroThreadsIsInline) {
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
+  ParallelCtxGuard ctx_guard(ctx);
   ASSERT_EQ(zstd_parallel_create(&config, &ctx), GCOMP_OK);
   ASSERT_NE(ctx, nullptr);
   EXPECT_TRUE(zstd_parallel_is_inline(ctx));
 
-  zstd_parallel_destroy(ctx);
 }
 
 TEST_F(ZstdParallelTest, NullCtxOutFails) {
@@ -173,6 +200,7 @@ TEST_F(ZstdParallelTest, AllocAndFreeJob) {
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
+  ParallelCtxGuard ctx_guard(ctx);
   ASSERT_EQ(zstd_parallel_create(&config, &ctx), GCOMP_OK);
 
   zstd_parallel_job_t * job = nullptr;
@@ -183,7 +211,6 @@ TEST_F(ZstdParallelTest, AllocAndFreeJob) {
   EXPECT_NE(job->match_finder, nullptr);
 
   zstd_parallel_free_job(ctx, job);
-  zstd_parallel_destroy(ctx);
 }
 
 TEST_F(ZstdParallelTest, AllocJobNullCtxFails) {
@@ -205,11 +232,11 @@ TEST_F(ZstdParallelTest, AllocJobNullJobOutFails) {
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
+  ParallelCtxGuard ctx_guard(ctx);
   ASSERT_EQ(zstd_parallel_create(&config, &ctx), GCOMP_OK);
 
   EXPECT_EQ(zstd_parallel_alloc_job(ctx, nullptr), GCOMP_ERR_INVALID_ARG);
 
-  zstd_parallel_destroy(ctx);
 }
 
 //
@@ -230,6 +257,7 @@ TEST_F(ZstdParallelTest, InlineSubmitGetResult) {
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
+  ParallelCtxGuard ctx_guard(ctx);
   ASSERT_EQ(zstd_parallel_create(&config, &ctx), GCOMP_OK);
 
   // Allocate job
@@ -259,7 +287,6 @@ TEST_F(ZstdParallelTest, InlineSubmitGetResult) {
   EXPECT_EQ(memcmp(decoded.data(), test_data, decoded.size()), 0);
 
   zstd_parallel_free_job(ctx, job);
-  zstd_parallel_destroy(ctx);
 }
 
 TEST_F(ZstdParallelTest, InlineMultipleJobs) {
@@ -276,6 +303,7 @@ TEST_F(ZstdParallelTest, InlineMultipleJobs) {
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
+  ParallelCtxGuard ctx_guard(ctx);
   ASSERT_EQ(zstd_parallel_create(&config, &ctx), GCOMP_OK);
 
   const char * test_strings[] = {"First job", "Second job", "Third job"};
@@ -309,7 +337,6 @@ TEST_F(ZstdParallelTest, InlineMultipleJobs) {
   for (auto job : jobs) {
     zstd_parallel_free_job(ctx, job);
   }
-  zstd_parallel_destroy(ctx);
 }
 
 TEST_F(ZstdParallelTest, InlineWithChecksum) {
@@ -326,6 +353,7 @@ TEST_F(ZstdParallelTest, InlineWithChecksum) {
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
+  ParallelCtxGuard ctx_guard(ctx);
   ASSERT_EQ(zstd_parallel_create(&config, &ctx), GCOMP_OK);
 
   zstd_parallel_job_t * job = nullptr;
@@ -346,7 +374,6 @@ TEST_F(ZstdParallelTest, InlineWithChecksum) {
   EXPECT_EQ(memcmp(decoded.data(), test_data, decoded.size()), 0);
 
   zstd_parallel_free_job(ctx, job);
-  zstd_parallel_destroy(ctx);
 }
 
 //
@@ -367,6 +394,7 @@ TEST_F(ZstdParallelTest, ThreadedSubmitGetResult) {
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
+  ParallelCtxGuard ctx_guard(ctx);
   ASSERT_EQ(zstd_parallel_create(&config, &ctx), GCOMP_OK);
   EXPECT_FALSE(zstd_parallel_is_inline(ctx));
 
@@ -389,7 +417,6 @@ TEST_F(ZstdParallelTest, ThreadedSubmitGetResult) {
   EXPECT_EQ(memcmp(decoded.data(), test_data, decoded.size()), 0);
 
   zstd_parallel_free_job(ctx, job);
-  zstd_parallel_destroy(ctx);
 }
 
 TEST_F(ZstdParallelTest, ThreadedMultipleJobsOrderPreserved) {
@@ -406,6 +433,7 @@ TEST_F(ZstdParallelTest, ThreadedMultipleJobsOrderPreserved) {
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
+  ParallelCtxGuard ctx_guard(ctx);
   ASSERT_EQ(zstd_parallel_create(&config, &ctx), GCOMP_OK);
 
   // Create jobs with different sizes to potentially complete out of order
@@ -442,7 +470,6 @@ TEST_F(ZstdParallelTest, ThreadedMultipleJobsOrderPreserved) {
   for (auto job : jobs) {
     zstd_parallel_free_job(ctx, job);
   }
-  zstd_parallel_destroy(ctx);
 }
 
 //
@@ -463,6 +490,7 @@ TEST_F(ZstdParallelTest, ConcatenatedFramesDecodable) {
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
+  ParallelCtxGuard ctx_guard(ctx);
   ASSERT_EQ(zstd_parallel_create(&config, &ctx), GCOMP_OK);
 
   // Create multiple jobs
@@ -491,7 +519,6 @@ TEST_F(ZstdParallelTest, ConcatenatedFramesDecodable) {
     zstd_parallel_free_job(ctx, job);
   }
 
-  zstd_parallel_destroy(ctx);
 
   // Decode concatenated frames
   auto decoded =
@@ -531,6 +558,7 @@ TEST_F(ZstdParallelTest, MemoryLimitReducesInFlight) {
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
+  ParallelCtxGuard ctx_guard(ctx);
   ASSERT_EQ(zstd_parallel_create(&config, &ctx), GCOMP_OK);
   EXPECT_FALSE(zstd_parallel_is_inline(ctx));
 
@@ -538,7 +566,6 @@ TEST_F(ZstdParallelTest, MemoryLimitReducesInFlight) {
   // We can verify by checking job_size was respected
   EXPECT_EQ(zstd_parallel_get_job_size(ctx), 64 * 1024u);
 
-  zstd_parallel_destroy(ctx);
 }
 
 //
@@ -559,12 +586,12 @@ TEST_F(ZstdParallelTest, WaitInlineMode) {
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
+  ParallelCtxGuard ctx_guard(ctx);
   ASSERT_EQ(zstd_parallel_create(&config, &ctx), GCOMP_OK);
 
   // Wait should succeed immediately in inline mode
   EXPECT_EQ(zstd_parallel_wait(ctx), GCOMP_OK);
 
-  zstd_parallel_destroy(ctx);
 }
 
 TEST_F(ZstdParallelTest, ResetAfterAllJobsRetrieved) {
@@ -581,6 +608,7 @@ TEST_F(ZstdParallelTest, ResetAfterAllJobsRetrieved) {
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
+  ParallelCtxGuard ctx_guard(ctx);
   ASSERT_EQ(zstd_parallel_create(&config, &ctx), GCOMP_OK);
 
   // Submit and retrieve a job
@@ -598,7 +626,6 @@ TEST_F(ZstdParallelTest, ResetAfterAllJobsRetrieved) {
   EXPECT_EQ(zstd_parallel_pending_count(ctx), 0u);
 
   zstd_parallel_free_job(ctx, job);
-  zstd_parallel_destroy(ctx);
 }
 
 TEST_F(ZstdParallelTest, ResetWithPendingJobsFails) {
@@ -615,6 +642,7 @@ TEST_F(ZstdParallelTest, ResetWithPendingJobsFails) {
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
+  ParallelCtxGuard ctx_guard(ctx);
   ASSERT_EQ(zstd_parallel_create(&config, &ctx), GCOMP_OK);
 
   // Submit a job but don't retrieve it
@@ -631,7 +659,6 @@ TEST_F(ZstdParallelTest, ResetWithPendingJobsFails) {
   zstd_parallel_job_t * result = nullptr;
   ASSERT_EQ(zstd_parallel_get_result(ctx, &result), GCOMP_OK);
   zstd_parallel_free_job(ctx, job);
-  zstd_parallel_destroy(ctx);
 }
 
 //
@@ -652,6 +679,7 @@ TEST_F(ZstdParallelTest, EmptyInput) {
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
+  ParallelCtxGuard ctx_guard(ctx);
   ASSERT_EQ(zstd_parallel_create(&config, &ctx), GCOMP_OK);
 
   zstd_parallel_job_t * job = nullptr;
@@ -669,7 +697,6 @@ TEST_F(ZstdParallelTest, EmptyInput) {
   EXPECT_EQ(decoded.size(), 0u);
 
   zstd_parallel_free_job(ctx, job);
-  zstd_parallel_destroy(ctx);
 }
 
 TEST_F(ZstdParallelTest, RLECompressibleInput) {
@@ -686,6 +713,7 @@ TEST_F(ZstdParallelTest, RLECompressibleInput) {
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
+  ParallelCtxGuard ctx_guard(ctx);
   ASSERT_EQ(zstd_parallel_create(&config, &ctx), GCOMP_OK);
 
   zstd_parallel_job_t * job = nullptr;
@@ -708,7 +736,6 @@ TEST_F(ZstdParallelTest, RLECompressibleInput) {
   }
 
   zstd_parallel_free_job(ctx, job);
-  zstd_parallel_destroy(ctx);
 }
 
 TEST_F(ZstdParallelTest, LargeInputMultipleBlocks) {
@@ -725,6 +752,7 @@ TEST_F(ZstdParallelTest, LargeInputMultipleBlocks) {
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
+  ParallelCtxGuard ctx_guard(ctx);
   ASSERT_EQ(zstd_parallel_create(&config, &ctx), GCOMP_OK);
 
   zstd_parallel_job_t * job = nullptr;
@@ -747,7 +775,6 @@ TEST_F(ZstdParallelTest, LargeInputMultipleBlocks) {
   EXPECT_EQ(memcmp(decoded.data(), data.data(), data.size()), 0);
 
   zstd_parallel_free_job(ctx, job);
-  zstd_parallel_destroy(ctx);
 }
 
 //
@@ -777,12 +804,12 @@ TEST_F(ZstdParallelTest, GetResultNoPendingFails) {
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
+  ParallelCtxGuard ctx_guard(ctx);
   ASSERT_EQ(zstd_parallel_create(&config, &ctx), GCOMP_OK);
 
   zstd_parallel_job_t * job = nullptr;
   EXPECT_EQ(zstd_parallel_get_result(ctx, &job), GCOMP_ERR_INVALID_ARG);
 
-  zstd_parallel_destroy(ctx);
 }
 
 //
@@ -803,12 +830,12 @@ TEST_F(ZstdParallelTest, JobSizeAutoDefault) {
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
+  ParallelCtxGuard ctx_guard(ctx);
   ASSERT_EQ(zstd_parallel_create(&config, &ctx), GCOMP_OK);
 
   // Should use default job size (512KB)
   EXPECT_EQ(zstd_parallel_get_job_size(ctx), 512 * 1024u);
 
-  zstd_parallel_destroy(ctx);
 }
 
 TEST_F(ZstdParallelTest, JobSizeMinEnforced) {
@@ -825,12 +852,12 @@ TEST_F(ZstdParallelTest, JobSizeMinEnforced) {
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
+  ParallelCtxGuard ctx_guard(ctx);
   ASSERT_EQ(zstd_parallel_create(&config, &ctx), GCOMP_OK);
 
   // Should be clamped to minimum (64KB)
   EXPECT_EQ(zstd_parallel_get_job_size(ctx), 64 * 1024u);
 
-  zstd_parallel_destroy(ctx);
 }
 
 TEST_F(ZstdParallelTest, JobSizeMaxEnforced) {
@@ -847,12 +874,12 @@ TEST_F(ZstdParallelTest, JobSizeMaxEnforced) {
   };
 
   zstd_parallel_ctx_t * ctx = nullptr;
+  ParallelCtxGuard ctx_guard(ctx);
   ASSERT_EQ(zstd_parallel_create(&config, &ctx), GCOMP_OK);
 
   // Should be clamped to maximum (16MB)
   EXPECT_EQ(zstd_parallel_get_job_size(ctx), 16 * 1024 * 1024u);
 
-  zstd_parallel_destroy(ctx);
 }
 
 //

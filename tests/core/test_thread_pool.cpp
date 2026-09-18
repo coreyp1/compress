@@ -22,6 +22,32 @@
 // Test Fixtures
 //
 
+/**
+ * @brief Destroys a thread pool when the scope ends, however it ends.
+ *
+ * A gtest ASSERT returns from the test function on the spot, so an assertion
+ * between creating a pool and destroying it leaks the pool -- and its worker
+ * threads are parked on a semaphore with nothing left to set their shutdown
+ * flag.  The thread cleanup that runs at process exit then joins them and
+ * never returns, so the process hangs AFTER every test has finished and a
+ * failing test reports as a timeout with no name attached.
+ */
+class PoolGuard {
+public:
+  explicit PoolGuard(gcomp_thread_pool_t *& pool) : pool_(pool) {}
+  ~PoolGuard() {
+    if (pool_) {
+      gcomp_thread_pool_destroy(pool_);
+      pool_ = nullptr;
+    }
+  }
+  PoolGuard(const PoolGuard &) = delete;
+  PoolGuard & operator=(const PoolGuard &) = delete;
+
+private:
+  gcomp_thread_pool_t *& pool_;
+};
+
 class ThreadPoolTest : public ::testing::Test {
 protected:
   void SetUp() override {
@@ -86,12 +112,12 @@ static void job_complete_callback(GCOMP_MAYBE_UNUSED(void * ctx),
 
 TEST_F(ThreadPoolTest, CreateWithNullConfig) {
   gcomp_thread_pool_t * pool = nullptr;
+  PoolGuard pool_guard(pool);
   gcomp_status_t status = gcomp_thread_pool_create(nullptr, &pool);
   EXPECT_EQ(status, GCOMP_OK);
   ASSERT_NE(pool, nullptr);
   EXPECT_TRUE(gcomp_thread_pool_is_inline(pool));
   EXPECT_EQ(gcomp_thread_pool_get_num_threads(pool), 0U);
-  gcomp_thread_pool_destroy(pool);
 }
 
 TEST_F(ThreadPoolTest, CreateWithNullPoolOut) {
@@ -102,6 +128,7 @@ TEST_F(ThreadPoolTest, CreateWithNullPoolOut) {
 TEST_F(ThreadPoolTest, CreateInlineMode_ZeroThreads) {
   gcomp_thread_pool_config_t config = {.num_threads = 0, .allocator = nullptr};
   gcomp_thread_pool_t * pool = nullptr;
+  PoolGuard pool_guard(pool);
 
   gcomp_status_t status = gcomp_thread_pool_create(&config, &pool);
   EXPECT_EQ(status, GCOMP_OK);
@@ -109,12 +136,12 @@ TEST_F(ThreadPoolTest, CreateInlineMode_ZeroThreads) {
   EXPECT_TRUE(gcomp_thread_pool_is_inline(pool));
   EXPECT_EQ(gcomp_thread_pool_get_num_threads(pool), 0U);
 
-  gcomp_thread_pool_destroy(pool);
 }
 
 TEST_F(ThreadPoolTest, CreateInlineMode_OneThread) {
   gcomp_thread_pool_config_t config = {.num_threads = 1, .allocator = nullptr};
   gcomp_thread_pool_t * pool = nullptr;
+  PoolGuard pool_guard(pool);
 
   gcomp_status_t status = gcomp_thread_pool_create(&config, &pool);
   EXPECT_EQ(status, GCOMP_OK);
@@ -122,12 +149,12 @@ TEST_F(ThreadPoolTest, CreateInlineMode_OneThread) {
   EXPECT_TRUE(gcomp_thread_pool_is_inline(pool));
   EXPECT_EQ(gcomp_thread_pool_get_num_threads(pool), 0U);
 
-  gcomp_thread_pool_destroy(pool);
 }
 
 TEST_F(ThreadPoolTest, CreateMultiThreaded_TwoThreads) {
   gcomp_thread_pool_config_t config = {.num_threads = 2, .allocator = nullptr};
   gcomp_thread_pool_t * pool = nullptr;
+  PoolGuard pool_guard(pool);
 
   gcomp_status_t status = gcomp_thread_pool_create(&config, &pool);
   EXPECT_EQ(status, GCOMP_OK);
@@ -135,12 +162,12 @@ TEST_F(ThreadPoolTest, CreateMultiThreaded_TwoThreads) {
   EXPECT_FALSE(gcomp_thread_pool_is_inline(pool));
   EXPECT_EQ(gcomp_thread_pool_get_num_threads(pool), 2U);
 
-  gcomp_thread_pool_destroy(pool);
 }
 
 TEST_F(ThreadPoolTest, CreateMultiThreaded_FourThreads) {
   gcomp_thread_pool_config_t config = {.num_threads = 4, .allocator = nullptr};
   gcomp_thread_pool_t * pool = nullptr;
+  PoolGuard pool_guard(pool);
 
   gcomp_status_t status = gcomp_thread_pool_create(&config, &pool);
   EXPECT_EQ(status, GCOMP_OK);
@@ -148,7 +175,6 @@ TEST_F(ThreadPoolTest, CreateMultiThreaded_FourThreads) {
   EXPECT_FALSE(gcomp_thread_pool_is_inline(pool));
   EXPECT_EQ(gcomp_thread_pool_get_num_threads(pool), 4U);
 
-  gcomp_thread_pool_destroy(pool);
 }
 
 TEST_F(ThreadPoolTest, DestroyNull) {
@@ -163,6 +189,7 @@ TEST_F(ThreadPoolTest, DestroyNull) {
 TEST_F(ThreadPoolTest, InlineModeJobExecution) {
   gcomp_thread_pool_config_t config = {.num_threads = 0, .allocator = nullptr};
   gcomp_thread_pool_t * pool = nullptr;
+  PoolGuard pool_guard(pool);
 
   gcomp_status_t status = gcomp_thread_pool_create(&config, &pool);
   ASSERT_EQ(status, GCOMP_OK);
@@ -176,12 +203,12 @@ TEST_F(ThreadPoolTest, InlineModeJobExecution) {
   EXPECT_EQ(status, GCOMP_OK);
   EXPECT_EQ(g_job_counter.load(), 1);
 
-  gcomp_thread_pool_destroy(pool);
 }
 
 TEST_F(ThreadPoolTest, InlineModeJobExecutesInCallerThread) {
   gcomp_thread_pool_config_t config = {.num_threads = 1, .allocator = nullptr};
   gcomp_thread_pool_t * pool = nullptr;
+  PoolGuard pool_guard(pool);
 
   gcomp_status_t status = gcomp_thread_pool_create(&config, &pool);
   ASSERT_EQ(status, GCOMP_OK);
@@ -195,12 +222,12 @@ TEST_F(ThreadPoolTest, InlineModeJobExecutesInCallerThread) {
   EXPECT_TRUE(job.executed.load());
   EXPECT_EQ(job.thread_id, caller_id);
 
-  gcomp_thread_pool_destroy(pool);
 }
 
 TEST_F(ThreadPoolTest, InlineModeWithCallback) {
   gcomp_thread_pool_config_t config = {.num_threads = 0, .allocator = nullptr};
   gcomp_thread_pool_t * pool = nullptr;
+  PoolGuard pool_guard(pool);
 
   gcomp_status_t status = gcomp_thread_pool_create(&config, &pool);
   ASSERT_EQ(status, GCOMP_OK);
@@ -214,12 +241,12 @@ TEST_F(ThreadPoolTest, InlineModeWithCallback) {
   EXPECT_EQ(g_job_counter.load(), 1);
   EXPECT_EQ(g_complete_counter.load(), 1);
 
-  gcomp_thread_pool_destroy(pool);
 }
 
 TEST_F(ThreadPoolTest, InlineModeFailingJob) {
   gcomp_thread_pool_config_t config = {.num_threads = 0, .allocator = nullptr};
   gcomp_thread_pool_t * pool = nullptr;
+  PoolGuard pool_guard(pool);
 
   gcomp_status_t status = gcomp_thread_pool_create(&config, &pool);
   ASSERT_EQ(status, GCOMP_OK);
@@ -232,7 +259,6 @@ TEST_F(ThreadPoolTest, InlineModeFailingJob) {
   status = gcomp_thread_pool_wait(pool);
   EXPECT_EQ(status, GCOMP_ERR_INTERNAL);
 
-  gcomp_thread_pool_destroy(pool);
 }
 
 //
@@ -242,6 +268,7 @@ TEST_F(ThreadPoolTest, InlineModeFailingJob) {
 TEST_F(ThreadPoolTest, MultiThreadedJobExecution) {
   gcomp_thread_pool_config_t config = {.num_threads = 2, .allocator = nullptr};
   gcomp_thread_pool_t * pool = nullptr;
+  PoolGuard pool_guard(pool);
 
   gcomp_status_t status = gcomp_thread_pool_create(&config, &pool);
   ASSERT_EQ(status, GCOMP_OK);
@@ -260,12 +287,12 @@ TEST_F(ThreadPoolTest, MultiThreadedJobExecution) {
   EXPECT_EQ(status, GCOMP_OK);
   EXPECT_EQ(g_job_counter.load(), 10);
 
-  gcomp_thread_pool_destroy(pool);
 }
 
 TEST_F(ThreadPoolTest, MultiThreadedJobsExecuteInWorkerThreads) {
   gcomp_thread_pool_config_t config = {.num_threads = 2, .allocator = nullptr};
   gcomp_thread_pool_t * pool = nullptr;
+  PoolGuard pool_guard(pool);
 
   gcomp_status_t status = gcomp_thread_pool_create(&config, &pool);
   ASSERT_EQ(status, GCOMP_OK);
@@ -284,12 +311,12 @@ TEST_F(ThreadPoolTest, MultiThreadedJobsExecuteInWorkerThreads) {
   // In multi-threaded mode, job should execute in a different thread
   EXPECT_NE(job.thread_id, caller_id);
 
-  gcomp_thread_pool_destroy(pool);
 }
 
 TEST_F(ThreadPoolTest, MultiThreadedWithCallback) {
   gcomp_thread_pool_config_t config = {.num_threads = 2, .allocator = nullptr};
   gcomp_thread_pool_t * pool = nullptr;
+  PoolGuard pool_guard(pool);
 
   gcomp_status_t status = gcomp_thread_pool_create(&config, &pool);
   ASSERT_EQ(status, GCOMP_OK);
@@ -308,12 +335,12 @@ TEST_F(ThreadPoolTest, MultiThreadedWithCallback) {
   EXPECT_EQ(g_job_counter.load(), 5);
   EXPECT_EQ(g_complete_counter.load(), 5);
 
-  gcomp_thread_pool_destroy(pool);
 }
 
 TEST_F(ThreadPoolTest, MultiThreadedFailingJob) {
   gcomp_thread_pool_config_t config = {.num_threads = 2, .allocator = nullptr};
   gcomp_thread_pool_t * pool = nullptr;
+  PoolGuard pool_guard(pool);
 
   gcomp_status_t status = gcomp_thread_pool_create(&config, &pool);
   ASSERT_EQ(status, GCOMP_OK);
@@ -340,12 +367,12 @@ TEST_F(ThreadPoolTest, MultiThreadedFailingJob) {
   // Good jobs should still have executed
   EXPECT_EQ(g_job_counter.load(), 2);
 
-  gcomp_thread_pool_destroy(pool);
 }
 
 TEST_F(ThreadPoolTest, ParallelExecution) {
   gcomp_thread_pool_config_t config = {.num_threads = 4, .allocator = nullptr};
   gcomp_thread_pool_t * pool = nullptr;
+  PoolGuard pool_guard(pool);
 
   gcomp_status_t status = gcomp_thread_pool_create(&config, &pool);
   ASSERT_EQ(status, GCOMP_OK);
@@ -378,7 +405,6 @@ TEST_F(ThreadPoolTest, ParallelExecution) {
   // If it takes less than 300ms, we're definitely running in parallel.
   EXPECT_LT(duration.count(), 300);
 
-  gcomp_thread_pool_destroy(pool);
 }
 
 //
@@ -394,6 +420,7 @@ TEST_F(ThreadPoolTest, SubmitNullPool) {
 TEST_F(ThreadPoolTest, SubmitNullFunc) {
   gcomp_thread_pool_config_t config = {.num_threads = 0, .allocator = nullptr};
   gcomp_thread_pool_t * pool = nullptr;
+  PoolGuard pool_guard(pool);
 
   gcomp_status_t status = gcomp_thread_pool_create(&config, &pool);
   ASSERT_EQ(status, GCOMP_OK);
@@ -401,7 +428,6 @@ TEST_F(ThreadPoolTest, SubmitNullFunc) {
   status = gcomp_thread_pool_submit(pool, nullptr, nullptr, nullptr, nullptr);
   EXPECT_EQ(status, GCOMP_ERR_INVALID_ARG);
 
-  gcomp_thread_pool_destroy(pool);
 }
 
 TEST_F(ThreadPoolTest, WaitNullPool) {
@@ -412,6 +438,7 @@ TEST_F(ThreadPoolTest, WaitNullPool) {
 TEST_F(ThreadPoolTest, WaitNoJobs) {
   gcomp_thread_pool_config_t config = {.num_threads = 2, .allocator = nullptr};
   gcomp_thread_pool_t * pool = nullptr;
+  PoolGuard pool_guard(pool);
 
   gcomp_status_t status = gcomp_thread_pool_create(&config, &pool);
   ASSERT_EQ(status, GCOMP_OK);
@@ -420,7 +447,6 @@ TEST_F(ThreadPoolTest, WaitNoJobs) {
   status = gcomp_thread_pool_wait(pool);
   EXPECT_EQ(status, GCOMP_OK);
 
-  gcomp_thread_pool_destroy(pool);
 }
 
 //
