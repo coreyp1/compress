@@ -1321,10 +1321,19 @@ ifeq ($(UNAME_S), Linux)
 endif
 
 # Pattern rule for ASan-instrumented C object files
+# Every ASan compile below writes a .d file and every one of them is included
+# at the bottom of this block.  Without that the sanitizer build tracks source
+# timestamps only: edit a header and the objects that include it are not
+# rebuilt, so the run links objects compiled against different versions of the
+# same struct.  That happened -- a field added to zstd_match_finder_t left one
+# object sizing it at 56 bytes and another at 64, and ASan reported a
+# heap-buffer-overflow in code that was correct.  A sanitizer build that can be
+# assembled from mismatched objects is worse than no sanitizer build: it can
+# invent a failure, and it can just as easily hide a real one.
 $(ASAN_OBJ_DIR)/%.o: src/%.c
 	@printf "\n### Compiling (ASan+UBSan instrumented): $< ###\n"
 	@mkdir -p $(@D)
-	$(CC) $(ASAN_CFLAGS) $(INCLUDE) -c $< -o $@
+	$(CC) $(ASAN_CFLAGS) $(INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
 
 # ASan-instrumented static library
 $(ASAN_APP_DIR)/$(ASAN_STATIC_TARGET): $(ASAN_LIBOBJECTS)
@@ -1342,13 +1351,20 @@ $(ASAN_APP_DIR)/$(ASAN_TARGET): $(ASAN_LIBOBJECTS)
 # ASan test helper object
 $(ASAN_OBJ_DIR)/tests/common/test_helpers.o: tests/common/test_helpers.cpp
 	@mkdir -p $(@D)
-	$(CXX) $(ASAN_CXXFLAGS) $(TEST_INCLUDE) -c $< -o $@
+	$(CXX) $(ASAN_CXXFLAGS) $(TEST_INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
 
 # Pattern rule for ASan test object files
 $(ASAN_OBJ_DIR)/tests/%.o: tests/%.cpp
 	@printf "\n### Compiling ASan+UBSan Test Object: $* ###\n"
 	@mkdir -p $(@D)
-	$(CXX) $(ASAN_CXXFLAGS) $(TEST_INCLUDE) -c $< -o $@
+	$(CXX) $(ASAN_CXXFLAGS) $(TEST_INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
+
+# Header dependencies for the ASan build; see the comment above the first
+# ASan compile rule for why these matter.
+ASAN_TEST_OBJECTS := $(patsubst tests/%.cpp,$(ASAN_OBJ_DIR)/tests/%.o,$(TEST_SOURCES))
+ASAN_DEPFILES := $(ASAN_LIBOBJECTS:.o=.d) $(ASAN_TEST_HELPER_OBJ:.o=.d) \
+	$(ASAN_TEST_OBJECTS:.o=.d)
+-include $(ASAN_DEPFILES)
 
 # Pattern rule for ASan test executables. Args: $1 = source path, $2 = executable name (from TEST_PAIRS).
 define asan-test-executable-rule
