@@ -89,6 +89,9 @@
 
 #include <ghoti.io/compress/macros.h>
 #include "../../core/endian.h"
+#ifdef GCOMP_TEST_BUILD
+#include <assert.h>
+#endif
 #include "zstd_internal.h"
 #include <string.h>
 
@@ -103,6 +106,10 @@
 #define MF_HASH_LOG_MAX 20       ///< Maximum hash table log
 #define MF_CHAIN_LOG_DEFAULT 16  ///< Default chain table log (64K entries)
 #define MF_MAX_DISTANCE 0x7FFFFF ///< Maximum match distance (~8MB for blocks)
+
+/// Most positions the binary tree will hold: two slots of four bytes each,
+/// so this is a 64 MiB ceiling on the tree.  See zstd_mf_init().
+#define MF_BT_MAX_ENTRIES (8u * 1024u * 1024u)
 
 //
 // Hash Functions
@@ -157,37 +164,57 @@ static inline uint32_t zstd_mf_hash5(const uint8_t * data, unsigned hash_log) {
  * match length at which the chain walk stops looking for something better.
  */
 typedef struct {
-  unsigned search_depth; ///< Maximum chain search depth.
+  unsigned search_depth; ///< Candidates examined; see the table below.
   unsigned lazy_depth;   ///< Positions a match may be deferred through.
   uint32_t nice_length;  ///< Length at which a match is taken as it stands.
   unsigned hash_log;     ///< Log2 of the hash table size.
+  unsigned use_bt;       ///< Search a binary tree rather than a hash chain.
 } zstd_effort_t;
 
 /// Indexed by compression level; entry 0 is unused (level 0 means "default").
+// `search_depth` counts candidates examined, and what a candidate costs
+// changes at level 11 where the chain gives way to the tree -- so the numbers
+// change scale there too, and the two halves are not comparable.
+//
+// A chain step crosses off one position and learns nothing for the next, so
+// the only way to search harder is to walk further and the counts run into
+// the hundreds.  A tree step halves what is left, and a descent takes six
+// steps on average.  A bound of 128 would never once be reached: when these
+// levels first moved to the tree, levels 11 through 22 became four encoders
+// wearing twelve numbers, because the only thing separating most of them
+// was a bound that no longer bound anything.
+//
+// `nice_length` turned out to be the knob that matters for the tree, far
+// more than the depth.  Reaching it stops the descent, and stopping the
+// descent closes off whatever was still below -- so it does not only end
+// this search, it makes the tree smaller for every search after.  On 9 MB of
+// manuals, C source and XML at a fixed depth of 32, raising it from 64 to
+// 4096 took the output from 1,602,010 bytes to 1,527,249, while depth beyond
+// about 24 was worth almost nothing.
 static const zstd_effort_t k_zstd_effort[23] = {
-    {0, 0, 0, 0},       // 0: unused
-    {4, 0, 128, 14},    // 1: greedy, and fast because of it
-    {8, 1, 128, 14},    // 2
-    {16, 1, 128, 15},   // 3
-    {24, 1, 128, 16},   // 4
-    {48, 1, 128, 16},   // 5
-    {64, 1, 128, 16},   // 6
-    {128, 2, 192, 17},  // 7
-    {192, 2, 192, 17},  // 8
-    {256, 2, 192, 17},  // 9
-    {320, 2, 192, 17},  // 10
-    {384, 2, 192, 17},  // 11
-    {448, 2, 192, 17},  // 12
-    {512, 2, 256, 18},  // 13
-    {640, 2, 256, 18},  // 14
-    {768, 2, 256, 18},  // 15
-    {896, 2, 256, 18},  // 16
-    {1024, 2, 256, 18}, // 17
-    {1280, 2, 256, 18}, // 18
-    {1536, 2, 256, 18}, // 19
-    {1792, 2, 256, 18}, // 20
-    {2048, 2, 256, 18}, // 21
-    {2560, 2, 256, 18}, // 22
+    {0, 0, 0, 0, 0},          // 0: unused
+    {4, 0, 128, 14, 0},       // 1: greedy, and fast because of it
+    {8, 1, 128, 14, 0},       // 2
+    {16, 1, 128, 15, 0},      // 3
+    {24, 1, 128, 16, 0},      // 4
+    {48, 1, 128, 16, 0},      // 5
+    {64, 1, 128, 16, 0},      // 6
+    {128, 2, 192, 17, 0},     // 7
+    {192, 2, 192, 17, 0},     // 8
+    {256, 2, 192, 17, 0},     // 9
+    {320, 2, 192, 17, 0},     // 10: last of the chain levels
+    {18, 2, 768, 17, 1},      // 11: first of the tree levels
+    {20, 2, 1024, 17, 1},     // 12
+    {22, 2, 1280, 18, 1},     // 13
+    {24, 2, 1536, 18, 1},     // 14
+    {26, 2, 2048, 18, 1},     // 15
+    {28, 2, 2560, 18, 1},     // 16
+    {32, 2, 3072, 18, 1},     // 17
+    {36, 2, 3584, 18, 1},     // 18
+    {40, 3, 4096, 18, 1},     // 19: one more deferral is what is left
+    {44, 3, 5120, 18, 1},     // 20
+    {52, 3, 8192, 18, 1},     // 21
+    {64, 3, 12288, 18, 1}     // 22
 };
 
 /**
@@ -288,6 +315,37 @@ gcomp_status_t zstd_mf_init(zstd_match_finder_t * mf,
   // position past the first 128 KB could be chained at all.
   mf->chain_size = (size_t)window_size + ZSTD_BLOCK_SIZE_MAX;
 
+  // How far back the tree can reach, and what it costs.
+  //
+  // Slots are indexed by position modulo bt_size, so bt_size must be a power
+  // of two, and a match may only reach back less than that far -- otherwise
+  // two positions in play at once would share a pair of slots and one would
+  // overwrite the other's children.  Reaching less far than bt_size is all
+  // that is needed: inserting a position overwrites the slot of one at least
+  // bt_size behind it, and that one is already too far back to be followed.
+  //
+  // So bt_size is rounded DOWN to a power of two, not up.  Rounding up would
+  // very nearly double a table that is already two slots per position where
+  // the chain was one: at the top levels, which declare a 32 MB window, that
+  // asked for 536 MB against a 256 MiB budget and simply failed to encode.
+  // Rounding down spends no more than the chain did and gives up a little
+  // reach instead.
+  //
+  // The cap is the same trade taken further.  A declared window is a promise
+  // to the decoder about how much history it must keep (RFC 8878 section
+  // 3.1.1.1.2), not an undertaking to search all of it, so the tree searches
+  // what fits in its budget and the frame stays exactly as valid.
+  mf->use_bt = effort->use_bt;
+  if (mf->use_bt) {
+    size_t n = 1;
+    while (n < mf->chain_size && n < MF_BT_MAX_ENTRIES) {
+      n <<= 1;
+    }
+    mf->bt_size = n;
+    mf->bt_mask = n - 1;
+  }
+  mf->base_pos = 0;
+
   // Allocate hash table (use calloc to initialize to zero)
   mf->hash_table = gcomp_calloc(alloc, mf->hash_size, sizeof(uint32_t));
   if (!mf->hash_table) {
@@ -295,6 +353,22 @@ gcomp_status_t zstd_mf_init(zstd_match_finder_t * mf,
   }
   if (mem_tracker) {
     gcomp_memory_track_alloc(mem_tracker, mf->hash_size * sizeof(uint32_t));
+  }
+
+  // Allocate whichever of the two the level asked for.  A level uses the
+  // chain or the tree, never both, so only one is paid for.
+  if (mf->use_bt) {
+    mf->bt_table = gcomp_calloc(alloc, mf->bt_size * 2u, sizeof(uint32_t));
+    if (!mf->bt_table) {
+      gcomp_free(alloc, mf->hash_table);
+      mf->hash_table = NULL;
+      return GCOMP_ERR_MEMORY;
+    }
+    if (mem_tracker) {
+      gcomp_memory_track_alloc(
+          mem_tracker, mf->bt_size * 2u * sizeof(uint32_t));
+    }
+    return GCOMP_OK;
   }
 
   // Allocate chain table (use calloc to initialize to zero)
@@ -335,6 +409,15 @@ void zstd_mf_destroy(zstd_match_finder_t * mf, const gcomp_allocator_t * alloc,
     gcomp_free(alloc, mf->chain_table);
     mf->chain_table = NULL;
   }
+
+  if (mf->bt_table) {
+    if (mem_tracker) {
+      gcomp_memory_track_free(
+          mem_tracker, mf->bt_size * 2u * sizeof(uint32_t));
+    }
+    gcomp_free(alloc, mf->bt_table);
+    mf->bt_table = NULL;
+  }
 }
 
 /**
@@ -351,6 +434,12 @@ void zstd_mf_reset(zstd_match_finder_t * mf) {
   if (mf->chain_table) {
     memset(mf->chain_table, 0, mf->chain_size * sizeof(uint32_t));
   }
+  if (mf->bt_table) {
+    memset(mf->bt_table, 0, mf->bt_size * 2u * sizeof(uint32_t));
+  }
+  // Nothing refers to any position any more, so where data[0] sits in the
+  // stream stops mattering and counting can start again.
+  mf->base_pos = 0;
 }
 
 //
@@ -415,6 +504,10 @@ static inline size_t zstd_mf_count_match(
   return (size_t)(p1 - anchor);
 }
 
+// Defined below, next to the tree it walks.
+static bool zstd_mf_bt_search(zstd_match_finder_t * mf, const uint8_t * data,
+    size_t pos, size_t data_size, zstd_match_t * match_out);
+
 /**
  * @brief Find best match at current position.
  *
@@ -433,6 +526,15 @@ static inline size_t zstd_mf_count_match(
  */
 static bool zstd_mf_find_match(zstd_match_finder_t * mf, const uint8_t * data,
     size_t pos, size_t data_size, bool insert, zstd_match_t * match_out) {
+  // The tree cannot search without also inserting -- the descent is the
+  // insertion -- so `insert` has no meaning for it.  Every caller passes
+  // true; a caller that wanted to look without inserting would need a
+  // different function, not a flag.
+  if (mf->use_bt) {
+    (void)insert;
+    return zstd_mf_bt_search(mf, data, pos, data_size, match_out);
+  }
+
   // Need at least MF_HASH_READ_SIZE bytes for hash function
   if (pos + MF_HASH_READ_SIZE > data_size) {
     return false;
@@ -543,6 +645,182 @@ static bool zstd_mf_find_match(zstd_match_finder_t * mf, const uint8_t * data,
   return false;
 }
 
+
+/**
+ * @brief Insert a position into the binary tree, reporting the best match
+ *        met on the way down.
+ *
+ * WHY A TREE
+ * ==========
+ *
+ * A hash chain is a list of earlier positions that share a hash, and finding
+ * the longest match means walking it and comparing each candidate against the
+ * current position from the first byte every time.  The chain is in no
+ * particular order, so nothing one comparison learns helps the next, and the
+ * only way to search harder is to walk further: the levels here ask for 128
+ * candidates at level 7 and 2560 at level 22, and the cost is exactly that
+ * number.
+ *
+ * The tree holds the same positions ordered by the text that follows them,
+ * compared as strings.  Descending it is a binary search for the current
+ * position's own suffix, so each step halves what is left rather than
+ * crossing off one candidate, and the positions met on the way are the ones
+ * whose text is closest to this one -- which is to say, the longest matches.
+ *
+ * The comparisons are not repeated either.  Coming down, every node so far
+ * has sorted either before this position or after it; keep the longest match
+ * with each side, and everything still below lies between those two in sorted
+ * order, which means it agrees with this position for at least as many bytes
+ * as the shorter of the two.  Those bytes are known to match and are not
+ * looked at again.  That is what makes a step of the tree cheaper than a step
+ * of the chain, rather than merely rarer.
+ *
+ * BUILDING IT WHILE SEARCHING IT
+ * ==============================
+ *
+ * The descent and the insertion are one pass.  Every node passed that sorts
+ * before this position belongs in the subtree of things smaller than it, and
+ * every node that sorts after belongs in the larger one; writing each into
+ * the slot the previous one vacated builds both subtrees as the search goes
+ * down, and the search ends exactly where the new node belongs.  So a
+ * position is inserted by looking for it.
+ *
+ * This is also why every position must be inserted exactly once and in
+ * order.  Inserting one twice would make a node its own descendant.  The
+ * caller does that already -- the chain wanted the same thing for a weaker
+ * reason -- and positions skipped inside a match are inserted by the fill
+ * loop in zstd_mf_generate_sequences().
+ *
+ * POSITIONS ARE ABSOLUTE
+ * ======================
+ *
+ * The tree names positions from the start of the stream rather than from the
+ * front of the caller's buffer, and indexes its slots by that number modulo a
+ * power of two at least as large as the buffer.  Sliding the window is then
+ * one addition to base_pos, where the chain has to walk every entry it holds
+ * and rebase it.  Entries left behind by the slide sit before base_pos and
+ * the walk stops at them, which prunes the tree rather than corrupting it:
+ * fewer candidates, never wrong ones.
+ *
+ * No two positions that are live at once can share a pair of slots, because
+ * that would need them to be bt_size apart and the buffer is not that wide.
+ */
+static bool zstd_mf_bt_search(zstd_match_finder_t * mf, const uint8_t * data,
+    size_t pos, size_t data_size, zstd_match_t * match_out) {
+  // Need at least MF_HASH_READ_SIZE bytes for hash function
+  if (pos + MF_HASH_READ_SIZE > data_size) {
+    return false;
+  }
+
+  const size_t cur_abs = mf->base_pos + pos;
+  uint32_t hash = zstd_mf_hash4(data + pos, mf->hash_log);
+  uint32_t cur = mf->hash_table[hash];
+  mf->hash_table[hash] = (uint32_t)(cur_abs + 1u); // +1 so 0 means "no entry"
+
+  // The two slots this position's own children go in, and where the next
+  // node on each side gets written as the descent splits the tree.
+  uint32_t * const own = &mf->bt_table[2u * (cur_abs & mf->bt_mask)];
+  uint32_t * smaller = own;
+  uint32_t * larger = own + 1;
+
+  // How far back a sequence may reach, as an absolute position.  Nothing
+  // before the front of the buffer can be compared against at all, whatever
+  // the window allows (RFC 8878 section 3.1.1.1.2).
+  size_t max_offset = mf->window_size;
+  if (max_offset > MF_MAX_DISTANCE) {
+    max_offset = MF_MAX_DISTANCE;
+  }
+  // Strictly inside the ring, so that the position whose slot this one takes
+  // is always already out of reach.  See the sizing in zstd_mf_init().
+  if (max_offset > mf->bt_size - 1u) {
+    max_offset = mf->bt_size - 1u;
+  }
+  size_t min_abs = mf->base_pos;
+  if (cur_abs > max_offset && cur_abs - max_offset > min_abs) {
+    min_abs = cur_abs - max_offset;
+  }
+
+  const uint8_t * const limit = data + data_size;
+  size_t best_len = MF_MIN_MATCH - 1;
+  size_t best_offset = 0;
+  size_t len_smaller = 0; ///< Match with the nearest node sorting before us.
+  size_t len_larger = 0;  ///< Match with the nearest node sorting after us.
+  unsigned depth = mf->search_depth;
+
+  while (depth-- > 0) {
+    if (cur == 0u) {
+      break;
+    }
+    size_t m_abs = (size_t)cur - 1u;
+    if (m_abs < min_abs || m_abs >= cur_abs) {
+      break; // Fallen out of the window, or not strictly earlier.
+    }
+    size_t m = m_abs - mf->base_pos;
+
+    // Everything still in this subtree sorts between the two nodes already
+    // met, and both of those agree with this position for at least this
+    // many bytes, so this one does too.
+    size_t common = (len_smaller < len_larger) ? len_smaller : len_larger;
+#ifdef GCOMP_TEST_BUILD
+    // The whole saving rests on that being true.  If it ever were not, the
+    // length below would count bytes that do not match and the encoder would
+    // emit a sequence that decodes to something else -- so the sanitizer
+    // build checks it on every candidate of every block.
+    assert(memcmp(data + pos, data + m, common) == 0);
+#endif
+    size_t len = common +
+        zstd_mf_count_match(data + pos + common, data + m + common, limit);
+
+    if (len > best_len) {
+      best_len = len;
+      best_offset = cur_abs - m_abs;
+
+      // A match this long is taken as it stands; see nice_length.  The two
+      // slots are closed off below, which drops whatever was still under
+      // them -- a smaller tree, not a wrong one.
+      if (len >= mf->nice_length) {
+        break;
+      }
+    }
+
+    if (pos + len >= data_size) {
+      // Ran out of buffer.  Which side this position belongs on is decided
+      // by bytes that are not here yet, so the descent stops rather than
+      // guessing and putting the node somewhere it does not belong.
+      break;
+    }
+
+    uint32_t * const child = &mf->bt_table[2u * (m_abs & mf->bt_mask)];
+    if (data[pos + len] > data[m + len]) {
+      // This position sorts after m, so m and everything below it on its
+      // smaller side belong to this position's smaller subtree.  Carry on
+      // down m's larger child, which is where anything nearer sits.
+      *smaller = cur;
+      smaller = child + 1;
+      cur = child[1];
+      len_smaller = len;
+    }
+    else {
+      *larger = cur;
+      larger = child;
+      cur = child[0];
+      len_larger = len;
+    }
+  }
+
+  // Whatever the descent did not reach is not this position's.
+  *smaller = 0u;
+  *larger = 0u;
+
+  if (best_len >= MF_MIN_MATCH && best_offset > 0) {
+    match_out->offset = (uint32_t)best_offset;
+    match_out->length = (uint32_t)best_len;
+    return true;
+  }
+
+  return false;
+}
+
 /**
  * @brief Insert position into hash table without searching.
  *
@@ -550,6 +828,16 @@ static bool zstd_mf_find_match(zstd_match_finder_t * mf, const uint8_t * data,
  */
 static void zstd_mf_insert(zstd_match_finder_t * mf, const uint8_t * data,
     size_t pos, size_t data_size) {
+  // The tree has no cheaper way in: placing a node means finding where it
+  // belongs, and finding where it belongs is the search.  What the search
+  // turns up is thrown away here, which is the price of keeping the tree
+  // complete over the positions inside a match.
+  if (mf->use_bt) {
+    zstd_match_t ignored;
+    (void)zstd_mf_bt_search(mf, data, pos, data_size, &ignored);
+    return;
+  }
+
   // Need at least MF_HASH_READ_SIZE bytes for hash function
   if (pos + MF_HASH_READ_SIZE > data_size) {
     return;
@@ -566,6 +854,17 @@ static void zstd_mf_insert(zstd_match_finder_t * mf, const uint8_t * data,
 
 void zstd_mf_slide(zstd_match_finder_t * mf, size_t shift) {
   if (!mf || shift == 0) {
+    return;
+  }
+
+  // The tree names positions from the start of the stream, so moving the
+  // window changes only where data[0] sits in it.  Entries that have fallen
+  // out of the buffer are behind the new base and the walk stops at them;
+  // nothing has to be rewritten, which is the whole reason the tree counts
+  // this way.  The chain below names positions in the buffer instead, and
+  // has to move every entry it holds.
+  if (mf->use_bt) {
+    mf->base_pos += shift;
     return;
   }
 

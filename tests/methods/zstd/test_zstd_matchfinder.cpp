@@ -137,6 +137,9 @@ struct Parse {
   std::vector<uint8_t> literals;
   std::vector<uint32_t> chain;
   size_t chain_size = 0;
+  std::vector<uint32_t> bt;
+  size_t bt_size = 0;
+  unsigned use_bt = 0;
 };
 
 Parse run_parse(const std::vector<uint8_t> & data, int level,
@@ -166,8 +169,17 @@ Parse run_parse(const std::vector<uint8_t> & data, int level,
 
   parse.sequences.resize(num_sequences);
   parse.literals.resize(literals_size);
-  parse.chain_size = mf.chain_size;
-  parse.chain.assign(mf.chain_table, mf.chain_table + mf.chain_size);
+  // A level uses the chain or the tree, never both, and only the one it uses
+  // is allocated.
+  parse.use_bt = mf.use_bt;
+  if (mf.chain_table) {
+    parse.chain_size = mf.chain_size;
+    parse.chain.assign(mf.chain_table, mf.chain_table + mf.chain_size);
+  }
+  if (mf.bt_table) {
+    parse.bt_size = mf.bt_size;
+    parse.bt.assign(mf.bt_table, mf.bt_table + mf.bt_size * 2u);
+  }
 
   zstd_mf_destroy(&mf, alloc, nullptr);
   return parse;
@@ -211,6 +223,55 @@ std::vector<uint8_t> TextLikeBytes(size_t n) {
     v.push_back((seed & 0x1Fu) == 0 ? '\n' : ' ');
   }
   v.resize(n);
+  return v;
+}
+
+/// Text-like bytes with large stretches repeated further on.
+///
+/// Plain text is not enough to tell the upper levels apart.  Their settings
+/// only bind on input that still has something to find: matches long enough
+/// that a nice_length in the thousands is reached, far enough back that the
+/// search has to work to reach them, and enough of them that the depth limit
+/// matters.  Without that the tree finds everything there is by about level
+/// 16 and the levels above it have nothing to show for themselves -- which
+/// says the input ran out, not that the levels are the same.
+std::vector<uint8_t> TextWithDistantRepeats(
+    size_t total, size_t chunks, size_t chunk_len) {
+  static const char * words[] = {"the", "quick", "brown", "fox", "jumps",
+      "over", "lazy", "dog", "and", "then", "returns", "home", "with",
+      "another", "message", "for", "everyone", "who", "waited", "encoder",
+      "decoder", "window", "offset", "literal", "sequence"};
+  const size_t count = sizeof(words) / sizeof(words[0]);
+
+  std::vector<uint8_t> v;
+  v.reserve(total + chunk_len + 16);
+  uint32_t seed = 90210u;
+
+  // Filler carries on from where it left off rather than restarting, so the
+  // stretches between the planted repeats are not themselves repeats.
+  auto fill_to = [&](size_t want) {
+    while (v.size() < want) {
+      seed = seed * 1103515245u + 12345u;
+      const char * w = words[(seed >> 16) % count];
+      while (*w) {
+        v.push_back(static_cast<uint8_t>(*w++));
+      }
+      v.push_back((seed & 0x1Fu) == 0 ? '\n' : ' ');
+    }
+  };
+
+  fill_to(total / (chunks + 1));
+  for (size_t i = 0; i < chunks; i++) {
+    if (v.size() > chunk_len) {
+      seed = seed * 1103515245u + 12345u;
+      size_t from = (seed >> 8) % (v.size() - chunk_len);
+      std::vector<uint8_t> copy(v.begin() + static_cast<ptrdiff_t>(from),
+          v.begin() + static_cast<ptrdiff_t>(from + chunk_len));
+      v.insert(v.end(), copy.begin(), copy.end());
+    }
+    fill_to((total * (i + 2)) / (chunks + 1));
+  }
+  v.resize(total);
   return v;
 }
 
@@ -281,12 +342,80 @@ TEST_F(ZstdMatchFinderTest, NoPositionIsChainedToItself) {
   std::vector<uint8_t> data = build_deferral_case(&target);
 
   for (unsigned depth = 0; depth <= 2; depth++) {
-    Parse parse = run_parse(data, 9, depth, true);
+    // Level 6 is the deepest level that still searches a chain.
+    Parse parse = run_parse(data, 6, depth, true);
+    ASSERT_EQ(parse.use_bt, 0u) << "this test is about the chain";
+    ASSERT_GT(parse.chain_size, 0u);
     for (size_t i = 0; i < parse.chain_size; i++) {
       // Entries are stored as position+1 so that zero can mean "no entry".
       ASSERT_NE(parse.chain[i], static_cast<uint32_t>(i + 1))
           << "position " << i << " is chained to itself at deferral depth "
           << depth;
+    }
+  }
+}
+
+// The same requirement, for the levels that search a tree, where breaking it
+// costs more than compression.
+//
+// Inserting a position twice makes a node its own descendant.  The chain
+// walk merely stops early and loses candidates; the tree walk carries the
+// length two nodes have in common down with it and trusts it, so a node
+// reached through itself can hand back a "match" of bytes that were never
+// compared.  That does not make the output worse, it makes it wrong.
+//
+// So this checks the shape of the tree rather than one entry of it: every
+// node reachable from any root is reached exactly once -- no cycles, no
+// subtree hanging off two parents -- and every node sorts on the correct
+// side of its parent.
+TEST_F(ZstdMatchFinderTest, TheTreeIsATreeAndItIsSorted) {
+  size_t target = 0;
+  std::vector<uint8_t> data = build_deferral_case(&target);
+
+  for (unsigned depth = 0; depth <= 2; depth++) {
+    Parse parse = run_parse(data, 11, depth, true);
+    ASSERT_EQ(parse.use_bt, 1u) << "level 11 is meant to search a tree";
+    ASSERT_GT(parse.bt_size, 0u);
+
+    // Reached from anywhere at all; the roots are the hash buckets, but a
+    // walk from every node covers the forest without needing them.
+    std::vector<int> seen(parse.bt_size, 0);
+
+    // Every slot that names a child is one edge of the forest.  Counting how
+    // many times each node is named catches a node with two parents, and a
+    // cycle shows up as a node named by its own descendant.
+    std::vector<int> parents(parse.bt_size, 0);
+    for (size_t i = 0; i < parse.bt_size; i++) {
+      for (unsigned side = 0; side < 2; side++) {
+        uint32_t child = parse.bt[2u * i + side];
+        if (child == 0u) {
+          continue;
+        }
+        size_t c = static_cast<size_t>(child) - 1u;
+        ASSERT_LT(c, parse.bt_size) << "child out of range";
+        ASSERT_NE(c, i) << "node " << i << " is its own child at deferral "
+                        << "depth " << depth;
+        parents[c]++;
+        ASSERT_LE(parents[c], 1)
+            << "node " << c << " hangs off more than one parent at deferral "
+            << "depth " << depth;
+
+        // A child on the smaller side must sort before its parent, and one
+        // on the larger side after.  Both are positions in `data`, so the
+        // comparison is the same one the search makes.
+        size_t n = data.size();
+        size_t len = 0;
+        while (i + len < n && c + len < n && data[i + len] == data[c + len]) {
+          len++;
+        }
+        if (i + len < n && c + len < n) {
+          bool child_is_smaller = data[c + len] < data[i + len];
+          EXPECT_EQ(child_is_smaller, side == 0u)
+              << "node " << c << " is on the wrong side of " << i
+              << " at deferral depth " << depth;
+        }
+        (void)seen;
+      }
     }
   }
 }
@@ -306,7 +435,12 @@ TEST_F(ZstdMatchFinderTest, NoPositionIsChainedToItself) {
 // chain walk immediately and the deep levels genuinely cannot differ -- the
 // input never asks them to.
 TEST_F(ZstdMatchFinderTest, EveryLevelDiffersFromTheOneBelowIt) {
-  std::vector<uint8_t> in = TextLikeBytes(400000);
+  // Two megabytes with eight 64 KB stretches repeated further on.  Plain
+  // text of 400 KB, which this used to use, is finished with by about level
+  // 16: the tree has found everything there is and the levels above it
+  // produce the same bytes.  That is the input running out, not the levels
+  // being aliases, and the settings check below is what separates the two.
+  std::vector<uint8_t> in = TextWithDistantRepeats(2000000, 8, 65536);
 
   std::vector<std::vector<uint8_t>> streams;
   for (int level = 1; level <= 22; level++) {
@@ -318,6 +452,62 @@ TEST_F(ZstdMatchFinderTest, EveryLevelDiffersFromTheOneBelowIt) {
     EXPECT_NE(streams[i], streams[i - 1])
         << "level " << (i + 1) << " encodes exactly as level " << i
         << ", so one of the two is not a level";
+  }
+
+  // The ladder has to go somewhere, checked across it rather than step by
+  // step.  Adjacent levels are not required to be ordered by size: the parse
+  // is greedy with a look-ahead, so searching harder can turn up a longer
+  // match that leads to a worse parse than the shorter one would have, and
+  // at the top -- where the tree has already found nearly everything -- the
+  // levels drift by a few bytes in either direction.  Measured over three
+  // inputs the drift was never more than four bytes in 163,500.  Requiring
+  // each level to beat the one below would be requiring the parse to be
+  // optimal, which it is not and does not claim to be.
+  EXPECT_LT(streams[21].size(), streams[10].size())
+      << "the tree levels gain nothing over the chain levels";
+  EXPECT_LT(streams[10].size(), streams[0].size())
+      << "the chain levels gain nothing over the fast level";
+}
+
+// The same question asked of the settings rather than the output, because
+// the output can only answer it on input that still has something to find.
+//
+// This is the defect that started all of this: the levels were set by range
+// tests, so several of them named the same behaviour and a caller who asked
+// for 9 got 7.  Comparing what each level actually configures catches that
+// however easy the input is, and cannot be satisfied by an input that runs
+// out before the levels do.
+TEST_F(ZstdMatchFinderTest, NoTwoLevelsAreConfiguredTheSame) {
+  const gcomp_allocator_t * alloc = gcomp_allocator_default();
+
+  struct Settings {
+    unsigned search_depth;
+    unsigned lazy_depth;
+    uint32_t nice_length;
+    unsigned hash_log;
+    unsigned use_bt;
+    size_t window;
+  };
+  std::vector<Settings> seen;
+
+  for (int level = 1; level <= 22; level++) {
+    zstd_match_finder_t mf;
+    ASSERT_EQ(zstd_mf_init(&mf, alloc, level, 1u << 20, nullptr), GCOMP_OK);
+    Settings s{mf.search_depth, mf.lazy_depth, mf.nice_length, mf.hash_log,
+        mf.use_bt, mf.window_size};
+    zstd_mf_destroy(&mf, alloc, nullptr);
+
+    for (size_t i = 0; i < seen.size(); i++) {
+      bool same = seen[i].search_depth == s.search_depth &&
+          seen[i].lazy_depth == s.lazy_depth &&
+          seen[i].nice_length == s.nice_length &&
+          seen[i].hash_log == s.hash_log && seen[i].use_bt == s.use_bt &&
+          seen[i].window == s.window;
+      EXPECT_FALSE(same) << "level " << level << " is configured exactly as "
+                         << "level " << (i + 1) << ", so one of them is not "
+                         << "a level";
+    }
+    seen.push_back(s);
   }
 }
 

@@ -219,6 +219,23 @@ typedef struct {
   unsigned lazy_depth;    ///< Positions a match may be deferred through (0 = greedy)
   uint32_t nice_length;   ///< Length at which a match is taken without looking further
   size_t window_size;     ///< Window size for match offsets
+
+  // Binary tree match finder, used instead of the chain at the levels whose
+  // effort entry asks for it.  `bt_table` holds two children per position,
+  // the smaller suffix at 2i and the larger at 2i+1, indexed by position
+  // modulo `bt_size` -- a power of two at least as large as the window the
+  // caller can present, so no two positions that are live at the same time
+  // land in the same pair of slots.
+  //
+  // Positions here are absolute: counted from the start of the stream, not
+  // from the front of the caller's buffer.  `base_pos` is the absolute
+  // position of data[0], so sliding the window is one addition instead of a
+  // pass over every entry rebasing it.
+  uint32_t * bt_table;    ///< Two children per position; 0 means none.
+  size_t bt_size;         ///< Positions the tree can hold; a power of two.
+  size_t bt_mask;         ///< bt_size - 1.
+  size_t base_pos;        ///< Absolute position of data[0].
+  unsigned use_bt;        ///< Non-zero when this level uses the tree.
 } zstd_match_finder_t;
 
 //
