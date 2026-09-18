@@ -93,19 +93,19 @@
 #include <assert.h>
 #endif
 #include "zstd_internal.h"
+#include "zstd_matchfinder_private.h"
 #include <string.h>
 
 //
 // Match Finder Constants
 //
 
-#define MF_MIN_MATCH 3           ///< Minimum match length
-#define MF_HASH_READ_SIZE 4      ///< Bytes read by hash function (must be >= 4)
+// MF_MIN_MATCH, MF_HASH_READ_SIZE and MF_MAX_DISTANCE are in
+// zstd_matchfinder_private.h, which the optimal parse shares.
 #define MF_HASH_LOG_DEFAULT 17   ///< Default hash table log (128K entries)
 #define MF_HASH_LOG_MIN 12       ///< Minimum hash table log
 #define MF_HASH_LOG_MAX 20       ///< Maximum hash table log
 #define MF_CHAIN_LOG_DEFAULT 16  ///< Default chain table log (64K entries)
-#define MF_MAX_DISTANCE 0x7FFFFF ///< Maximum match distance (~8MB for blocks)
 
 /// Most positions the binary tree will hold: two slots of four bytes each,
 /// so this is a 64 MiB ceiling on the tree.  See zstd_mf_init().
@@ -466,45 +466,10 @@ static inline bool zstd_mf_prefer_later(
       zstd_mf_match_gain(here->length, here->offset) + MF_LITERAL_BITS;
 }
 
-/**
- * @brief Count how many bytes match at two positions.
- *
- * Eight bytes at a time while eight remain.  Both reads are in bounds: the
- * loop only runs while p1 + 8 is within p1_end, which is the end of the
- * buffer, and p2 is always behind p1 -- a match source is earlier than the
- * position matching it -- so p2 + 8 is further inside the buffer still.
- *
- * Where the two words differ, the first differing byte is the lowest
- * differing bit of their exclusive-or, divided by eight.  Reading both
- * little-endian puts the earliest byte in memory in the low bits, so this
- * counts forwards through memory on either byte order.
- *
- * This is the comparison that decides every candidate match, and one byte
- * per iteration made it 5% of encoding on its own.
- */
-static inline size_t zstd_mf_count_match(
-    const uint8_t * p1, const uint8_t * p2, const uint8_t * p1_end) {
-  const uint8_t * anchor = p1;
-
-  while (p1 + 8 <= p1_end) {
-    uint64_t a = gcomp_read_le64(p1);
-    uint64_t b = gcomp_read_le64(p2);
-    if (a != b) {
-      return (size_t)(p1 - anchor) +
-          (size_t)((unsigned)__builtin_ctzll(a ^ b) >> 3);
-    }
-    p1 += 8;
-    p2 += 8;
-  }
-
-  while (p1 < p1_end && *p1 == *p2) {
-    p1++;
-    p2++;
-  }
-  return (size_t)(p1 - anchor);
-}
-
 // Defined below, next to the tree it walks.
+static inline size_t zstd_mf_bt_descend(zstd_match_finder_t * mf,
+    const uint8_t * data, size_t pos, size_t data_size,
+    zstd_mf_candidate_t * out, size_t out_cap, zstd_match_t * best_out);
 static bool zstd_mf_bt_search(zstd_match_finder_t * mf, const uint8_t * data,
     size_t pos, size_t data_size, zstd_match_t * match_out);
 
@@ -705,11 +670,12 @@ static bool zstd_mf_find_match(zstd_match_finder_t * mf, const uint8_t * data,
  * No two positions that are live at once can share a pair of slots, because
  * that would need them to be bt_size apart and the buffer is not that wide.
  */
-static bool zstd_mf_bt_search(zstd_match_finder_t * mf, const uint8_t * data,
-    size_t pos, size_t data_size, zstd_match_t * match_out) {
+static inline size_t zstd_mf_bt_descend(zstd_match_finder_t * mf,
+    const uint8_t * data, size_t pos, size_t data_size,
+    zstd_mf_candidate_t * out, size_t out_cap, zstd_match_t * best_out) {
   // Need at least MF_HASH_READ_SIZE bytes for hash function
   if (pos + MF_HASH_READ_SIZE > data_size) {
-    return false;
+    return 0;
   }
 
   const size_t cur_abs = mf->base_pos + pos;
@@ -726,15 +692,7 @@ static bool zstd_mf_bt_search(zstd_match_finder_t * mf, const uint8_t * data,
   // How far back a sequence may reach, as an absolute position.  Nothing
   // before the front of the buffer can be compared against at all, whatever
   // the window allows (RFC 8878 section 3.1.1.1.2).
-  size_t max_offset = mf->window_size;
-  if (max_offset > MF_MAX_DISTANCE) {
-    max_offset = MF_MAX_DISTANCE;
-  }
-  // Strictly inside the ring, so that the position whose slot this one takes
-  // is always already out of reach.  See the sizing in zstd_mf_init().
-  if (max_offset > mf->bt_size - 1u) {
-    max_offset = mf->bt_size - 1u;
-  }
+  const size_t max_offset = zstd_mf_max_offset(mf);
   size_t min_abs = mf->base_pos;
   if (cur_abs > max_offset && cur_abs - max_offset > min_abs) {
     min_abs = cur_abs - max_offset;
@@ -743,6 +701,7 @@ static bool zstd_mf_bt_search(zstd_match_finder_t * mf, const uint8_t * data,
   const uint8_t * const limit = data + data_size;
   size_t best_len = MF_MIN_MATCH - 1;
   size_t best_offset = 0;
+  size_t found = 0;
   size_t len_smaller = 0; ///< Match with the nearest node sorting before us.
   size_t len_larger = 0;  ///< Match with the nearest node sorting after us.
   unsigned depth = mf->search_depth;
@@ -774,6 +733,16 @@ static bool zstd_mf_bt_search(zstd_match_finder_t * mf, const uint8_t * data,
     if (len > best_len) {
       best_len = len;
       best_offset = cur_abs - m_abs;
+      // Every improvement is a match worth reporting, not just the last one.
+      // They come out in increasing length order because that is the only
+      // way one gets recorded, and each is the nearest source the descent
+      // has found for its own length.  A caller that wants only the longest
+      // passes no list, and this whole branch folds away.
+      if (out && len >= MF_MIN_MATCH && found < out_cap) {
+        out[found].length = (uint32_t)len;
+        out[found].offset = (uint32_t)best_offset;
+        found++;
+      }
 
       // A match this long is taken as it stands; see nice_length.  The two
       // slots are closed off below, which drops whatever was still under
@@ -812,13 +781,42 @@ static bool zstd_mf_bt_search(zstd_match_finder_t * mf, const uint8_t * data,
   *smaller = 0u;
   *larger = 0u;
 
-  if (best_len >= MF_MIN_MATCH && best_offset > 0) {
-    match_out->offset = (uint32_t)best_offset;
-    match_out->length = (uint32_t)best_len;
-    return true;
+  if (out) {
+    return found;
   }
+  if (best_out && best_len >= MF_MIN_MATCH && best_offset > 0) {
+    best_out->offset = (uint32_t)best_offset;
+    best_out->length = (uint32_t)best_len;
+    return 1;
+  }
+  return 0;
+}
 
-  return false;
+/**
+ * @brief The descent, reporting only the longest match it met.
+ */
+static bool zstd_mf_bt_search(zstd_match_finder_t * mf, const uint8_t * data,
+    size_t pos, size_t data_size, zstd_match_t * match_out) {
+  return zstd_mf_bt_descend(mf, data, pos, data_size, NULL, 0, match_out) != 0;
+}
+
+size_t zstd_mf_find_matches(zstd_match_finder_t * mf, const uint8_t * data,
+    size_t pos, size_t data_size, zstd_mf_candidate_t * out, size_t out_cap) {
+  if (!mf->use_bt) {
+    // The chain has no cheap way to report a frontier: its candidates arrive
+    // in no useful order, so building one would mean keeping and sorting
+    // every improvement.  Nothing asks -- the optimal parse is only offered
+    // at tree levels -- so the one best match is what comes back.
+    zstd_match_t one;
+    if (out_cap == 0 ||
+        !zstd_mf_find_match(mf, data, pos, data_size, true, &one)) {
+      return 0;
+    }
+    out[0].length = one.length;
+    out[0].offset = one.offset;
+    return 1;
+  }
+  return zstd_mf_bt_descend(mf, data, pos, data_size, out, out_cap, NULL);
 }
 
 /**
@@ -826,15 +824,14 @@ static bool zstd_mf_bt_search(zstd_match_finder_t * mf, const uint8_t * data,
  *
  * Used for positions we're skipping (e.g., inside a match).
  */
-static void zstd_mf_insert(zstd_match_finder_t * mf, const uint8_t * data,
+void zstd_mf_insert_one(zstd_match_finder_t * mf, const uint8_t * data,
     size_t pos, size_t data_size) {
   // The tree has no cheaper way in: placing a node means finding where it
   // belongs, and finding where it belongs is the search.  What the search
   // turns up is thrown away here, which is the price of keeping the tree
   // complete over the positions inside a match.
   if (mf->use_bt) {
-    zstd_match_t ignored;
-    (void)zstd_mf_bt_search(mf, data, pos, data_size, &ignored);
+    (void)zstd_mf_bt_descend(mf, data, pos, data_size, NULL, 0, NULL);
     return;
   }
 
@@ -901,7 +898,7 @@ void zstd_mf_index_range(zstd_match_finder_t * mf, const uint8_t * data,
     return;
   }
   for (size_t i = from; i < to && i + MF_HASH_READ_SIZE <= data_size; i++) {
-    zstd_mf_insert(mf, data, i, data_size);
+    zstd_mf_insert_one(mf, data, i, data_size);
   }
 }
 
@@ -1048,7 +1045,7 @@ gcomp_status_t zstd_mf_generate_sequences(zstd_match_finder_t * mf,
       size_t fill_from = (indexed > pos) ? indexed + 1 : pos + 1;
       for (size_t i = fill_from;
            i < match_end && i + MF_HASH_READ_SIZE <= data_size; i++) {
-        zstd_mf_insert(mf, data, i, data_size);
+        zstd_mf_insert_one(mf, data, i, data_size);
       }
 
       pos = match_end;
