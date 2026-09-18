@@ -127,6 +127,12 @@
 // largest of each that fits: past a point, more sweeping buys hundredths of
 // a percent for whole multiples of the time.
 
+/// Literal and match lengths below this have their price in a table rather
+/// than worked out from their code.  Match length codes are one-to-one with
+/// lengths up to 34 and coarsen from there; this covers well past the point
+/// where a length is common.
+#define ZSTD_OPT_DIRECT_LEN 256u
+
 /**
  * @brief One position in the sweep.
  *
@@ -163,6 +169,14 @@ struct zstd_opt_state_s {
   uint32_t ll_price[ZSTD_SEQ_LL_CODES];
   uint32_t ml_price[ZSTD_SEQ_ML_CODES];
   uint32_t of_price[ZSTD_SEQ_OF_CODES];
+
+  // The same two prices for every length that comes up often, worked out
+  // once a block instead of per relaxation.  A sweep asks for a match length
+  // price at every length it relaxes, which is hundreds of times per
+  // position, and turning a length into its code is a run of comparisons:
+  // that conversion alone was 17% of encoding.
+  uint32_t ll_price_len[ZSTD_OPT_DIRECT_LEN];
+  uint32_t ml_price_len[ZSTD_OPT_DIRECT_LEN];
 
   uint32_t lit_freq[256];
   uint32_t ll_freq[ZSTD_SEQ_LL_CODES];
@@ -225,6 +239,20 @@ static void zstd_opt_price_from_freq(const uint32_t * freq, uint32_t * price,
   }
 }
 
+static inline uint32_t zstd_opt_ll_price_slow(
+    const struct zstd_opt_state_s * st, uint32_t litlen) {
+  unsigned code = zstd_enc_get_ll_code(litlen);
+  return st->ll_price[code] +
+      ((uint32_t)zstd_seq_ll_extra_bits[code] << ZSTD_OPT_PRICE_SHIFT);
+}
+
+static inline uint32_t zstd_opt_ml_price_slow(
+    const struct zstd_opt_state_s * st, uint32_t mlen) {
+  unsigned code = zstd_enc_get_ml_code(mlen);
+  return st->ml_price[code] +
+      ((uint32_t)zstd_seq_ml_extra_bits[code] << ZSTD_OPT_PRICE_SHIFT);
+}
+
 static void zstd_opt_rebuild_prices(struct zstd_opt_state_s * st) {
   zstd_opt_price_from_freq(
       st->lit_freq, st->lit_price, 256, ZSTD_OPT_PRICE_ONE);
@@ -234,6 +262,11 @@ static void zstd_opt_rebuild_prices(struct zstd_opt_state_s * st) {
       ZSTD_OPT_PRICE_ONE / 8u);
   zstd_opt_price_from_freq(st->of_freq, st->of_price, ZSTD_SEQ_OF_CODES,
       ZSTD_OPT_PRICE_ONE / 8u);
+
+  for (uint32_t n = 0; n < ZSTD_OPT_DIRECT_LEN; n++) {
+    st->ll_price_len[n] = zstd_opt_ll_price_slow(st, n);
+    st->ml_price_len[n] = zstd_opt_ml_price_slow(st, n);
+  }
 }
 
 /**
@@ -241,9 +274,8 @@ static void zstd_opt_rebuild_prices(struct zstd_opt_state_s * st) {
  */
 static inline uint32_t zstd_opt_ll_price(
     const struct zstd_opt_state_s * st, uint32_t litlen) {
-  unsigned code = zstd_enc_get_ll_code(litlen);
-  return st->ll_price[code] +
-      ((uint32_t)zstd_seq_ll_extra_bits[code] << ZSTD_OPT_PRICE_SHIFT);
+  return (litlen < ZSTD_OPT_DIRECT_LEN) ? st->ll_price_len[litlen]
+                                        : zstd_opt_ll_price_slow(st, litlen);
 }
 
 /**
@@ -251,9 +283,8 @@ static inline uint32_t zstd_opt_ll_price(
  */
 static inline uint32_t zstd_opt_ml_price(
     const struct zstd_opt_state_s * st, uint32_t mlen) {
-  unsigned code = zstd_enc_get_ml_code(mlen);
-  return st->ml_price[code] +
-      ((uint32_t)zstd_seq_ml_extra_bits[code] << ZSTD_OPT_PRICE_SHIFT);
+  return (mlen < ZSTD_OPT_DIRECT_LEN) ? st->ml_price_len[mlen]
+                                      : zstd_opt_ml_price_slow(st, mlen);
 }
 
 /**
