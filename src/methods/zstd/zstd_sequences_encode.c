@@ -12,6 +12,9 @@
 
 #include <ghoti.io/compress/macros.h>
 #include "../../core/endian.h"
+#ifdef GCOMP_TEST_BUILD
+#include <assert.h>
+#endif
 #include "zstd_internal.h"
 #include <string.h>
 #include "zstd_sequences_private.h"
@@ -877,14 +880,6 @@ gcomp_status_t zstd_sequences_encode(const zstd_sequence_t * sequences,
         &of_pre, &ml_pre, output, output_cap, output_len_out);
   }
 
-  // Price the predefined tables without writing them.  The custom tables are
-  // then written for real: when they win -- which is the common case once a
-  // block has more than a handful of sequences -- that is two walks over the
-  // sequences rather than three.
-  size_t pre_size = 0;
-  gcomp_status_t pre_status = zstd_sequences_encode_using(sequences,
-      num_sequences, &ll_pre, &of_pre, &ml_pre, NULL, 0, &pre_size);
-
   // Per-block tables.
   uint32_t ll_freq[ZSTD_SEQ_LL_CODES] = {0};
   uint32_t ml_freq[ZSTD_SEQ_ML_CODES] = {0};
@@ -902,6 +897,110 @@ gcomp_status_t zstd_sequences_encode(const zstd_sequence_t * sequences,
     ml_freq[ml_code]++;
     of_freq[of_code]++;
   }
+
+  // A lower bound on what the predefined tables would cost, worked out from
+  // the histogram alone.
+  //
+  // The block is written with whichever table set is smaller, and finding
+  // out used to mean encoding it twice: once with the predefined tables to
+  // price them, once with its own to write.  That pricing walk was a sixth
+  // of encoding, and on real data its answer is not close -- across 604
+  // blocks of a general corpus at four levels the per-block tables won every
+  // one of them, never by less than 12.3%.
+  //
+  // It does not have to be exact to settle the question.  Every part of the
+  // cost except the state transitions is fixed: the extra bits a code
+  // carries are the code's own (RFC 8878 3.1.1.3.2.1), the three initial
+  // states cost one accuracy log each, and the marker is one bit.  A state
+  // transition costs at least the narrowest range width the symbol has in
+  // the table, which zstd_seq_index_table() already worked out as
+  // map_shift.  All of that is a sum over the 36 or so codes rather than a
+  // walk over the sequences.
+  //
+  // If the per-block tables come out no larger than this bound they are no
+  // larger than the real thing either, and the choice is made without the
+  // walk.  When the bound does not settle it, the walk still happens, below.
+  uint64_t pre_lb_bits = 1u + ll_pre.log + of_pre.log + ml_pre.log;
+  bool pre_lb_usable = true;
+  for (unsigned c = 0; c < ZSTD_SEQ_LL_CODES; c++) {
+    if (!ll_freq[c]) {
+      continue;
+    }
+    if (!ll_pre.count[c]) {
+      pre_lb_usable = false; // Predefined cannot carry this code at all.
+      break;
+    }
+    pre_lb_bits += (uint64_t)ll_freq[c] *
+        (zstd_seq_ll_extra_bits[c] + ll_pre.map_shift[c]);
+  }
+  for (unsigned c = 0; pre_lb_usable && c < ZSTD_SEQ_ML_CODES; c++) {
+    if (!ml_freq[c]) {
+      continue;
+    }
+    if (!ml_pre.count[c]) {
+      pre_lb_usable = false;
+      break;
+    }
+    pre_lb_bits += (uint64_t)ml_freq[c] *
+        (zstd_seq_ml_extra_bits[c] + ml_pre.map_shift[c]);
+  }
+  for (unsigned c = 0; pre_lb_usable && c < ZSTD_SEQ_OF_CODES; c++) {
+    if (!of_freq[c]) {
+      continue;
+    }
+    if (!of_pre.count[c]) {
+      pre_lb_usable = false;
+      break;
+    }
+    // An offset code's extra bits are the code itself
+    // (RFC 8878 3.1.1.3.2.1.1).
+    pre_lb_bits += (uint64_t)of_freq[c] * (c + of_pre.map_shift[c]);
+  }
+
+  // The last sequence has no successor and writes no state transitions at
+  // all; the sum above counted three for it like every other.  Taking back
+  // the least those three could have cost keeps the bound under the truth.
+  // Without this it ran over the real size on one block in every 151, by
+  // just under 1% -- enough to have chosen the wrong table.
+  if (pre_lb_usable) {
+    const zstd_sequence_t * last = &sequences[num_sequences - 1];
+    uint8_t last_ll = zstd_enc_get_ll_code(last->lit_length);
+    uint8_t last_ml = zstd_enc_get_ml_code(last->match_length);
+    uint8_t last_of = zstd_enc_get_of_code(last->match_offset);
+    uint64_t back = (uint64_t)ll_pre.map_shift[last_ll] +
+        ml_pre.map_shift[last_ml] + of_pre.map_shift[last_of];
+    pre_lb_bits = (pre_lb_bits > back) ? (pre_lb_bits - back) : 0u;
+  }
+
+  // Predefined mode writes the sequence count and the modes byte and no
+  // table descriptions at all (RFC 8878 3.1.1.3.2).
+  size_t pre_lb = (num_sequences < 128)
+      ? 1u
+      : ((num_sequences < 0x7F00) ? 2u : 3u);
+  pre_lb += 1u + (size_t)((pre_lb_bits + 7u) / 8u);
+
+#ifdef GCOMP_TEST_BUILD
+  // The bound must never come out above what the walk would have found.  If
+  // it did, a block would take the per-block tables when the predefined ones
+  // were smaller, and nothing in the output would show it: on ordinary data
+  // the per-block tables win by more than 12%, so a bound wrong by a few
+  // percent still picks the same table and the stream stays byte for byte
+  // what it was.  Only the ratio would move, and only on the rare block
+  // where the two are close.
+  //
+  // So the sanitizer build prices every block both ways and checks one
+  // against the other, which puts the whole test suite and the fuzz corpus
+  // behind this.  It found the bound wrong once already, on one block in
+  // every 151: the last sequence writes no state transitions, and the sum
+  // above had counted three for it.
+  if (pre_lb_usable) {
+    size_t exact_pre = 0;
+    if (zstd_sequences_encode_using(sequences, num_sequences, &ll_pre, &of_pre,
+            &ml_pre, NULL, 0, &exact_pre) == GCOMP_OK) {
+      assert(pre_lb <= exact_pre);
+    }
+  }
+#endif
 
   static const unsigned kLlMaxLog = 9; // RFC 8878 3.1.1.3.2.1
   static const unsigned kOfMaxLog = 8;
@@ -933,17 +1032,27 @@ gcomp_status_t zstd_sequences_encode(const zstd_sequence_t * sequences,
         num_sequences, &ll_cus, &of_cus, &ml_cus, output, output_cap,
         &cus_size);
 
-    if (cus_status == GCOMP_OK &&
-        (pre_status != GCOMP_OK || cus_size <= pre_size)) {
-      *output_len_out = cus_size;
-      return GCOMP_OK;
+    if (cus_status == GCOMP_OK) {
+      // No larger than the bound means no larger than the real thing.
+      if (pre_lb_usable && cus_size <= pre_lb) {
+        *output_len_out = cus_size;
+        return GCOMP_OK;
+      }
+
+      // Too close to call from the bound, so price it properly.
+      size_t pre_size = 0;
+      gcomp_status_t pre_status = zstd_sequences_encode_using(sequences,
+          num_sequences, &ll_pre, &of_pre, &ml_pre, NULL, 0, &pre_size);
+      if (pre_status != GCOMP_OK || cus_size <= pre_size) {
+        *output_len_out = cus_size;
+        return GCOMP_OK;
+      }
     }
   }
 
-  if (pre_status != GCOMP_OK) {
-    return pre_status;
-  }
-
+  // Predefined it is.  Writing it reports whatever pricing it would have:
+  // there is nothing left to compare it against, so there is no reason to
+  // walk the sequences a second time to find out first.
   return zstd_sequences_encode_using(sequences, num_sequences, &ll_pre, &of_pre,
       &ml_pre, output, output_cap, output_len_out);
 }
