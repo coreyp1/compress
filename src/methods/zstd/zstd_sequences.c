@@ -181,33 +181,28 @@ typedef struct {
  * For backward bitstreams, we read from high bit positions to low.
  * The container holds a window of bits, and we reload when needed.
  */
-static void zstd_seq_bit_reader_reload(zstd_seq_bit_reader_t * br) {
-  // The current bit position in the stream is:
-  // (total_bits - bits_consumed) from the high end
-  // Which corresponds to byte position:
-  // (total_bits - bits_consumed) / 8 from the start
+/**
+ * @brief The source byte the container must begin at to cover the next bits.
+ *
+ * The stream is read backwards, so the bits wanted next are the highest ones
+ * not yet consumed.  The container holds the eight bytes ending with the one
+ * those bits live in -- or starts at the beginning of the stream when there
+ * are fewer than eight bytes before it.
+ */
+static inline size_t zstd_seq_bit_reader_window(unsigned bits_remaining) {
+  unsigned top_byte = (bits_remaining - 1u) / 8u;
+  return (top_byte >= 7u) ? (size_t)(top_byte - 7u) : (size_t)0u;
+}
 
-  // We need to ensure we have enough bits loaded.
-  // Load bytes from the position we need, going backward.
-
-  unsigned bits_remaining = br->total_bits - br->bits_consumed;
-  if (bits_remaining == 0) {
-    return;
-  }
-
-  // Calculate which byte contains the next bits we need
-  // bits_remaining is the number of bits left, counting from bit 0
-  unsigned next_bit_pos = bits_remaining - 1;
-  unsigned byte_containing_next = next_bit_pos / 8;
-
-  // Load up to 8 bytes starting from where we need data
-  // We want to load bytes [start_byte, start_byte + 7] or available range
-  size_t start_byte = 0;
-  if (byte_containing_next >= 7) {
-    start_byte = byte_containing_next - 7;
-  }
-
-  // Already holding these bytes; nothing to do.
+/**
+ * @brief Put the eight bytes beginning at @p start_byte into the container.
+ *
+ * Does nothing when they are already there, which is most of the time: a
+ * sequence reads its three FSE states and its extra bits out of a handful of
+ * adjacent bytes.
+ */
+static void zstd_seq_bit_reader_load(
+    zstd_seq_bit_reader_t * br, size_t start_byte) {
   if (br->container_loaded && br->container_start_byte == start_byte) {
     return;
   }
@@ -218,11 +213,9 @@ static void zstd_seq_bit_reader_reload(zstd_seq_bit_reader_t * br) {
   }
 
   if (bytes_to_load == 8u) {
-    // The loop below is byte i of the source at bit i*8, which is what a
-    // little-endian 64-bit read is; every compiler this library supports
-    // folds gcomp_read_le64 into a single load.  The window moves every
-    // eight bits consumed, so this runs several times per sequence and the
-    // eight-iteration version was worth about a sixth of the whole decode.
+    // Byte i of the source at bit i*8 is a little-endian 64-bit read, which
+    // every compiler here folds into a single load.  This used to be an
+    // eight-iteration byte loop and was worth about a sixth of the decode.
     br->bit_container = gcomp_read_le64(br->src + start_byte);
   }
   else {
@@ -234,11 +227,20 @@ static void zstd_seq_bit_reader_reload(zstd_seq_bit_reader_t * br) {
     }
   }
 
-  // Track how many bits are in the container and their position
-  // The container now holds bits [start_byte * 8, start_byte * 8 + loaded * 8)
   br->bits_in_container = (unsigned)(bytes_to_load * 8);
   br->container_start_byte = start_byte;
   br->container_loaded = 1;
+}
+
+/**
+ * @brief Reload the bit container from the source stream.
+ */
+static void zstd_seq_bit_reader_reload(zstd_seq_bit_reader_t * br) {
+  unsigned bits_remaining = br->total_bits - br->bits_consumed;
+  if (bits_remaining == 0) {
+    return;
+  }
+  zstd_seq_bit_reader_load(br, zstd_seq_bit_reader_window(bits_remaining));
 }
 
 static gcomp_status_t zstd_seq_bit_reader_init(
@@ -280,41 +282,40 @@ static gcomp_status_t zstd_seq_bit_reader_init(
   return GCOMP_OK;
 }
 
+/**
+ * @brief Read the next @p nb_bits bits, most significant first.
+ *
+ * This is the hottest function in a Zstandard decode -- six calls per
+ * sequence, three for the FSE states and three for the extra bits -- so
+ * everything it needs is worked out exactly once.  It used to compute where
+ * the container starts twice, once here and once inside the reload, and then
+ * find the bit offset within it with a division, a modulo, a multiply and an
+ * add.  The offset is just the distance from the container's first bit:
+ * (p/8 - start)*8 + p%8 is p - start*8.
+ */
 static uint32_t zstd_seq_bit_reader_read(
     zstd_seq_bit_reader_t * br, unsigned nb_bits) {
   if (nb_bits == 0) {
     return 0;
   }
 
-  // Check for underflow
+  // Not enough bits left to satisfy this read.
   if (br->bits_consumed + nb_bits > br->total_bits) {
-    return 0; // Not enough bits
+    return 0;
   }
 
-  // Reload if needed
-  zstd_seq_bit_reader_reload(br);
+  const unsigned bits_remaining = br->total_bits - br->bits_consumed;
+  const size_t start_byte = zstd_seq_bit_reader_window(bits_remaining);
+  zstd_seq_bit_reader_load(br, start_byte);
 
-  // Calculate the bit position within the stream
-  // We're reading from (total_bits - bits_consumed - nb_bits) to
-  // (total_bits - bits_consumed - 1)
-  unsigned bits_remaining = br->total_bits - br->bits_consumed;
-  unsigned next_bit_pos = bits_remaining - nb_bits;
-
-  // Calculate which byte in the source this corresponds to
-  unsigned byte_offset = next_bit_pos / 8;
-  unsigned bit_in_byte = next_bit_pos % 8;
-
-  // Where the container starts in the source.  The reload above worked this
-  // out from exactly the same two values and recorded it, so it is read back
-  // here rather than computed a second time.
-  unsigned container_start_byte = (unsigned)br->container_start_byte;
-
-  // Position in container
-  unsigned container_bit_pos =
-      (byte_offset - container_start_byte) * 8 + bit_in_byte;
+  // The bits wanted run from next_bit_pos upwards, counting from the bottom
+  // of the stream; the container starts at start_byte * 8 of that same count.
+  const unsigned next_bit_pos = bits_remaining - nb_bits;
+  const unsigned container_bit_pos =
+      next_bit_pos - (unsigned)(start_byte * 8u);
 
   uint32_t value = (uint32_t)(br->bit_container >> container_bit_pos) &
-      ((1U << nb_bits) - 1);
+      ((1U << nb_bits) - 1u);
 
   br->bits_consumed += nb_bits;
   return value;
