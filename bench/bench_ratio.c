@@ -215,6 +215,10 @@ typedef struct {
 static const bench_case_t k_cases[] = {
     {"deflate-1", "deflate", "deflate.level", 1, 1, 0, 0},
     {"deflate-6", "deflate", "deflate.level", 6, 1, 0, 0},
+    // Levels 7 and up parse by shortest path rather than deferring, and
+    // these two sit either side of what that costs and buys: 7 is the first
+    // level to do it, 9 one that spends more on it.
+    {"deflate-7", "deflate", "deflate.level", 7, 1, 0, 0},
     {"deflate-9", "deflate", "deflate.level", 9, 1, 0, 0},
     {"zstd-1", "zstd", "zstd.level", 1, 2, 0, 0},
     {"zstd-3", "zstd", "zstd.level", 3, 2, 0, 0},
