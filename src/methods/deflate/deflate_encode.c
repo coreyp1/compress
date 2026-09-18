@@ -50,6 +50,100 @@
 // Distance past which a three-byte match stops paying for itself.
 #define DEFLATE_TOO_FAR 4096u
 
+/**
+ * @brief How hard one compression level searches.
+ *
+ * WHAT A LEVEL MEANS
+ * ==================
+ *
+ * RFC 1951 says nothing about any of this.  It describes the stream, not how
+ * to choose what goes in it, so a level is not a specified thing -- it is a
+ * promise about how much work the encoder will spend, and the only way to set
+ * one is to measure.
+ *
+ * Two numbers decide it:
+ *
+ * - `max_chain`: how many candidates the hash chain walk will consider.
+ *
+ * - `max_lazy`: hold a match shorter than this back one byte, to see whether
+ *   the next position starts a longer one.  Levels 1 to 3 do not defer at all
+ *   (see use_lazy in the caller), so for them this is read only when the lazy
+ *   strategy is asked for by name -- which is a request for the effort, and
+ *   gets the threshold the deferring levels use.  At the level-shaped value of
+ *   4 it would mean "hold a match back only if it is exactly three bytes
+ *   long", and a three-byte match is the one case where deferring cannot pay:
+ *   the byte given up is a literal, the match that displaces it is four bytes
+ *   at best, and the sequence it replaces would have been found at the next
+ *   position anyway.
+ *
+ * NINE LEVELS THAT WERE FOUR
+ * ==========================
+ *
+ * These used to be set by three range tests, and the ranges made levels into
+ * aliases of each other.  Compressing 11 MB of source, manuals, XML and an ELF
+ * binary at each level in turn:
+ *
+ * | Level | Size      | Against the level below |
+ * |-------|-----------|-------------------------|
+ * | 1     | 2,594,541 |                         |
+ * | 2     | 2,594,541 | identical               |
+ * | 3     | 2,594,541 | identical               |
+ * | 4     | 2,351,738 | -9.36%                  |
+ * | 5     | 2,351,738 | identical               |
+ * | 6     | 2,351,738 | identical               |
+ * | 7     | 2,318,112 | -1.43%                  |
+ * | 8     | 2,318,112 | identical               |
+ * | 9     | 2,315,952 | -0.09%                  |
+ *
+ * Byte for byte identical, not merely close.  Five of the nine levels did
+ * nothing but round down to another level, and a caller asking for 8 got 7
+ * while paying 8's reputation.  A table has one row per level because there
+ * are nine levels.
+ *
+ * WHAT ZLIB HAS THAT IS NOT HERE
+ * ==============================
+ *
+ * zlib's table carries two more numbers, and both were tried here:
+ *
+ * - `nice_length`: stop walking the chain once a match is this long.
+ * - `good_length`: when the match already held is this long, walk a quarter
+ *   as far.
+ *
+ * Neither does anything measurable in this encoder.  At level 6 with a chain
+ * of 128, adding zlib's good_length moved the encode rate from 31.2 MB/s to
+ * 31.5 and the output from 0.11% above zlib to 0.16%; adding its nice_length
+ * moved it to 29.7 MB/s and 0.12%.  Both are inside the noise on speed and
+ * slightly worse on size.  On the input where nice_length should bind hardest
+ * -- runs, structured records and skewed bytes, where matches are long and
+ * chains are deep -- cutting it from off to 128 to 64 left the rate at 1.4
+ * MB/s throughout and cost bytes each time.
+ *
+ * The reason is the guard in deflate_find_match that stops the walk when the
+ * chain stops going backwards through the stream.  That guard already ends
+ * the average walk after about three candidates, so a knob whose job is to
+ * end the walk early has nothing left to end.  They are not here because
+ * carrying configuration that does not configure anything is how the last
+ * dead setting went unnoticed for months.
+ */
+typedef struct {
+  uint32_t max_lazy; ///< Defer a match shorter than this.
+  int max_chain;     ///< Longest hash chain walk.
+} deflate_effort_t;
+
+/// Indexed by compression level; entry 0 is unused (level 0 stores).
+static const deflate_effort_t k_deflate_effort[10] = {
+    {0, 0},     // 0: stored, nothing is searched
+    {16, 4},    // 1
+    {16, 8},    // 2
+    {16, 16},   // 3
+    {16, 16},   // 4: the first level that defers
+    {16, 32},   // 5
+    {16, 128},  // 6: the default
+    {32, 256},  // 7
+    {128, 1024},// 8
+    {258, 4096},// 9
+};
+
 // The window holds history and lookahead in one circular buffer, so every
 // byte of lookahead is a byte of history the encoder does not have.  A match
 // is at most DEFLATE_MAX_MATCH_LENGTH bytes and needs three more to be worth
@@ -2439,39 +2533,24 @@ static gcomp_status_t deflate_encode_batch(
         ((st->strategy == DEFLATE_STRATEGY_DEFAULT ||
              st->strategy == DEFLATE_STRATEGY_FIXED) &&
             st->level >= 4);
-    uint32_t max_lazy = (st->level <= 3)    ? 4u
-        : (st->level <= 6)                  ? 16u
-        : (st->level <= 8)                  ? 32u
-                                            : 258u;
+    const deflate_effort_t * effort =
+        &k_deflate_effort[(st->level >= 1 && st->level <= 9) ? st->level : 6];
+    uint32_t max_lazy = effort->max_lazy;
 
-    // A strategy that defers at levels 1 to 3 needs the threshold of the
-    // levels that defer, not the one those levels use.
-    //
-    // The level-based value of 4 means "hold a match back only if it is
-    // exactly three bytes long", and a three-byte match is the one case where
-    // deferring cannot pay: the byte given up is a literal, the match that
-    // displaces it is four bytes at best, and the sequence it replaces would
-    // have been found at the next position anyway.  Each deferral traded one
-    // match for one literal and saved no symbols at all.  On filter-shaped
-    // bytes the lazy strategy came out *larger* than DEFAULT -- 507,624 against
-    // 501,304 - which is the opposite of what the strategy is for, and it is
-    // what led to this being written off as a strategy that had outlived its
-    // reason.
-    //
-    // With the threshold the deferring levels use, the same file goes to
-    // 448,562: 10.5% smaller than DEFAULT rather than 1.3% larger.  Over a
-    // 12 MB corpus of source, prose, XML and binaries it is 25.954% against
-    // DEFAULT's 26.680%, for about 15% of the encode throughput.
-    if (st->strategy == DEFLATE_STRATEGY_LAZY && st->level <= 3) {
-      max_lazy = 16u;
-    }
+    // Levels 1 to 3 carry the deferring threshold rather than a level-shaped
+    // one, because the only thing that reads it there is the lazy strategy,
+    // and asking for that strategy by name is asking for the effort.  See
+    // max_lazy in deflate_effort_t for why the level-shaped value of 4 is the
+    // one setting at which deferring cannot pay: on filter-shaped bytes it
+    // made the lazy strategy come out *larger* than DEFAULT, 507,624 against
+    // 501,304, which is the opposite of what the strategy is for.  With this
+    // threshold the same file is 448,562.
 
     // Determine hash chain length based on level.
     //
-    // The lazy strategy used to quadruple this - 16/128/256 against 4/32/128 - on the
-    // reasoning that filter output hides longer patterns behind short hash
-    // chains. Measured across 52 files of real PNG filtered rows, 7.3 MB, it
-    // does not pay:
+    // The lazy strategy used to quadruple this on the reasoning that filter
+    // output hides longer patterns behind short hash chains. Measured across
+    // 52 files of real PNG filtered rows, 7.3 MB, it does not pay:
     //
     //   chain   with lazy matching   without
     //      32        31.22%           32.91%
@@ -2482,15 +2561,13 @@ static gcomp_status_t deflate_encode_batch(
     // Chain length is worth 0.1 points across a factor of eight. Lazy matching
     // is worth 1.7. So it now searches exactly as hard as DEFAULT and
     // differs from it only by holding matches back, which is the same
-    // relationship zlib's levels 4-9 have to its levels 1-3. On that corpus
-    // this is 2.2x the throughput of the old setting for 0.25% more bytes,
-    // and the same ranking holds on a general corpus of source and binaries.
+    // relationship zlib's levels 4-9 have to its levels 1-3.
     if (st->strategy == DEFLATE_STRATEGY_RLE) {
       // RLE doesn't use hash chains (only checks distance 1)
       max_chain = 0;
     }
     else {
-      max_chain = (st->level <= 3) ? 4 : (st->level <= 6) ? 32 : 128;
+      max_chain = effort->max_chain;
     }
 
     // Only the fixed strategy forces fixed codes now.  Every other block goes
@@ -2659,7 +2736,8 @@ static gcomp_status_t deflate_encode_batch(
           }
         }
         else if (st->lookahead >= DEFLATE_MIN_MATCH_LENGTH) {
-          // DEFAULT/LAZY/FIXED: Standard LZ77 match finding
+          // DEFAULT/LAZY/FIXED: Standard LZ77 match finding.
+          //
           match = deflate_find_match(st, pos, stream_pos, max_chain);
 
           // A three-byte match far away is not worth its distance code.  The

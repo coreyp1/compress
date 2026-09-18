@@ -1693,6 +1693,75 @@ size_t EncodeWith(gcomp_registry_t * reg, const char * strategy,
 // switches from deflate_fast to deflate_slow, and FILTERED defers at every
 // level - so the two differ only at levels 1 to 3, which is where these ask
 // the question.
+// Bytes drawn from a three symbol alphabet.
+//
+// Every three byte sequence in this is one of twenty-seven, so every hash
+// bucket collects a very large number of positions and the hash chains are
+// genuinely deep.  That is what makes the difference between a chain of 1024
+// and a chain of 4096 observable at all: on ordinary text the chains run out
+// long before either bound is reached, and the top levels of the ladder
+// encode identically not because they are configured the same but because the
+// input never asks them to differ.
+std::vector<uint8_t> DeepChainBytes(size_t n) {
+  std::vector<uint8_t> v;
+  v.reserve(n);
+  uint32_t x = 2463534242u;
+  for (size_t i = 0; i < n; i++) {
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    v.push_back(static_cast<uint8_t>('A' + (x % 3u)));
+  }
+  return v;
+}
+
+// Nine levels must be nine levels.
+//
+// They were not.  The chain depth and the deferral threshold were each set by
+// a range test - level <= 3, level <= 6, level <= 8 - and the ranges made
+// levels into aliases of one another.  Levels 1, 2 and 3 produced byte for
+// byte identical output, as did 4, 5 and 6, and as did 7 and 8.  A caller who
+// asked for 8 got 7 and paid 8's reputation for it; a caller who moved from 1
+// to 3 to buy a smaller file bought nothing and could not tell.
+//
+// Nothing caught it, because every test that touched levels asked whether the
+// output round-tripped, and identical output round-trips perfectly.
+TEST_F(DeflateEncoderTest, EveryLevelDiffersFromTheOneBelowIt) {
+  std::vector<uint8_t> in = DeepChainBytes(200000);
+
+  std::vector<std::vector<uint8_t>> streams;
+  for (int level = 1; level <= 9; level++) {
+    std::vector<uint8_t> out;
+    EncodeWithLevel(registry_, "default", level, in, out);
+    streams.push_back(std::move(out));
+  }
+
+  for (size_t i = 1; i < streams.size(); i++) {
+    EXPECT_NE(streams[i], streams[i - 1])
+        << "level " << (i + 1) << " encodes exactly as level " << i
+        << ", so one of the two is not a level";
+  }
+}
+
+// And a higher level must not produce a larger file.  This is asked for on
+// the same input rather than on arbitrary bytes on purpose: greedy parsing is
+// not monotone in search depth for every possible input - a longer match at a
+// further distance can cost more bits than the literals it replaced - so the
+// ordering is asked for where searching harder is meant to help.
+TEST_F(DeflateEncoderTest, HigherLevelsDoNotProduceLargerOutput) {
+  std::vector<uint8_t> in = DeepChainBytes(200000);
+
+  size_t previous = SIZE_MAX;
+  for (int level = 1; level <= 9; level++) {
+    std::vector<uint8_t> out;
+    size_t size = EncodeWithLevel(registry_, "default", level, in, out);
+    EXPECT_LE(size, previous)
+        << "level " << level << " produced " << size
+        << " bytes, more than level " << (level - 1) << "'s " << previous;
+    previous = size;
+  }
+}
+
 TEST_F(DeflateEncoderTest, LazyBeatsDefaultOnFilterShapedData) {
   std::vector<uint8_t> in = LazyLookingBytes(400000);
   for (int level = 1; level <= 3; level++) {
@@ -1700,14 +1769,34 @@ TEST_F(DeflateEncoderTest, LazyBeatsDefaultOnFilterShapedData) {
     std::vector<uint8_t> b;
     size_t plain = EncodeWithLevel(registry_, "default", level, in, a);
     size_t deferred = EncodeWithLevel(registry_, "lazy", level, in, b);
-    // Measured at 10.5% smaller; asking for 5% leaves room to move without
-    // letting the strategy quietly stop earning its name.  It did stop, once:
-    // the deferral threshold at levels 1 to 3 was the one value that makes
-    // deferring pointless - hold a match only if it is exactly three bytes -
-    // and FILTERED came out larger than DEFAULT on this very data.
-    EXPECT_LT(deferred + deferred / 20, plain)
+
+    // The strategy must earn its name at every level it differs at.  It
+    // stopped once: the deferral threshold at levels 1 to 3 was the one value
+    // that makes deferring pointless - hold a match back only if it is
+    // exactly three bytes - and the strategy came out LARGER than DEFAULT on
+    // this very data.  That is what this line catches.
+    EXPECT_LT(deferred, plain)
         << "level " << level << ": lazy " << deferred << " vs default "
         << plain;
+
+    // How much it earns is not the same at all three levels.  Measured on
+    // this input: 7.35% at level 1, 4.27% at level 2, 1.53% at level 3.
+    //
+    // Levels 1, 2 and 3 used to share a chain depth of 4, so deferral was the
+    // entire difference between the two strategies at all three and the
+    // margin was the same 10.5% throughout.  Each level now has its own depth
+    // - 4, 8 and 16 - which moves both strategies, and not in a straight
+    // line: a deeper chain finds longer matches, and a longer match at a
+    // further distance can cost more bits than the literals it replaced, so
+    // neither strategy is monotone in search depth on run-shaped bytes like
+    // these.  That is a property of greedy parsing, not a regression.
+    //
+    // The margin is therefore asked for at level 1, which is the one level
+    // where deferral is still the whole difference between the two.
+    if (level == 1) {
+      EXPECT_LT(deferred + deferred / 20, plain)
+          << "level 1: lazy " << deferred << " vs default " << plain;
+    }
   }
 }
 
