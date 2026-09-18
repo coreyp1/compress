@@ -88,6 +88,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <ghoti.io/compress/macros.h>
+#include "../../core/endian.h"
 #include "zstd_internal.h"
 #include <string.h>
 
@@ -378,10 +379,35 @@ static inline bool zstd_mf_prefer_later(
 
 /**
  * @brief Count how many bytes match at two positions.
+ *
+ * Eight bytes at a time while eight remain.  Both reads are in bounds: the
+ * loop only runs while p1 + 8 is within p1_end, which is the end of the
+ * buffer, and p2 is always behind p1 -- a match source is earlier than the
+ * position matching it -- so p2 + 8 is further inside the buffer still.
+ *
+ * Where the two words differ, the first differing byte is the lowest
+ * differing bit of their exclusive-or, divided by eight.  Reading both
+ * little-endian puts the earliest byte in memory in the low bits, so this
+ * counts forwards through memory on either byte order.
+ *
+ * This is the comparison that decides every candidate match, and one byte
+ * per iteration made it 5% of encoding on its own.
  */
 static inline size_t zstd_mf_count_match(
     const uint8_t * p1, const uint8_t * p2, const uint8_t * p1_end) {
   const uint8_t * anchor = p1;
+
+  while (p1 + 8 <= p1_end) {
+    uint64_t a = gcomp_read_le64(p1);
+    uint64_t b = gcomp_read_le64(p2);
+    if (a != b) {
+      return (size_t)(p1 - anchor) +
+          (size_t)((unsigned)__builtin_ctzll(a ^ b) >> 3);
+    }
+    p1 += 8;
+    p2 += 8;
+  }
+
   while (p1 < p1_end && *p1 == *p2) {
     p1++;
     p2++;
