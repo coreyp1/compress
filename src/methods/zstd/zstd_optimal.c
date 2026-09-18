@@ -114,18 +114,27 @@
 
 // Both bounds are set per level -- `opt_segment` and `opt_budget` in the
 // effort table -- because both buy ratio with time, which is what a level
-// is.  On 9 MB of manuals, C source and XML at level 19, holding one at its
-// default and moving the other:
-//
-//   positions per sweep    256    1024    4096   16384   65536
-//   output bytes       1422403 1401094 1394698 1393091 1391564
+// is.  On 9 MB of manuals, C source and XML, moving one and holding the
+// other:
 //
 //   shortenings per position 0       8      32     128     512
 //   output bytes       1419279 1406833 1397301 1394698 1394370
 //
-// Both flatten out, which is why the top level is not simply given the
-// largest of each that fits: past a point, more sweeping buys hundredths of
-// a percent for whole multiples of the time.
+// which flattens out, so the top level is not simply given the largest that
+// fits: past a point it buys hundredths of a percent for multiples of the
+// time.
+//
+// The sweep length does NOT simply want to be as large as it fits, and the
+// reason is worth stating.  It is also the interval at which prices are
+// rebuilt, so a longer sweep both sees further -- better -- and prices what
+// it sees by staler counts -- worse.  At level 22:
+//
+//   positions per sweep   1024    2048    4096    8192   16384   65536
+//   output bytes       1388460 1384745 1383033 1382364 1382211 1383055
+//
+// The two effects cross at about 16384, and going to 65536 from there is
+// worse on both axes: larger output, and slower for having done more work
+// to get it.
 
 /// Literal and match lengths below this have their price in a table rather
 /// than worked out from their code.  Match length codes are one-to-one with
@@ -480,38 +489,39 @@ void zstd_opt_reset(zstd_match_finder_t * mf) {
 // The sweep
 //
 
-/// Counts of what one block emitted, folded back into the model afterwards.
-typedef struct {
-  uint32_t lit[256];
-  uint32_t ll[ZSTD_SEQ_LL_CODES];
-  uint32_t ml[ZSTD_SEQ_ML_CODES];
-  uint32_t of[ZSTD_SEQ_OF_CODES];
-} zstd_opt_tally_t;
-
 /**
- * @brief Fold one block's counts into the model, halving what was there.
+ * @brief Halve every count, so that a block weighs against its predecessors.
  *
- * Halving is what makes this a moving average rather than a total: a block
- * counts fully, the one before it half as much, the one before that a
- * quarter.  A file whose character changes part way through is priced by the
- * part it is in.
+ * Called once at the start of a block, after which what the block emits is
+ * counted into the same arrays as it goes.  That makes the model a moving
+ * average rather than a running total: the block being parsed counts fully,
+ * the one before it half as much, the one before that a quarter.  A file
+ * whose character changes part way through is priced by the part it is in.
+ *
+ * Counting as it goes, rather than at the end, is also what lets the prices
+ * follow a block from the inside: they are rebuilt at every sweep boundary,
+ * so a block whose second half looks nothing like its first is not priced
+ * throughout by its first.
+ *
+ * No count ever reaches zero.  A symbol that has not come up is not
+ * impossible, only unseen, and a count of zero would price it at infinity --
+ * a symbol the parse would refuse to emit however much it saved.
  */
-static void zstd_opt_absorb(
-    struct zstd_opt_state_s * st, const zstd_opt_tally_t * tally) {
+static void zstd_opt_decay(struct zstd_opt_state_s * st) {
   for (size_t i = 0; i < 256; i++) {
-    uint32_t v = (st->lit_freq[i] >> 1) + tally->lit[i];
+    uint32_t v = st->lit_freq[i] >> 1;
     st->lit_freq[i] = v ? v : 1u;
   }
   for (size_t i = 0; i < ZSTD_SEQ_LL_CODES; i++) {
-    uint32_t v = (st->ll_freq[i] >> 1) + tally->ll[i];
+    uint32_t v = st->ll_freq[i] >> 1;
     st->ll_freq[i] = v ? v : 1u;
   }
   for (size_t i = 0; i < ZSTD_SEQ_ML_CODES; i++) {
-    uint32_t v = (st->ml_freq[i] >> 1) + tally->ml[i];
+    uint32_t v = st->ml_freq[i] >> 1;
     st->ml_freq[i] = v ? v : 1u;
   }
   for (size_t i = 0; i < ZSTD_SEQ_OF_CODES; i++) {
-    uint32_t v = (st->of_freq[i] >> 1) + tally->of[i];
+    uint32_t v = st->of_freq[i] >> 1;
     st->of_freq[i] = v ? v : 1u;
   }
 }
@@ -589,6 +599,7 @@ gcomp_status_t zstd_opt_generate_sequences(zstd_match_finder_t * mf,
   // inside a match never reaches the literals section -- but they are the
   // same alphabet in very nearly the same proportions, and that is what the
   // price needs.
+  zstd_opt_decay(st);
   if (!st->primed) {
     for (size_t i = start_pos; i < data_size; i++) {
       st->lit_freq[data[i]]++;
@@ -596,9 +607,6 @@ gcomp_status_t zstd_opt_generate_sequences(zstd_match_finder_t * mf,
     st->primed = true;
   }
   zstd_opt_rebuild_prices(st);
-
-  zstd_opt_tally_t tally;
-  memset(&tally, 0, sizeof(tally));
 
   size_t pos = start_pos;
   size_t lit_start = start_pos;
@@ -616,6 +624,10 @@ gcomp_status_t zstd_opt_generate_sequences(zstd_match_finder_t * mf,
 
   while (pos < data_size && num_seq < max_sequences) {
     const size_t base = pos;
+
+    // Price this sweep by everything counted up to it, this block's own
+    // sequences included.  See zstd_opt_decay().
+    zstd_opt_rebuild_prices(st);
 
     for (size_t i = 1; i <= dirty; i++) {
       nodes[i].price = ZSTD_OPT_PRICE_INF;
@@ -828,11 +840,11 @@ gcomp_status_t zstd_opt_generate_sequences(zstd_match_finder_t * mf,
       memcpy(literals_out + lit_pos, data + lit_start, lit_len);
       lit_pos += lit_len;
       for (uint32_t b = 0; b < lit_len; b++) {
-        tally.lit[data[lit_start + b]]++;
+        st->lit_freq[data[lit_start + b]]++;
       }
-      tally.ll[zstd_enc_get_ll_code(lit_len)]++;
-      tally.ml[zstd_enc_get_ml_code(m)]++;
-      tally.of[zstd_enc_get_of_code(enc)]++;
+      st->ll_freq[zstd_enc_get_ll_code(lit_len)]++;
+      st->ml_freq[zstd_enc_get_ml_code(m)]++;
+      st->of_freq[zstd_enc_get_of_code(enc)]++;
 
       sequences[num_seq].lit_length = lit_len;
       sequences[num_seq].match_offset = enc;
@@ -873,11 +885,11 @@ gcomp_status_t zstd_opt_generate_sequences(zstd_match_finder_t * mf,
       memcpy(literals_out + lit_pos, data + lit_start, lit_len);
       lit_pos += lit_len;
       for (uint32_t b = 0; b < lit_len; b++) {
-        tally.lit[data[lit_start + b]]++;
+        st->lit_freq[data[lit_start + b]]++;
       }
-      tally.ll[zstd_enc_get_ll_code(lit_len)]++;
-      tally.ml[zstd_enc_get_ml_code(forced_len)]++;
-      tally.of[zstd_enc_get_of_code(enc)]++;
+      st->ll_freq[zstd_enc_get_ll_code(lit_len)]++;
+      st->ml_freq[zstd_enc_get_ml_code(forced_len)]++;
+      st->of_freq[zstd_enc_get_of_code(enc)]++;
 
       sequences[num_seq].lit_length = lit_len;
       sequences[num_seq].match_offset = enc;
@@ -904,11 +916,9 @@ gcomp_status_t zstd_opt_generate_sequences(zstd_match_finder_t * mf,
     memcpy(literals_out + lit_pos, data + lit_start, remaining);
     lit_pos += remaining;
     for (size_t b = 0; b < remaining; b++) {
-      tally.lit[data[lit_start + b]]++;
+      st->lit_freq[data[lit_start + b]]++;
     }
   }
-
-  zstd_opt_absorb(st, &tally);
 
   *num_sequences_out = num_seq;
   *literals_size_out = lit_pos;
