@@ -354,6 +354,34 @@ static void lz4_decoder_finish_skippable(lz4_decoder_state_t * state) {
   state->header_accum_pos = 0;
 }
 
+/**
+ * @brief Hand already-decompressed bytes to the caller.
+ *
+ * A block is decompressed into state->output_buffer in one piece and then
+ * copied out as the caller's buffer allows.  That copy used to move one byte
+ * per iteration, in three separate places, and was 42.9% of an LZ4 decode --
+ * more than the decompressor itself.  Copying a byte at a time is roughly
+ * eight instructions of loop and bounds checking per byte; memcpy moves
+ * sixteen or thirty-two at once.
+ *
+ * @return Non-zero once everything buffered has been delivered.
+ */
+static int lz4_drain_output(
+    lz4_decoder_state_t * state, gcomp_buffer_t * output) {
+  size_t pending = state->output_buffer_len - state->output_buffer_pos;
+  if (pending > 0u) {
+    size_t space = output->size - output->used;
+    size_t n = (pending < space) ? pending : space;
+    if (n > 0u) {
+      memcpy((uint8_t *)output->data + output->used,
+          state->output_buffer + state->output_buffer_pos, n);
+      output->used += n;
+      state->output_buffer_pos += n;
+    }
+  }
+  return state->output_buffer_pos >= state->output_buffer_len;
+}
+
 gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
     gcomp_buffer_t * input, gcomp_buffer_t * output) {
   if (!decoder || !decoder->method_state || !input || !output) {
@@ -373,12 +401,7 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
 
   // First, drain any pending output
   if (state->output_buffer_pos < state->output_buffer_len) {
-    while (state->output_buffer_pos < state->output_buffer_len &&
-        output->used < output->size) {
-      ((uint8_t *)output->data)[output->used++] =
-          state->output_buffer[state->output_buffer_pos++];
-    }
-    if (state->output_buffer_pos < state->output_buffer_len) {
+    if (!lz4_drain_output(state, output)) {
       return GCOMP_OK; // Need more output space
     }
   }
@@ -816,12 +839,7 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
       }
 
       // Output decompressed data
-      while (state->output_buffer_pos < state->output_buffer_len &&
-          output->used < output->size) {
-        ((uint8_t *)output->data)[output->used++] =
-            state->output_buffer[state->output_buffer_pos++];
-      }
-      if (state->output_buffer_pos < state->output_buffer_len) {
+      if (!lz4_drain_output(state, output)) {
         return GCOMP_OK; // Need more output space
       }
       break;
@@ -982,12 +1000,7 @@ gcomp_status_t lz4_decoder_finish(
   lz4_decoder_state_t * state = (lz4_decoder_state_t *)decoder->method_state;
 
   // Drain any pending output
-  while (state->output_buffer_pos < state->output_buffer_len &&
-      output->used < output->size) {
-    ((uint8_t *)output->data)[output->used++] =
-        state->output_buffer[state->output_buffer_pos++];
-  }
-  if (state->output_buffer_pos < state->output_buffer_len) {
+  if (!lz4_drain_output(state, output)) {
     return GCOMP_OK;
   }
 

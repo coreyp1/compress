@@ -493,24 +493,58 @@ gcomp_status_t lz4_block_decompress(const uint8_t * input, size_t input_len,
       return GCOMP_ERR_LIMIT;
     }
 
-    // Copy match (byte-by-byte for overlapping matches)
-    for (size_t i = 0; i < match_len; i++) {
-      // Handle case where match_src is in history and crosses into output
-      if (history && match_src >= history && match_src < history + history_len) {
-        *dst++ = *match_src++;
-        // Check boundary AFTER increment for next iteration
-        if (match_src >= history + history_len) {
-          match_src = output; // Continue from start of output
-        }
+    // Copy the match.
+    //
+    // This used to ask, for every single byte, whether the source was still
+    // inside the history buffer and whether it had reached the write cursor.
+    // Neither question changes more than once in a whole match: a match begins
+    // in one buffer or the other and crosses between them at most once.  Asked
+    // once instead of per byte, the copies become memcpy, and LZ4 decoding
+    // spends its time moving bytes rather than deciding where they are.
+    size_t remaining = match_len;
+
+    // The part that comes from the previous block's tail, if any.  It is a
+    // flat run, so it goes in one piece, and what follows continues at the
+    // start of this block's output.
+    if (history && match_src >= history && match_src < history + history_len) {
+      size_t from_history = (size_t)((history + history_len) - match_src);
+      if (from_history > remaining) {
+        from_history = remaining;
       }
-      else if (match_src >= output && match_src < dst) {
-        // Match is in already-decompressed output - valid for overlapping matches
-        *dst++ = *match_src++;
+      memcpy(dst, match_src, from_history);
+      dst += from_history;
+      remaining -= from_history;
+      match_src = output;
+    }
+
+    // The rest comes from what this block has already written.  Source and
+    // destination are the same buffer and the source may be very close
+    // behind, so a run stops at the distance between them; up to that point
+    // the two ranges cannot overlap and memcpy is exact.  A distance of one
+    // is a single byte repeated.
+    //
+    // The offset was checked against what has been written before match_src
+    // was computed, and the history branch above leaves match_src at the
+    // start of the output with at least one byte already written, so this
+    // holds on entry; each pass moves source and destination together and so
+    // preserves it.  It is checked anyway, once rather than per run, because
+    // what follows is a memcpy driven by a length that came out of untrusted
+    // input.
+    if (remaining > 0u && (match_src < output || match_src >= dst)) {
+      return GCOMP_ERR_CORRUPT; // Back-reference outside what exists.
+    }
+    while (remaining > 0u) {
+      size_t distance = (size_t)(dst - match_src);
+      size_t run = (distance < remaining) ? distance : remaining;
+      if (distance == 1u) {
+        memset(dst, *match_src, run);
       }
       else {
-        // Pointer is outside valid ranges - corrupt data
-        return GCOMP_ERR_CORRUPT;
+        memcpy(dst, match_src, run);
       }
+      dst += run;
+      match_src += run;
+      remaining -= run;
     }
   }
 

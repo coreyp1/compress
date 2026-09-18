@@ -707,6 +707,149 @@ TEST_F(Lz4DecoderTest, DecodeHighEntropy) {
   EXPECT_EQ(memcmp(decoded.data(), input.data(), input.size()), 0);
 }
 
+//
+// Match copying
+//
+// lz4_block_decompress() copies a match from one of two places: the bytes
+// this block has already written, or the tail of the previous block carried
+// over as history when blocks are linked.  A single match can start in the
+// history and finish in the output.
+//
+// It used to ask which of those it was for every byte, and it now asks once
+// and copies in runs.  Getting that wrong produces wrong bytes rather than a
+// crash, and an ordinary round trip of ordinary data barely touches the
+// interesting cases, so these aim at them.
+//
+
+namespace {
+
+/// Bytes that force matches at a chosen offset, including offsets smaller
+/// than the match length -- which is where the source and destination of the
+/// copy overlap and the run has to stop at the distance between them.
+std::vector<uint8_t> OverlappingMatchBytes(size_t total, size_t period) {
+  std::vector<uint8_t> block;
+  uint32_t x = 0x1234567u ^ static_cast<uint32_t>(period);
+  for (size_t i = 0; i < period; i++) {
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    block.push_back(static_cast<uint8_t>(x >> 19));
+  }
+  std::vector<uint8_t> v;
+  v.reserve(total + period);
+  while (v.size() < total) {
+    v.insert(v.end(), block.begin(), block.end());
+  }
+  v.resize(total);
+  return v;
+}
+
+} // namespace
+
+// Repeats at every short period, which is what makes a match overlap its own
+// source.  A period of one is a single byte repeated and takes its own path.
+TEST_F(Lz4DecoderTest, MatchCopy_OverlappingMatches) {
+  for (size_t period : {size_t(1), size_t(2), size_t(3), size_t(4), size_t(7),
+           size_t(8), size_t(15), size_t(16), size_t(17), size_t(64),
+           size_t(255), size_t(256)}) {
+    std::vector<uint8_t> input = OverlappingMatchBytes(200000, period);
+    for (int linked : {0, 1}) {
+      gcomp_options_t * opts = nullptr;
+      ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+      ASSERT_EQ(gcomp_options_set_bool(
+                    opts, "lz4.independent_blocks", linked ? 0 : 1),
+          GCOMP_OK);
+      ASSERT_EQ(gcomp_options_set_uint64(opts, "lz4.block_size", 65536u),
+          GCOMP_OK);
+      std::vector<uint8_t> encoded =
+          compress(input.data(), input.size(), opts);
+      gcomp_options_destroy(opts);
+      ASSERT_FALSE(encoded.empty()) << "period " << period;
+
+      std::vector<uint8_t> back = decompress(encoded.data(), encoded.size());
+      EXPECT_EQ(back, input)
+          << "period " << period << (linked ? " linked" : " independent");
+    }
+  }
+}
+
+// With linked blocks a match can reach back into the previous block, and one
+// match can begin in that history and end in the block being decoded.  Small
+// blocks and long-range repeats make that happen often.
+TEST_F(Lz4DecoderTest, MatchCopy_ReachesIntoThePreviousBlock) {
+  // A phrase that recurs at a distance longer than one block, so matches must
+  // come from the history rather than from the block being written.
+  std::vector<uint8_t> input;
+  uint32_t x = 0xABCDEFu;
+  auto noise = [&x]() {
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    return static_cast<uint8_t>(x >> 19);
+  };
+  std::vector<uint8_t> phrase;
+  for (int i = 0; i < 700; i++) {
+    phrase.push_back(noise());
+  }
+  for (int block = 0; block < 40; block++) {
+    input.insert(input.end(), phrase.begin(), phrase.end());
+    for (int i = 0; i < 900; i++) {
+      input.push_back(noise());
+    }
+  }
+
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  ASSERT_EQ(gcomp_options_set_bool(opts, "lz4.independent_blocks", 0),
+      GCOMP_OK);
+  ASSERT_EQ(gcomp_options_set_uint64(opts, "lz4.block_size", 65536u),
+      GCOMP_OK);
+  std::vector<uint8_t> encoded = compress(input.data(), input.size(), opts);
+  gcomp_options_destroy(opts);
+  ASSERT_FALSE(encoded.empty());
+
+  std::vector<uint8_t> back = decompress(encoded.data(), encoded.size());
+  EXPECT_EQ(back, input);
+}
+
+// And through output buffers small enough to cut matches in half, so the
+// resume path is entered from every state.
+TEST_F(Lz4DecoderTest, MatchCopy_SurvivesAnyOutputBufferSize) {
+  std::vector<uint8_t> input = OverlappingMatchBytes(40000, 5);
+  std::vector<uint8_t> tail = OverlappingMatchBytes(20000, 300);
+  input.insert(input.end(), tail.begin(), tail.end());
+
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  ASSERT_EQ(
+      gcomp_options_set_bool(opts, "lz4.independent_blocks", 0), GCOMP_OK);
+  std::vector<uint8_t> encoded = compress(input.data(), input.size(), opts);
+  gcomp_options_destroy(opts);
+  ASSERT_FALSE(encoded.empty());
+
+  for (size_t chunk : {size_t(1), size_t(2), size_t(3), size_t(17),
+           size_t(64), size_t(1000), size_t(65535), size_t(65536)}) {
+    gcomp_decoder_t * dec = nullptr;
+    ASSERT_EQ(gcomp_decoder_create(registry_, "lz4", nullptr, &dec), GCOMP_OK);
+    std::vector<uint8_t> out_buf(chunk), decoded;
+    gcomp_buffer_t in = {encoded.data(), encoded.size(), 0};
+    size_t guard = 0;
+    for (;;) {
+      ASSERT_LT(++guard, input.size() * 4 + 100000u) << "chunk " << chunk;
+      gcomp_buffer_t ob = {out_buf.data(), out_buf.size(), 0};
+      size_t before = in.used;
+      ASSERT_EQ(gcomp_decoder_update(dec, &in, &ob), GCOMP_OK)
+          << "chunk " << chunk;
+      decoded.insert(decoded.end(), out_buf.data(), out_buf.data() + ob.used);
+      if (ob.used == 0 && in.used == before) {
+        break;
+      }
+    }
+    gcomp_decoder_destroy(dec);
+    EXPECT_EQ(decoded, input) << "chunk " << chunk;
+  }
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
