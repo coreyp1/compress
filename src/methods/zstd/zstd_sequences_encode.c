@@ -66,6 +66,7 @@ typedef struct {
   uint64_t bit_container; ///< Bit accumulator
   unsigned bits_used;     ///< Bits used in container (0-64)
   bool overflow;          ///< Set once a write did not fit
+  uint64_t measured_bits; ///< Bits offered, when buf is NULL.  See add_bits.
 } zstd_enc_bit_writer_t;
 
 static void zstd_enc_bw_init(
@@ -76,6 +77,7 @@ static void zstd_enc_bw_init(
   bw->bit_container = 0;
   bw->bits_used = 0;
   bw->overflow = false;
+  bw->measured_bits = 0;
 }
 
 /**
@@ -159,8 +161,23 @@ static void zstd_enc_bw_flush(zstd_enc_bit_writer_t * bw) {
  * per sequence, whenever a code has no extra bits) that the test for them
  * cost 2% of encoding.
  */
-static void zstd_enc_bw_add_bits(
+static inline void zstd_enc_bw_add_bits(
     zstd_enc_bit_writer_t * bw, uint32_t value, unsigned nb_bits) {
+  // Measuring.  How long the stream comes out is settled by how many bits go
+  // into it and nothing else, so the bits themselves are not assembled: the
+  // container, the shifts and the flushing are all work towards bytes that
+  // are never written or read.  Half of the sequence encoder's time is this
+  // walk -- every block is priced with the predefined tables before being
+  // written with its own -- and a third of that was spent building a
+  // bitstream to measure and throw away.
+  //
+  // The branch costs the writing path one perfectly predicted test: a writer
+  // either has a buffer for its whole life or never has one.
+  if (!bw->buf) {
+    bw->measured_bits += nb_bits;
+    return;
+  }
+
   // Flush if we don't have room for the new bits
   // Keep at least 32 bits of headroom for safety
   if (bw->bits_used + nb_bits > 56) {
@@ -180,6 +197,13 @@ static void zstd_enc_bw_add_bits(
  * Returns the total stream size.
  */
 static size_t zstd_enc_bw_close(zstd_enc_bit_writer_t * bw) {
+  // Measuring: the stream is every bit offered plus the marker, rounded up
+  // to whole bytes, which is exactly what the writing path below arrives at
+  // by writing them.
+  if (!bw->buf) {
+    return (size_t)((bw->measured_bits + 1u + 7u) / 8u);
+  }
+
   // Add marker bit at HIGH end
   bw->bit_container |= (1ULL << bw->bits_used);
   bw->bits_used++;
