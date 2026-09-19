@@ -304,6 +304,53 @@ TEST_F(ZstdLimitsTest, MaxExpansionRatioEdgeCaseJustPasses) {
 // max_window_bytes Tests (Decoder)
 //
 
+// A frame may declare a window this decoder cannot hold, and saying so must
+// not be undefined behaviour first.
+//
+// RFC 8878 section 3.1.1.1.2: Window_Log is 10 + Exponent and the exponent is
+// five bits, so a well-formed frame header can ask for a window log of up to
+// 41. The parser computed the size as `1U << (exponent + 10)` - undefined for
+// any exponent above 21, and for the ones just past that it wrapped to a small
+// number that passed the window limit check further down.
+//
+// The bytes below are the two nine-byte frame headers a fuzzer produced, kept
+// here as well as in fuzz/regression because a unit test says what the answer
+// should be and a replay only says the process survived. Exponent 22 and 24,
+// so window logs of 32 and 34.
+TEST_F(ZstdLimitsTest, AnUnholdableWindowIsRefusedRatherThanShifted) {
+  struct Case {
+    const char * name;
+    std::vector<uint8_t> frame;
+  };
+  const std::vector<Case> cases = {
+      {"window log 32",
+          {0x28, 0xb5, 0x2f, 0xfd, 0x01, 0xb5, 0x01, 0x00, 0x00}},
+      {"window log 34",
+          {0x28, 0xb5, 0x2f, 0xfd, 0x00, 0xc2, 0x01, 0x00, 0x00}},
+  };
+
+  for (const auto & c : cases) {
+    // The default limit, and an unlimited-looking one: neither may be reached
+    // by way of a shift that is not defined.
+    for (uint64_t limit : {(uint64_t)0, (uint64_t)(1ull << 31)}) {
+      gcomp_options_t * dec_opts = nullptr;
+      ASSERT_EQ(gcomp_options_create(&dec_opts), GCOMP_OK);
+      if (limit != 0) {
+        ASSERT_EQ(gcomp_options_set_uint64(
+                      dec_opts, "limits.max_window_bytes", limit),
+            GCOMP_OK);
+      }
+
+      gcomp_status_t status =
+          tryDecompress(c.frame.data(), c.frame.size(), dec_opts);
+      EXPECT_EQ(status, GCOMP_ERR_LIMIT)
+          << c.name << " with max_window_bytes=" << limit;
+
+      gcomp_options_destroy(dec_opts);
+    }
+  }
+}
+
 TEST_F(ZstdLimitsTest, MaxWindowBytesEnforced) {
   // Compress with large window size
   gcomp_options_t * enc_opts = nullptr;

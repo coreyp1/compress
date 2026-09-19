@@ -339,10 +339,36 @@ static gcomp_status_t zstd_parse_frame_header(
     uint8_t wd = buf[pos++];
     uint8_t exponent = (wd >> 3) & 0x1F;
     uint8_t mantissa = wd & 0x07;
-    state->header.window_log = exponent + 10;
-    uint32_t base = 1U << (exponent + 10);
-    uint32_t add = (base / 8) * mantissa;
-    state->header.window_size = base + add;
+
+    // RFC 8878 section 3.1.1.1.2: Window_Log is 10 + Exponent, and the
+    // exponent is five bits, so a frame may legally declare a window log of
+    // up to 41. Shifting a 32-bit type by that much is undefined, and the
+    // result does not fit window_size either: the old
+    //
+    //     uint32_t base = 1U << (exponent + 10);
+    //
+    // was undefined behaviour for any exponent above 21, and for the ones
+    // just past that it wrapped to a small number that sailed through the
+    // limit check below. A nine-byte frame header reached it.
+    //
+    // Computed in 64 bits and refused here. A window this size is not a
+    // corrupt frame - it is a well-formed one asking for more history than
+    // this decoder will hold - so it is GCOMP_ERR_LIMIT, the same answer the
+    // check further down gives.
+    unsigned window_log = (unsigned)exponent + 10u;
+    uint64_t base = (uint64_t)1u << window_log;
+    uint64_t window_size = base + (base / 8u) * mantissa;
+
+    if (window_size > state->max_window_bytes || window_size > UINT32_MAX) {
+      gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
+          "window size %llu exceeds limit %llu",
+          (unsigned long long)window_size,
+          (unsigned long long)state->max_window_bytes);
+      return GCOMP_ERR_LIMIT;
+    }
+
+    state->header.window_log = (uint8_t)window_log;
+    state->header.window_size = (uint32_t)window_size;
   }
 
   // Parse dictionary ID (if present)
