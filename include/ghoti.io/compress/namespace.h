@@ -28,6 +28,55 @@
 
 /// @cond HIDDEN_SYMBOLS
 
+// Public types, and the struct tags behind them. Renamed as well as the
+// functions, so that two versions whose structs differ in layout cannot be
+// confused for one another - which is the point of the scheme, and which
+// renaming only the functions leaves undone. The `_s` tags are listed
+// alongside their `_t` typedefs because an internal header may name the tag
+// directly. GCU_* names are absent on purpose: they are cutil's, and cutil
+// has already renamed them.
+#define gcomp_allocator_t GHOTIIO_COMPRESS(gcomp_allocator_t)
+#define gcomp_block_job_s GHOTIIO_COMPRESS(gcomp_block_job_s)
+#define gcomp_block_job_t GHOTIIO_COMPRESS(gcomp_block_job_t)
+#define gcomp_buffer_t GHOTIIO_COMPRESS(gcomp_buffer_t)
+#define gcomp_capabilities_t GHOTIIO_COMPRESS(gcomp_capabilities_t)
+#define gcomp_decoder_s GHOTIIO_COMPRESS(gcomp_decoder_s)
+#define gcomp_decoder_t GHOTIIO_COMPRESS(gcomp_decoder_t)
+#define gcomp_encoder_s GHOTIIO_COMPRESS(gcomp_encoder_s)
+#define gcomp_encoder_t GHOTIIO_COMPRESS(gcomp_encoder_t)
+#define gcomp_flush_t GHOTIIO_COMPRESS(gcomp_flush_t)
+#define gcomp_job_complete_cb_t GHOTIIO_COMPRESS(gcomp_job_complete_cb_t)
+#define gcomp_job_func_t GHOTIIO_COMPRESS(gcomp_job_func_t)
+#define gcomp_job_process_func_t GHOTIIO_COMPRESS(gcomp_job_process_func_t)
+#define gcomp_job_queue_config_t GHOTIIO_COMPRESS(gcomp_job_queue_config_t)
+#define gcomp_job_queue_s GHOTIIO_COMPRESS(gcomp_job_queue_s)
+#define gcomp_job_queue_t GHOTIIO_COMPRESS(gcomp_job_queue_t)
+#define gcomp_job_status_t GHOTIIO_COMPRESS(gcomp_job_status_t)
+#define gcomp_lz4_frame_info_t GHOTIIO_COMPRESS(gcomp_lz4_frame_info_t)
+#define gcomp_lz4_skippable_cb GHOTIIO_COMPRESS(gcomp_lz4_skippable_cb)
+#define gcomp_memory_tracker_t GHOTIIO_COMPRESS(gcomp_memory_tracker_t)
+#define gcomp_method_s GHOTIIO_COMPRESS(gcomp_method_s)
+#define gcomp_method_schema_s GHOTIIO_COMPRESS(gcomp_method_schema_s)
+#define gcomp_method_schema_t GHOTIIO_COMPRESS(gcomp_method_schema_t)
+#define gcomp_method_t GHOTIIO_COMPRESS(gcomp_method_t)
+#define gcomp_option_schema_s GHOTIIO_COMPRESS(gcomp_option_schema_s)
+#define gcomp_option_schema_t GHOTIIO_COMPRESS(gcomp_option_schema_t)
+#define gcomp_option_type_t GHOTIIO_COMPRESS(gcomp_option_type_t)
+#define gcomp_options_s GHOTIIO_COMPRESS(gcomp_options_s)
+#define gcomp_options_t GHOTIIO_COMPRESS(gcomp_options_t)
+#define gcomp_read_cb GHOTIIO_COMPRESS(gcomp_read_cb)
+#define gcomp_registry_s GHOTIIO_COMPRESS(gcomp_registry_s)
+#define gcomp_registry_t GHOTIIO_COMPRESS(gcomp_registry_t)
+#define gcomp_status_t GHOTIIO_COMPRESS(gcomp_status_t)
+#define gcomp_thread_pool_config_t GHOTIIO_COMPRESS(gcomp_thread_pool_config_t)
+#define gcomp_thread_pool_s GHOTIIO_COMPRESS(gcomp_thread_pool_s)
+#define gcomp_thread_pool_t GHOTIIO_COMPRESS(gcomp_thread_pool_t)
+#define gcomp_unknown_key_policy_t GHOTIIO_COMPRESS(gcomp_unknown_key_policy_t)
+#define gcomp_write_cb GHOTIIO_COMPRESS(gcomp_write_cb)
+#define gcomp_xxhash32_state_t GHOTIIO_COMPRESS(gcomp_xxhash32_state_t)
+#define gcomp_xxhash64_state_t GHOTIIO_COMPRESS(gcomp_xxhash64_state_t)
+
+
 #define gcomp_allocator_default GHOTIIO_COMPRESS(gcomp_allocator_default)
 #define gcomp_adler32 GHOTIIO_COMPRESS(gcomp_adler32)
 #define gcomp_adler32_combine GHOTIIO_COMPRESS(gcomp_adler32_combine)
