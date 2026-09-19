@@ -34,7 +34,8 @@ for g in $GCDA; do
   gcov -p -r -o "$(dirname "$g")" "$g" >/dev/null 2>&1 || true
 done
 
-awk '
+status=0
+awk -v min="${COVERAGE_MIN:-0}" '
   FNR == 1 { src = "" }
   # The Source: header names the file this .gcov describes.
   src == "" && /Source:/ {
@@ -107,8 +108,8 @@ awk '
       f = files[i]
       printf "%-52s %8d %6.1f%%\n", f, total[f], covered[f] * 100 / total[f]
     }
-    printf "%-52s %8d %6.1f%%\n", "TOTAL", grand_total,
-      (grand_total ? grand_covered * 100 / grand_total : 0)
+    pct = (grand_total ? grand_covered * 100 / grand_total : 0)
+    printf "%-52s %8d %6.1f%%\n", "TOTAL", grand_total, pct
 
     if (gap_count > 0) {
       printf "\n%d growth/capacity lines never executed:\n", gap_count
@@ -120,7 +121,22 @@ awk '
     } else {
       printf "\nEvery growth/capacity line was executed.\n"
     }
+
+    # A floor, so that coverage can only be argued upward.  Off unless
+    # COVERAGE_MIN is set, because the number is only meaningful for a full
+    # instrumented run of the whole suite.
+    if (min > 0) {
+      if (pct + 0.05 < min) {
+        printf "\ncoverage: %.1f%% is below the floor of %s%%\n", pct, min
+        exit 1
+      }
+      printf "\ncoverage: %.1f%% meets the floor of %s%%\n", pct, min
+    }
   }
-' ./*.gcov
+' ./*.gcov || status=$?
 
 rm -f ./*.gcov
+
+if [ "${status:-0}" -ne 0 ]; then
+  exit "$status"
+fi
