@@ -571,6 +571,55 @@ TEST_F(ZstdMatchFinderTest, TheOptimalParseWritesRepeatOffsets) {
       << "distance back";
 }
 
+// The deferred parse has to reach for a repeat offset too.
+//
+// It used to get one only by accident -- when the chain or the tree happened
+// to return an offset that was already in the list -- which on structured
+// text was two sequences in a hundred, against thirty in a hundred for the
+// shortest-path parse on the same block.  A repeat costs two or three bits;
+// the offset it replaces carries its own log2 in extra bits, fourteen or more
+// on records this far apart.  So the levels that defer now try the three
+// repeats after the search settles.
+//
+// The input is the same shape as the optimal parse's test above, and the
+// bound is deliberately far below what it measures, because what this is for
+// is catching the probe being removed or wired up wrongly rather than
+// tracking its exact value.  Level 6 is a chain level and level 9 a tree
+// level, so both halves of the deferred band are checked.
+TEST_F(ZstdMatchFinderTest, TheDeferredParseWritesRepeatOffsetsToo) {
+  constexpr size_t kRecord = 64;
+  std::vector<uint8_t> data;
+  Noise noise(0xC0FFEEu);
+  std::vector<uint8_t> record;
+  noise.append(record, kRecord);
+  for (size_t r = 0; r < 4096; r++) {
+    std::vector<uint8_t> copy = record;
+    copy[r % kRecord] = static_cast<uint8_t>(r);
+    copy[(r * 7u) % kRecord] = static_cast<uint8_t>(r >> 8);
+    data.insert(data.end(), copy.begin(), copy.end());
+  }
+
+  for (int level : {6, 9}) {
+    Parse parse = run_parse(data, level, 0, false);
+    size_t repeats = 0;
+    for (const zstd_sequence_t & seq : parse.sequences) {
+      if (seq.match_offset >= 1u && seq.match_offset <= 3u) {
+        repeats++;
+      }
+    }
+    // The bound has to be above what the parse managed by accident, or the
+    // test passes without the probe it is here for.  On this input that was
+    // 58% of sequences at level 6 and 85% at level 9, purely because the
+    // search kept returning the distance that was already at the front of
+    // the list; with the probe and the no-literal codes it is 99% of them.
+    EXPECT_GT(repeats, (parse.sequences.size() * 9u) / 10u)
+        << "level " << level << ": of " << parse.sequences.size()
+        << " sequences only " << repeats
+        << " used a repeat offset, on input whose every match is the same "
+        << "distance back";
+  }
+}
+
 // A parse is a set of instructions for rebuilding the input, and this checks
 // that following them gives the input back -- reading the sequences the way
 // RFC 8878 section 3.1.1.3.2.1.1 says a decoder must, with its own copy of
@@ -691,6 +740,29 @@ TEST_F(ZstdMatchFinderTest, EverySequenceResolvesToTheBytesItClaims) {
     ASSERT_GT(codes[code], 0u)
         << "this input never uses offset code " << code;
   }
+
+  // The deferred parse writes the same codes, including the shifted form a
+  // sequence with no literals uses, so it has to be exercised here as well:
+  // it is a second implementation of the same rules reading one shared
+  // header, and a census at level 19 alone would leave it unchecked.
+  size_t deferred_codes[4] = {0, 0, 0, 0};
+  size_t deferred_no_literals = 0;
+  Parse deferred = run_parse(data, 9, 0, false);
+  for (const zstd_sequence_t & seq : deferred.sequences) {
+    if (seq.match_offset >= 1u && seq.match_offset <= 3u) {
+      deferred_codes[seq.match_offset]++;
+      if (seq.lit_length == 0u) {
+        deferred_no_literals++;
+      }
+    }
+  }
+  for (unsigned code = 1; code <= 3; code++) {
+    ASSERT_GT(deferred_codes[code], 0u)
+        << "the deferred parse never writes offset code " << code;
+  }
+  ASSERT_GT(deferred_no_literals, 0u)
+      << "the deferred parse never writes a repeat code on a sequence with "
+      << "no literals, which is the case whose codes are shifted";
   ASSERT_GT(after_a_rotation, 100u)
       << "no code looks up an offset that a previous rotation moved, so a "
       << "wrong rotation would not show";

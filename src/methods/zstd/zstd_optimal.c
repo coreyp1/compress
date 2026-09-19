@@ -110,6 +110,7 @@
 #endif
 #include "../../core/bitcost.h"
 #include "zstd_internal.h"
+#include "zstd_repcodes.h"
 #include "zstd_matchfinder_private.h"
 #include "zstd_sequences_private.h"
 #include <string.h>
@@ -269,106 +270,6 @@ static inline uint32_t zstd_opt_of_price(
     const struct zstd_opt_state_s * st, uint32_t encoded_offset) {
   unsigned code = zstd_enc_get_of_code(encoded_offset);
   return st->of_price[code] + ((uint32_t)code << ZSTD_OPT_PRICE_SHIFT);
-}
-
-//
-// Repeat offsets
-//
-// These two must agree exactly with what zstd_opt_emit() below writes, or
-// the parse would be pricing a stream other than the one it goes on to
-// produce.  A test build checks that they do, at every sequence of every
-// block; see the assertions in zstd_opt_emit().
-//
-
-/**
- * @brief How @p offset would be written, given the path's repeat offsets.
- *
- * A distance equal to one of the three most recently used is written as the
- * code 1, 2 or 3 rather than as a distance, which is a large saving.  Which
- * of the three a code names depends on whether the sequence has literals
- * before it: with none, the codes shift up by one and the third names the
- * most recent distance less one (RFC 8878 section 3.1.1.3.2.1.1).
- *
- * That shifted form is not a curiosity here.  A parse that chooses matches
- * by cost puts them end to end constantly: at level 19, 52% of the sequences
- * over 400 KB of manual pages have no literals before them, and 64% over C
- * source.  Declining the codes there, as the deferred parse still does,
- * meant writing a full distance for most of the block.  Taking them is worth
- * 0.44% of the output at level 22, and it is faster, because a cheaper
- * offset makes a longer match worth taking and there are fewer sequences.
- *
- * Anything else is the distance plus three, since the first three values are
- * spoken for.
- */
-static inline uint32_t zstd_opt_encode_offset(
-    const uint32_t * rep, uint32_t litlen, uint32_t offset) {
-  if (litlen > 0u) {
-    if (offset == rep[0]) {
-      return 1u;
-    }
-    if (offset == rep[1]) {
-      return 2u;
-    }
-    if (offset == rep[2]) {
-      return 3u;
-    }
-  }
-  else {
-    if (offset == rep[1]) {
-      return 1u;
-    }
-    if (offset == rep[2]) {
-      return 2u;
-    }
-    // Code 3 with no literals means one less than the most recent distance,
-    // and a distance of zero is not a distance.
-    if (rep[0] > 1u && offset == rep[0] - 1u) {
-      return 3u;
-    }
-  }
-  return offset + 3u;
-}
-
-/**
- * @brief The three repeat offsets after a sequence written as @p encoded.
- *
- * Whichever of the three the sequence used comes to the front and everything
- * it passed drops one place; a distance that was not in the list at all
- * comes to the front and pushes the last one off.  Both cases are the same
- * rule, and it is written once here so that the parse's idea of the list and
- * the encoder's cannot drift apart.
- */
-static inline void zstd_opt_rep_after(const uint32_t * in, uint32_t encoded,
-    uint32_t litlen, uint32_t offset, uint32_t * out) {
-  unsigned slot = 3u; // Not one of the three.
-  if (encoded <= 3u) {
-    slot = encoded - 1u + ((litlen == 0u) ? 1u : 0u);
-  }
-
-  switch (slot) {
-    case 0u:
-      out[0] = in[0];
-      out[1] = in[1];
-      out[2] = in[2];
-      break;
-    case 1u:
-      out[0] = in[1];
-      out[1] = in[0];
-      out[2] = in[2];
-      break;
-    case 2u:
-      out[0] = in[2];
-      out[1] = in[0];
-      out[2] = in[1];
-      break;
-    default:
-      // A distance from outside the list -- either written in full, or the
-      // "one less than the most recent" that code 3 means with no literals.
-      out[0] = offset;
-      out[1] = in[0];
-      out[2] = in[1];
-      break;
-  }
 }
 
 //

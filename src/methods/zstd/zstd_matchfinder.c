@@ -97,6 +97,7 @@
 #endif
 #include "zstd_internal.h"
 #include "zstd_matchfinder_private.h"
+#include "zstd_repcodes.h"
 #include <string.h>
 
 //
@@ -1123,59 +1124,69 @@ gcomp_status_t zstd_mf_generate_sequences(zstd_match_finder_t * mf,
         deferrals--;
       }
 
-      // Convert to encoded offset (zstd uses codes 1-3 for repeat offsets)
-      // Note: When lit_length == 0, offset encoding is different:
-      //   offset 1 -> rep_offset_2
-      //   offset 2 -> rep_offset_3
-      //   offset 3 -> rep_offset_1 - 1
-      // To avoid this complexity, we use new offset encoding when lit_length==0
-      // and the match is a repeat offset.
-      uint32_t encoded_offset = match.offset;
+      // A repeat offset costs two or three bits where a distant one costs
+      // twenty, and the deferred parse used to reach for one only by
+      // accident -- when the search happened to return an offset already in
+      // the list.  On 128 KB of XML that was 2.0% of sequences against the
+      // shortest-path parse's 30% on the same block, and it is most of why
+      // level 9 came out 6.3% larger than libzstd's on that file.
+      //
+      // Two things were wrong, and the smaller one was the probe.  The
+      // larger was that this parse declined the codes entirely when a
+      // sequence had no literals, where RFC 8878 section 3.1.1.3.2.1.1
+      // shifts them -- 1 names the second distance, 2 the third, 3 the most
+      // recent less one.  That is not a corner: 73% of the sequences over
+      // 128 KB of C source have no literals before them, 70% over manual
+      // pages, 36% over XML.  Declining them there meant writing a full
+      // distance for most of the block.
+      //
+      // The rules themselves are in zstd_repcodes.h, shared with the
+      // shortest-path parse, because a disagreement between two copies of
+      // them produces a stream that decodes to the wrong bytes rather than
+      // one that is merely larger.
       size_t lit_len = pos - lit_start;
+      uint32_t rep[3] = {rep1, rep2, rep3};
 
-      if (lit_len > 0) {
-        // Normal case: lit_length > 0
-        if (match.offset == rep1) {
-          encoded_offset = 1;
-          // rep1 stays the same
-        }
-        else if (match.offset == rep2) {
-          encoded_offset = 2;
-          // Swap rep1 and rep2
-          uint32_t tmp = rep2;
-          rep2 = rep1;
-          rep1 = tmp;
-        }
-        else if (match.offset == rep3) {
-          encoded_offset = 3;
-          // Rotate offsets
-          uint32_t tmp = rep3;
-          rep3 = rep2;
-          rep2 = rep1;
-          rep1 = tmp;
-        }
-        else {
-          // New offset: add 3 (offset codes 1-3 are for repeat offsets)
-          encoded_offset = match.offset + 3;
-          // Update repeat offsets
-          rep3 = rep2;
-          rep2 = rep1;
-          rep1 = match.offset;
-        }
+      // What the list offers here, nearest first.  With literals that is the
+      // three distances themselves; without, it is the shifted set the codes
+      // can name.
+      uint32_t rep_try[3];
+      if (lit_len > 0u) {
+        rep_try[0] = rep[0];
+        rep_try[1] = rep[1];
+        rep_try[2] = rep[2];
       }
       else {
-        // Special case: lit_length == 0
-        // When lit_length is 0, repeat offset codes are shifted:
-        //   offset 1 -> rep_offset_2
-        //   offset 2 -> rep_offset_3
-        //   offset 3 -> rep_offset_1 - 1
-        // For simplicity, we always encode as new offset to avoid this
-        // complexity. This is less efficient but correct.
-        encoded_offset = match.offset + 3;
-        rep3 = rep2;
-        rep2 = rep1;
-        rep1 = match.offset;
+        rep_try[0] = rep[1];
+        rep_try[1] = rep[2];
+        rep_try[2] = (rep[0] > 1u) ? (rep[0] - 1u) : 0u;
       }
+
+      if (match.length < mf->nice_length) {
+        for (unsigned r = 0; r < 3u; r++) {
+          const uint32_t roff = rep_try[r];
+          if (roff == 0u || (size_t)roff > pos) {
+            continue;
+          }
+          size_t rlen = zstd_mf_count_match(
+              data + pos, data + pos - roff, data + data_size);
+          if (rlen >= MF_MIN_MATCH &&
+              rlen + ZSTD_MF_REP_SLACK >= (size_t)match.length) {
+            match.offset = roff;
+            match.length = (uint32_t)rlen;
+            break;
+          }
+        }
+      }
+
+      uint32_t encoded_offset =
+          zstd_opt_encode_offset(rep, (uint32_t)lit_len, match.offset);
+      uint32_t rep_next[3];
+      zstd_opt_rep_after(
+          rep, encoded_offset, (uint32_t)lit_len, match.offset, rep_next);
+      rep1 = rep_next[0];
+      rep2 = rep_next[1];
+      rep3 = rep_next[2];
 
       // Copy literals before this match (lit_len computed above)
       memcpy(literals_out + lit_pos, data + lit_start, lit_len);

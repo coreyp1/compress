@@ -40,6 +40,10 @@ extern "C" {
 /// so the cap is a bound on the array rather than on the search.
 #define ZSTD_MF_MAX_CANDIDATES 64
 
+/// How many bytes shorter a repeat-offset match may be and still be taken.
+/// See the probe in zstd_mf_generate_sequences() for what it is buying.
+#define ZSTD_MF_REP_SLACK 2u
+
 /**
  * @brief One match a search turned up: this many bytes, this far back.
  *
