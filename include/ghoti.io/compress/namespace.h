@@ -29,6 +29,9 @@
 /// @cond HIDDEN_SYMBOLS
 
 #define gcomp_allocator_default GHOTIIO_COMPRESS(gcomp_allocator_default)
+#define gcomp_adler32 GHOTIIO_COMPRESS(gcomp_adler32)
+#define gcomp_adler32_combine GHOTIIO_COMPRESS(gcomp_adler32_combine)
+#define gcomp_adler32_update GHOTIIO_COMPRESS(gcomp_adler32_update)
 #define gcomp_crc32 GHOTIIO_COMPRESS(gcomp_crc32)
 #define gcomp_crc32_finalize GHOTIIO_COMPRESS(gcomp_crc32_finalize)
 #define gcomp_crc32_update GHOTIIO_COMPRESS(gcomp_crc32_update)
@@ -90,6 +93,9 @@
 #define gcomp_memory_track_free GHOTIIO_COMPRESS(gcomp_memory_track_free)
 #define gcomp_method_deflate_register GHOTIIO_COMPRESS(gcomp_method_deflate_register)
 #define gcomp_method_get_all_schemas GHOTIIO_COMPRESS(gcomp_method_get_all_schemas)
+#define gcomp_method_zlib_register GHOTIIO_COMPRESS(gcomp_method_zlib_register)
+#define gcomp_zlib_header_info_t GHOTIIO_COMPRESS(gcomp_zlib_header_info_t)
+#define gcomp_zlib_peek_header GHOTIIO_COMPRESS(gcomp_zlib_peek_header)
 #define gcomp_method_get_option_keys GHOTIIO_COMPRESS(gcomp_method_get_option_keys)
 #define gcomp_method_get_option_schema GHOTIIO_COMPRESS(gcomp_method_get_option_schema)
 #define gcomp_method_gzip_register GHOTIIO_COMPRESS(gcomp_method_gzip_register)

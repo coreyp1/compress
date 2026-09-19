@@ -272,6 +272,12 @@ The gzip format includes a CRC32 checksum of the original uncompressed data. The
 
 The trailer also includes ISIZE (original file size mod 2^32). The decoder validates this to catch truncation or corruption.
 
+## Compared with zlib
+
+[zlib](zlib.md) (RFC 1950) wraps the same deflate stream in 6 bytes instead of
+18+, with an Adler-32 rather than a CRC-32 and no room for a name or a
+timestamp. Use gzip for files; use zlib where a format asks for RFC 1950.
+
 ## Flushing
 
 A gzip member is a header, a deflate stream and a trailer, so

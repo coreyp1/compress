@@ -37,7 +37,7 @@ namespace {
 
 /// Every method the library registers, so a new one cannot quietly opt out.
 const char * const kMethods[] = {"rle", "lzw", "lz4", "deflate", "gzip",
-    "zstd"};
+    "zlib", "zstd"};
 
 /**
  * Data with three characters: text that compresses through matches, a long
@@ -489,7 +489,7 @@ TEST_F(FlushTest, AFullFlushActuallyDropsTheHistory) {
   // blocks, where a block already carries no history and the two flush modes
   // are identical -- which is exactly what the first version of this test
   // measured, and why it failed with 15,819 bytes against 15,819.
-  for (const char * method : {"deflate", "gzip", "lz4", "zstd"}) {
+  for (const char * method : {"deflate", "gzip", "zlib", "lz4", "zstd"}) {
     const bool linked = (strcmp(method, "lz4") == 0);
 
     auto encode = [&](gcomp_flush_t mode) {

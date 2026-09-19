@@ -358,6 +358,87 @@ int main(void) {
   snprintf(path, sizeof(path), "fuzz/corpus/lzw_decoder/trunc_2.bin");
   write_file(path, lzw_trunc2, sizeof(lzw_trunc2));
 
+  // Generate zlib (RFC 1950) corpus
+  //
+  // The header is two bytes, so a fuzzer stumbles onto a well-formed one by
+  // chance about once in 8,000 inputs.  These seeds put it past that
+  // immediately, and cover each way the header can be wrong: the wrong
+  // compression method, a window larger than the format allows, a FCHECK that
+  // does not check, and FDICT, which is the one part of RFC 1950 the decoder
+  // refuses rather than attempts.
+  printf("\nGenerating zlib corpus directory...\n");
+  mkdir_p("fuzz/corpus/zlib_decoder");
+  mkdir_p("fuzz/corpus/zlib_roundtrip");
+
+  // Minimal valid zlib stream: CMF=0x78 CINFO=7 CM=8, FLG=0x01 (FCHECK fits),
+  // an empty stored deflate block, and Adler-32 of nothing, which is 1.
+  uint8_t zlib_empty[] = {0x78, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01};
+  snprintf(path, sizeof(path), "fuzz/corpus/zlib_decoder/empty.zz");
+  write_file(path, zlib_empty, sizeof(zlib_empty));
+
+  // The three header bytes zlib itself emits for its three common levels.
+  uint8_t zlib_level1[] = {0x78, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01};
+  snprintf(path, sizeof(path), "fuzz/corpus/zlib_decoder/level1.zz");
+  write_file(path, zlib_level1, sizeof(zlib_level1));
+  uint8_t zlib_level6[] = {0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01};
+  snprintf(path, sizeof(path), "fuzz/corpus/zlib_decoder/level6.zz");
+  write_file(path, zlib_level6, sizeof(zlib_level6));
+  uint8_t zlib_level9[] = {0x78, 0xda, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01};
+  snprintf(path, sizeof(path), "fuzz/corpus/zlib_decoder/level9.zz");
+  write_file(path, zlib_level9, sizeof(zlib_level9));
+
+  // A small window: CINFO=0 is a 256-byte window, the smallest the format
+  // names.  CMF=0x08, FLG=0x1d makes 0x081d a multiple of 31.
+  uint8_t zlib_small_window[] = {0x08, 0x1d, 0x03, 0x00, 0x00, 0x00, 0x00,
+      0x01};
+  snprintf(path, sizeof(path), "fuzz/corpus/zlib_decoder/small_window.zz");
+  write_file(path, zlib_small_window, sizeof(zlib_small_window));
+
+  // FDICT set: 0x78bb is a multiple of 31 and 0xbb has bit 5 set.  Four bytes
+  // of dictionary id follow.
+  uint8_t zlib_fdict[] = {0x78, 0xbb, 0xde, 0xad, 0xbe, 0xef, 0x03, 0x00, 0x00,
+      0x00, 0x00, 0x01};
+  snprintf(path, sizeof(path), "fuzz/corpus/zlib_decoder/fdict.zz");
+  write_file(path, zlib_fdict, sizeof(zlib_fdict));
+
+  // Each way the header can be malformed.
+  uint8_t zlib_bad_cm[] = {0x79, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01};
+  snprintf(path, sizeof(path), "fuzz/corpus/zlib_decoder/bad_cm.zz");
+  write_file(path, zlib_bad_cm, sizeof(zlib_bad_cm));
+  uint8_t zlib_bad_cinfo[] = {0x8c, 0x62, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01};
+  snprintf(path, sizeof(path), "fuzz/corpus/zlib_decoder/bad_cinfo.zz");
+  write_file(path, zlib_bad_cinfo, sizeof(zlib_bad_cinfo));
+  uint8_t zlib_bad_fcheck[] = {0x78, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01};
+  snprintf(path, sizeof(path), "fuzz/corpus/zlib_decoder/bad_fcheck.zz");
+  write_file(path, zlib_bad_fcheck, sizeof(zlib_bad_fcheck));
+
+  // A stream whose Adler-32 does not match its data.
+  uint8_t zlib_bad_adler[] = {0x78, 0x01, 0x03, 0x00, 0xde, 0xad, 0xbe, 0xef};
+  snprintf(path, sizeof(path), "fuzz/corpus/zlib_decoder/bad_adler.zz");
+  write_file(path, zlib_bad_adler, sizeof(zlib_bad_adler));
+
+  // Cut short at each stage.
+  snprintf(path, sizeof(path), "fuzz/corpus/zlib_decoder/trunc_header.zz");
+  write_file(path, zlib_empty, 1);
+  snprintf(path, sizeof(path), "fuzz/corpus/zlib_decoder/trunc_body.zz");
+  write_file(path, zlib_empty, 3);
+  snprintf(path, sizeof(path), "fuzz/corpus/zlib_decoder/trunc_trailer.zz");
+  write_file(path, zlib_empty, 6);
+
+  // Round-trip seeds are plain input; the first byte picks the settings.
+  {
+    uint8_t seed_text[] = "the quick brown fox jumps over the lazy dog";
+    snprintf(path, sizeof(path), "fuzz/corpus/zlib_roundtrip/text.bin");
+    write_file(path, seed_text, sizeof(seed_text) - 1);
+    uint8_t seed_zeros[256];
+    memset(seed_zeros, 0, sizeof(seed_zeros));
+    snprintf(path, sizeof(path), "fuzz/corpus/zlib_roundtrip/zeros.bin");
+    write_file(path, seed_zeros, sizeof(seed_zeros));
+    uint8_t seed_one[] = {0x42};
+    snprintf(path, sizeof(path), "fuzz/corpus/zlib_roundtrip/one_byte.bin");
+    write_file(path, seed_one, sizeof(seed_one));
+  }
+
   // Generate gzip corpus with various header combinations
   printf("\nGenerating gzip corpus directory...\n");
   mkdir_p("fuzz/corpus/gzip_decoder");

@@ -290,6 +290,15 @@ At every level the encoder:
 
 The fixed code is written whenever it prices smaller, which is the same rule stated above rather than a fallback.
 
+## Containers around deflate
+
+Raw deflate has no header and no checksum, so it is only usable where
+something else frames and verifies it. Two wrappers in this library add that:
+
+- [zlib](zlib.md) (RFC 1950) — 6 bytes, Adler-32. What PNG, PDF and HTTP
+  `deflate` actually carry.
+- [gzip](gzip.md) (RFC 1952) — 18+ bytes, CRC-32, plus a name and timestamp.
+
 ## Flushing
 
 `gcomp_encoder_flush()` emits every symbol for the input consumed so far

@@ -122,7 +122,7 @@ with deflate — seven times the input. The API will let you do it; do not.
 
 | Method | Sync flush | Full flush |
 |---|---|---|
-| **deflate**, **gzip** | Ends the block, writes the empty stored block (`00 00 FF FF`) that byte-aligns the output — zlib's `Z_SYNC_FLUSH` tail | Also empties the match history, so nothing afterwards reaches back |
+| **deflate**, **gzip**, **zlib** | Ends the block, writes the empty stored block (`00 00 FF FF`) that byte-aligns the output — zlib's `Z_SYNC_FLUSH` tail | Also empties the match history, so nothing afterwards reaches back |
 | **lz4** | Closes the block being filled; an ordinary LZ4 block, so the frame is unchanged | Identical with independent blocks (the default), which carry no history anyway. With `lz4.independent_blocks=false` it also drops the 64 KB window |
 | **zstd** | Emits the block being filled; the frame stays open | **Ends the frame and starts another.** Reading the result needs `zstd.concat` on the decoder — see below |
 | **lzw** | Emits the pending code followed by a `CLEAR`, which is the only way to push a partial code out where a decoder can read it | Identical — the `CLEAR` already resets the dictionary |
