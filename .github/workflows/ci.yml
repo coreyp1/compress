@@ -1,0 +1,200 @@
+# Continuous integration for ghoti.io-compress.
+#
+# Everything here is a target the Makefile already had, run the way the
+# project documents it. The point of the file is that they are all run, on
+# every change, rather than when somebody remembers: this library shipped two
+# defects that a green local `make test` did not see - an encoder that lost
+# staged output, and an LZW decoder that could not stream at all - and both
+# were found by running something that was not being run.
+#
+# The layout follows ../text's workflow, which is the only precedent in the
+# suite: the project is checked out into a subdirectory so that cutil can be
+# checked out beside it rather than inside it, and both are installed into one
+# prefix in the workspace, exactly the way ../bootstrap.sh does it locally.
+# The steps common to every job are in .github/actions/setup.
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A branch that is pushed twice in quick succession does not need the first
+# run finished. Pull requests are cancelled; pushes to master are not, so that
+# every commit on the branch keeps its own result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PREFIX: ${{ github.workspace }}/.local
+  PKG_CONFIG_PATH: ${{ github.workspace }}/.local/share/pkgconfig
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The everyday gate: it builds, the symbols are namespaced, the tests pass,
+  # the examples still compile, and what `make install` leaves behind can
+  # actually be consumed.
+  #
+  # Both compilers, because -Werror is only as good as the warnings the
+  # compiler in use happens to emit, and the two disagree about which ones
+  # those are. Neither is pinned: whatever the runner image ships is a third
+  # opinion on top of the GCC 14 the suite is developed against, and a warning
+  # only one of them emits is still a warning worth reading. If that ever
+  # becomes noise rather than signal, pin a version here rather than dropping
+  # the job.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Build and test (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cc: gcc
+            cxx: g++
+            packages: ""
+          - cc: clang
+            cxx: clang++
+            packages: clang
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: compress
+
+      - uses: ./compress/.github/actions/setup
+        with:
+          packages: ${{ matrix.packages }}
+
+      - name: Build
+        working-directory: compress
+        run: make -j"$(nproc)" CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} PREFIX="$PREFIX"
+
+      # `make test` depends on this, but running it as its own step reports a
+      # namespace regression as a namespace regression rather than as a test
+      # failure at the bottom of a long log.
+      - name: Symbol namespace gate
+        working-directory: compress
+        run: make check-symbols CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} PREFIX="$PREFIX"
+
+      - name: Tests
+        working-directory: compress
+        run: make test -j"$(nproc)" CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} PREFIX="$PREFIX"
+
+      - name: Examples
+        working-directory: compress
+        run: make examples CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} PREFIX="$PREFIX"
+
+      # The tests reach the library through include/ and a static archive
+      # linked with --whole-archive. A consumer reaches it through pkg-config,
+      # the installed headers and the shared library, and nothing else here
+      # exercises that path - which is where CONVENTIONS.md section 1 records
+      # three defects that every in-tree build was blind to.
+      - name: Install
+        working-directory: compress
+        run: make install CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} PREFIX="$PREFIX"
+
+      - name: A consumer can use what was installed
+        working-directory: compress
+        run: CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} tools/check-install.sh "$PREFIX"
+
+  # ---------------------------------------------------------------------------
+  # ASan and UBSan, in their own build directory so the objects are never
+  # shared with the plain build.
+  # ---------------------------------------------------------------------------
+  sanitizers:
+    name: ASan + UBSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: compress
+
+      - uses: ./compress/.github/actions/setup
+
+      - name: Tests under ASan and UBSan
+        working-directory: compress
+        run: make test-asan -j"$(nproc)" PREFIX="$PREFIX"
+
+  # ---------------------------------------------------------------------------
+  # Valgrind finds what the sanitizers do not: uninitialised reads that happen
+  # to be harmless, and leaks in code the sanitizers' interceptors do not see.
+  # The -quiet variant is the one that treats a leak as a failure.
+  # ---------------------------------------------------------------------------
+  valgrind:
+    name: Valgrind
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: compress
+
+      - uses: ./compress/.github/actions/setup
+        with:
+          packages: valgrind
+
+      - name: Build
+        working-directory: compress
+        run: make -j"$(nproc)" PREFIX="$PREFIX"
+
+      - name: Tests under Valgrind
+        working-directory: compress
+        run: make test-valgrind-quiet PREFIX="$PREFIX"
+
+  # ---------------------------------------------------------------------------
+  # The tracked regression corpus, replayed through every harness.
+  #
+  # This is not fuzzing: fuzz/regression is read-only and the target fails if
+  # replaying it changes the directory. It is the cheapest gate in the file
+  # and the one that catches a reintroduced parser defect, because every input
+  # in there is one that found something once.
+  #
+  # AFL_CC=clang rather than afl-clang-fast: a replay never mutates anything,
+  # so the instrumentation afl-fuzz needs buys nothing here, and the everyday
+  # gate stays free of the AFL toolchain. The harnesses are still built with
+  # ASan and UBSan, which is what makes a bad read a failure rather than a
+  # silent success. A real campaign needs afl-fuzz and a corpus that persists
+  # between runs; see documentation/testing/fuzzing.md.
+  # ---------------------------------------------------------------------------
+  fuzz-replay:
+    name: Fuzz corpus replay
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: compress
+
+      - uses: ./compress/.github/actions/setup
+        with:
+          packages: clang
+
+      - name: Replay the tracked corpus
+        working-directory: compress
+        run: make fuzz-replay -j"$(nproc)" AFL_CC=clang PREFIX="$PREFIX"
+
+  # ---------------------------------------------------------------------------
+  # A floor, so that coverage can only be argued upward. Raise it when the
+  # number rises; do not lower it to make a branch pass.
+  #
+  # The suite reaches 82.2% as of this commit and the floor is 80: the report
+  # counts every line of src/, including the Windows branches a Linux runner
+  # cannot execute, so the number will never approach 100. It is a ratchet with
+  # a little slack, not a target.
+  # ---------------------------------------------------------------------------
+  coverage:
+    name: Coverage floor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: compress
+
+      - uses: ./compress/.github/actions/setup
+
+      - name: Line coverage
+        working-directory: compress
+        run: make coverage -j"$(nproc)" COVERAGE_MIN=80 PREFIX="$PREFIX"

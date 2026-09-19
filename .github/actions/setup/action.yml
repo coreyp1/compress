@@ -1,0 +1,50 @@
+# The part of every job that is the same in every job.
+#
+# This library resolves its one dependency through pkg-config and nothing
+# else - there is deliberately no sibling-checkout fallback, because a second
+# resolution path that only in-tree builds exercise is one that silently rots
+# (CONVENTIONS.md section 1). So cutil is built and installed into a prefix
+# inside the workspace first, exactly the way ../bootstrap.sh does it locally,
+# and every job then builds against that prefix the way a consumer would.
+#
+# The references the oracle tests compare against are installed here too,
+# rather than per job. They are not optional: five test files assert that a
+# reference is actually present (OracleIsActuallyAvailable), because a skipped
+# oracle test and an absent one look identical in the summary line, and a CI
+# that quietly compared our output against nothing would still be green.
+name: Set up the build
+description: Install the toolchain and dependencies, and build cutil into the workspace prefix.
+
+inputs:
+  packages:
+    description: Apt packages this job needs beyond the common set.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install build dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential pkg-config libgtest-dev \
+          python3 gzip zstd liblz4-dev \
+          ${{ inputs.packages }}
+
+    # Unpinned on purpose: the suite is developed as a whole and a library is
+    # expected to build against its dependency's tip. Pin `ref:` here if that
+    # ever stops being true.
+    - name: Check out cutil
+      uses: actions/checkout@v4
+      with:
+        repository: Ghoti-io/CUtil
+        path: cutil
+
+    - name: Build and install cutil
+      shell: bash
+      working-directory: cutil
+      run: |
+        make -j"$(nproc)" PREFIX="$PREFIX"
+        make install PREFIX="$PREFIX"

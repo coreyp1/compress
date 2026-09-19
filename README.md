@@ -158,6 +158,47 @@ GCOMP_SKIP_ORACLE_TESTS=1 make test
 GCOMP_ORACLE_VERBOSE=1 make test
 ```
 
+### Continuous Integration
+
+Every push and pull request runs `.github/workflows/ci.yml`, which is nothing
+but the targets above, run in six jobs:
+
+| Job | Runs |
+| --- | --- |
+| Build and test (gcc) | `make`, `check-symbols`, `test`, `examples`, `install`, `tools/check-install.sh` |
+| Build and test (clang) | the same, with `CC=clang CXX=clang++` |
+| ASan + UBSan | `make test-asan` |
+| Valgrind | `make test-valgrind-quiet`, which fails on a leak |
+| Fuzz corpus replay | `make fuzz-replay AFL_CC=clang` over the tracked `fuzz/regression` corpus |
+| Coverage floor | `make coverage COVERAGE_MIN=...`, which fails if line coverage drops below the floor |
+
+Two things there are not just a target being run:
+
+- **`tools/check-install.sh`** compiles a program that knows nothing but the
+  module name, links it with whatever `pkg-config` hands back, runs it, and
+  round-trips a buffer through every method. The tests link the static archive
+  with `--whole-archive` and include headers straight out of `include/`, so
+  nothing else checks what a consumer of the *installed* library actually gets.
+  It can be run by hand against any prefix:
+
+  ```bash
+  tools/check-install.sh /path/to/prefix
+  ```
+
+- **The oracle references are installed by CI rather than left to chance.**
+  Eight test files assert that their reference implementation is actually
+  present (`OracleIsActuallyAvailable`), because a skipped oracle test and an
+  absent one look identical in the summary line - a run that compared nothing
+  against anything would otherwise report success. `GCOMP_SKIP_ORACLE_TESTS=1`
+  is how a machine without them says so deliberately.
+
+A campaign with `afl-fuzz` is not in CI. It needs a corpus that persists
+between runs to be worth anything, and `make fuzz-corpus` currently seeds only
+the deflate, RLE and LZW harnesses - the other campaign targets name corpus
+directories nothing creates. The campaigns themselves are documented in
+`documentation/testing/fuzzing.md`; the replay above is the part that is
+worth running on every change.
+
 ## Installation
 
 ```bash
