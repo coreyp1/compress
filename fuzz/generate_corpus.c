@@ -22,6 +22,9 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#include <ghoti.io/compress/compress.h>
+#include <ghoti.io/compress/registry.h>
+
 // Include golden vectors (redefine nullptr for C compatibility)
 #ifdef __cplusplus
 // C++ mode - nullptr is fine
@@ -561,10 +564,119 @@ int main(void) {
     free(long_name_buf);
   }
 
+  // Every method, seeded by the library rather than by hand.
+  //
+  // The vectors above are hand-written deflate and gzip frames, and they are
+  // worth keeping - they are edge cases somebody chose. But they only ever
+  // covered deflate, gzip, RLE and LZW, so the LZ4 and zstd campaigns had no
+  // seeds at all and gzip's roundtrip had an empty directory. A campaign that
+  // starts from one minimal frame is a campaign starting from nothing.
+  //
+  // So the encoders produce the decoder seeds. A seed corpus made by the
+  // implementation under test is the normal arrangement - AFL mutates it, and
+  // fuzz/regression holds the inputs that actually found something - and it
+  // means a method added later is seeded by adding it to this list.
+  printf("\nGenerating per-method corpora from the library...\n");
+  {
+    // The directory prefix each method's campaign targets name. deflate's
+    // are the unprefixed ones, for historical reasons.
+    static const struct {
+      const char * method;
+      const char * prefix;
+    } kMethods[] = {
+        {"deflate", ""},
+        {"gzip", "gzip_"},
+        {"zlib", "zlib_"},
+        {"lz4", "lz4_"},
+        {"lzw", "lzw_"},
+        {"rle", "rle_"},
+        {"zstd", "zstd_"},
+    };
+
+    gcomp_registry_t * registry = gcomp_registry_default();
+    if (!registry) {
+      fprintf(stderr, "Error: no default registry; cannot seed\n");
+      return 1;
+    }
+
+    for (size_t m = 0; m < sizeof(kMethods) / sizeof(kMethods[0]); m++) {
+      const char * method = kMethods[m].method;
+      const char * prefix = kMethods[m].prefix;
+
+      // Deliberately short: "fuzz/corpus/" plus a prefix and a name is well
+      // under this, and a size the compiler can see fits is what keeps
+      // -Wformat-truncation quiet when these are pasted into path[].
+      char dec_dir[64];
+      char enc_dir[64];
+      char rt_dir[64];
+      snprintf(dec_dir, sizeof(dec_dir), "fuzz/corpus/%sdecoder", prefix);
+      snprintf(enc_dir, sizeof(enc_dir), "fuzz/corpus/%sencoder", prefix);
+      snprintf(rt_dir, sizeof(rt_dir), "fuzz/corpus/%sroundtrip", prefix);
+      mkdir_p(dec_dir);
+      mkdir_p(enc_dir);
+      mkdir_p(rt_dir);
+
+      for (size_t i = 0;
+           i < sizeof(plaintext_samples) / sizeof(plaintext_samples[0]); i++) {
+        const uint8_t * text = (const uint8_t *)plaintext_samples[i];
+        size_t len = strlen(plaintext_samples[i]);
+
+        // The raw sample feeds the encoder and roundtrip harnesses.
+        snprintf(path, sizeof(path), "%s/sample_%zu.bin", enc_dir, i);
+        write_file(path, text, len);
+        snprintf(path, sizeof(path), "%s/sample_%zu.bin", rt_dir, i);
+        write_file(path, text, len);
+
+        // Compressed, it feeds the decoder harness. RLE can expand, so the
+        // buffer is generous rather than exact.
+        uint8_t encoded[8192];
+        size_t produced = 0;
+        gcomp_status_t status = gcomp_encode_buffer(registry, method, NULL,
+            text, len, encoded, sizeof(encoded), &produced);
+        if (status != GCOMP_OK) {
+          fprintf(stderr, "Error: %s could not encode sample %zu (%d)\n",
+              method, i, (int)status);
+          return 1;
+        }
+        snprintf(path, sizeof(path), "%s/sample_%zu.bin", dec_dir, i);
+        write_file(path, encoded, produced);
+      }
+
+      // One larger, more structured input per method: something with matches
+      // worth finding, so the decoder seeds are not all a single block of
+      // literals.
+      {
+        uint8_t prose[4096];
+        for (size_t i = 0; i < sizeof(prose); i++) {
+          prose[i] = (uint8_t)('a' + (i % 23) + ((i / 97) % 3));
+        }
+        snprintf(path, sizeof(path), "%s/prose_4096.bin", enc_dir);
+        write_file(path, prose, sizeof(prose));
+        snprintf(path, sizeof(path), "%s/prose_4096.bin", rt_dir);
+        write_file(path, prose, sizeof(prose));
+
+        uint8_t encoded[16384];
+        size_t produced = 0;
+        gcomp_status_t status = gcomp_encode_buffer(registry, method, NULL,
+            prose, sizeof(prose), encoded, sizeof(encoded), &produced);
+        if (status != GCOMP_OK) {
+          fprintf(stderr, "Error: %s could not encode prose (%d)\n", method,
+              (int)status);
+          return 1;
+        }
+        snprintf(path, sizeof(path), "%s/prose_4096.bin", dec_dir);
+        write_file(path, encoded, produced);
+      }
+    }
+  }
+
   printf("\n");
   printf("Seed corpus generation complete!\n");
   printf("\n");
-  printf("Corpus locations:\n");
+  printf("Corpus locations: fuzz/corpus/<method>_{decoder,encoder,roundtrip}\n");
+  printf("(deflate's are the unprefixed decoder/, encoder/, roundtrip/.)\n");
+  printf("\n");
+  printf("Named in full:\n");
   printf("  Decoder:      fuzz/corpus/decoder/\n");
   printf("  Encoder:      fuzz/corpus/encoder/\n");
   printf("  Roundtrip:    fuzz/corpus/roundtrip/\n");

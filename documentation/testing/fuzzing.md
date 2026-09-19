@@ -222,6 +222,33 @@ make fuzz-lzw-encoder
 make fuzz-lzw-roundtrip
 ```
 
+## Zstd Fuzz Targets
+
+```bash
+make fuzz-zstd-decoder
+make fuzz-zstd-encoder
+make fuzz-zstd-roundtrip
+```
+
+The decoder harness is the interesting one: a zstd frame header carries a
+window descriptor, and what a decoder does with a window a frame merely
+*claims* is where `limits.max_memory_bytes` earns its keep.
+
+## zlib Fuzz Targets
+
+```bash
+make fuzz-zlib-decoder
+make fuzz-zlib-roundtrip
+```
+
+There is no zlib encoder harness; `fuzz_zlib_roundtrip` covers that direction.
+Both harnesses existed before either of these targets did, and could only be
+reached through `make fuzz-replay`, which feeds every harness it finds.
+
+The container is thin - CMF/FLG, deflate, a big-endian Adler-32 (RFC 1950) -
+so what the decoder harness is really probing is the header's FCHECK and FDICT
+bits and the trailer, on top of everything the deflate harness already covers.
+
 ## Understanding AFL++ Output
 
 When you run AFL++, you'll see a status screen:
@@ -346,10 +373,27 @@ The seed corpus provides starting inputs for the fuzzer. Better seeds lead to be
 make fuzz-corpus
 ```
 
-This creates:
-- `fuzz/corpus/decoder/` - Valid DEFLATE streams and malformed edge cases
-- `fuzz/corpus/encoder/` - Various plaintext patterns
-- `fuzz/corpus/roundtrip/` - Various plaintext patterns
+This creates, for every method:
+
+- `fuzz/corpus/<method>_decoder/` - streams that method's encoder produced,
+  plus hand-written malformed and edge-case frames where they exist
+- `fuzz/corpus/<method>_encoder/` - plaintext patterns and edge-case sizes
+- `fuzz/corpus/<method>_roundtrip/` - the same plaintext patterns
+
+DEFLATE's three are the unprefixed `decoder/`, `encoder/` and `roundtrip/`.
+
+The decoder seeds are produced by this library's own encoders, which is the
+normal arrangement for a seed corpus - AFL mutates them, and the inputs that
+have actually found something live in `fuzz/regression/`, which is tracked and
+never written to.
+
+`make fuzz-corpus` then **fails if any campaign target names a corpus
+directory it did not fill**, and it reads that list out of the Makefile rather
+than keeping a second copy beside it. The two had already drifted: the LZ4 and
+zstd campaigns named directories nothing created, and `fuzz-gzip-roundtrip`
+named one that was created and left empty. Each of those targets has a
+fallback that writes a single minimal frame, so the campaigns ran - from one
+seed, silently, rather than from the corpus they appeared to be using.
 
 ### Adding Custom Seeds
 
@@ -365,7 +409,14 @@ gunzip -c some_file.gz > temp.deflate  # Note: gzip has header, need raw deflate
 
 ## Continuous Fuzzing
 
-For thorough testing, run fuzzers for extended periods:
+CI does not run a campaign. It runs `make fuzz-replay`, which feeds every file
+in `fuzz/regression/` to every harness and fails if any of them does not exit
+cleanly, or if the corpus changed during the replay. That is a regression
+check, not a search: it takes seconds, and it is what keeps an input that once
+found something found.
+
+A campaign is a search, and it needs a corpus that survives between runs to be
+worth starting. For thorough testing, run fuzzers for extended periods:
 
 ```bash
 # Run overnight
@@ -432,7 +483,10 @@ fuzz/
 ├── fuzz_zstd_decoder.c      # Zstd decoder fuzz harness
 ├── fuzz_zstd_encoder.c      # Zstd encoder fuzz harness
 ├── fuzz_zstd_roundtrip.c    # Zstd roundtrip fuzz harness
+├── fuzz_zlib_decoder.c      # zlib decoder fuzz harness
+├── fuzz_zlib_roundtrip.c    # zlib roundtrip fuzz harness
 ├── generate_corpus.c        # Seed corpus generator
+├── regression/              # Tracked; replayed by `make fuzz-replay`
 ├── corpus/                  # Seed inputs (generated)
 │   ├── decoder/             # Raw deflate test inputs
 │   ├── encoder/             # Plaintext inputs for deflate
@@ -451,7 +505,9 @@ fuzz/
 │   ├── lzw_roundtrip/       # Plaintext inputs for LZW roundtrip
 │   ├── zstd_decoder/        # Zstd frame format test inputs
 │   ├── zstd_encoder/        # Plaintext inputs for zstd
-│   └── zstd_roundtrip/      # Plaintext for zstd roundtrip
+│   ├── zstd_roundtrip/      # Plaintext for zstd roundtrip
+│   ├── zlib_decoder/        # zlib streams (RFC 1950 container)
+│   └── zlib_roundtrip/      # Plaintext for zlib roundtrip
 └── findings/                # AFL++ output (generated)
     ├── decoder/
     │   ├── crashes/         # Crash-inducing inputs
@@ -473,7 +529,9 @@ fuzz/
     ├── lzw_roundtrip/
     ├── zstd_decoder/
     ├── zstd_encoder/
-    └── zstd_roundtrip/
+    ├── zstd_roundtrip/
+    ├── zlib_decoder/
+    └── zlib_roundtrip/
 ```
 
 ## References

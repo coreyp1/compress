@@ -525,10 +525,19 @@ $(APP_DIR)/$(AFL_STATIC_TARGET): $(AFL_LIBOBJECTS)
 	ar rcs $@ $^
 
 # Corpus generator (built with regular gcc, no AFL instrumentation)
-$(APP_DIR)/fuzz/generate_corpus$(EXE_EXTENSION): fuzz/generate_corpus.c
+#
+# Linked against the ordinary static library, not the AFL one: it is a tool
+# that runs once, and it needs the encoders to produce a seed for every method
+# rather than carrying hand-written frames for seven formats - the hand-written
+# ones went stale for four of them and nobody noticed, because an empty seed
+# directory only shows up when somebody starts a campaign.
+$(APP_DIR)/fuzz/generate_corpus$(EXE_EXTENSION): fuzz/generate_corpus.c \
+		$(APP_DIR)/$(STATIC_TARGET)
 	@printf "\n### Compiling Corpus Generator ###\n"
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $<
+	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< \
+		-Wl,--whole-archive $(APP_DIR)/$(STATIC_TARGET) -Wl,--no-whole-archive \
+		$(CUTIL_LIBS) -lm -lpthread -Wl,-rpath,$(PREFIX)/lib/$(SUITE)
 
 # Pattern rule for fuzz executables (linked against AFL-instrumented library)
 $(APP_DIR)/fuzz/%$(EXE_EXTENSION): fuzz/%.c $(APP_DIR)/$(AFL_STATIC_TARGET)
@@ -553,6 +562,7 @@ $(APP_DIR)/fuzz/%$(EXE_EXTENSION): fuzz/%.c $(APP_DIR)/$(AFL_STATIC_TARGET)
 .PHONY: fuzz-rle-decoder fuzz-rle-encoder fuzz-rle-roundtrip
 .PHONY: fuzz-lzw-decoder fuzz-lzw-encoder fuzz-lzw-roundtrip
 .PHONY: fuzz-zstd-decoder fuzz-zstd-encoder fuzz-zstd-roundtrip
+.PHONY: fuzz-zlib-decoder fuzz-zlib-roundtrip
 # Sanitizer commands
 .PHONY: test-asan test-asan-quiet test-ubsan sanitizer-help
 watch: ## Watch the file directory for changes and compile the target
@@ -794,6 +804,25 @@ fuzz-corpus: $(APP_DIR)/fuzz/generate_corpus$(EXE_EXTENSION)
 	@printf "####################################\n"
 	@printf "\033[0m\n"
 	@$(APP_DIR)/fuzz/generate_corpus$(EXE_EXTENSION)
+# Every campaign target below names its seed directory with -i, so the list of
+# directories that must exist is read out of this file rather than kept as a
+# second list beside it. The two lists had already drifted: the LZ4 and zstd
+# campaigns named directories nothing created, and fuzz-gzip-roundtrip named
+# one that was created and left empty. afl-fuzz refuses to start on an empty
+# input directory, so each of those was a campaign that could not be run.
+	@missing=""; \
+	for dir in $$(grep -oE '\-i fuzz/corpus/[a-z0-9_]+' $(MAKEFILE_LIST) \
+			| awk '{print $$2}' | sort -u); do \
+		if [ -z "$$(find $$dir -type f 2>/dev/null | head -n 1)" ]; then \
+			missing="$$missing $$dir"; \
+		fi; \
+	done; \
+	if [ -n "$$missing" ]; then \
+		printf "\033[0;31m\nNo seeds for:%s\n" "$$missing" >&2; \
+		printf "A campaign target names a corpus directory that fuzz/generate_corpus.c does not fill.\033[0m\n" >&2; \
+		exit 1; \
+	fi
+	@printf "\033[0;32mEvery campaign target has a seed corpus.\033[0m\n"
 
 fuzz-decoder: ## Run decoder fuzzer (Ctrl+C to stop)
 fuzz-decoder: $(APP_DIR)/fuzz/fuzz_deflate_decoder$(EXE_EXTENSION)
@@ -1073,6 +1102,41 @@ fuzz-zstd-roundtrip: $(APP_DIR)/fuzz/fuzz_zstd_roundtrip$(EXE_EXTENSION)
 		printf 'Hello' > fuzz/corpus/zstd_roundtrip/hello.bin; \
 	fi
 	$(AFL_RUN_ENV) afl-fuzz -m $(AFL_MEM_LIMIT) $(AFL_TIME_FLAG) -i fuzz/corpus/zstd_roundtrip -o fuzz/findings/zstd_roundtrip -- $(APP_DIR)/fuzz/fuzz_zstd_roundtrip$(EXE_EXTENSION)
+
+# The zlib harnesses have existed since the container was added and had no way
+# to be run: fuzz-replay fed them, because it feeds every harness it finds, but
+# there was no campaign target for either. There is no zlib encoder harness to
+# match - fuzz_zlib_roundtrip covers that direction, the way the other
+# roundtrip harnesses do.
+fuzz-zlib-decoder: ## Run zlib decoder fuzzer (Ctrl+C to stop)
+fuzz-zlib-decoder: $(APP_DIR)/fuzz/fuzz_zlib_decoder$(EXE_EXTENSION)
+	@printf "\033[0;32m\n"
+	@printf "#######################################\n"
+	@printf "### Running zlib Decoder Fuzzer     ###\n"
+	@printf "#######################################\n"
+	@printf "\033[0m\n"
+	@mkdir -p fuzz/findings/zlib_decoder
+	@if [ ! -d fuzz/corpus/zlib_decoder ] || [ -z "$$(ls -A fuzz/corpus/zlib_decoder 2>/dev/null)" ]; then \
+		printf "\033[0;33mWarning: No seed corpus found. Creating minimal seed...\033[0m\n"; \
+		mkdir -p fuzz/corpus/zlib_decoder; \
+		printf '\x78\x9c\x03\x00\x00\x00\x00\x01' > fuzz/corpus/zlib_decoder/empty.zz; \
+	fi
+	$(AFL_RUN_ENV) afl-fuzz -m $(AFL_MEM_LIMIT) $(AFL_TIME_FLAG) -i fuzz/corpus/zlib_decoder -o fuzz/findings/zlib_decoder -- $(APP_DIR)/fuzz/fuzz_zlib_decoder$(EXE_EXTENSION)
+
+fuzz-zlib-roundtrip: ## Run zlib roundtrip fuzzer (Ctrl+C to stop)
+fuzz-zlib-roundtrip: $(APP_DIR)/fuzz/fuzz_zlib_roundtrip$(EXE_EXTENSION)
+	@printf "\033[0;32m\n"
+	@printf "#######################################\n"
+	@printf "### Running zlib Roundtrip Fuzzer   ###\n"
+	@printf "#######################################\n"
+	@printf "\033[0m\n"
+	@mkdir -p fuzz/findings/zlib_roundtrip
+	@if [ ! -d fuzz/corpus/zlib_roundtrip ] || [ -z "$$(ls -A fuzz/corpus/zlib_roundtrip 2>/dev/null)" ]; then \
+		printf "\033[0;33mWarning: No seed corpus found. Creating minimal seed...\033[0m\n"; \
+		mkdir -p fuzz/corpus/zlib_roundtrip; \
+		printf 'Hello, world!' > fuzz/corpus/zlib_roundtrip/hello.txt; \
+	fi
+	$(AFL_RUN_ENV) afl-fuzz -m $(AFL_MEM_LIMIT) $(AFL_TIME_FLAG) -i fuzz/corpus/zlib_roundtrip -o fuzz/findings/zlib_roundtrip -- $(APP_DIR)/fuzz/fuzz_zlib_roundtrip$(EXE_EXTENSION)
 
 # So tests and fuzz harnesses can load the compress library and its cutil
 # dependency.

@@ -192,12 +192,18 @@ Two things there are not just a target being run:
   against anything would otherwise report success. `GCOMP_SKIP_ORACLE_TESTS=1`
   is how a machine without them says so deliberately.
 
-A campaign with `afl-fuzz` is not in CI. It needs a corpus that persists
-between runs to be worth anything, and `make fuzz-corpus` currently seeds only
-the deflate, RLE and LZW harnesses - the other campaign targets name corpus
-directories nothing creates. The campaigns themselves are documented in
-`documentation/testing/fuzzing.md`; the replay above is the part that is
-worth running on every change.
+A campaign with `afl-fuzz` is not in CI: it needs a corpus that persists
+between runs to be worth anything, and the replay above is the part worth
+running on every change. The campaigns themselves are documented in
+`documentation/testing/fuzzing.md`.
+
+`make fuzz-corpus` seeds every method - each of `fuzz/corpus/<method>_decoder`,
+`_encoder` and `_roundtrip`, with deflate's being the unprefixed ones - and
+then fails if any campaign target names a directory it did not fill. It reads
+that list out of the Makefile rather than keeping a second copy, because the
+two had already drifted: LZ4 and zstd had no seeds at all and gzip's roundtrip
+directory was created empty, so those campaigns fell back to a single
+hand-written frame apiece without saying so.
 
 ## Installation
 
