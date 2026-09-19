@@ -19,6 +19,31 @@
  *   and parseable through the functions below
  * - Streaming with arbitrary input/output buffer sizes
  * - Memory tracking and limits
+ * - Parallel encoding on a thread pool (see below)
+ *
+ * ## Parallel encoding
+ *
+ * Set `threads.count` above 1 and blocks are compressed on worker threads.
+ * What comes out is **one ordinary LZ4 frame, byte-for-byte identical to
+ * what a single thread would have produced** -- the same input and options
+ * give the same bytes at any thread count, so nothing downstream can tell
+ * the difference or needs to.
+ *
+ * ```c
+ * gcomp_options_set_uint64(options, "threads.count", 4);
+ * ```
+ *
+ * One job is one block, so `lz4.block_size` is also the parallel
+ * granularity; an input of only a few blocks has correspondingly little to
+ * divide up.
+ *
+ * Parallel encoding requires independent blocks, which is the default.  With
+ * `lz4.independent_blocks=false` a block may reference the one before it, so
+ * there is nothing to compress in parallel; `threads.count` is then ignored
+ * and the encoder compresses in the calling thread.  This is not an error
+ * and does not change the output.
+ *
+ * Decoding is always single-threaded.
  *
  * ## Usage
  *

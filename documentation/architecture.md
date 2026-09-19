@@ -611,6 +611,28 @@ LZ4 and Zstd parallel encoders share a generic **parallel block** helper in `src
 
 Method-specific logic (per-job allocation, block or frame compression, checksums) remains in `lz4_parallel.c` and `zstd_parallel.c`; the helper only manages context lifecycle, threading, and ordering.
 
+The two methods divide work differently, because their formats do:
+
+| | LZ4 | Zstd |
+|---|---|---|
+| Work unit | one block (`lz4.block_size`) | one job (`zstd.job_size`) |
+| Output | one frame, independent blocks | concatenated independent frames |
+| Same bytes as 1 thread? | **Yes** | No |
+| Requires | `lz4.independent_blocks` (default) | — |
+
+LZ4 can promise byte-identical output because the Block Independence flag
+already guarantees a block is compressed knowing nothing about its
+predecessors, so a worker receives exactly the window the serial encoder
+would have built. A zstd frame carries its own window and cannot be split
+that way, so its parallel mode emits a frame per job instead.
+
+Both encoders hold back at most one job's output when the caller's buffer
+fills mid-result, and neither may collect another result while one is staged
+— doing so overwrites the staged bytes and silently drops them from the
+stream. That was a live defect in both, fixed in `lz4_encoder.c` and
+`zstd_encoder.c`; see `MoreBlocksThanSlotsDoesNotStall` and
+`ASmallOutputBufferDoesNotLoseAJobsOutput`.
+
 ## Bit I/O and Format Differences
 
 Deflate and zstd use separate bit I/O code by design; the duplication is intentional.

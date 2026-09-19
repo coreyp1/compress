@@ -69,7 +69,7 @@ The LZ4 method is a **standalone** compression method (not a wrapper). It implem
 
 LZ4 supports two block modes:
 
-- **Independent blocks** (`lz4.independent_blocks=true`, default): Each block is compressed independently. Back-references cannot cross block boundaries. This mode enables parallel decompression and random access.
+- **Independent blocks** (`lz4.independent_blocks=true`, default): Each block is compressed independently. Back-references cannot cross block boundaries. This is what makes [parallel encoding](#parallel-compression) possible, and it would permit parallel decoding and random access too, though this decoder does neither.
 
 - **Dependent blocks** (`lz4.independent_blocks=false`): Blocks can reference data from previous blocks. Achieves better compression ratio but requires sequential processing.
 
@@ -86,8 +86,9 @@ dependent against independent:
 | all zeros | +0.54% | +0.08% | +0.01% |
 | English-like prose | +0.08% | +0.02% | +0.00% |
 
-Dependent blocks cost 64 KB of encoder memory and rule out the parallel
-encoder, which needs each block to stand alone.
+Dependent blocks cost 64 KB of encoder memory and rule out the
+[parallel encoder](#parallel-compression), which needs each block to stand
+alone; `threads.count` is ignored in that mode.
 
 ## Options
 
@@ -103,6 +104,14 @@ encoder, which needs each block to stand alone.
 | `lz4.content_size` | uint64 | (none) | Content size to write in header (encoder); validated on decode if present |
 | `lz4.dictionary_id` | uint64 | (none) | Dictionary ID to write in header (parsing only, dictionaries not yet supported) |
 | `lz4.concat` | bool | false | Decoder: support concatenated LZ4 frames |
+
+### Threading options
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `threads.count` | uint64 | 1 | Number of worker threads (0 or 1 = single-threaded) |
+
+See [Parallel compression](#parallel-compression) below.
 
 ### Core limit options
 
@@ -387,6 +396,98 @@ being 32 bits.
 The parser returns `GCOMP_ERR_CORRUPT` for a magic number outside the skippable
 range and for a frame cut short of the size it declares, so it is safe to point
 at untrusted bytes.
+
+## Parallel compression
+
+Set `threads.count` above 1 and the encoder compresses blocks on a pool of
+worker threads instead of in the calling thread.
+
+```c
+gcomp_options_t *opts = NULL;
+gcomp_options_create(&opts);
+gcomp_options_set_uint64(opts, "threads.count", 4);
+
+gcomp_encoder_t *enc = NULL;
+gcomp_encoder_create(registry, "lz4", opts, &enc);
+```
+
+### What comes out
+
+**One ordinary LZ4 frame, byte-for-byte identical to what one thread would
+have produced.** This is not an approximation: the same input, block size,
+checksum settings and dictionary give the same output bytes at any thread
+count. Nothing downstream can tell which encoder produced a frame, and
+nothing needs to.
+
+That is possible because the format already has the seam. With the Block
+Independence flag set, each block is compressed knowing nothing about the
+blocks before it, so a worker can be handed exactly the window the serial
+encoder would have handed itself. (Zstd's parallel mode, by contrast,
+produces *concatenated frames*, because a zstd frame cannot be split.)
+
+### What divides the work
+
+One job is one block, so **`lz4.block_size` is also the parallel
+granularity**. There is no LZ4 equivalent of `zstd.job_size`; the frame
+format already names the unit.
+
+That has a practical consequence: an input smaller than a few blocks has
+little to parallelise. 13 MB with the default 4 MB blocks is three blocks,
+so no thread count beats about 3x however many cores are free. The same
+input at 256 KB blocks is 53 blocks and scales further, at a small cost in
+ratio.
+
+Measured on a 12-core machine over 13.8 MB of mixed text (best of seven,
+interleaved):
+
+| Block size | 1 thread | 2 threads | 4 threads | 8 threads |
+|------------|----------|-----------|-----------|-----------|
+| 4 MB   | 547 MB/s | 803 MB/s (1.5x) | 1175 MB/s (2.2x) | 1241 MB/s (2.3x) |
+| 1 MB   | 521 MB/s | 804 MB/s (1.5x) | 1222 MB/s (2.3x) | 1364 MB/s (2.6x) |
+| 256 KB | 532 MB/s | 850 MB/s (1.6x) | 1472 MB/s (2.8x) | 1915 MB/s (3.6x) |
+
+Output size was identical at every thread count in every row.
+
+### When it does not apply
+
+`threads.count > 1` is honoured only with independent blocks. Linked blocks
+(`lz4.independent_blocks=false`) are the format saying block N may reference
+block N-1, and that dependency is exactly what rules out compressing the two
+at once. The combination is not an error and does not change the output; the
+encoder simply compresses in the calling thread.
+
+Because that is easy to arrange by accident — two options that each make
+sense — the encoder reports what it actually did rather than leaving the
+caller to assume:
+
+```c
+uint32_t workers = gcomp_lz4_encoder_worker_count(enc);  /* 1 when inline */
+```
+
+### Memory
+
+Each in-flight block holds its own window, output buffer and match-finder
+table:
+
+```
+  dictionary_size + block_size    (window)
++ block_size + 24                 (framed output)
++ 256 KB                          (hash table)
+```
+
+Up to `threads.count * 2` blocks are in flight at once, and that bound is
+lowered to fit `limits.max_memory_bytes` — so raising the block size costs
+memory rather than breaching the limit. At the default 4 MB block size,
+four threads want roughly 66 MB of in-flight buffers; `limits.max_memory_bytes`
+defaults to 256 MiB, and an encoder that cannot fit even one block in what
+is left of the budget fails at creation with `GCOMP_ERR_MEMORY`.
+
+### Decompression
+
+Decoding is single-threaded regardless of `threads.count`. Independent
+blocks would permit parallel decode, and the flag is preserved in the frame
+so a future decoder could use it, but this one does not.
+
 
 ## Error handling
 

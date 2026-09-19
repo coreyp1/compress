@@ -54,6 +54,12 @@
  *    incremental emission when the output buffer is small. State variables
  *    track progress to resume on subsequent calls.
  *
+ * In parallel mode (see below) steps 1 and 2 move into per-block jobs: input
+ * is collected into a job's window instead of `block_buffer` and a worker
+ * compresses and frames it. Steps 3 and 4 are unchanged, and so is
+ * everything outside the block loop -- the header, the end mark and the
+ * trailer are written here either way.
+ *
  * ## Memory Management
  *
  * The encoder allocates these buffers (tracked via `gcomp_memory_tracker_t`):
@@ -64,6 +70,13 @@
  *   retained prefix, then the block being collected |
  * | compressed_buffer | block_size + overhead | Hold compressed block for
  * output | | hash_table | 64K entries (256KB) | Match finding for LZ77 |
+ *
+ * Parallel mode allocates neither `block_buffer` nor `hash_table`: each
+ * in-flight job carries its own, so the encoder's would never be read. It
+ * keeps `compressed_buffer`, which becomes the place a collected block's
+ * tail waits when the caller's output buffer fills part-way through it, and
+ * adds a copy of the dictionary to seed jobs from. Job buffers are reported
+ * to the same tracker, so the limit covers them too.
  *
  * Total memory is checked against `limits.max_memory_bytes` after allocation.
  *
@@ -85,14 +98,21 @@
  *
  * ## Thread Safety
  *
- * A single encoder instance is NOT thread-safe. Each thread should have
- * its own encoder instance. The encoder itself does not use threading;
- * parallel compression is handled at a higher level via lz4_parallel.c.
+ * A single encoder instance is NOT thread-safe: one encoder belongs to one
+ * thread, and two threads sharing one is a defect whatever the options say.
+ *
+ * `threads.count > 1` is about something else -- it lets *this* encoder hand
+ * whole blocks to a pool of workers, which the LZ4 Frame Format permits
+ * exactly when the Block Independence flag is set.  The caller still drives a
+ * single encoder from a single thread and still gets one frame; only the
+ * block compression happens elsewhere, and the bytes are the same either way.
+ * See lz4_parallel.h.
  *
  * Copyright 2026 by Corey Pennycuff
  */
 
 #include "lz4_internal.h"
+#include "lz4_parallel.h"
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/limits.h>
 #include <ghoti.io/compress/macros.h>
@@ -104,6 +124,9 @@
 //
 // Helper: Read options and configure encoder
 //
+
+/// Defined with the other parallel helpers, below; destroy() is above them.
+static void lz4_encoder_discard_parallel_jobs(lz4_encoder_state_t * state);
 
 /**
  * @brief Retire the block just emitted and prepare the window for the next.
@@ -183,6 +206,7 @@ static gcomp_status_t lz4_encoder_read_options(
   state->dictionary = NULL;
   state->dictionary_size = 0;
   state->max_memory_bytes = LZ4_DEFAULT_MAX_MEMORY_BYTES;
+  state->num_threads = 1;
 
   if (!options) {
     return GCOMP_OK;
@@ -236,6 +260,13 @@ static gcomp_status_t lz4_encoder_read_options(
     state->max_memory_bytes = u64_val;
   }
 
+  // Read threads.count.  Whether it is honoured is decided later, in init:
+  // it takes independent blocks as well, and that is a different option.
+  if (gcomp_options_get_uint64(options, "threads.count", &u64_val) ==
+      GCOMP_OK) {
+    state->num_threads = u64_val > 1 ? (uint32_t)u64_val : 1u;
+  }
+
   return GCOMP_OK;
 }
 
@@ -274,10 +305,6 @@ gcomp_status_t lz4_encoder_init(gcomp_registry_t * registry,
     goto cleanup;
   }
 
-  // Allocate block buffer.  Linked blocks keep LZ4_WINDOW_SIZE bytes of the
-  // preceding frame in front of the block being filled, so a match can reach
-  // back across the block boundary; independent blocks keep nothing and the
-  // buffer is exactly one block, as before.
   // How much of the dictionary we will actually hold, before anything is
   // allocated: only the tail, since the match offset is two bytes.
   const void * dict_data = NULL;
@@ -296,35 +323,138 @@ gcomp_status_t lz4_encoder_init(gcomp_registry_t * registry,
     dict_size = 0;
   }
 
-  // Independent blocks need a window too when there is a dictionary: such a
-  // block may not reference the blocks before it, but it may reference the
-  // dictionary, so the dictionary sits in front of every one of them.
-  state->prefix_capacity = (state->header.block_independence && dict_size == 0)
-      ? 0
-      : LZ4_WINDOW_SIZE;
-  state->prefix_len = 0;
+  // Whether the workers get used at all.
+  //
+  // `threads.count` asks for them.  The LZ4 Frame Format grants them only
+  // when the Block Independence flag is set, because a linked block may
+  // reference the block before it, and that dependency is exactly what makes
+  // compressing the two at the same time impossible.  Linked blocks are not
+  // an error and neither is asking for threads; the two together simply leave
+  // nothing to parallelise, so the encoder compresses in the calling thread
+  // and reports it through gcomp_lz4_encoder_worker_count() rather than
+  // failing a call or quietly leaving the caller to assume.
+  const bool use_parallel =
+      state->num_threads > 1 && state->header.block_independence;
+
   state->dictionary_size = dict_size;
   state->block_buffer_size = state->header.block_max_size;
-  size_t window_bytes = state->block_buffer_size + state->prefix_capacity;
-  state->block_buffer = (uint8_t *)gcomp_malloc(alloc, window_bytes);
-  if (!state->block_buffer) {
-    status = gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
-        "failed to allocate lz4 block buffer (%zu bytes)", window_bytes);
-    goto cleanup;
+  // 64K entries.  In parallel mode this is also every job's table size: the
+  // hash is a function of the table size, so a job with a different one would
+  // find a different set of matches and emit different bytes.
+  state->hash_table_size = 65536;
+
+  if (use_parallel) {
+    // Each in-flight block carries its own window and table, so the encoder's
+    // own would never be read; they are not allocated.  What it does still
+    // need is the dictionary -- to seed every job's window from -- and the
+    // table indexing it produces, worked out once here instead of once per
+    // block.
+    state->prefix_capacity = 0;
+    state->prefix_len = 0;
+    if (dict_size > 0) {
+      state->dictionary = (uint8_t *)gcomp_malloc(alloc, dict_size);
+      if (!state->dictionary) {
+        status = gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
+            "failed to allocate lz4 dictionary copy (%zu bytes)", dict_size);
+        goto cleanup;
+      }
+      gcomp_memory_track_alloc(&state->mem_tracker, dict_size);
+      memcpy(state->dictionary, dict_data, dict_size);
+
+      size_t table_bytes = state->hash_table_size * sizeof(uint32_t);
+      state->dict_hash_table = (uint32_t *)gcomp_malloc(alloc, table_bytes);
+      if (!state->dict_hash_table) {
+        status = gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
+            "failed to allocate lz4 dictionary hash table (%zu bytes)",
+            table_bytes);
+        goto cleanup;
+      }
+      gcomp_memory_track_alloc(&state->mem_tracker, table_bytes);
+      memset(state->dict_hash_table, 0, table_bytes);
+      lz4_block_index_window(state->dictionary, dict_size,
+          state->dict_hash_table, state->hash_table_size);
+    }
   }
-  gcomp_memory_track_alloc(&state->mem_tracker, window_bytes);
-  state->block_buffer_pos = 0;
-  if (dict_size > 0) {
-    // The dictionary lives at the front of the window.  Block data is always
-    // written after prefix_len, so with independent blocks nothing ever
-    // overwrites it and re-seeding is only a matter of re-indexing.  With
-    // linked blocks the window slides and the frame's own output displaces it,
-    // which is what should happen.
-    memcpy(state->block_buffer, dict_data, dict_size);
-    state->prefix_len = dict_size;
+  else {
+    // Allocate block buffer.  Linked blocks keep LZ4_WINDOW_SIZE bytes of the
+    // preceding frame in front of the block being filled, so a match can reach
+    // back across the block boundary; independent blocks keep nothing and the
+    // buffer is exactly one block, as before.
+
+    // Independent blocks need a window too when there is a dictionary: such a
+    // block may not reference the blocks before it, but it may reference the
+    // dictionary, so the dictionary sits in front of every one of them.
+    state->prefix_capacity =
+        (state->header.block_independence && dict_size == 0) ? 0
+                                                             : LZ4_WINDOW_SIZE;
+    state->prefix_len = 0;
+    size_t window_bytes = state->block_buffer_size + state->prefix_capacity;
+    state->block_buffer = (uint8_t *)gcomp_malloc(alloc, window_bytes);
+    if (!state->block_buffer) {
+      status = gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
+          "failed to allocate lz4 block buffer (%zu bytes)", window_bytes);
+      goto cleanup;
+    }
+    gcomp_memory_track_alloc(&state->mem_tracker, window_bytes);
+    state->block_buffer_pos = 0;
+    if (dict_size > 0) {
+      // The dictionary lives at the front of the window.  Block data is always
+      // written after prefix_len, so with independent blocks nothing ever
+      // overwrites it and re-seeding is only a matter of re-indexing.  With
+      // linked blocks the window slides and the frame's own output displaces
+      // it, which is what should happen.
+      memcpy(state->block_buffer, dict_data, dict_size);
+      state->prefix_len = dict_size;
+    }
+
+    // Allocate hash table for compression (64KB entries)
+    state->hash_table = (uint32_t *)gcomp_malloc(
+        alloc, state->hash_table_size * sizeof(uint32_t));
+    if (!state->hash_table) {
+      status = gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
+          "failed to allocate lz4 hash table (%zu bytes)",
+          state->hash_table_size * sizeof(uint32_t));
+      goto cleanup;
+    }
+    gcomp_memory_track_alloc(
+        &state->mem_tracker, state->hash_table_size * sizeof(uint32_t));
+    memset(state->hash_table, 0, state->hash_table_size * sizeof(uint32_t));
+
+    // Make the dictionary findable before the first block is compressed.  The
+    // bytes are already in the window; without this the table is empty and the
+    // first block would match nothing in them.
+    if (state->dictionary_size > 0) {
+      lz4_block_index_window(state->block_buffer, state->dictionary_size,
+          state->hash_table, state->hash_table_size);
+
+      // Keep that table.  Every independent block starts from the dictionary
+      // and nothing else, so this is the table each of them begins with:
+      // lz4_encoder_seed_window() copies it back instead of scanning up to
+      // 64 KB of dictionary again for every block.  liblz4 keeps a preloaded
+      // table for the same reason.
+      state->dict_hash_table = (uint32_t *)gcomp_malloc(
+          alloc, state->hash_table_size * sizeof(uint32_t));
+      if (!state->dict_hash_table) {
+        status = gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
+            "failed to allocate lz4 dictionary hash table (%zu bytes)",
+            state->hash_table_size * sizeof(uint32_t));
+        goto cleanup;
+      }
+      gcomp_memory_track_alloc(
+          &state->mem_tracker, state->hash_table_size * sizeof(uint32_t));
+      memcpy(state->dict_hash_table, state->hash_table,
+          state->hash_table_size * sizeof(uint32_t));
+    }
   }
 
-  // Allocate compressed buffer (block + header + checksum overhead)
+  // Allocate compressed buffer (block + header + checksum overhead).
+  //
+  // In parallel mode this is not where a block is built -- a worker builds it
+  // whole, framed -- but it is still where the tail of one waits when the
+  // caller's output buffer fills part-way through handing it over.  One
+  // block's worth is enough because only one result is ever held back at a
+  // time, and LZ4_PARALLEL_BLOCK_OVERHEAD is this same arithmetic so that a
+  // framed block always fits.
   state->compressed_buffer_size = state->header.block_max_size +
       LZ4_BLOCK_HEADER_SIZE + LZ4_BLOCK_CHECKSUM_SIZE + 16; // Extra for safety
   state->compressed_buffer =
@@ -339,44 +469,34 @@ gcomp_status_t lz4_encoder_init(gcomp_registry_t * registry,
   state->compressed_buffer_pos = 0;
   state->compressed_buffer_len = 0;
 
-  // Allocate hash table for compression (64KB entries)
-  state->hash_table_size = 65536;
-  state->hash_table = (uint32_t *)gcomp_malloc(
-      alloc, state->hash_table_size * sizeof(uint32_t));
-  if (!state->hash_table) {
-    status = gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
-        "failed to allocate lz4 hash table (%zu bytes)",
-        state->hash_table_size * sizeof(uint32_t));
-    goto cleanup;
-  }
-  gcomp_memory_track_alloc(
-      &state->mem_tracker, state->hash_table_size * sizeof(uint32_t));
-  memset(state->hash_table, 0, state->hash_table_size * sizeof(uint32_t));
-
-  // Make the dictionary findable before the first block is compressed.  The
-  // bytes are already in the window; without this the table is empty and the
-  // first block would match nothing in them.
-  if (state->dictionary_size > 0) {
-    lz4_block_index_window(state->block_buffer, state->dictionary_size,
-        state->hash_table, state->hash_table_size);
-
-    // Keep that table.  Every independent block starts from the dictionary
-    // and nothing else, so this is the table each of them begins with:
-    // lz4_encoder_seed_window() copies it back instead of scanning up to
-    // 64 KB of dictionary again for every block.  liblz4 keeps a preloaded
-    // table for the same reason.
-    state->dict_hash_table = (uint32_t *)gcomp_malloc(
-        alloc, state->hash_table_size * sizeof(uint32_t));
-    if (!state->dict_hash_table) {
-      status = gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
-          "failed to allocate lz4 dictionary hash table (%zu bytes)",
-          state->hash_table_size * sizeof(uint32_t));
+  if (use_parallel) {
+    // Created last of the encoder's allocations, so that the in-flight bound
+    // it works out is against what is actually left of the memory budget.
+    lz4_parallel_config_t pconfig = {
+        .num_threads = state->num_threads,
+        .max_in_flight = 0, // Auto
+        .block_max_size = state->header.block_max_size,
+        .block_checksum = state->header.block_checksum,
+        .dictionary = state->dictionary,
+        .dictionary_size = state->dictionary_size,
+        .dict_hash_table = state->dict_hash_table,
+        .hash_table_size = state->hash_table_size,
+        .max_memory_bytes = state->max_memory_bytes,
+        .mem_tracker = &state->mem_tracker,
+        .allocator = alloc,
+    };
+    status = lz4_parallel_create(&pconfig, &state->parallel_ctx);
+    if (status != GCOMP_OK) {
+      gcomp_encoder_set_error(
+          encoder, status, "lz4 parallel context creation failed");
       goto cleanup;
     }
-    gcomp_memory_track_alloc(
-        &state->mem_tracker, state->hash_table_size * sizeof(uint32_t));
-    memcpy(state->dict_hash_table, state->hash_table,
-        state->hash_table_size * sizeof(uint32_t));
+    status = lz4_parallel_alloc_job(state->parallel_ctx, &state->parallel_job);
+    if (status != GCOMP_OK) {
+      gcomp_encoder_set_error(
+          encoder, status, "failed to allocate lz4 parallel job");
+      goto cleanup;
+    }
   }
 
   // Check memory limit through the core helper, which is where "0 means
@@ -442,8 +562,16 @@ gcomp_status_t lz4_encoder_init(gcomp_registry_t * registry,
   return GCOMP_OK;
 
 cleanup:
-  // Single cleanup path for all error cases
+  // Single cleanup path for all error cases.  The job goes back before the
+  // context that allocated it: its buffers are freed through that context.
   if (state) {
+    if (state->parallel_job) {
+      lz4_parallel_free_job(state->parallel_ctx, state->parallel_job);
+    }
+    if (state->parallel_ctx) {
+      lz4_parallel_destroy(state->parallel_ctx);
+    }
+    gcomp_free(alloc, state->dictionary);
     gcomp_free(alloc, state->dict_hash_table);
     gcomp_free(alloc, state->hash_table);
     gcomp_free(alloc, state->compressed_buffer);
@@ -451,6 +579,15 @@ cleanup:
     gcomp_free(alloc, state);
   }
   return status;
+}
+
+uint32_t gcomp_lz4_encoder_worker_count(const gcomp_encoder_t * encoder) {
+  if (!encoder || !encoder->method_state) {
+    return 1;
+  }
+  const lz4_encoder_state_t * state =
+      (const lz4_encoder_state_t *)encoder->method_state;
+  return lz4_parallel_worker_count(state->parallel_ctx);
 }
 
 const gcomp_stepdown_tally_t * gcomp_lz4_encoder_stepdowns(
@@ -469,6 +606,23 @@ void lz4_encoder_destroy(gcomp_encoder_t * encoder) {
 
   lz4_encoder_state_t * state = (lz4_encoder_state_t *)encoder->method_state;
   const gcomp_allocator_t * alloc = state->allocator;
+
+  // Parallel teardown first: destroying the context waits for the workers, so
+  // nothing is still reading a job's buffers by the time they are freed, and
+  // the job in hand is freed through the context that allocated it.
+  if (state->parallel_job) {
+    lz4_parallel_free_job(state->parallel_ctx, state->parallel_job);
+    state->parallel_job = NULL;
+  }
+  lz4_encoder_discard_parallel_jobs(state);
+  if (state->parallel_ctx) {
+    lz4_parallel_destroy(state->parallel_ctx);
+    state->parallel_ctx = NULL;
+  }
+  if (state->dictionary) {
+    gcomp_memory_track_free(&state->mem_tracker, state->dictionary_size);
+    gcomp_free(alloc, state->dictionary);
+  }
 
   if (state->dict_hash_table) {
     gcomp_memory_track_free(
@@ -515,6 +669,407 @@ static bool lz4_emit_staged(
   return state->compressed_buffer_pos >= state->compressed_buffer_len;
 }
 
+//
+// Parallel mode
+//
+// Everything below runs only when state->parallel_ctx is set, which is to say
+// when threads.count asked for workers and the frame's blocks are
+// independent.  The shape follows the zstd encoder's parallel path, because
+// the problem is the same one; what differs is that a job here is a block
+// inside the frame rather than a frame of its own, so the header, the end
+// mark and the content checksum are the serial path's and are untouched.
+
+/**
+ * @brief Hand out whatever of a collected block is still waiting.
+ *
+ * Only one block's tail is ever held back -- see
+ * lz4_encoder_take_parallel_result() -- so this is the whole of the encoder's
+ * staged parallel output.
+ *
+ * @return true once nothing is staged.
+ */
+/**
+ * @brief Is a collected block still part-way through being handed out?
+ *
+ * There is room for exactly one, so this is also the answer to "may another
+ * result be collected" -- collecting a second would write over the first.
+ */
+static bool lz4_encoder_has_staged_output(const lz4_encoder_state_t * state) {
+  return state->compressed_buffer_len > 0;
+}
+
+static bool lz4_encoder_drain_parallel_output(
+    lz4_encoder_state_t * state, gcomp_buffer_t * output) {
+  if (state->compressed_buffer_len == 0) {
+    return true;
+  }
+  if (!lz4_emit_staged(state, output)) {
+    return false;
+  }
+  state->compressed_buffer_len = 0;
+  state->compressed_buffer_pos = 0;
+  return true;
+}
+
+/**
+ * @brief Take one finished block: its bytes to the caller, its job back.
+ *
+ * The job's output buffer already holds the block exactly as the frame wants
+ * it, so this copies and does not encode.  What will not fit in the caller's
+ * buffer is held in compressed_buffer until there is room; because only one
+ * block can be held that way, collecting stops as soon as it happens.
+ *
+ * The job is freed on every path, error included -- it is this function's to
+ * dispose of once it has been handed one.
+ *
+ * @param buffered_out Receives whether a tail was held back.
+ */
+static gcomp_status_t lz4_encoder_take_parallel_result(
+    lz4_encoder_state_t * state, gcomp_buffer_t * output,
+    lz4_parallel_job_t * completed, bool * buffered_out) {
+  *buffered_out = false;
+
+  if (completed->base.status == GCOMP_JOB_ERROR ||
+      completed->base.result != GCOMP_OK) {
+    gcomp_status_t status = completed->base.result;
+    lz4_parallel_free_job(state->parallel_ctx, completed);
+    return status;
+  }
+
+  // What the worker settled for belongs in this encoder's tally, or a block
+  // stored by a worker would be a step-down nothing counted -- which is the
+  // failure mode src/core/stepdown.h exists to prevent.
+  if (completed->stepped_down) {
+    gcomp_stepdown_note(&state->stepdowns, completed->stepdown);
+  }
+
+  const uint8_t * data = completed->base.output;
+  size_t len = completed->base.output_size;
+
+  size_t direct = output->size - output->used;
+  if (direct > len) {
+    direct = len;
+  }
+  if (direct > 0) {
+    memcpy((uint8_t *)output->data + output->used, data, direct);
+    output->used += direct;
+  }
+
+  size_t remaining = len - direct;
+  if (remaining > 0) {
+    if (remaining > state->compressed_buffer_size) {
+      // Cannot happen: the staging buffer is sized from the same block size
+      // and the same overhead the job's output buffer is.  Refuse rather than
+      // overrun if it ever does.
+      lz4_parallel_free_job(state->parallel_ctx, completed);
+      return GCOMP_ERR_INTERNAL;
+    }
+    memcpy(state->compressed_buffer, data + direct, remaining);
+    state->compressed_buffer_pos = 0;
+    state->compressed_buffer_len = remaining;
+    *buffered_out = true;
+  }
+
+  lz4_parallel_free_job(state->parallel_ctx, completed);
+  return GCOMP_OK;
+}
+
+/**
+ * @brief Collect every block that is already finished, waiting for none.
+ */
+static gcomp_status_t lz4_encoder_collect_parallel_results(
+    lz4_encoder_state_t * state, gcomp_buffer_t * output) {
+  // Nothing may be collected while a block is still being handed out: the one
+  // staging buffer would be overwritten and those bytes would simply vanish
+  // from the frame.  The loop below breaks when it stages something, but that
+  // is not enough on its own -- a caller can reach here with a block already
+  // staged, because lz4_encoder_submit_parallel_job() collects one to make
+  // room and then returns to a caller that collects again.  That is exactly
+  // how it happened: two threads, a 1 KB output buffer and 2 MB of input
+  // produced a 713,861-byte frame where the serial encoder produced 840,163,
+  // and the frame still decoded -- to the wrong content.  See
+  // MoreBlocksThanSlotsDoesNotStall.
+  while (!lz4_encoder_has_staged_output(state) &&
+      lz4_parallel_result_ready(state->parallel_ctx)) {
+    lz4_parallel_job_t * completed = NULL;
+    gcomp_status_t status =
+        lz4_parallel_get_result(state->parallel_ctx, &completed);
+    if (status != GCOMP_OK) {
+      if (completed) {
+        lz4_parallel_free_job(state->parallel_ctx, completed);
+      }
+      return status;
+    }
+    bool buffered = false;
+    status =
+        lz4_encoder_take_parallel_result(state, output, completed, &buffered);
+    if (status != GCOMP_OK) {
+      return status;
+    }
+    // Only one block's tail can be held back at a time, so once something is
+    // staged there is nowhere to put the next result.
+    if (buffered) {
+      break;
+    }
+  }
+  return GCOMP_OK;
+}
+
+/**
+ * @brief Collect one block, waiting for it if it is not finished yet.
+ *
+ * Used when the context has no room for another job: the only thing that
+ * frees a slot is taking a result back.
+ */
+static gcomp_status_t lz4_encoder_collect_one_parallel_result(
+    lz4_encoder_state_t * state, gcomp_buffer_t * output) {
+  lz4_parallel_job_t * completed = NULL;
+  gcomp_status_t status =
+      lz4_parallel_get_result(state->parallel_ctx, &completed);
+  if (status != GCOMP_OK) {
+    if (completed) {
+      lz4_parallel_free_job(state->parallel_ctx, completed);
+    }
+    return status;
+  }
+  bool buffered = false;
+  return lz4_encoder_take_parallel_result(state, output, completed, &buffered);
+}
+
+/**
+ * @brief Hand the block being filled to the workers.
+ *
+ * WAITING FOR YOURSELF
+ * ====================
+ *
+ * The context holds at most max_in_flight blocks, and the only thing that
+ * frees a slot is collecting a result.  The thread that collects is this one.
+ * So when the context is full the thing to do is collect, never wait: there
+ * is nobody else to wait for.  The zstd encoder learned this the hard way --
+ * see the note of the same name in zstd_encoder.c, where waiting one level
+ * down deadlocked every stream longer than max_in_flight jobs.
+ *
+ * Collecting needs somewhere to put the result, and only one block's tail can
+ * be held back.  If the caller's buffer is full and a tail is already staged
+ * there is nothing useful to do here: @p submitted_out is set false and the
+ * job stays filled and unsubmitted, to be offered again once the caller has
+ * drained.
+ *
+ * @param submitted_out Receives whether the job was handed over.
+ */
+static gcomp_status_t lz4_encoder_submit_parallel_job(
+    lz4_encoder_state_t * state, gcomp_buffer_t * output,
+    bool * submitted_out) {
+  *submitted_out = false;
+  if (!state->parallel_job) {
+    return GCOMP_ERR_INTERNAL;
+  }
+
+  for (;;) {
+    gcomp_status_t status =
+        lz4_parallel_try_submit(state->parallel_ctx, state->parallel_job);
+    if (status == GCOMP_OK) {
+      break;
+    }
+    if (status != GCOMP_ERR_LIMIT) {
+      return status;
+    }
+    if (lz4_encoder_has_staged_output(state)) {
+      return GCOMP_OK; // Nowhere to put a result; the caller must drain.
+    }
+    status = lz4_encoder_collect_one_parallel_result(state, output);
+    if (status != GCOMP_OK) {
+      return status;
+    }
+  }
+
+  state->parallel_job = NULL; // The context owns it now.
+  *submitted_out = true;
+  return GCOMP_OK;
+}
+
+/**
+ * @brief Throw away every block still in flight, freeing its job.
+ *
+ * For destroy and reset, where the frame is being abandoned rather than
+ * finished.  Waiting first is what makes it safe to free the buffers: a
+ * worker may still be writing into one.  Without this, tearing an encoder
+ * down mid-frame would leak every job the workers had not yet handed back.
+ */
+static void lz4_encoder_discard_parallel_jobs(lz4_encoder_state_t * state) {
+  if (!state->parallel_ctx) {
+    return;
+  }
+  lz4_parallel_wait(state->parallel_ctx);
+  while (lz4_parallel_pending_count(state->parallel_ctx) > 0) {
+    lz4_parallel_job_t * completed = NULL;
+    lz4_parallel_get_result(state->parallel_ctx, &completed);
+    if (!completed) {
+      break;
+    }
+    lz4_parallel_free_job(state->parallel_ctx, completed);
+  }
+}
+
+/**
+ * @brief Fill and submit blocks from the caller's input.
+ *
+ * The content checksum is updated here, on this thread, as bytes are copied
+ * into a job.  It covers the uncompressed content in order, and jobs are
+ * filled in order, so the running hash is the same one the serial path
+ * computes -- which it has to be, because it goes in the frame trailer and a
+ * decoder will check it.
+ */
+static gcomp_status_t lz4_encoder_update_parallel(gcomp_encoder_t * encoder,
+    lz4_encoder_state_t * state, gcomp_buffer_t * input,
+    gcomp_buffer_t * output) {
+  gcomp_status_t status;
+
+  if (!lz4_encoder_drain_parallel_output(state, output)) {
+    return GCOMP_OK; // Need more output space.
+  }
+
+  status = lz4_encoder_collect_parallel_results(state, output);
+  if (status != GCOMP_OK) {
+    return gcomp_encoder_set_error(
+        encoder, status, "lz4 parallel compression failed");
+  }
+
+  if (!lz4_encoder_drain_parallel_output(state, output)) {
+    return GCOMP_OK;
+  }
+
+  const size_t block_size = state->block_buffer_size;
+
+  while (input->used < input->size) {
+    if (!state->parallel_job) {
+      return gcomp_encoder_set_error(
+          encoder, GCOMP_ERR_INTERNAL, "lz4 parallel job missing");
+    }
+
+    size_t job_space = block_size - state->parallel_job->base.input_size;
+    size_t available = input->size - input->used;
+    size_t to_copy = (available < job_space) ? available : job_space;
+
+    if (to_copy > 0) {
+      const uint8_t * in_ptr = (const uint8_t *)input->data + input->used;
+      // Cast away const: the window is the job's own and is mutable while it
+      // is being filled.  It is const in the job because a worker only reads
+      // it, and by then this encoder has let go of it.
+      uint8_t * job_input = (uint8_t *)state->parallel_job->base.input;
+      memcpy(job_input + state->parallel_job->base.input_size, in_ptr,
+          to_copy);
+      state->parallel_job->base.input_size += to_copy;
+      input->used += to_copy;
+      state->total_input_bytes += to_copy;
+
+      if (state->header.content_checksum) {
+        gcomp_xxhash32_update(&state->content_hash, in_ptr, to_copy);
+      }
+    }
+
+    if (state->parallel_job->base.input_size < block_size) {
+      continue; // Block not full yet; more input will finish it.
+    }
+
+    bool submitted = false;
+    status = lz4_encoder_submit_parallel_job(state, output, &submitted);
+    if (status != GCOMP_OK) {
+      return gcomp_encoder_set_error(
+          encoder, status, "lz4 parallel job submit failed");
+    }
+    if (!submitted) {
+      // The workers are full and their results have nowhere to go.  The block
+      // is still here, still full; it goes next time, once the caller has
+      // taken what is already staged.
+      return GCOMP_OK;
+    }
+
+    status = lz4_parallel_alloc_job(state->parallel_ctx, &state->parallel_job);
+    if (status != GCOMP_OK) {
+      return gcomp_encoder_set_error(
+          encoder, status, "failed to allocate lz4 parallel job");
+    }
+
+    status = lz4_encoder_collect_parallel_results(state, output);
+    if (status != GCOMP_OK) {
+      return gcomp_encoder_set_error(
+          encoder, status, "lz4 parallel compression failed");
+    }
+    if (!lz4_encoder_drain_parallel_output(state, output)) {
+      return GCOMP_OK;
+    }
+  }
+
+  return GCOMP_OK;
+}
+
+/**
+ * @brief Get the last block out and every earlier one collected.
+ *
+ * Leaves the encoder at the end mark with blocks_finished set, which is where
+ * the serial path leaves it too, so the rest of finish() is shared.
+ *
+ * @return GCOMP_OK when every block is out, GCOMP_ERR_LIMIT when the caller
+ *         must make room and call finish() again.
+ */
+static gcomp_status_t lz4_encoder_finish_parallel_blocks(
+    gcomp_encoder_t * encoder, lz4_encoder_state_t * state,
+    gcomp_buffer_t * output) {
+  gcomp_status_t status;
+
+  if (!lz4_encoder_drain_parallel_output(state, output)) {
+    return GCOMP_ERR_LIMIT;
+  }
+
+  if (state->parallel_job) {
+    if (state->parallel_job->base.input_size > 0) {
+      bool submitted = false;
+      status = lz4_encoder_submit_parallel_job(state, output, &submitted);
+      if (status != GCOMP_OK) {
+        return gcomp_encoder_set_error(
+            encoder, status, "lz4 parallel job submit failed");
+      }
+      if (!submitted) {
+        // finish() reports completion with GCOMP_OK, and the last block has
+        // not even been handed over, so this must not.
+        return GCOMP_ERR_LIMIT;
+      }
+    }
+    else {
+      // A frame whose length is a multiple of the block size ends with an
+      // empty job in hand.  An empty block is not written: the LZ4 Frame
+      // Format's end mark is a zero block size, so one would end the frame
+      // early.
+      lz4_parallel_free_job(state->parallel_ctx, state->parallel_job);
+      state->parallel_job = NULL;
+    }
+  }
+
+  status = lz4_parallel_wait(state->parallel_ctx);
+  if (status != GCOMP_OK) {
+    return gcomp_encoder_set_error(encoder, status, "lz4 parallel wait failed");
+  }
+
+  status = lz4_encoder_collect_parallel_results(state, output);
+  if (status != GCOMP_OK) {
+    return gcomp_encoder_set_error(
+        encoder, status, "lz4 parallel compression failed");
+  }
+
+  if (!lz4_encoder_drain_parallel_output(state, output)) {
+    return GCOMP_ERR_LIMIT;
+  }
+
+  if (lz4_parallel_pending_count(state->parallel_ctx) > 0) {
+    // Blocks remain, so the frame is not complete; another call will take
+    // them once there is room.
+    return GCOMP_ERR_LIMIT;
+  }
+
+  return GCOMP_OK;
+}
+
 gcomp_status_t lz4_encoder_update(gcomp_encoder_t * encoder,
     gcomp_buffer_t * input, gcomp_buffer_t * output) {
   if (!encoder || !encoder->method_state || !input || !output) {
@@ -549,6 +1104,13 @@ gcomp_status_t lz4_encoder_update(gcomp_encoder_t * encoder,
     if (output->used >= output->size) {
       return GCOMP_OK; // Output full, continue later
     }
+  }
+
+  // Parallel mode fills and submits blocks instead of compressing them here.
+  // Only the block loop differs: the header above and the end mark and
+  // trailer in finish() are the same bytes in the same places.
+  if (state->stage == LZ4_ENC_STAGE_BLOCKS && state->parallel_ctx) {
+    return lz4_encoder_update_parallel(encoder, state, input, output);
   }
 
   // Process input data
@@ -689,8 +1251,17 @@ gcomp_status_t lz4_encoder_finish(
 
   // Flush any remaining buffered data as a final block
   if (state->stage == LZ4_ENC_STAGE_BLOCKS && !state->blocks_finished) {
+    if (state->parallel_ctx) {
+      // Get the last block submitted and every earlier one collected.  This
+      // is the only part of finish() that differs; what follows is shared.
+      gcomp_status_t parallel_status =
+          lz4_encoder_finish_parallel_blocks(encoder, state, output);
+      if (parallel_status != GCOMP_OK) {
+        return parallel_status;
+      }
+    }
     // Check if we have compressed data still being output
-    if (state->compressed_buffer_len > 0) {
+    else if (state->compressed_buffer_len > 0) {
       // Continue outputting previously compressed block
       lz4_emit_staged(state, output);
       if (state->compressed_buffer_pos < state->compressed_buffer_len) {
@@ -824,10 +1395,32 @@ gcomp_status_t lz4_encoder_reset(gcomp_encoder_t * encoder) {
   state->finish_called = false;
   state->blocks_finished = false;
 
-  // Clear the hash table and put the window back where a new frame starts:
-  // at the dictionary, or at nothing.  The two must move together -- an entry
-  // and the byte it names are only meaningful as a pair.
-  lz4_encoder_seed_window(state);
+  if (state->parallel_ctx) {
+    // Abandon whatever the workers still hold: reset starts a new frame, and
+    // blocks of the old one have nowhere to go.  They have to be drained
+    // before the context can be reset, and waited for before their buffers
+    // can be freed.
+    if (state->parallel_job) {
+      lz4_parallel_free_job(state->parallel_ctx, state->parallel_job);
+      state->parallel_job = NULL;
+    }
+    lz4_encoder_discard_parallel_jobs(state);
+
+    gcomp_status_t status = lz4_parallel_reset(state->parallel_ctx);
+    if (status != GCOMP_OK) {
+      return status;
+    }
+    status = lz4_parallel_alloc_job(state->parallel_ctx, &state->parallel_job);
+    if (status != GCOMP_OK) {
+      return status;
+    }
+  }
+  else {
+    // Clear the hash table and put the window back where a new frame starts:
+    // at the dictionary, or at nothing.  The two must move together -- an
+    // entry and the byte it names are only meaningful as a pair.
+    lz4_encoder_seed_window(state);
+  }
 
   // Reset content checksum
   if (state->header.content_checksum) {

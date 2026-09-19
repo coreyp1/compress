@@ -221,6 +221,20 @@ static const gcomp_option_schema_t g_lz4_option_schemas[] = {
         0,                                         // max_uint
         "Maximum output/input ratio (decompression bomb protection)", // help
     },
+    // threads.count - Number of worker threads for parallel compression
+    {
+        "threads.count",                                       // key
+        GCOMP_OPT_UINT64,                                      // type
+        1,                                                     // has_default
+        {.ui64 = 1},                                           // default_value
+        1,                                                     // has_min
+        0,                                                     // has_max
+        0,                                                     // min_int
+        0,                                                     // max_int
+        0,                                                     // min_uint
+        0,                                                     // max_uint
+        "Number of worker threads (0 or 1 = single-threaded)", // help
+    },
 };
 
 static const char * const g_lz4_option_keys[] = {
@@ -236,6 +250,7 @@ static const char * const g_lz4_option_keys[] = {
     "limits.max_block_bytes",
     "limits.max_memory_bytes",
     "limits.max_expansion_ratio",
+    "threads.count",
 };
 
 static const gcomp_method_schema_t g_lz4_schema = {

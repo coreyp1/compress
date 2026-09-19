@@ -317,6 +317,7 @@ Methods may define additional threading-related options beyond `threads.count`:
 | Option | Used By | Description |
 |--------|---------|-------------|
 | `zstd.job_size` | Zstd | Size of each parallel compression job |
+| `lz4.block_size` | LZ4 | Block size, which is also LZ4's parallel job size |
 
 ## Existing Implementations
 
@@ -326,7 +327,9 @@ The Zstd encoder implements parallel compression using the core thread pool and 
 
 - **Location**: `src/methods/zstd/zstd_parallel.c`
 - **Options**: `threads.count`, `zstd.job_size`
-- **Output format**: Concatenated independent frames
+- **Output format**: Concatenated independent frames (so, unlike LZ4, not
+  byte-identical to single-threaded output — a zstd frame carries its window
+  and cannot be split)
 
 See [Zstd Module Documentation](modules/zstd.md#parallel-compression) for details.
 
@@ -336,7 +339,17 @@ The LZ4 encoder also supports parallel compression:
 
 - **Location**: `src/methods/lz4/lz4_parallel.c`
 - **Options**: `threads.count`, `lz4.block_size`
-- **Output format**: LZ4 framed stream with independent blocks
+- **Work unit**: one block, so `lz4.block_size` is also the parallel
+  granularity — there is no LZ4 equivalent of `zstd.job_size`
+- **Output format**: one ordinary LZ4 frame with independent blocks,
+  **byte-for-byte identical to single-threaded output**
+- **Requires** `lz4.independent_blocks` (the default). With linked blocks a
+  block may reference the one before it, so there is nothing to parallelise;
+  the encoder compresses inline and reports it through
+  `gcomp_lz4_encoder_worker_count()`.
+
+See [LZ4 Module Documentation](modules/lz4.md#parallel-compression) for
+details and measurements.
 
 ## Future Considerations
 

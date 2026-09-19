@@ -213,6 +213,14 @@ typedef struct {
 // Encoder State Structure
 //
 
+/**
+ * Parallel encoding types, declared here so the encoder state can hold
+ * pointers to them without pulling lz4_parallel.h into every translation
+ * unit that only needs the state.  See lz4_parallel.h for what they are.
+ */
+typedef struct lz4_parallel_ctx_s lz4_parallel_ctx_t;
+typedef struct lz4_parallel_job_s lz4_parallel_job_t;
+
 typedef struct {
   // Allocator for memory management
   const gcomp_allocator_t * allocator;
@@ -285,6 +293,25 @@ typedef struct {
    * src/core/stepdown.h.
    */
   gcomp_stepdown_tally_t stepdowns;
+
+  /**
+   * @name Parallel encoding
+   *
+   * Set up only when `threads.count > 1` and blocks are independent; see
+   * lz4_parallel.h.  When @ref parallel_ctx is NULL the encoder compresses in
+   * the calling thread and none of the rest of this group is used -- that is
+   * the single test the update and finish paths branch on.
+   *
+   * In parallel mode a job's buffers replace @ref block_buffer and
+   * @ref hash_table, which are not allocated at all; @ref compressed_buffer
+   * survives as the place a collected block's tail waits when the caller's
+   * output buffer filled part-way through it.
+   * @{
+   */
+  uint32_t num_threads;              ///< `threads.count`, as asked for
+  lz4_parallel_ctx_t * parallel_ctx; ///< NULL when compressing inline
+  lz4_parallel_job_t * parallel_job; ///< The block currently being filled
+  /** @} */
 
   // Finish state
   bool finish_called;   ///< finish() has been called
@@ -616,6 +643,18 @@ gcomp_status_t lz4_block_decompress(const uint8_t * input, size_t input_len,
  * @param encoder Encoder to read; NULL returns NULL.
  * @return The tally, owned by the encoder, or NULL if there is no state.
  */
+/**
+ * @brief How many threads this encoder is actually compressing blocks with.
+ *
+ * 1 when compressing inline, whether because `threads.count` said so or
+ * because the frame uses linked blocks and parallelism is not available.
+ * Read by tests, and by anyone who would rather check than assume.
+ *
+ * @param encoder Encoder to ask; NULL reads as 1.
+ * @return Worker thread count.
+ */
+uint32_t gcomp_lz4_encoder_worker_count(const gcomp_encoder_t * encoder);
+
 const gcomp_stepdown_tally_t * gcomp_lz4_encoder_stepdowns(
     const gcomp_encoder_t * encoder);
 
