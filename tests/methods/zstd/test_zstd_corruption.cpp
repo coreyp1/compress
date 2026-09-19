@@ -607,3 +607,85 @@ int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
+
+/**
+ * A Compressed_Literals_Block whose Compressed_Size disagrees with the block.
+ *
+ * RFC 8878 section 3.1.1.3.1.1: Compressed_Size covers everything after the
+ * Literals_Section_Header -- the Huffman tree description plus the stream or
+ * streams -- so it can be neither larger than what is left of the block nor
+ * smaller than the tree description it contains.  It is a field of the input,
+ * and the decoder took it on trust: the tree reader was bounded by the rest of
+ * the block instead of by Compressed_Size, and the stream length was then
+ * computed as Compressed_Size - tree_size.  When the tree description outran
+ * Compressed_Size that subtraction went negative and wrapped to a size_t near
+ * SIZE_MAX, which the backward Huffman reader used as a length -- indexing its
+ * "last" byte from well before the buffer.
+ *
+ * Both frames are hand-built, because our encoder never emits an inconsistent
+ * Compressed_Size.
+ *
+ * A plain build cannot tell the two versions apart: the read lands on whatever
+ * precedes the allocation, decoding fails a few steps later for an unrelated
+ * reason, and GCOMP_ERR_CORRUPT comes back either way -- which is why the
+ * fuzzer needed a sanitizer to see this at all.  So this test asserts the
+ * behaviour (an inconsistent Compressed_Size is refused) and pins the shape of
+ * an input that reaches the arithmetic; the memory error itself is caught by
+ * the sanitizer builds over the zstd-literals-compressed-size inputs in
+ * fuzz/regression.  See CONVENTIONS section 7.
+ */
+TEST_F(ZstdCorruptionTest, LiteralsCompressedSizeInconsistentWithBlockIsRefused) {
+  // A Compressed_Literals_Block, Size_Format 0: a three byte header holding a
+  // 10 bit Regenerated_Size and a 10 bit Compressed_Size, followed by the
+  // Huffman tree description and the stream.
+  auto build = [](uint32_t regenerated_size, uint32_t compressed_size,
+                   const std::vector<uint8_t> & literals_body) {
+    uint32_t lsh = 2u        // Compressed_Literals_Block
+        | (0u << 2)          // Size_Format 0: single stream, 10 bit sizes
+        | ((regenerated_size & 0x3FFu) << 4)
+        | ((compressed_size & 0x3FFu) << 14);
+
+    std::vector<uint8_t> block = {(uint8_t)(lsh & 0xFF),
+        (uint8_t)((lsh >> 8) & 0xFF), (uint8_t)((lsh >> 16) & 0xFF)};
+    block.insert(block.end(), literals_body.begin(), literals_body.end());
+
+    uint32_t bh = 1u          // Last_Block
+        | (2u << 1)           // Compressed_Block
+        | ((uint32_t)block.size() << 3);
+
+    std::vector<uint8_t> frame = {0x28, 0xb5, 0x2f, 0xfd,
+        0x00, // Frame_Header_Descriptor: no content size, not single segment
+        0x00, // Window_Descriptor: Window_Log 10
+        (uint8_t)(bh & 0xFF), (uint8_t)((bh >> 8) & 0xFF),
+        (uint8_t)((bh >> 16) & 0xFF)};
+    frame.insert(frame.end(), block.begin(), block.end());
+    return frame;
+  };
+
+  // 0x80 is a directly encoded tree description: a header byte of 128 or more
+  // means Number_Of_Symbols = byte - 127, here one, carried in the nibbles of
+  // the byte that follows.  The description is therefore two bytes long.
+  const std::vector<uint8_t> tree = {0x80, 0x10};
+
+  struct Case {
+    const char * name;
+    std::vector<uint8_t> frame;
+  };
+  const std::vector<Case> cases = {
+      // Compressed_Size is one byte, smaller than the two byte tree
+      // description inside it.  This is the frame shape the fuzzer found:
+      // without the fix, UBSan reports the pointer overflow in
+      // zstd_huf_rev_reader_init before anything else happens.
+      {"compressed size smaller than its own tree description",
+          build(4, 1, tree)},
+
+      // Compressed_Size names 500 bytes where two are present.  Refused by the
+      // bound against the rest of the block.
+      {"compressed size past the end of the block", build(4, 500, tree)},
+  };
+
+  for (const auto & c : cases) {
+    EXPECT_EQ(tryDecode(c.frame.data(), c.frame.size()), GCOMP_ERR_CORRUPT)
+        << c.name;
+  }
+}

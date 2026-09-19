@@ -459,6 +459,15 @@ static gcomp_status_t zstd_huf_read_weights_fse(const uint8_t * src,
   }
 
   // Initialize bit reader for the FSE bitstream (after the table header)
+  //
+  // RFC 8878 section 4.2.1.2: the distribution table header and the bitstream
+  // that follows it together occupy exactly compressed_size bytes, so the
+  // header cannot be the longer of the two.  Subtracting without checking
+  // would wrap to a size near SIZE_MAX rather than reporting corruption.
+  if (fse_header_size > compressed_size) {
+    return GCOMP_ERR_CORRUPT;
+  }
+
   const uint8_t * bitstream = src + fse_header_size;
   size_t bitstream_size = compressed_size - fse_header_size;
 

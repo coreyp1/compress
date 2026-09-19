@@ -271,6 +271,22 @@ gcomp_status_t zstd_literals_decode(zstd_decoder_state_t * state,
   const uint8_t * literals_data = src + header_size;
   size_t literals_data_size = src_size - header_size;
 
+  // RFC 8878 section 3.1.1.3.1.1: for a Compressed_Literals_Block or a
+  // Treeless_Literals_Block the header carries Compressed_Size, the length of
+  // everything that follows the header -- the Huffman tree description, when
+  // present, plus the stream or streams.  It is a field of the input, so it
+  // can name more bytes than the block actually holds.
+  //
+  // Nothing below validated it.  Every later size was derived from it by
+  // subtraction, so an oversized value either ran the Huffman reader off the
+  // end of the block or, where the subtraction went negative, wrapped to a
+  // size_t near SIZE_MAX that the reader then indexed from.
+  if ((header.type == LITERALS_TYPE_COMPRESSED ||
+          header.type == LITERALS_TYPE_TREELESS) &&
+      header.compressed_size > literals_data_size) {
+    return GCOMP_ERR_CORRUPT;
+  }
+
   switch (header.type) {
   case LITERALS_TYPE_RAW:
     // Raw literals: copy directly
@@ -311,10 +327,21 @@ gcomp_status_t zstd_literals_decode(zstd_decoder_state_t * state,
             &state->mem_tracker, HUF_MAX_TABLE_SIZE * sizeof(zstd_huf_entry_t));
       }
 
-      status = zstd_huf_read_table(literals_data, literals_data_size,
+      // The tree description lives inside Compressed_Size, so that -- not the
+      // rest of the block -- is the bound the reader is given.  Passing the
+      // larger literals_data_size let a truncated description keep reading
+      // into the sequences section that follows.
+      status = zstd_huf_read_table(literals_data, header.compressed_size,
           state->huf_table, state->huf_table_size, &max_bits, &huf_header_size);
       if (status != GCOMP_OK) {
         return status;
+      }
+
+      // zstd_huf_read_table stops at the end of the description, which by the
+      // line above cannot exceed Compressed_Size; the check is kept so the
+      // subtraction can never wrap if that ever stops being true.
+      if (huf_header_size > header.compressed_size) {
+        return GCOMP_ERR_CORRUPT;
       }
 
       state->huf_table_valid = true;
