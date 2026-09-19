@@ -388,6 +388,19 @@ protected:
 // Verifies our compressed output can be decompressed by Python zlib
 //
 
+TEST_F(OracleTest, OracleIsActuallyAvailable) {
+  // A skipped oracle test and an absent one look identical in the summary
+  // line. If no oracle at all can run, say so as a failure rather than
+  // reporting a green suite that checked nothing against a reference.
+  //
+  // Every test in this file compares against Python's zlib; the gzip CLI is
+  // reported by SetUp but gates nothing here.
+  ASSERT_TRUE(has_python_zlib_)
+      << "python3 with the zlib module was not found, so nothing in this file "
+         "compares our output against a reference implementation. Install it, "
+         "or set GCOMP_SKIP_ORACLE_TESTS=1 to say the gap is intentional.";
+}
+
 TEST_F(OracleTest, OurEncoder_PythonDecoder_TextData) {
   if (!has_python_zlib_) {
     GTEST_SKIP() << "Python zlib not available";

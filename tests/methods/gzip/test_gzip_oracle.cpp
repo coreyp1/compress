@@ -417,6 +417,26 @@ protected:
 // Tests: Golden vectors (pre-generated external gzip data)
 //
 
+TEST_F(GzipOracleTest, OracleIsActuallyAvailable) {
+  // A skipped oracle test and an absent one look identical in the summary
+  // line. If no oracle at all can run, say so as a failure rather than
+  // reporting a green suite that checked nothing against a reference.
+  //
+  // Three references gate tests here and they can go missing independently,
+  // so each is reported rather than stopping at the first.
+  EXPECT_TRUE(has_python_gzip_)
+      << "python3 with the gzip module was not found; the tests that read our "
+         "output with it, and write input for us with it, are all skipped.";
+  EXPECT_TRUE(has_gzip_cli_)
+      << "the gzip CLI was not found; nothing checks that the system gzip can "
+         "read what we write.";
+  EXPECT_TRUE(has_gunzip_cli_)
+      << "the gunzip CLI was not found; nothing checks that we can read what "
+         "the system gzip writes.\n"
+         "Install what is missing, or set GCOMP_SKIP_ORACLE_TESTS=1 to say the "
+         "gap is intentional.";
+}
+
 TEST_F(GzipOracleTest, GoldenVectors_Decompress) {
   for (size_t i = 0; i < g_gzip_golden_vectors_count; i++) {
     const auto & vec = g_gzip_golden_vectors[i];

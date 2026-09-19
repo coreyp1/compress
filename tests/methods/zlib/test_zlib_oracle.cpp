@@ -227,6 +227,27 @@ protected:
 };
 
 /// zlib must be able to read everything we write, at every level.
+TEST_F(ZlibOracleTest, OracleIsActuallyAvailable) {
+  // This fixture has no SetUp() skip: the switch is folded into
+  // HasPythonZlib(), which reports "not available" for a run that asked for no
+  // oracle tests. That is indistinguishable from a missing python3 here, so
+  // the switch is read directly.
+  if (const char * skip = std::getenv("GCOMP_SKIP_ORACLE_TESTS")) {
+    if (skip[0] == '1') {
+      GTEST_SKIP() << "Oracle tests disabled via GCOMP_SKIP_ORACLE_TESTS";
+    }
+  }
+
+  // A skipped oracle test and an absent one look identical in the summary
+  // line. If no oracle at all can run, say so as a failure rather than
+  // reporting a green suite that checked nothing against a reference.
+  ASSERT_TRUE(available_)
+      << "python3 with the zlib module was not found, so nothing in this file "
+         "compares our RFC 1950 output against a reference implementation. "
+         "Install it, or set GCOMP_SKIP_ORACLE_TESTS=1 to say the gap is "
+         "intentional.";
+}
+
 TEST_F(ZlibOracleTest, ZlibReadsWhatWeWrite) {
   if (!available_) {
     GTEST_SKIP() << "Python zlib not available";
