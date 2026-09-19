@@ -343,18 +343,6 @@ void gzip_write_trailer(uint32_t crc32, uint32_t isize, uint8_t * buf);
 void gzip_header_info_free(
     gzip_header_info_t * info, const gcomp_allocator_t * allocator);
 
-/**
- * @brief Extract options to pass through to the inner deflate encoder/decoder.
- *
- * Creates a clone of the source options for pass-through to deflate. The
- * deflate method will ignore unknown keys via its schema validation.
- *
- * @param src Source options (may be NULL)
- * @param dst_out Receives cloned options (set to NULL if src is NULL)
- * @return GCOMP_OK on success
- */
-gcomp_status_t gzip_extract_passthrough_options(gcomp_registry_t * registry,
-    const gcomp_options_t * src, gcomp_options_t ** dst_out);
 
 #ifdef __cplusplus
 }

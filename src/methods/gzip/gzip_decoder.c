@@ -57,6 +57,8 @@
 #include "../../core/registry_internal.h"
 #include "../deflate/deflate_internal.h"
 #include "gzip_internal.h"
+
+#include "../../core/wrapper_options.h"
 #include <ghoti.io/compress/crc32.h>
 #include <ghoti.io/compress/limits.h>
 #include <ghoti.io/compress/macros.h>
@@ -196,7 +198,8 @@ gcomp_status_t gzip_decoder_init(gcomp_registry_t * registry,
   }
 
   // Extract pass-through options for deflate
-  status = gzip_extract_passthrough_options(registry, options, &deflate_options);
+  status = gcomp_clone_options_for_method(
+      registry, "deflate", options, &deflate_options);
   if (status != GCOMP_OK) {
     goto cleanup;
   }

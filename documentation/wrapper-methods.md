@@ -6,11 +6,11 @@ This document describes the pattern for implementing wrapper compression methods
 
 Wrapper methods extend a base compression method (like deflate) with additional format features:
 
-| Wrapper | Wraps | Adds |
-|---------|-------|------|
-| gzip | deflate | 10-byte header, CRC32, file size |
-| zlib | deflate | 2-byte header, Adler-32 checksum |
-| zip | deflate | File metadata, directory structure |
+| Wrapper | Wraps | Adds | Status |
+|---------|-------|------|--------|
+| gzip | deflate | 10-byte header, CRC32, file size | implemented, see [modules/gzip.md](modules/gzip.md) |
+| zlib | deflate | 2-byte header, Adler-32 checksum | implemented, see [modules/zlib.md](modules/zlib.md) |
+| zip | deflate | File metadata, directory structure | not implemented |
 
 The wrapper method pattern allows these formats to:
 - Reuse the proven deflate encoder/decoder

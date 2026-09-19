@@ -123,7 +123,7 @@ The following are used only inside the library and are **not** part of the publi
 
 ### Method Layer
 
-Each compression method (deflate, gzip, LZ4, LZW, RLE, zstd) implements the `gcomp_method_t` interface:
+Each compression method (deflate, gzip, zlib, LZ4, LZW, RLE, zstd) implements the `gcomp_method_t` interface:
 
 ```c
 struct gcomp_method_s {
@@ -531,7 +531,9 @@ compress/
 │   │   ├── parallel_block.c      # Shared block-parallel driver (LZ4, zstd)
 │   │   ├── huffman_lengths.c     # Length-limited code lengths by
 │   │   │                         #   boundary package-merge (deflate, zstd)
+│   │   ├── wrapper_options.c     # Option cloning for wrappers (gzip, zlib)
 │   │   ├── crc32.c               # CRC-32 (gzip)
+│   │   ├── adler32.c             # Adler-32 (zlib, and so PNG)
 │   │   ├── xxhash32.c            # XXH32 (LZ4)
 │   │   ├── xxhash64.c            # XXH64 (zstd)
 │   │   ├── bitcost.h             # Fixed-point log2 and symbol pricing
@@ -578,6 +580,11 @@ compress/
 │       │   ├── rle_profile.c     # PackBits and TGA token grammars
 │       │   ├── rle_internal.h    # Shared state and phases
 │       │   └── rle_register.c    # Vtable and registration
+│       ├── zlib/
+│       │   ├── zlib_encoder.c    # RFC 1950 wrapper encoder
+│       │   ├── zlib_decoder.c    # RFC 1950 wrapper decoder
+│       │   ├── zlib_format.c     # CMF/FLG build and validation
+│       │   └── zlib_register.c   # Vtable and registration
 │       └── zstd/
 │           ├── zstd_encoder.c    # Zstd frame encoder
 │           ├── zstd_decoder.c    # Zstd frame decoder
@@ -610,6 +617,32 @@ LZ4 and Zstd parallel encoders share a generic **parallel block** helper in `src
 - **Submit / get_result:** Methods submit an opaque job (whose first member is `gcomp_block_job_t`) and a process callback; they retrieve the next completed job in order.
 
 Method-specific logic (per-job allocation, block or frame compression, checksums) remains in `lz4_parallel.c` and `zstd_parallel.c`; the helper only manages context lifecycle, threading, and ordering.
+
+## Wrapper Methods
+
+`gzip` and `zlib` are the same shape: a header, an inner deflate stream, and a
+checksum trailer over the *uncompressed* data. Neither compresses anything
+itself; each owns a `gcomp_encoder_t` for "deflate" and frames what it
+produces.
+
+| | gzip (RFC 1952) | zlib (RFC 1950) |
+|---|---|---|
+| Header | 10 bytes plus optional name, comment, extra | 2 bytes |
+| Checksum | CRC-32, little-endian | Adler-32, **big-endian** |
+| Overhead | 18+ bytes | 6 bytes |
+| Concatenation | Supported (`gzip.concat`) | Not a thing the format does |
+
+Both decide what of the caller's options the inner deflate should see through
+`gcomp_clone_options_for_method()` in `src/core/wrapper_options.c`. The inner
+method's own schema is the authority: deflate's policy is
+`GCOMP_UNKNOWN_KEY_ERROR`, so passing it a `gzip.name` or a `zlib.dictionary`
+would fail the call, and a hand-written list of what to pass would be a second
+copy of deflate's schema kept up to date by hope.
+
+Neither container records the length of the deflate stream, so both find its
+end the same way: by asking the inner decoder, whose `finish()` reports
+`GCOMP_OK` exactly when it has seen the final block and which leaves the
+trailer bytes unconsumed.
 
 The two methods divide work differently, because their formats do:
 
