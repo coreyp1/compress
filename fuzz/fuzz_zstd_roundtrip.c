@@ -194,6 +194,23 @@ int main(GCOMP_MAYBE_UNUSED(int argc), GCOMP_MAYBE_UNUSED(char ** argv)) {
     return 0;
   }
 
+  // What the decoder is told, for every configuration below.
+  //
+  // Without it the decode runs under the default limits.max_expansion_ratio of
+  // 1000:1 and refuses the encoder's own output for anything that compresses
+  // harder than that - two of the 1,780 tracked regression inputs do, at
+  // 1179:1 and 1429:1. A roundtrip harness is asking whether the pair agrees
+  // with itself, and a ratio guard aimed at hostile input is not part of that
+  // question. The output buffer is the bound that matters here and it is
+  // already fixed.
+  gcomp_options_t * dec_opts = NULL;
+  gcomp_options_create(&dec_opts);
+  if (dec_opts) {
+    gcomp_options_set_uint64(dec_opts, "limits.max_expansion_ratio", 0);
+    gcomp_options_set_uint64(dec_opts, "limits.max_output_bytes",
+        (uint64_t)DECOMPRESSED_BUFFER_SIZE);
+  }
+
   // Test basic roundtrip (level 3, no checksum)
   {
     gcomp_options_t * opts = NULL;
@@ -202,7 +219,7 @@ int main(GCOMP_MAYBE_UNUSED(int argc), GCOMP_MAYBE_UNUSED(char ** argv)) {
       gcomp_options_set_int64(opts, "zstd.level", 3);
       gcomp_options_set_uint64(opts, "zstd.window_log", 14);
     }
-    test_roundtrip(input, input_size, compressed, decompressed, opts, NULL);
+    test_roundtrip(input, input_size, compressed, decompressed, opts, dec_opts);
     if (opts)
       gcomp_options_destroy(opts);
   }
@@ -216,7 +233,7 @@ int main(GCOMP_MAYBE_UNUSED(int argc), GCOMP_MAYBE_UNUSED(char ** argv)) {
       gcomp_options_set_int64(opts, "zstd.level", 3);
       gcomp_options_set_uint64(opts, "zstd.window_log", 14);
     }
-    test_roundtrip(input, input_size, compressed, decompressed, opts, NULL);
+    test_roundtrip(input, input_size, compressed, decompressed, opts, dec_opts);
     if (opts)
       gcomp_options_destroy(opts);
   }
@@ -229,7 +246,7 @@ int main(GCOMP_MAYBE_UNUSED(int argc), GCOMP_MAYBE_UNUSED(char ** argv)) {
       gcomp_options_set_int64(opts, "zstd.level", 9);
       gcomp_options_set_uint64(opts, "zstd.window_log", 16);
     }
-    test_roundtrip(input, input_size, compressed, decompressed, opts, NULL);
+    test_roundtrip(input, input_size, compressed, decompressed, opts, dec_opts);
     if (opts)
       gcomp_options_destroy(opts);
   }
@@ -243,11 +260,14 @@ int main(GCOMP_MAYBE_UNUSED(int argc), GCOMP_MAYBE_UNUSED(char ** argv)) {
       gcomp_options_set_uint64(opts, "zstd.window_log", 14);
       gcomp_options_set_uint64(opts, "zstd.content_size", input_size);
     }
-    test_roundtrip(input, input_size, compressed, decompressed, opts, NULL);
+    test_roundtrip(input, input_size, compressed, decompressed, opts, dec_opts);
     if (opts)
       gcomp_options_destroy(opts);
   }
 
+  if (dec_opts) {
+    gcomp_options_destroy(dec_opts);
+  }
   free(decompressed);
   free(compressed);
   free(input);

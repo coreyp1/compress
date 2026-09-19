@@ -74,6 +74,12 @@ static void make_roundtrip_opts(gcomp_options_t ** enc_opts_out,
   gcomp_options_create(&dec_opts);
   if (dec_opts) {
     gcomp_options_set_string(dec_opts, "lzw.format", format);
+    // The code width is not carried in the stream, so a decoder that is not
+    // told it assumes 12 and reads a 9-, 10- or 11-bit stream as corrupt.
+    // Leaving it off made this harness abort on the library's own output for
+    // every input whose first byte was a multiple of four - fifteen of the
+    // 1,780 tracked regression inputs, none of them a defect in the library.
+    gcomp_options_set_uint64(dec_opts, "lzw.max_code_bits", max_code_bits);
     gcomp_options_set_uint64(
         dec_opts, "limits.max_output_bytes", (uint64_t)DECOMPRESS_BUFFER_SIZE);
     gcomp_options_set_uint64(dec_opts, "limits.max_expansion_ratio", 0);

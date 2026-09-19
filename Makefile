@@ -540,10 +540,24 @@ $(APP_DIR)/fuzz/generate_corpus$(EXE_EXTENSION): fuzz/generate_corpus.c \
 		$(CUTIL_LIBS) -lm -lpthread -Wl,-rpath,$(PREFIX)/lib/$(SUITE)
 
 # Pattern rule for fuzz executables (linked against AFL-instrumented library)
+#
+# --whole-archive for the same reason the test binaries use it, one line 300
+# above: a method registers itself from a constructor, nothing references that
+# object, and a static link drops it. Without it the registry comes up empty,
+# every gcomp_decoder_create() fails with an unknown method, and the harness
+# returns having done nothing.
+#
+# That is not a theory about what could go wrong. afl-showmap on the harness as
+# it was linked reports the same 73 edges for a valid zstd frame and for 200
+# bytes of /dev/urandom, because neither reaches a decoder; with the archive
+# linked whole it is 340 against 175. Thirteen million executions were spent
+# fuzzing read_stdin().
 $(APP_DIR)/fuzz/%$(EXE_EXTENSION): fuzz/%.c $(APP_DIR)/$(AFL_STATIC_TARGET)
 	@printf "\n### Compiling Fuzz Harness: $* ###\n"
 	@mkdir -p $(@D)
-	$(AFL_CC) $(AFL_CFLAGS) $(AFL_LDFLAGS) -o $@ $< $(APP_DIR)/$(AFL_STATIC_TARGET) $(CUTIL_LIBS) -lm
+	$(AFL_CC) $(AFL_CFLAGS) $(AFL_LDFLAGS) -o $@ $< \
+		-Wl,--whole-archive $(APP_DIR)/$(AFL_STATIC_TARGET) -Wl,--no-whole-archive \
+		$(CUTIL_LIBS) -lm -lpthread
 
 ####################################################################
 # Commands
