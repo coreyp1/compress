@@ -245,6 +245,7 @@ typedef struct {
   unsigned use_opt;              ///< Non-zero when this level parses optimally.
   uint32_t opt_segment;          ///< Positions one sweep covers.
   uint32_t opt_budget;           ///< Shortened matches one position may try.
+  unsigned opt_two_pass;         ///< Parse each sweep twice (levels 20 and up).
 
   /**
    * @brief The last position put into the tree, plus one; 0 before any.

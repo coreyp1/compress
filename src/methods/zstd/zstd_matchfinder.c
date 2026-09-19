@@ -183,6 +183,7 @@ typedef struct {
   unsigned use_opt;      ///< Parse by shortest path rather than greedily.
   uint32_t opt_segment;  ///< Positions one shortest-path sweep covers.
   uint32_t opt_budget;   ///< Shortened matches one position may try.
+  unsigned two_pass;     ///< Parse each sweep twice; see zstd_optimal.c.
 } zstd_effort_t;
 
 /// Indexed by compression level; entry 0 is unused (level 0 means "default").
@@ -262,29 +263,29 @@ typedef struct {
 // 4096 took the output from 1,602,010 bytes to 1,527,249, while depth beyond
 // about 24 was worth almost nothing.
 static const zstd_effort_t k_zstd_effort[23] = {
-    {0, 0, 0, 0, 0, 0, 0, 0},              // 0: unused
-    {4, 0, 128, 14, 0, 0, 0, 0},           // 1: greedy, and fast because of it
-    {8, 1, 128, 14, 0, 0, 0, 0},           // 2
-    {16, 1, 128, 15, 0, 0, 0, 0},          // 3
-    {24, 1, 128, 16, 0, 0, 0, 0},          // 4
-    {48, 1, 128, 16, 0, 0, 0, 0},          // 5
-    {64, 1, 128, 16, 0, 0, 0, 0},          // 6: the window steps to 2 MB next
-    {80, 1, 128, 17, 0, 0, 0, 0},          // 7
-    {112, 2, 192, 17, 0, 0, 0, 0},         // 8: last of the chain levels
-    {24, 2, 256, 17, 1, 0, 0, 0},          // 9: first of the tree levels
-    {32, 2, 512, 17, 1, 0, 0, 0},          // 10
-    {36, 0, 768, 17, 1, 1, 1024, 8},       // 11: first of the optimal levels
-    {40, 0, 1024, 17, 1, 1, 1280, 12},     // 12
-    {44, 0, 1280, 18, 1, 1, 1536, 16},     // 13
-    {48, 0, 1536, 18, 1, 1, 2048, 24},     // 14
-    {52, 0, 2048, 18, 1, 1, 2560, 32},     // 15
-    {56, 0, 2560, 18, 1, 1, 3072, 48},     // 16
-    {60, 0, 3072, 18, 1, 1, 4096, 64},     // 17
-    {64, 0, 3584, 18, 1, 1, 5120, 96},     // 18
-    {72, 0, 4096, 18, 1, 1, 6144, 128},    // 19
-    {80, 0, 5120, 18, 1, 1, 8192, 192},    // 20
-    {96, 0, 8192, 18, 1, 1, 12288, 320},   // 21
-    {128, 0, 12288, 18, 1, 1, 16384, 512}  // 22
+    {0, 0, 0, 0, 0, 0, 0, 0, 0},              // 0: unused
+    {4, 0, 128, 14, 0, 0, 0, 0, 0},           // 1: greedy, and fast because of it
+    {8, 1, 128, 14, 0, 0, 0, 0, 0},           // 2
+    {16, 1, 128, 15, 0, 0, 0, 0, 0},          // 3
+    {24, 1, 128, 16, 0, 0, 0, 0, 0},          // 4
+    {48, 1, 128, 16, 0, 0, 0, 0, 0},          // 5
+    {64, 1, 128, 16, 0, 0, 0, 0, 0},          // 6: the window steps to 2 MB next
+    {80, 1, 128, 17, 0, 0, 0, 0, 0},          // 7
+    {112, 2, 192, 17, 0, 0, 0, 0, 0},         // 8: last of the chain levels
+    {24, 2, 256, 17, 1, 0, 0, 0, 0},          // 9: first of the tree levels
+    {32, 2, 512, 17, 1, 0, 0, 0, 0},          // 10
+    {36, 0, 768, 17, 1, 1, 1024, 8, 0},       // 11: first of the optimal levels
+    {40, 0, 1024, 17, 1, 1, 1280, 12, 0},     // 12
+    {44, 0, 1280, 18, 1, 1, 1536, 16, 0},     // 13
+    {48, 0, 1536, 18, 1, 1, 2048, 24, 0},     // 14
+    {52, 0, 2048, 18, 1, 1, 2560, 32, 0},     // 15
+    {56, 0, 2560, 18, 1, 1, 3072, 48, 0},     // 16
+    {60, 0, 3072, 18, 1, 1, 4096, 64, 0},     // 17
+    {64, 0, 3584, 18, 1, 1, 5120, 96, 0},     // 18
+    {72, 0, 4096, 18, 1, 1, 6144, 128, 0},    // 19
+    {80, 0, 5120, 18, 1, 1, 8192, 192, 1}, // 20: parsed twice
+    {96, 0, 8192, 18, 1, 1, 12288, 320, 1}, // 21
+    {128, 0, 12288, 18, 1, 1, 16384, 512, 1} // 22
 };
 
 /**
@@ -409,6 +410,7 @@ gcomp_status_t zstd_mf_init(zstd_match_finder_t * mf,
   mf->use_bt = effort->use_bt;
   mf->use_opt = effort->use_opt;
   mf->opt_segment = effort->opt_segment;
+  mf->opt_two_pass = effort->two_pass;
   mf->opt_budget = effort->opt_budget;
   if (mf->use_bt) {
     size_t n = 1;

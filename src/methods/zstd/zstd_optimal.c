@@ -212,6 +212,23 @@ struct zstd_opt_state_s {
 
   zstd_opt_node_t * nodes;
   size_t node_cap; ///< Entries; one per position of a sweep, plus one.
+
+  // Two-pass parsing, at the levels that ask for it.  The first pass is
+  // priced by whatever came before this sweep; the second by what the first
+  // pass found in it.  The match finder cannot be asked twice -- searching a
+  // position is also what inserts it into the tree, and the tree requires
+  // each position inserted exactly once and in order -- so the first pass
+  // keeps what it found and the second reads it back.
+  zstd_mf_candidate_t * cand_store; ///< node_cap * ZSTD_MF_MAX_CANDIDATES.
+  uint32_t * cand_count;            ///< Candidates held for each position.
+  bool two_pass;
+
+  // The counts as they stood before a sweep folded its first pass in, so
+  // that the emit can fold the real parse in from the same starting point.
+  uint32_t save_lit_freq[256];
+  uint32_t save_ll_freq[ZSTD_SEQ_LL_CODES];
+  uint32_t save_ml_freq[ZSTD_SEQ_ML_CODES];
+  uint32_t save_of_freq[ZSTD_SEQ_OF_CODES];
 };
 
 static inline uint32_t zstd_opt_ll_price_slow(
@@ -299,6 +316,26 @@ gcomp_status_t zstd_opt_init(zstd_match_finder_t * mf,
             st->node_cap * sizeof(zstd_opt_node_t));
   }
 
+  st->two_pass = (mf->opt_two_pass != 0u);
+  if (st->two_pass) {
+    st->cand_store = gcomp_calloc(alloc,
+        st->node_cap * ZSTD_MF_MAX_CANDIDATES, sizeof(zstd_mf_candidate_t));
+    st->cand_count = gcomp_calloc(alloc, st->node_cap, sizeof(uint32_t));
+    if (!st->cand_store || !st->cand_count) {
+      gcomp_free(alloc, st->cand_store);
+      gcomp_free(alloc, st->cand_count);
+      gcomp_free(alloc, st->nodes);
+      gcomp_free(alloc, st);
+      return GCOMP_ERR_MEMORY;
+    }
+    if (mem_tracker) {
+      gcomp_memory_track_alloc(mem_tracker,
+          st->node_cap * ZSTD_MF_MAX_CANDIDATES
+                  * sizeof(zstd_mf_candidate_t) +
+              st->node_cap * sizeof(uint32_t));
+    }
+  }
+
   mf->opt = st;
   zstd_opt_reset(mf);
   return GCOMP_OK;
@@ -314,7 +351,15 @@ void zstd_opt_destroy(zstd_match_finder_t * mf, const gcomp_allocator_t * alloc,
     gcomp_memory_track_free(mem_tracker,
         sizeof(struct zstd_opt_state_s) +
             st->node_cap * sizeof(zstd_opt_node_t));
+    if (st->two_pass) {
+      gcomp_memory_track_free(mem_tracker,
+          st->node_cap * ZSTD_MF_MAX_CANDIDATES
+                  * sizeof(zstd_mf_candidate_t) +
+              st->node_cap * sizeof(uint32_t));
+    }
   }
+  gcomp_free(alloc, st->cand_store);
+  gcomp_free(alloc, st->cand_count);
   gcomp_free(alloc, st->nodes);
   gcomp_free(alloc, st);
   mf->opt = NULL;
@@ -446,6 +491,91 @@ static inline void zstd_opt_relax_run(const struct zstd_opt_state_s * st,
   }
 }
 
+/**
+ * @brief Record, at each position the path passes through, the edge it leaves
+ *        by, so the path can then be walked forwards.
+ *
+ * @p j is where the sweep stopped, and the best path to exactly there is the
+ * parse for this segment.
+ */
+static void zstd_opt_backtrack(zstd_opt_node_t * nodes, size_t j) {
+  size_t k = j;
+  while (k > 0) {
+    uint32_t m = nodes[k].mlen;
+    if (m == 0u) {
+      nodes[k - 1u].out_mlen = 0u;
+      k--;
+    }
+    else {
+      nodes[k - m].out_mlen = m;
+      nodes[k - m].out_off = nodes[k].offset;
+      k -= m;
+    }
+  }
+}
+
+/**
+ * @brief Count the symbols a backtracked path would emit, without emitting.
+ *
+ * The second pass of a two-pass sweep needs prices built from what the first
+ * pass found in this segment, and prices are built from the counts.  So the
+ * first pass's path is folded in here, the prices are rebuilt from it, and
+ * the counts are put back before the real emit folds the second pass's path
+ * in for good.
+ *
+ * It walks the path exactly as the emit does, including the same repeat
+ * offset evolution, because a sequence's offset code -- and so which symbol
+ * gets counted -- depends on the state the sequences before it left behind.
+ * Anything less faithful would price the second pass against a stream that
+ * does not exist.
+ */
+static void zstd_opt_fold_path(struct zstd_opt_state_s * st,
+    const zstd_opt_node_t * nodes, size_t j, size_t base,
+    const uint8_t * data, size_t lit_start, const uint32_t * rep_in,
+    uint32_t forced_len, uint32_t forced_off) {
+  uint32_t rep[3] = {rep_in[0], rep_in[1], rep_in[2]};
+  size_t i = 0;
+
+  while (i < j) {
+    const uint32_t m = nodes[i].out_mlen;
+    if (m == 0u) {
+      i++;
+      continue;
+    }
+    const size_t p = base + i;
+    const uint32_t lit_len = (uint32_t)(p - lit_start);
+    const uint32_t off = nodes[i].out_off;
+    const uint32_t enc = zstd_opt_encode_offset(rep, lit_len, off);
+    uint32_t next_rep[3];
+    zstd_opt_rep_after(rep, enc, lit_len, off, next_rep);
+    rep[0] = next_rep[0];
+    rep[1] = next_rep[1];
+    rep[2] = next_rep[2];
+
+    for (uint32_t b = 0; b < lit_len; b++) {
+      st->lit_freq[data[lit_start + b]]++;
+    }
+    st->ll_freq[zstd_enc_get_ll_code(lit_len)]++;
+    st->ml_freq[zstd_enc_get_ml_code(m)]++;
+    st->of_freq[zstd_enc_get_of_code(enc)]++;
+
+    lit_start = p + m;
+    i += m;
+  }
+
+  if (forced_len) {
+    const size_t p = base + i;
+    const uint32_t lit_len = (uint32_t)(p - lit_start);
+    const uint32_t enc = zstd_opt_encode_offset(rep, lit_len, forced_off);
+    for (uint32_t b = 0; b < lit_len; b++) {
+      st->lit_freq[data[lit_start + b]]++;
+    }
+    st->ll_freq[zstd_enc_get_ll_code(lit_len)]++;
+    st->ml_freq[zstd_enc_get_ml_code(forced_len)]++;
+    st->of_freq[zstd_enc_get_of_code(enc)]++;
+  }
+}
+
 gcomp_status_t zstd_opt_generate_sequences(zstd_match_finder_t * mf,
     const uint8_t * data, size_t data_size, size_t start_pos,
     zstd_sequence_t * sequences, size_t max_sequences,
@@ -491,6 +621,32 @@ gcomp_status_t zstd_opt_generate_sequences(zstd_match_finder_t * mf,
   while (pos < data_size && num_seq < max_sequences) {
     const size_t base = pos;
 
+    size_t j = 0;
+    uint32_t forced_len = 0;
+    uint32_t forced_off = 0;
+
+    // A sweep is priced by what came before it, which for the first sweep of
+    // a block is the block before this one.  That is a guess about this
+    // segment, and the levels at the top of the ladder can afford to check
+    // it: parse the segment once, fold the parse that came out into the
+    // counts, and parse it again against what the segment actually contains.
+    //
+    // The match finder cannot be asked the same question twice.  Searching a
+    // position is also what inserts it into the tree, and the tree requires
+    // every position inserted exactly once and in order -- ask again and the
+    // second pass finds a tree whose head is a position later than the one
+    // being searched, and the descent stops before it starts.  So the first
+    // pass keeps every candidate it was given and the second reads them back
+    // out of st->cand_store.
+    const unsigned passes = st->two_pass ? 2u : 1u;
+    if (passes > 1u) {
+      memcpy(st->save_lit_freq, st->lit_freq, sizeof(st->lit_freq));
+      memcpy(st->save_ll_freq, st->ll_freq, sizeof(st->ll_freq));
+      memcpy(st->save_ml_freq, st->ml_freq, sizeof(st->ml_freq));
+      memcpy(st->save_of_freq, st->of_freq, sizeof(st->of_freq));
+    }
+
+    for (unsigned pass = 0; pass < passes; pass++) {
     // Price this sweep by everything counted up to it, this block's own
     // sequences included.  See zstd_opt_decay().
     zstd_opt_rebuild_prices(st);
@@ -514,9 +670,9 @@ gcomp_status_t zstd_opt_generate_sequences(zstd_match_finder_t * mf,
       nodes[0].rep[2] = rep[2];
     }
 
-    size_t j = 0;
-    uint32_t forced_len = 0;
-    uint32_t forced_off = 0;
+    j = 0;
+    forced_len = 0;
+    forced_off = 0;
 
     while (j < segment && base + j < data_size) {
       const size_t p = base + j;
@@ -545,10 +701,26 @@ gcomp_status_t zstd_opt_generate_sequences(zstd_match_finder_t * mf,
       }
 
       // Searching this position is also what inserts it into the tree, so it
-      // happens once, here, whatever the parse goes on to decide.
-      zstd_mf_candidate_t cand[ZSTD_MF_MAX_CANDIDATES];
-      size_t ncand = zstd_mf_find_matches(
-          mf, data, p, data_size, cand, ZSTD_MF_MAX_CANDIDATES);
+      // happens once, here, whatever the parse goes on to decide -- and on a
+      // second pass it must not happen at all, which is what cand_store is
+      // for.
+      zstd_mf_candidate_t cand_local[ZSTD_MF_MAX_CANDIDATES];
+      zstd_mf_candidate_t * cand = cand_local;
+      size_t ncand;
+      if (pass == 0u) {
+        ncand = zstd_mf_find_matches(
+            mf, data, p, data_size, cand_local, ZSTD_MF_MAX_CANDIDATES);
+        if (passes > 1u) {
+          zstd_mf_candidate_t * slot =
+              st->cand_store + (size_t)j * ZSTD_MF_MAX_CANDIDATES;
+          memcpy(slot, cand_local, ncand * sizeof(zstd_mf_candidate_t));
+          st->cand_count[j] = (uint32_t)ncand;
+        }
+      }
+      else {
+        cand = st->cand_store + (size_t)j * ZSTD_MF_MAX_CANDIDATES;
+        ncand = st->cand_count[j];
+      }
 
       // The distances a one-symbol code can name from here are worth trying
       // at every position, not only where the match finder happens to turn
@@ -652,25 +824,48 @@ gcomp_status_t zstd_opt_generate_sequences(zstd_match_finder_t * mf,
       j++;
     }
 
+    // Between the two passes: what the first one found becomes what the
+    // second one is priced by.  The counts go back afterwards so that the
+    // emit folds in the parse that is actually written, once.
+    if (pass + 1u < passes) {
+      zstd_opt_backtrack(nodes, j);
+
+      // The counts the first pass inherited are halved before its own parse
+      // is folded in, the same way a block start halves what came before it.
+      // Without that the segment's sixteen thousand positions are weighed
+      // against everything the block has counted so far and barely move the
+      // prices: folding on top of the full history was worth 0.049% at level
+      // 22 where halving first is worth 0.103%.
+      for (size_t c = 0; c < 256u; c++) {
+        st->lit_freq[c] = (st->lit_freq[c] + 1u) >> 1u;
+      }
+      for (size_t c = 0; c < ZSTD_SEQ_LL_CODES; c++) {
+        st->ll_freq[c] = (st->ll_freq[c] + 1u) >> 1u;
+      }
+      for (size_t c = 0; c < ZSTD_SEQ_ML_CODES; c++) {
+        st->ml_freq[c] = (st->ml_freq[c] + 1u) >> 1u;
+      }
+      for (size_t c = 0; c < ZSTD_SEQ_OF_CODES; c++) {
+        st->of_freq[c] = (st->of_freq[c] + 1u) >> 1u;
+      }
+
+      zstd_opt_fold_path(
+          st, nodes, j, base, data, lit_start, rep, forced_len, forced_off);
+    }
+    } // for each pass
+
+    if (passes > 1u) {
+      memcpy(st->lit_freq, st->save_lit_freq, sizeof(st->lit_freq));
+      memcpy(st->ll_freq, st->save_ll_freq, sizeof(st->ll_freq));
+      memcpy(st->ml_freq, st->save_ml_freq, sizeof(st->ml_freq));
+      memcpy(st->of_freq, st->save_of_freq, sizeof(st->of_freq));
+    }
+
     // `j` is where the sweep stopped, and the best path to exactly there is
     // the parse for this segment.  Walk it backwards, recording at each
     // position the edge the path leaves by, so it can then be walked
     // forwards to emit.
-    {
-      size_t k = j;
-      while (k > 0) {
-        uint32_t m = nodes[k].mlen;
-        if (m == 0u) {
-          nodes[k - 1u].out_mlen = 0u;
-          k--;
-        }
-        else {
-          nodes[k - m].out_mlen = m;
-          nodes[k - m].out_off = nodes[k].offset;
-          k -= m;
-        }
-      }
-    }
+    zstd_opt_backtrack(nodes, j);
 
     // Emit forwards.
     size_t i = 0;

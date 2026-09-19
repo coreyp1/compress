@@ -137,7 +137,8 @@ picks from what it finds, and how large a window it declares.
 | 7-8 | hash chain, 80-112 | deferred | 2 MB | the fast end of the chain |
 | 9-10 | **binary tree**, 24-32 | deferred | 2 MB | where the tree takes over |
 | 11-15 | binary tree, 36-52 | **shortest path** | 8 MB | archival; where the parse takes over |
-| 16-22 | binary tree, 56-128 | shortest path | 8 MB at 16, 32 MB from 17 | maximum compression |
+| 16-19 | binary tree, 56-72 | shortest path | 8 MB at 16, 32 MB from 17 | maximum compression |
+| 20-22 | binary tree, 80-128 | shortest path, **twice** | 32 MB | everything it has |
 
 **The candidate counts either side of level 9 are not comparable.** A hash-chain
 step crosses off one position and learns nothing about the next, so searching
@@ -159,6 +160,15 @@ byte histogram, and walks the cheapest path through the block. Because a zstd
 sequence carries a literal-length code, a path's cost is not exactly the sum of
 its edges, so this is a very good approximation rather than a proof of optimality;
 `src/methods/zstd/zstd_optimal.c` says where the approximation lies.
+
+Levels 20 to 22 parse each sweep twice: once priced by what came before it,
+then again priced by what the first pass found in the sweep itself. It is
+worth 0.06% at level 20 and 0.10% at level 22 over the 19 MB corpus, and
+costs about a quarter of the encode rate - which is the trade those levels
+exist to make. It also costs memory: the match finder cannot be asked the
+same question twice, because searching a position is what inserts it into the
+tree, so the first pass keeps every candidate it was given for the second to
+read back. That is 8 MB at level 22.
 
 Levels 9 and 10 pay for the tree in memory: two slots per position where the
 chain had one, 16 MiB against 8.5 over the 2 MB window they declare.

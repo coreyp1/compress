@@ -1045,6 +1045,33 @@ TEST_F(ZstdMatchFinderTest, LevelOneIsGreedyAndTheRestAreNot) {
 // A level that parses optimally must not sit below one that does not: the
 // levels are a ladder, and a caller who asks for more effort and gets a
 // cheaper algorithm has been given the wrong thing.
+// Parsing a sweep twice is the top three levels' own thing, and it needs the
+// parse it is doubling: the second pass reads back candidates the first one
+// stored, and a level with no shortest-path parse stores none.  Both halves
+// of that are a table edit away from being wrong, and a table edit that
+// turned it off would otherwise show up only as a level quietly getting
+// worse -- which is how twelve levels once became four encoders.
+TEST_F(ZstdMatchFinderTest, TheTopThreeLevelsParseEachSweepTwice) {
+  const gcomp_allocator_t * alloc = gcomp_allocator_default();
+
+  for (int level = 1; level <= 22; level++) {
+    zstd_match_finder_t mf;
+    ASSERT_EQ(zstd_mf_init(&mf, alloc, level, 1u << 20, nullptr), GCOMP_OK);
+
+    const bool twice = mf.opt_two_pass != 0u;
+    EXPECT_EQ(twice, level >= 20)
+        << "level " << level << (twice ? " parses" : " does not parse")
+        << " each sweep twice";
+    if (twice) {
+      EXPECT_TRUE(mf.use_opt)
+          << "level " << level
+          << " asks for a second pass over a parse it does not run";
+    }
+
+    zstd_mf_destroy(&mf, alloc, nullptr);
+  }
+}
+
 TEST_F(ZstdMatchFinderTest, TheOptimalLevelsAreTheTopOfTheLadder) {
   const gcomp_allocator_t * alloc = gcomp_allocator_default();
   int first_optimal = 0;
