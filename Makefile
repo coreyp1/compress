@@ -1176,15 +1176,30 @@ endif
 
 test: ## Make and run the Unit tests
 test: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES) $(TEST_GATES)
-	@for test_exe in $(TEST_EXECUTABLES); do \
+# The loop used to end with the test run itself, so the recipe exited with the
+# status of the LAST binary and every failure before it printed and was
+# discarded. `make test` reported success with a failing suite, which is the
+# one thing this target exists to do. It was found by deliberately breaking a
+# test to check that a new one could fail: the suite exited 0.
+#
+# Failures are collected rather than stopping at the first, so one run names
+# every suite that failed. Spelled as text's is, which was fixed first.
+	@failed=""; \
+	for test_exe in $(TEST_EXECUTABLES); do \
 		test_name=$$(basename $$test_exe $(EXE_EXTENSION) | sed 's/test/\u&/'); \
 		printf "\033[0;30;43m\n"; \
 		printf "############################\n"; \
 		printf "### Running %s tests ###\n" "$$test_name"; \
 		printf "############################"; \
 		printf "\033[0m\n\n"; \
-		LD_LIBRARY_PATH="$(TEST_LD_PATH)" $$test_exe --gtest_brief=1; \
-	done
+		if ! LD_LIBRARY_PATH="$(TEST_LD_PATH)" $$test_exe --gtest_brief=1; then \
+			failed="$$failed $$test_name"; \
+		fi; \
+	done; \
+	if [ -n "$$failed" ]; then \
+		printf "\033[0;31m\n### Failing suites:%s ###\033[0m\n" "$$failed" >&2; \
+		exit 1; \
+	fi
 
 test-quiet: ## Run tests with minimal output (one line per test suite)
 test-quiet: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES)
@@ -1225,15 +1240,25 @@ test-quiet: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES)
 test-valgrind: ## Run all tests under valgrind (Linux only)
 test-valgrind: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES)
 ifeq ($(OS_NAME), Linux)
-	@for test_exe in $(TEST_EXECUTABLES); do \
+# Collected and reported at the end, for the same reason `test` does it: a
+# loop whose last command is the run exits with the status of the last binary
+# only, and every failure before it is discarded.
+	@failed=""; \
+	for test_exe in $(TEST_EXECUTABLES); do \
 		test_name=$$(basename $$test_exe $(EXE_EXTENSION) | sed 's/test/\u&/'); \
 		printf "\033[0;30;43m\n"; \
 		printf "############################\n"; \
 		printf "### Running %s tests under Valgrind ###\n" "$$test_name"; \
 		printf "############################"; \
 		printf "\033[0m\n\n"; \
-		LD_LIBRARY_PATH="$(TEST_LD_PATH)" $(VALGRIND_TEST_ENV) valgrind $(VALGRIND_FLAGS) $$test_exe --gtest_brief=1; \
-	done
+		if ! LD_LIBRARY_PATH="$(TEST_LD_PATH)" $(VALGRIND_TEST_ENV) valgrind $(VALGRIND_FLAGS) $$test_exe --gtest_brief=1; then \
+			failed="$$failed $$test_name"; \
+		fi; \
+	done; \
+	if [ -n "$$failed" ]; then \
+		printf "\033[0;31m\n### Failing suites:%s ###\033[0m\n" "$$failed" >&2; \
+		exit 1; \
+	fi
 else
 	@printf "\033[0;31m\n"
 	@printf "Valgrind is only available on Linux\n"
