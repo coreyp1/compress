@@ -15,6 +15,8 @@
 #include "test_helpers.h"
 #include <cstring>
 #include <ghoti.io/compress/deflate.h>
+#include <ghoti.io/compress/compress.h>
+#include <ghoti.io/compress/crc32.h>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/gzip.h>
 #include <ghoti.io/compress/limits.h>
@@ -303,6 +305,71 @@ TEST_F(GzipLimitsTest, FNAMELimitEnforced) {
   EXPECT_EQ(status, GCOMP_ERR_LIMIT);
 
   gcomp_options_destroy(dec_opts);
+}
+
+// A header field longer than the decoder's internal buffer, which the default
+// limit allows and that buffer could not hold.
+//
+// FNAME and FCOMMENT carry no length, so they were accumulated a byte at a
+// time into header_accum - 1024 bytes - while the bound was checked against
+// gzip.max_name_bytes, a megabyte by default. Any gzip file with a filename
+// over 1 KiB wrote past that array on default options; UBSan found it in the
+// header of an ordinary file. The accumulator grows now.
+//
+// The member is built here rather than by this library's encoder, which
+// refuses to emit a header larger than GZIP_MAX_HEADER_BUFFER and so cannot
+// produce the input at all. That asymmetry is the point: a decoder has to read
+// what other producers write.
+TEST_F(GzipLimitsTest, AHeaderFieldLongerThanTheInternalBufferIsRead) {
+  const std::vector<uint8_t> payload = {'H', 'i', ' ', 't', 'h', 'e', 'r', 'e'};
+
+  // The payload as a raw deflate stream, which is what a gzip member carries.
+  std::vector<uint8_t> deflated(1024);
+  size_t deflated_size = 0;
+  ASSERT_EQ(gcomp_encode_buffer(gcomp_registry_default(), "deflate", nullptr,
+                payload.data(), payload.size(), deflated.data(),
+                deflated.size(), &deflated_size),
+      GCOMP_OK);
+  deflated.resize(deflated_size);
+
+  struct Field {
+    const char * name;
+    uint8_t flag;
+    size_t length;
+  };
+  // Both fields, because they are separate cases in the same state machine and
+  // only one of them being wrong is the shape this started as.
+  const std::vector<Field> fields = {
+      {"FNAME", 0x08, 4000},
+      {"FCOMMENT", 0x10, 5000},
+  };
+
+  for (const auto & f : fields) {
+    std::vector<uint8_t> member = {0x1f, 0x8b, 0x08, f.flag, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x03};
+    member.insert(member.end(), f.length, (uint8_t)'n');
+    member.push_back(0x00); // the field's terminator
+
+    member.insert(member.end(), deflated.begin(), deflated.end());
+
+    // gcomp_crc32() returns the unfinalized value; RFC 1952 wants the
+    // finalized one, which is what gcomp_crc32_finalize() is for.
+    uint32_t crc =
+        gcomp_crc32_finalize(gcomp_crc32(payload.data(), payload.size()));
+    uint32_t isize = (uint32_t)payload.size();
+    for (int i = 0; i < 4; i++) {
+      member.push_back((uint8_t)((crc >> (8 * i)) & 0xff));
+    }
+    for (int i = 0; i < 4; i++) {
+      member.push_back((uint8_t)((isize >> (8 * i)) & 0xff));
+    }
+
+    std::vector<uint8_t> output;
+    gcomp_status_t status =
+        decompress_with_status(member.data(), member.size(), nullptr, output);
+    EXPECT_EQ(status, GCOMP_OK) << f.name << " of " << f.length << " bytes";
+    EXPECT_EQ(output, payload) << f.name;
+  }
 }
 
 TEST_F(GzipLimitsTest, FCOMMENTLimitEnforced) {

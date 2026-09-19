@@ -248,6 +248,59 @@ cleanup:
 // Header Parsing
 //
 
+/**
+ * @brief Accumulate one byte of a NUL-terminated header field.
+ *
+ * FNAME and FCOMMENT carry no length, so their size is not known until the NUL
+ * arrives, and gzip.max_name_bytes and gzip.max_comment_bytes default to a
+ * megabyte each. Both were accumulated into header_accum, which is 1024 bytes,
+ * with the bound checked against the megabyte: an ordinary gzip file with a
+ * filename longer than 1 KiB wrote past a fixed array inside the decoder
+ * state, on default options. Found by fuzzing.
+ *
+ * The buffer grows to what the field needs and no further than the limit
+ * allows, and is kept across resets so that a stream of concatenated members
+ * does not reallocate for each one.
+ *
+ * @param decoder The decoder, for the error message
+ * @param state Decoder state
+ * @param byte The byte to append
+ * @param limit The configured maximum for this field, in bytes
+ * @param field_name "FNAME" or "FCOMMENT", for the error message
+ * @return GCOMP_OK, or GCOMP_ERR_LIMIT / GCOMP_ERR_MEMORY
+ */
+static gcomp_status_t gzip_header_field_push(gcomp_decoder_t * decoder,
+    gzip_decoder_state_t * state, uint8_t byte, uint64_t limit,
+    const char * field_name) {
+  if ((uint64_t)state->header_accum_pos >= limit) {
+    return gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
+        "gzip %s exceeds limit %lu bytes", field_name, (unsigned long)limit);
+  }
+
+  if (state->header_accum_pos == state->header_field_cap) {
+    size_t want = state->header_field_cap ? state->header_field_cap * 2u : 256u;
+    if ((uint64_t)want > limit) {
+      want = (size_t)limit;
+    }
+    uint8_t * grown = (uint8_t *)gcomp_malloc(state->allocator, want);
+    if (!grown) {
+      return gcomp_decoder_set_error(decoder, GCOMP_ERR_MEMORY,
+          "failed to allocate %zu bytes for gzip %s", want, field_name);
+    }
+    if (state->header_field) {
+      memcpy(grown, state->header_field, state->header_accum_pos);
+      gcomp_free(state->allocator, state->header_field);
+      gcomp_memory_track_free(&state->mem_tracker, state->header_field_cap);
+    }
+    state->header_field = grown;
+    state->header_field_cap = want;
+    gcomp_memory_track_alloc(&state->mem_tracker, want);
+  }
+
+  state->header_field[state->header_accum_pos++] = byte;
+  return GCOMP_OK;
+}
+
 static gcomp_status_t parse_header_byte(
     gzip_decoder_state_t * state, uint8_t byte, gcomp_decoder_t * decoder) {
   // Always accumulate bytes for header CRC.
@@ -399,14 +452,13 @@ static gcomp_status_t parse_header_byte(
     }
     break;
 
-  case GZIP_HEADER_FNAME:
+  case GZIP_HEADER_FNAME: {
     // Accumulate until null terminator
-    if (state->header_accum_pos >= state->max_name_bytes) {
-      return gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
-          "gzip FNAME exceeds limit %lu bytes",
-          (unsigned long)state->max_name_bytes);
+    gcomp_status_t push = gzip_header_field_push(
+        decoder, state, byte, state->max_name_bytes, "FNAME");
+    if (push != GCOMP_OK) {
+      return push;
     }
-    state->header_accum[state->header_accum_pos++] = byte;
     if (byte == 0) {
       // Null terminator found
       state->header_info.name =
@@ -416,7 +468,7 @@ static gcomp_status_t parse_header_byte(
             decoder, GCOMP_ERR_MEMORY, "failed to allocate FNAME buffer");
       }
       gcomp_memory_track_alloc(&state->mem_tracker, state->header_accum_pos);
-      memcpy(state->header_info.name, state->header_accum,
+      memcpy(state->header_info.name, state->header_field,
           state->header_accum_pos);
 
       // Move to next field
@@ -432,15 +484,15 @@ static gcomp_status_t parse_header_byte(
       state->header_accum_pos = 0;
     }
     break;
+  }
 
-  case GZIP_HEADER_FCOMMENT:
+  case GZIP_HEADER_FCOMMENT: {
     // Accumulate until null terminator
-    if (state->header_accum_pos >= state->max_comment_bytes) {
-      return gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
-          "gzip FCOMMENT exceeds limit %lu bytes",
-          (unsigned long)state->max_comment_bytes);
+    gcomp_status_t push = gzip_header_field_push(
+        decoder, state, byte, state->max_comment_bytes, "FCOMMENT");
+    if (push != GCOMP_OK) {
+      return push;
     }
-    state->header_accum[state->header_accum_pos++] = byte;
     if (byte == 0) {
       // Null terminator found
       state->header_info.comment =
@@ -450,7 +502,7 @@ static gcomp_status_t parse_header_byte(
             decoder, GCOMP_ERR_MEMORY, "failed to allocate FCOMMENT buffer");
       }
       gcomp_memory_track_alloc(&state->mem_tracker, state->header_accum_pos);
-      memcpy(state->header_info.comment, state->header_accum,
+      memcpy(state->header_info.comment, state->header_field,
           state->header_accum_pos);
 
       // Move to next field
@@ -463,6 +515,7 @@ static gcomp_status_t parse_header_byte(
       state->header_accum_pos = 0;
     }
     break;
+  }
 
   case GZIP_HEADER_FHCRC:
     state->header_accum[state->header_accum_pos++] = byte;
@@ -844,6 +897,13 @@ void gzip_decoder_destroy(gcomp_decoder_t * decoder) {
   }
   if (state->header_info.extra) {
     gcomp_memory_track_free(&state->mem_tracker, state->header_info.extra_len);
+  }
+
+  if (state->header_field) {
+    gcomp_memory_track_free(&state->mem_tracker, state->header_field_cap);
+    gcomp_free(alloc, state->header_field);
+    state->header_field = NULL;
+    state->header_field_cap = 0;
   }
 
   gzip_header_info_free(&state->header_info, state->allocator);

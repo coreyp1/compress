@@ -197,6 +197,12 @@ typedef struct {
   uint8_t
       header_accum[GZIP_MAX_HEADER_BUFFER]; ///< Accumulator for partial reads
   size_t header_accum_pos;
+  /// Accumulator for FNAME and FCOMMENT, which are NUL-terminated rather than
+  /// length-prefixed and may legitimately run to gzip.max_name_bytes /
+  /// gzip.max_comment_bytes - a megabyte each by default, far past
+  /// header_accum. Grown as the field arrives; freed with the state.
+  uint8_t * header_field;
+  size_t header_field_cap;
   size_t header_field_target; ///< Target size for current field
   uint32_t header_crc_accum;  ///< Running CRC for FHCRC validation
 
