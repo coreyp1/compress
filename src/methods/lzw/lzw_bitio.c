@@ -47,7 +47,10 @@ static gcomp_status_t read_lsb(
     lzw_bitreader_t * reader, unsigned num_bits, uint32_t * out) {
   while (reader->bit_count < num_bits) {
     if (reader->byte_pos >= reader->size) {
-      return GCOMP_ERR_CORRUPT;
+      // Out of input part-way through a code.  Whatever was read is already
+      // in bit_buffer and byte_pos says those bytes were taken, so the next
+      // window continues the same code.  See lzw_bitreader_read_bits().
+      return GCOMP_ERR_LIMIT;
     }
     reader->bit_buffer |= (uint32_t)(reader->data[reader->byte_pos])
         << reader->bit_count;
@@ -71,7 +74,12 @@ static gcomp_status_t read_msb(
 
   for (unsigned i = 0; i < num_bits; i++) {
     if (byte_pos >= reader->size) {
-      return GCOMP_ERR_CORRUPT;
+      // Out of input part-way through a code.  Nothing is committed -- the
+      // reader's byte_pos and bit_count are left where they were -- so the
+      // bytes this code started in are not consumed and are read again, from
+      // the same bit offset, when the caller brings more.  See
+      // lzw_bitreader_read_bits().
+      return GCOMP_ERR_LIMIT;
     }
     unsigned bit = (reader->data[byte_pos] >> (7u - bit_offset)) & 1u;
     value = (value << 1) | bit;
@@ -87,6 +95,29 @@ static gcomp_status_t read_msb(
   return GCOMP_OK;
 }
 
+/**
+ * @brief Read one code.
+ *
+ * RUNNING OUT OF INPUT IS NOT CORRUPTION
+ * ======================================
+ *
+ * Codes are 9 to 12 bits and do not stop on byte boundaries, so a window of
+ * input almost always ends part-way through one.  For a streaming decoder
+ * that is the ordinary case -- the rest of the code is in the bytes that have
+ * not arrived yet -- and it is reported as GCOMP_ERR_LIMIT, meaning "come
+ * back with more input", not GCOMP_ERR_CORRUPT.
+ *
+ * It used to be reported as corruption, and the decoder treated it as fatal.
+ * The effect was that the LZW decoder could not accept a stream in pieces at
+ * all: 5,000 bytes encoded to 557 and then handed over 64 bytes at a time
+ * failed on the first call, at offset 0.  Only a whole stream in one buffer
+ * ever worked.  A genuinely truncated stream is still caught, by
+ * lzw_decoder_finish(), which reports a stream that ended without EOI.
+ *
+ * @return GCOMP_OK when a code was read, GCOMP_ERR_LIMIT when the window ran
+ *         out first, GCOMP_ERR_INVALID_ARG for a width this format cannot
+ *         have.
+ */
 gcomp_status_t lzw_bitreader_read_bits(
     lzw_bitreader_t * reader, unsigned num_bits, uint32_t * out) {
   if (!reader || !out) {

@@ -223,6 +223,98 @@ TEST_F(LzwDecoderTest, LimitMaxMemoryBytesSufficientSucceeds) {
   gcomp_options_destroy(opts);
 }
 
+
+/**
+ * The decoder used to treat "the window ended part-way through a code" as
+ * corruption, which made it unable to accept a stream in pieces at all.  LZW
+ * codes are 9 to 12 bits, so almost any split lands mid-code: 5,000 bytes
+ * encoded to 557 and handed over 64 at a time failed on the very first call,
+ * at offset 0.  Only a whole stream in one buffer ever worked, which is not
+ * what a streaming decoder is for.
+ */
+TEST(LzwStreamingDecode, DecodesAStreamHandedOverInPieces) {
+  gcomp_registry_t * reg = gcomp_registry_default();
+  ASSERT_NE(reg, nullptr);
+
+  std::vector<uint8_t> data(5000);
+  for (size_t i = 0; i < data.size(); i++) {
+    data[i] = (uint8_t)('A' + (i * 7 % 23));
+  }
+
+  // Encode in one go; nothing here is about the encoder.
+  gcomp_encoder_t * enc = nullptr;
+  ASSERT_EQ(gcomp_encoder_create(reg, "lzw", nullptr, &enc), GCOMP_OK);
+  std::vector<uint8_t> stream(data.size() + 4096);
+  gcomp_buffer_t in_buf = {data.data(), data.size(), 0};
+  gcomp_buffer_t out_buf = {stream.data(), stream.size(), 0};
+  ASSERT_EQ(gcomp_encoder_update(enc, &in_buf, &out_buf), GCOMP_OK);
+  ASSERT_EQ(gcomp_encoder_finish(enc, &out_buf), GCOMP_OK);
+  stream.resize(out_buf.used);
+  gcomp_encoder_destroy(enc);
+  ASSERT_LT(stream.size(), data.size());
+
+  for (size_t piece : {(size_t)1, (size_t)7, (size_t)64}) {
+    gcomp_decoder_t * dec = nullptr;
+    ASSERT_EQ(gcomp_decoder_create(reg, "lzw", nullptr, &dec), GCOMP_OK);
+
+    std::vector<uint8_t> out(data.size() + 4096);
+    size_t produced = 0;
+    size_t offset = 0;
+    while (offset < stream.size()) {
+      size_t take = piece < stream.size() - offset ? piece
+                                                   : stream.size() - offset;
+      gcomp_buffer_t din = {stream.data() + offset, take, 0};
+      gcomp_buffer_t dout = {out.data() + produced, out.size() - produced, 0};
+      ASSERT_EQ(gcomp_decoder_update(dec, &din, &dout), GCOMP_OK)
+          << "piece=" << piece << " offset=" << offset;
+      produced += dout.used;
+      ASSERT_FALSE(din.used == 0 && dout.used == 0)
+          << "decoder stalled at offset " << offset;
+      offset += din.used;
+    }
+    gcomp_buffer_t dout = {out.data() + produced, out.size() - produced, 0};
+    EXPECT_EQ(gcomp_decoder_finish(dec, &dout), GCOMP_OK) << "piece=" << piece;
+    produced += dout.used;
+    out.resize(produced);
+    EXPECT_EQ(out, data) << "piece=" << piece;
+    gcomp_decoder_destroy(dec);
+  }
+}
+
+/**
+ * A stream that really is truncated is still caught -- at finish(), where a
+ * missing EOI is detectable, rather than by guessing at update() that the
+ * caller had no more to give.
+ */
+TEST(LzwStreamingDecode, StillCatchesATrulyTruncatedStream) {
+  gcomp_registry_t * reg = gcomp_registry_default();
+  ASSERT_NE(reg, nullptr);
+
+  std::vector<uint8_t> data(3000);
+  for (size_t i = 0; i < data.size(); i++) {
+    data[i] = (uint8_t)('a' + (i % 17));
+  }
+
+  gcomp_encoder_t * enc = nullptr;
+  ASSERT_EQ(gcomp_encoder_create(reg, "lzw", nullptr, &enc), GCOMP_OK);
+  std::vector<uint8_t> stream(data.size() + 4096);
+  gcomp_buffer_t in_buf = {data.data(), data.size(), 0};
+  gcomp_buffer_t out_buf = {stream.data(), stream.size(), 0};
+  ASSERT_EQ(gcomp_encoder_update(enc, &in_buf, &out_buf), GCOMP_OK);
+  ASSERT_EQ(gcomp_encoder_finish(enc, &out_buf), GCOMP_OK);
+  stream.resize(out_buf.used / 2); // Cut it off mid-stream.
+  gcomp_encoder_destroy(enc);
+
+  gcomp_decoder_t * dec = nullptr;
+  ASSERT_EQ(gcomp_decoder_create(reg, "lzw", nullptr, &dec), GCOMP_OK);
+  std::vector<uint8_t> out(data.size() + 4096);
+  gcomp_buffer_t din = {stream.data(), stream.size(), 0};
+  gcomp_buffer_t dout = {out.data(), out.size(), 0};
+  gcomp_decoder_update(dec, &din, &dout);
+  EXPECT_EQ(gcomp_decoder_finish(dec, &dout), GCOMP_ERR_CORRUPT);
+  gcomp_decoder_destroy(dec);
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

@@ -304,14 +304,19 @@ gcomp_status_t lzw_decoder_update(gcomp_decoder_t * decoder,
     uint32_t code = 0;
     gcomp_status_t r =
         lzw_bitreader_read_bits(&state->reader, state->current_bits, &code);
-    if (r == GCOMP_ERR_CORRUPT) {
-      input->used += state->reader.byte_pos;
-      state->total_input_bytes += (uint64_t)state->reader.byte_pos;
-      return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
-          "LZW decoder truncated or invalid stream");
+    if (r == GCOMP_ERR_LIMIT) {
+      // The window ended part-way through a code.  That is where a caller
+      // handing over input in pieces normally stops, so it is not an error:
+      // break, consume what was read below, and continue when more arrives.
+      // A stream that really has ended early is caught by
+      // lzw_decoder_finish(), which requires an EOI.
+      break;
     }
     if (r != GCOMP_OK) {
-      break;
+      input->used += state->reader.byte_pos;
+      state->total_input_bytes += (uint64_t)state->reader.byte_pos;
+      return gcomp_decoder_set_error(
+          decoder, r, "LZW decoder invalid code width");
     }
 
     if (code == state->clear_code) {
