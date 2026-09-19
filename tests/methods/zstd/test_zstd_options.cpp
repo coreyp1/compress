@@ -7,6 +7,7 @@
  */
 
 #include "../common/test_helpers.h"
+#include <cstdlib>
 #include <cstring>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/method.h>
@@ -30,6 +31,21 @@ protected:
 //
 // Schema Introspection Tests
 //
+
+// Memcheck keeps validity and addressability bits for every allocated byte,
+// so a test that asks for a 2 GB window costs several gigabytes more here
+// than it does outside Valgrind, and the run is killed before it reports
+// anything. The window size is the point of those tests, so there is nothing
+// smaller for them to ask for: they skip instead, and the ordinary run and
+// the ASan run still cover them. The Makefile's valgrind targets set this.
+static bool UnderValgrind() {
+  const char * vg = std::getenv("GCOMP_UNDER_VALGRIND");
+  return vg && vg[0] == '1';
+}
+
+static const char kValgrindWindowSkip[] =
+    "a 2 GB window does not fit under Memcheck's shadow memory; this test "
+    "runs outside valgrind";
 
 TEST_F(ZstdOptionsTest, SchemaAvailable) {
   ASSERT_NE(method_, nullptr);
@@ -233,6 +249,10 @@ TEST_F(ZstdOptionsTest, ValidWindowLogMin) {
 // tables, and the default memory limit of 256 MiB refuses it - which is the
 // limit doing its job, not the option being invalid.
 TEST_F(ZstdOptionsTest, ValidWindowLogMax) {
+  if (UnderValgrind()) {
+    GTEST_SKIP() << kValgrindWindowSkip;
+  }
+
   gcomp_options_t * opts = nullptr;
   ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
   gcomp_options_set_uint64(opts, "zstd.window_log", 31);
@@ -245,6 +265,17 @@ TEST_F(ZstdOptionsTest, ValidWindowLogMax) {
 }
 
 TEST_F(ZstdOptionsTest, LargeWindowLogNeedsTheMemoryToBackIt) {
+  // This one asks to be *refused*, and still costs the memory: the encoder
+  // allocates the window, the block buffer and the match finder's tables and
+  // only then calls gcomp_memory_check_limit(), so the 2 GB is allocated
+  // before limits.max_memory_bytes turns it down. Outside Valgrind that is
+  // invisible - Linux does not back an untouched mapping with pages - which
+  // is why nothing noticed. Under Memcheck it is real, and it is why this
+  // test is skipped here rather than only the one above.
+  if (UnderValgrind()) {
+    GTEST_SKIP() << kValgrindWindowSkip;
+  }
+
   gcomp_options_t * opts = nullptr;
   ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
   gcomp_options_set_uint64(opts, "zstd.window_log", 31);

@@ -215,6 +215,13 @@ TEST_GATES ?= check-symbols
 # Valgrind flags (exclude "still reachable" as it's not a leak)
 VALGRIND_FLAGS := --leak-check=full --show-leak-kinds=definite,indirect,possible --track-origins=yes --error-exitcode=1
 
+# Told to the tests themselves, because a handful of them ask for more memory
+# than Memcheck can shadow. Memcheck keeps validity and addressability bits
+# for every allocated byte, so a test that deliberately allocates gigabytes
+# costs several times that here and is killed rather than reporting anything.
+# Such a test skips on this, and says why; nothing else reads it.
+VALGRIND_TEST_ENV := GCOMP_UNDER_VALGRIND=1
+
 # Test helper object file
 TEST_HELPER_OBJ := $(OBJ_DIR)/tests/common/test_helpers.o
 
@@ -1225,7 +1232,7 @@ ifeq ($(OS_NAME), Linux)
 		printf "### Running %s tests under Valgrind ###\n" "$$test_name"; \
 		printf "############################"; \
 		printf "\033[0m\n\n"; \
-		LD_LIBRARY_PATH="$(TEST_LD_PATH)" valgrind $(VALGRIND_FLAGS) $$test_exe --gtest_brief=1; \
+		LD_LIBRARY_PATH="$(TEST_LD_PATH)" $(VALGRIND_TEST_ENV) valgrind $(VALGRIND_FLAGS) $$test_exe --gtest_brief=1; \
 	done
 else
 	@printf "\033[0;31m\n"
@@ -1242,7 +1249,7 @@ ifeq ($(OS_NAME), Linux)
 	printf "\033[1;35m%-30s %8s %10s %s\033[0m\n" "------------------------------" "--------" "----------" "------"; \
 	for test_exe in $(TEST_EXECUTABLES); do \
 		test_name=$$(basename $$test_exe $(EXE_EXTENSION)); \
-		output=$$(LD_LIBRARY_PATH="$(TEST_LD_PATH)" valgrind $(VALGRIND_FLAGS) $$test_exe --gtest_brief=1 2>&1); \
+		output=$$(LD_LIBRARY_PATH="$(TEST_LD_PATH)" $(VALGRIND_TEST_ENV) valgrind $(VALGRIND_FLAGS) $$test_exe --gtest_brief=1 2>&1); \
 		exit_code=$$?; \
 		num_tests=$$(echo "$$output" | grep -oP '\[\s*=+\s*\]\s*\K\d+(?=\s+tests?)' | head -1); \
 		time_ms=$$(echo "$$output" | grep -oP '\(\K\d+(?=\s*ms\s*total\))' | head -1); \
@@ -1250,7 +1257,7 @@ ifeq ($(OS_NAME), Linux)
 		[ -z "$$time_ms" ] && time_ms=0; \
 		total_tests=$$((total_tests + num_tests)); \
 		total_time=$$((total_time + time_ms)); \
-		has_leak=$$(echo "$$output" | grep -c "definitely lost\|indirectly lost\|possibly lost" || true); \
+		has_leak=$$(echo "$$output" | grep -cE "(definitely|indirectly|possibly) lost: [1-9]" || true); \
 		if [ $$exit_code -eq 0 ] && [ $$has_leak -eq 0 ]; then \
 			total_passed=$$((total_passed + num_tests)); \
 			printf "%-30s %8d %8dms \033[0;32mPASS\033[0m\n" "$$test_name" "$$num_tests" "$$time_ms"; \
