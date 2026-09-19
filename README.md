@@ -9,6 +9,8 @@ The `compress` library provides:
 - Support for multiple compression methods (deflate, gzip, lz4, lzw, rle, zstd)
 - Parallel encoding via `threads.count` for zstd (concatenated frames) and LZ4
   (one frame, byte-identical to single-threaded output)
+- `gcomp_encoder_flush()` for protocol framing: hand the peer everything
+  consumed so far without ending the stream (sync and full modes, every method)
 - Global default registry and explicit registries for compression methods
 - Key/value option system for rich configuration
 - Intelligent safety defaults with overridable resource limits

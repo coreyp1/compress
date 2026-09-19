@@ -290,6 +290,30 @@ At every level the encoder:
 
 The fixed code is written whenever it prices smaller, which is the same rule stated above rather than a fallback.
 
+## Flushing
+
+`gcomp_encoder_flush()` emits every symbol for the input consumed so far
+without ending the stream. See [Streaming API](../api/streaming.md#flushing)
+for the general contract.
+
+DEFLATE blocks do not end on byte boundaries, so a flush ends the current
+block and then writes the empty stored block RFC 1951 §3.2.4 describes:
+`BFINAL=0`, `BTYPE=00`, padding to the next byte, then `LEN=0x0000` and
+`NLEN=0xFFFF`. That is the familiar `00 00 FF FF` tail, and it is what stops
+the decoder reading the padding bits as the next block's header. Both sides
+come out of it byte-aligned.
+
+At level 0 no marker is needed: stored blocks are already byte-aligned and
+self-terminating, so emitting the buffered data is the whole flush.
+
+`GCOMP_FLUSH_FULL` additionally empties the match history — the hash chains,
+and the window that the RLE strategy consults directly — so nothing written
+afterwards refers to anything before the flush.
+
+Anything still in the lookahead becomes literals, because there is no further
+input to match it against. Those bytes are still entered into the hash chains,
+so a later match can find them; only the flushed block itself pays.
+
 ## Streaming usage
 
 ### Decoding

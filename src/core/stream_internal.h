@@ -77,6 +77,16 @@ typedef gcomp_status_t (*gcomp_encoder_finish_fn_t)(
     gcomp_encoder_t * encoder, gcomp_buffer_t * output);
 
 /**
+ * @brief Encoder flush function type
+ *
+ * Emits everything consumed so far without ending the stream.  See
+ * gcomp_encoder_flush() for the contract a method must honour; the mode is
+ * passed through unchanged.
+ */
+typedef gcomp_status_t (*gcomp_encoder_flush_fn_t)(
+    gcomp_encoder_t * encoder, gcomp_buffer_t * output, gcomp_flush_t mode);
+
+/**
  * @brief Encoder reset function type
  *
  * Resets the encoder to its initial state, allowing it to be reused for a new
@@ -138,6 +148,8 @@ struct gcomp_encoder_s {
   void * method_state;                 ///< Method-specific encoder state
   gcomp_encoder_update_fn_t update_fn; ///< Method's update implementation
   gcomp_encoder_finish_fn_t finish_fn; ///< Method's finish implementation
+  gcomp_encoder_flush_fn_t
+      flush_fn; ///< Method's flush implementation (NULL = unsupported)
   gcomp_encoder_reset_fn_t
       reset_fn;              ///< Method's reset implementation (optional)
   gcomp_status_t last_error; ///< Last error status (GCOMP_OK if none)

@@ -334,6 +334,7 @@ static gcomp_status_t lz4_create_encoder(gcomp_registry_t * registry,
 
   (*encoder_out)->update_fn = lz4_encoder_update_wrapper;
   (*encoder_out)->finish_fn = lz4_encoder_finish_wrapper;
+  (*encoder_out)->flush_fn = lz4_encoder_flush;
   (*encoder_out)->reset_fn = lz4_encoder_reset;
   return GCOMP_OK;
 }

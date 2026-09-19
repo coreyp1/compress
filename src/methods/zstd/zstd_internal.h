@@ -581,6 +581,20 @@ gcomp_status_t zstd_encoder_finish(
 /**
  * @brief Reset Zstd encoder to initial state.
  */
+/**
+ * @brief Emit the block being filled, without ending the frame.
+ *
+ * See gcomp_encoder_flush().  A zstd frame is a run of blocks, so a flushed
+ * block is an ordinary one and the frame stays open.  GCOMP_FLUSH_FULL
+ * additionally empties the match finder and resets the repeat offsets, so no
+ * sequence after the flush names a distance into what came before.
+ *
+ * In parallel mode a job is a whole frame, so a flush closes the frame in
+ * hand -- the same concatenated stream parallel mode always produces.
+ */
+gcomp_status_t zstd_encoder_flush(
+    gcomp_encoder_t * encoder, gcomp_buffer_t * output, gcomp_flush_t mode);
+
 gcomp_status_t zstd_encoder_reset(gcomp_encoder_t * encoder);
 
 //

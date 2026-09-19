@@ -292,6 +292,11 @@ static gcomp_status_t zstd_encoder_finish_wrapper(
   return zstd_encoder_finish(encoder, output);
 }
 
+static gcomp_status_t zstd_encoder_flush_wrapper(
+    gcomp_encoder_t * encoder, gcomp_buffer_t * output, gcomp_flush_t mode) {
+  return zstd_encoder_flush(encoder, output, mode);
+}
+
 static gcomp_status_t zstd_decoder_update_wrapper(gcomp_decoder_t * decoder,
     gcomp_buffer_t * input, gcomp_buffer_t * output) {
   return zstd_decoder_update(decoder, input, output);
@@ -346,6 +351,7 @@ static gcomp_status_t zstd_create_encoder(gcomp_registry_t * registry,
 
   (*encoder_out)->update_fn = zstd_encoder_update_wrapper;
   (*encoder_out)->finish_fn = zstd_encoder_finish_wrapper;
+  (*encoder_out)->flush_fn = zstd_encoder_flush_wrapper;
   (*encoder_out)->reset_fn = zstd_encoder_reset;
   return GCOMP_OK;
 }

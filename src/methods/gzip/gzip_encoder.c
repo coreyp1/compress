@@ -489,6 +489,64 @@ gcomp_status_t gzip_encoder_update(gcomp_encoder_t * encoder,
 }
 
 //
+// Encoder Flush
+//
+
+gcomp_status_t gzip_encoder_flush(gcomp_encoder_t * encoder,
+    gcomp_buffer_t * output, gcomp_flush_t mode) {
+  if (!encoder || !encoder->method_state || !output) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  if (output->size > 0 && !output->data) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  gzip_encoder_state_t * state = (gzip_encoder_state_t *)encoder->method_state;
+
+  if (state->stage == GZIP_ENC_STAGE_TRAILER ||
+      state->stage == GZIP_ENC_STAGE_DONE) {
+    return gcomp_encoder_set_error(encoder, GCOMP_ERR_INVALID_ARG,
+        "gzip encoder cannot flush after finish");
+  }
+
+  // The gzip header comes before any deflate data, so a flush before the
+  // first byte of input still has this much to hand over.
+  if (state->stage == GZIP_ENC_STAGE_HEADER) {
+    uint8_t * output_data = (uint8_t *)output->data;
+    size_t avail_out = output->size - output->used;
+    size_t header_remaining = state->header_len - state->header_pos;
+    size_t to_write =
+        (avail_out < header_remaining) ? avail_out : header_remaining;
+    if (to_write > 0) {
+      memcpy(output_data + output->used, state->header_buf + state->header_pos,
+          to_write);
+      output->used += to_write;
+      state->header_pos += to_write;
+    }
+    if (state->header_pos < state->header_len) {
+      return GCOMP_ERR_LIMIT;
+    }
+    state->stage = GZIP_ENC_STAGE_BODY;
+  }
+
+  // Nothing gzip-specific to do for the body.  A gzip member is a header, a
+  // deflate stream and a trailer; flushing it is flushing the deflate stream,
+  // and the CRC-32 and ISIZE are accumulated in update() as input arrives, so
+  // they are already correct for everything the flush is about to emit.
+  gcomp_status_t status =
+      gcomp_encoder_flush(state->inner_encoder, output, mode);
+  if (status == GCOMP_ERR_LIMIT) {
+    return GCOMP_ERR_LIMIT; // Caller drains and calls again.
+  }
+  if (status != GCOMP_OK) {
+    return gcomp_encoder_set_error(encoder, status,
+        "deflate encoder flush failed: %s",
+        gcomp_encoder_get_error_detail(state->inner_encoder));
+  }
+  return GCOMP_OK;
+}
+
+//
 // Encoder Finish
 //
 

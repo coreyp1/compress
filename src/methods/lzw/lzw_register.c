@@ -200,6 +200,7 @@ static gcomp_status_t lzw_create_encoder(gcomp_registry_t * registry,
 
   (*encoder_out)->update_fn = lzw_encoder_update_wrapper;
   (*encoder_out)->finish_fn = lzw_encoder_finish_wrapper;
+  (*encoder_out)->flush_fn = lzw_encoder_flush;
   (*encoder_out)->reset_fn = lzw_encoder_reset;
   return GCOMP_OK;
 }

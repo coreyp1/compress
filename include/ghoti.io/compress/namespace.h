@@ -63,6 +63,7 @@
 #define gcomp_encoder_finish GHOTIIO_COMPRESS(gcomp_encoder_finish)
 #define gcomp_encoder_get_error GHOTIIO_COMPRESS(gcomp_encoder_get_error)
 #define gcomp_encoder_get_error_detail GHOTIIO_COMPRESS(gcomp_encoder_get_error_detail)
+#define gcomp_encoder_flush GHOTIIO_COMPRESS(gcomp_encoder_flush)
 #define gcomp_encoder_reset GHOTIIO_COMPRESS(gcomp_encoder_reset)
 #define gcomp_encoder_set_error GHOTIIO_COMPRESS(gcomp_encoder_set_error)
 #define gcomp_encoder_update GHOTIIO_COMPRESS(gcomp_encoder_update)

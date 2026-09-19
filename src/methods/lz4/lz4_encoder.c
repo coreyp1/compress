@@ -1377,6 +1377,176 @@ gcomp_status_t lz4_encoder_finish(
   return GCOMP_ERR_LIMIT;
 }
 
+/**
+ * @brief Compress whatever is in the block buffer and stage it as a block.
+ *
+ * The same work lz4_encoder_update() does when a block fills up and
+ * lz4_encoder_finish() does for the tail, for a block that is short of full.
+ * Kept here rather than shared with those two because each of them threads it
+ * through a different surrounding state machine; what matters is that the
+ * three agree on the rules, and they do: the same compressor, the same
+ * destination capacity, the same stored-versus-compressed test, the same
+ * checksum.
+ */
+static void lz4_encoder_stage_partial_block(lz4_encoder_state_t * state) {
+  size_t compressed_len;
+  gcomp_status_t status = lz4_block_compress_linked(state->block_buffer,
+      state->prefix_len, state->block_buffer_pos, state->compressed_buffer + 4,
+      state->compressed_buffer_size - 4, &compressed_len, state->hash_table,
+      state->hash_table_size);
+
+  if (status != GCOMP_OK || compressed_len >= state->block_buffer_pos) {
+    // See the note in lz4_encoder_update(): a full destination here is the
+    // discovery that the compressed form is larger, not a failure.
+    gcomp_stepdown_note(&state->stepdowns,
+        (status == GCOMP_OK || status == GCOMP_ERR_LIMIT)
+            ? GCOMP_STEPDOWN_STORED_IS_SMALLER
+            : GCOMP_STEPDOWN_ENCODE_FAILED);
+    uint32_t block_size =
+        (uint32_t)state->block_buffer_pos | LZ4_BLOCK_UNCOMPRESSED_FLAG;
+    gcomp_write_le32(state->compressed_buffer, block_size);
+    memcpy(state->compressed_buffer + 4, state->block_buffer + state->prefix_len,
+        state->block_buffer_pos);
+    compressed_len = state->block_buffer_pos;
+  }
+  else {
+    gcomp_write_le32(state->compressed_buffer, (uint32_t)compressed_len);
+  }
+
+  size_t total_block_len = 4 + compressed_len;
+  if (state->header.block_checksum) {
+    uint32_t checksum =
+        gcomp_xxhash32(state->compressed_buffer + 4, compressed_len, 0);
+    gcomp_write_le32(state->compressed_buffer + total_block_len, checksum);
+    total_block_len += 4;
+  }
+
+  state->compressed_buffer_len = total_block_len;
+  state->compressed_buffer_pos = 0;
+
+  // Retire the block exactly as the streaming path does: keep what the next
+  // one may match into, drop the rest, move the table with it.
+  lz4_encoder_slide_window(state);
+}
+
+gcomp_status_t lz4_encoder_flush(
+    gcomp_encoder_t * encoder, gcomp_buffer_t * output, gcomp_flush_t mode) {
+  if (!encoder || !encoder->method_state || !output) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  if (output->size > 0 && !output->data) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  lz4_encoder_state_t * state = (lz4_encoder_state_t *)encoder->method_state;
+
+  if (state->stage == LZ4_ENC_STAGE_ERROR) {
+    return GCOMP_ERR_INTERNAL;
+  }
+  if (state->finish_called) {
+    return gcomp_encoder_set_error(encoder, GCOMP_ERR_INVALID_ARG,
+        "lz4 encoder cannot flush after finish");
+  }
+
+  // The frame header comes before any block, so a flush before the first byte
+  // of input still has this much to hand over.
+  if (state->stage == LZ4_ENC_STAGE_HEADER) {
+    while (
+        state->header_pos < state->header_len && output->used < output->size) {
+      ((uint8_t *)output->data)[output->used++] =
+          state->header_buf[state->header_pos++];
+    }
+    if (state->header_pos < state->header_len) {
+      return GCOMP_ERR_LIMIT;
+    }
+    state->stage = LZ4_ENC_STAGE_BLOCKS;
+  }
+
+  if (state->parallel_ctx) {
+    if (!lz4_encoder_drain_parallel_output(state, output)) {
+      return GCOMP_ERR_LIMIT;
+    }
+
+    // Hand over the block being filled, then wait for every block still out
+    // with the workers.  A flush has to wait: its whole point is that nothing
+    // consumed is left in flight.
+    if (state->parallel_job && state->parallel_job->base.input_size > 0) {
+      bool submitted = false;
+      gcomp_status_t status =
+          lz4_encoder_submit_parallel_job(state, output, &submitted);
+      if (status != GCOMP_OK) {
+        return gcomp_encoder_set_error(
+            encoder, status, "lz4 parallel job submit failed");
+      }
+      if (!submitted) {
+        return GCOMP_ERR_LIMIT; // Output full with a result staged; drain.
+      }
+      status = lz4_parallel_alloc_job(state->parallel_ctx, &state->parallel_job);
+      if (status != GCOMP_OK) {
+        return gcomp_encoder_set_error(
+            encoder, status, "failed to allocate lz4 parallel job");
+      }
+    }
+
+    gcomp_status_t status = lz4_parallel_wait(state->parallel_ctx);
+    if (status != GCOMP_OK) {
+      return gcomp_encoder_set_error(
+          encoder, status, "lz4 parallel wait failed");
+    }
+    status = lz4_encoder_collect_parallel_results(state, output);
+    if (status != GCOMP_OK) {
+      return gcomp_encoder_set_error(
+          encoder, status, "lz4 parallel compression failed");
+    }
+    if (!lz4_encoder_drain_parallel_output(state, output)) {
+      return GCOMP_ERR_LIMIT;
+    }
+    if (lz4_parallel_pending_count(state->parallel_ctx) > 0) {
+      return GCOMP_ERR_LIMIT; // Blocks remain; call again once drained.
+    }
+
+    // Parallel encoding requires independent blocks, so there is no history
+    // for GCOMP_FLUSH_FULL to drop -- every block already starts from the
+    // dictionary alone.
+    return GCOMP_OK;
+  }
+
+  // A block staged by an earlier call -- by update(), or by a flush that ran
+  // out of output -- goes first.  block_buffer_pos was zeroed when it was
+  // staged, so the branch below will not stage it a second time.
+  if (state->compressed_buffer_len > 0) {
+    if (!lz4_emit_staged(state, output)) {
+      return GCOMP_ERR_LIMIT;
+    }
+    state->compressed_buffer_len = 0;
+    state->compressed_buffer_pos = 0;
+  }
+  else if (state->block_buffer_pos > 0) {
+    lz4_encoder_stage_partial_block(state);
+    if (!lz4_emit_staged(state, output)) {
+      return GCOMP_ERR_LIMIT;
+    }
+    state->compressed_buffer_len = 0;
+    state->compressed_buffer_pos = 0;
+  }
+
+  if (mode == GCOMP_FLUSH_FULL && !state->header.block_independence) {
+    // Linked blocks are the only case with history to drop.  Independent
+    // blocks retired theirs when the block was staged, above.
+    //
+    // This resets to an empty window rather than back to the dictionary:
+    // with linked blocks the window slides and the frame's own output
+    // displaces the dictionary as it goes, so by now there is generally
+    // nothing of it left to restore.  Subsequent blocks start from nothing,
+    // which is what "nothing after this refers to anything before it" means.
+    state->prefix_len = 0;
+    state->block_buffer_pos = 0;
+    memset(state->hash_table, 0, state->hash_table_size * sizeof(uint32_t));
+  }
+
+  return GCOMP_OK;
+}
+
 gcomp_status_t lz4_encoder_reset(gcomp_encoder_t * encoder) {
   if (!encoder || !encoder->method_state) {
     return GCOMP_ERR_INVALID_ARG;

@@ -134,6 +134,22 @@ gcomp_decoder_destroy(dec);
 gcomp_options_destroy(opts);
 ```
 
+## Flushing
+
+`gcomp_encoder_flush()` emits the pending run and literal packet. See
+[Streaming API](../api/streaming.md#flushing) for the general contract.
+
+RLE keeps no history across packets — each PackBits or TGA packet stands
+entirely on its own — so the two flush modes do the same thing, and a flush
+costs nothing but the packet boundary it forces early.
+
+One constraint is specific to this method: a PackBits literal packet is a
+length byte plus up to 128 bytes, written as a unit, so there is no way to hand
+out half of one. A flush therefore needs **129 bytes** of free output space.
+Given less, it returns `GCOMP_ERR_LIMIT` with an error detail saying so, rather
+than leaving a caller to loop waiting for progress that cannot come. This is
+the same minimum `gcomp_encoder_update()` reports, for the same reason.
+
 ## Reset
 
 Encoder and decoder support `gcomp_encoder_reset()` and `gcomp_decoder_reset()`. Reset clears literal/run accumulation (encoder) or partial-token state (decoder) and error state; options are retained. Use reset to reuse the same instance for another stream without destroy/create.

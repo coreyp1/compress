@@ -455,6 +455,19 @@ gcomp_status_t lz4_encoder_finish(
 /**
  * @brief Reset LZ4 encoder to initial state.
  */
+/**
+ * @brief Close out the block being filled, without ending the frame.
+ *
+ * See gcomp_encoder_flush().  A flushed block is an ordinary LZ4 block, so
+ * nothing about the frame changes except where the block boundaries fall.
+ * With independent blocks -- the default, and what parallel encoding requires
+ * -- a block already carries no history, so the two flush modes do the same
+ * thing.  With linked blocks GCOMP_FLUSH_FULL additionally drops the 64 KB
+ * window, so nothing after the flush can match into anything before it.
+ */
+gcomp_status_t lz4_encoder_flush(
+    gcomp_encoder_t * encoder, gcomp_buffer_t * output, gcomp_flush_t mode);
+
 gcomp_status_t lz4_encoder_reset(gcomp_encoder_t * encoder);
 
 //

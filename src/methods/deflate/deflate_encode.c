@@ -707,6 +707,9 @@ typedef struct gcomp_deflate_encoder_state_s {
   size_t opt_node_cap;                   ///< Entries in opt_nodes.
   int use_opt;                           ///< Parse by shortest path.
 
+  /** Non-zero while a flush tail is staged in pending_buf but not delivered. */
+  int flush_staged;
+
   uint8_t * pending_buf;    ///< Output staged by update() before delivery.
   size_t pending_size;      ///< Allocated size of pending_buf.
   size_t pending_used;      ///< Bytes rendered into pending_buf.
@@ -2502,6 +2505,7 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
   encoder->method_state = st;
   encoder->update_fn = gcomp_deflate_encoder_update;
   encoder->finish_fn = gcomp_deflate_encoder_finish;
+  encoder->flush_fn = gcomp_deflate_encoder_flush;
   encoder->reset_fn = gcomp_deflate_encoder_reset;
   return GCOMP_OK;
 
@@ -2594,6 +2598,7 @@ gcomp_status_t gcomp_deflate_encoder_reset(gcomp_encoder_t * encoder) {
 
   // Reset bitwriter state
   gcomp_deflate_bitwriter_reset(&st->bitwriter);
+  st->flush_staged = 0;
 
   // Reset block buffer (level 0)
   if (st->block_buffer) {
@@ -3691,6 +3696,268 @@ static size_t deflate_estimate_finish_size(
   }
 
   return result + alignment + margin;
+}
+
+/**
+ * @brief Write the empty stored block that ends a flush.
+ *
+ * RFC 1951 3.2.3 and 3.2.4: a block header of BFINAL=0, BTYPE=00, then
+ * padding to the next byte boundary, then LEN=0x0000 and NLEN=0xFFFF.  Five
+ * bytes at most, carrying no data.
+ *
+ * WHY A FLUSH CANNOT JUST STOP
+ * ============================
+ * DEFLATE blocks do not end on byte boundaries, so ending a block and handing
+ * over the whole bytes written leaves the decoder mid-byte with padding bits
+ * it has no way to recognise as padding.  It would read them as the next
+ * block's header -- three zero bits say "a stored block follows" -- and then
+ * take LEN and NLEN from whatever bytes arrive next, which are the start of
+ * real data.
+ *
+ * Writing the empty stored block explicitly makes that reading correct: the
+ * header is real, the padding is consumed by the alignment the format
+ * requires after it, LEN says zero bytes follow, and both sides come out of
+ * it byte-aligned at the start of the next block header.  This is the same
+ * four-byte 00 00 FF FF tail zlib's Z_SYNC_FLUSH produces, for the same
+ * reason.
+ */
+static gcomp_status_t deflate_write_sync_marker(
+    gcomp_deflate_encoder_state_t * st) {
+  gcomp_status_t s =
+      gcomp_deflate_bitwriter_write_bits(&st->bitwriter, 0u, 1); // BFINAL=0
+  if (s != GCOMP_OK) {
+    return s;
+  }
+  s = gcomp_deflate_bitwriter_write_bits(&st->bitwriter, 0u, 2); // BTYPE=stored
+  if (s != GCOMP_OK) {
+    return s;
+  }
+  s = gcomp_deflate_bitwriter_flush_to_byte(&st->bitwriter);
+  if (s != GCOMP_OK) {
+    return s;
+  }
+  static const uint8_t marker[4] = {0x00u, 0x00u, 0xFFu, 0xFFu};
+  for (size_t i = 0; i < sizeof(marker); i++) {
+    s = gcomp_deflate_bitwriter_write_bits(&st->bitwriter, marker[i], 8);
+    if (s != GCOMP_OK) {
+      return s;
+    }
+  }
+  return GCOMP_OK;
+}
+
+/**
+ * @brief Render a flush into the staging buffer.
+ *
+ * The same three steps finish() takes -- emit the match held back by lazy
+ * matching, turn the remaining lookahead into literals, close the block --
+ * with two differences: the block is not marked final, and the lookahead
+ * bytes are entered into the hash chains as they go.
+ *
+ * That second difference is the point of a *sync* flush.  finish() does not
+ * bother, because there is no next position to match from; here there is, and
+ * without it every byte of lookahead at every flush would be invisible to
+ * later matches.  For a caller flushing once per protocol message that is
+ * most of the stream.
+ */
+static gcomp_status_t deflate_stage_flush(
+    gcomp_deflate_encoder_state_t * st) {
+  gcomp_status_t s = gcomp_deflate_bitwriter_set_buffer(
+      &st->bitwriter, st->pending_buf, st->pending_size);
+  if (s != GCOMP_OK) {
+    return s;
+  }
+
+  if (st->level == 0) {
+    // Stored blocks are byte-aligned and self-terminating, so emitting the
+    // buffered data is the whole flush: no marker is needed, and the decoder
+    // is left exactly at the next block header.
+    while (st->block_buffer_used > 0) {
+      s = deflate_flush_stored_block(st, 0);
+      if (s != GCOMP_OK) {
+        return s;
+      }
+    }
+    st->pending_used = gcomp_deflate_bitwriter_bytes_written(&st->bitwriter);
+    return GCOMP_OK;
+  }
+
+  const int use_fixed_huffman = (st->strategy == DEFLATE_STRATEGY_FIXED);
+  const int skip_lz77 = (st->strategy == DEFLATE_STRATEGY_HUFFMAN_ONLY);
+
+  // A match held back by lazy matching has to go out, or the byte it starts
+  // on is emitted twice -- once as part of a match that never arrives and
+  // once as a literal below.  Same reasoning as finish(); the difference is
+  // that here the match may still be beaten by input that has not arrived, so
+  // this costs a little ratio.  That is what asking for a flush buys.
+  if (st->lazy_length >= DEFLATE_MIN_MATCH_LENGTH) {
+    uint32_t held_length = st->lazy_length;
+    uint32_t held_distance = st->lazy_distance;
+    st->lazy_length = 0;
+
+    if (st->sym_buf_used >= st->sym_buf_size) {
+      s = use_fixed_huffman ? deflate_flush_fixed_block(st, 0)
+                            : deflate_flush_dynamic_block(st, 0);
+      if (s != GCOMP_OK) {
+        return s;
+      }
+    }
+
+    st->lit_buf[st->sym_buf_used] = (uint16_t)held_length;
+    st->dist_buf[st->sym_buf_used] = (uint16_t)held_distance;
+    st->sym_buf_used++;
+    st->block_input_len += (size_t)held_length;
+    if (st->lit_freq) {
+      st->lit_freq[gcomp_deflate_length_code(held_length)]++;
+      st->dist_freq[gcomp_deflate_distance_code(held_distance)]++;
+    }
+
+    uint32_t remaining_bytes = held_length - 1u;
+    if ((size_t)remaining_bytes > st->lookahead) {
+      remaining_bytes = (uint32_t)st->lookahead;
+    }
+    st->lookahead -= remaining_bytes;
+  }
+
+  // Everything still in the lookahead is input the caller has handed over, so
+  // it has to be in the output by the time this returns.  There is no more
+  // input to match it against, so it goes out as literals.
+  while (st->lookahead > 0) {
+    if (st->sym_buf_used >= st->sym_buf_size) {
+      s = use_fixed_huffman ? deflate_flush_fixed_block(st, 0)
+                            : deflate_flush_dynamic_block(st, 0);
+      if (s != GCOMP_OK) {
+        return s;
+      }
+    }
+
+    size_t pos = (st->window_pos + st->window_size - st->lookahead) %
+        st->window_size;
+    uint8_t lit = st->window[pos];
+    st->lit_buf[st->sym_buf_used] = lit;
+    st->dist_buf[st->sym_buf_used] = 0;
+    st->sym_buf_used++;
+    st->block_input_len += 1u;
+    if (st->lit_freq) {
+      st->lit_freq[lit]++;
+    }
+
+    // Keep the byte findable.  See the note on this function.
+    if (!skip_lz77 && st->lookahead >= 3) {
+      deflate_insert_hash(st, pos, st->total_in - st->lookahead);
+    }
+
+    st->lookahead--;
+  }
+
+  // Close the block, if there is one.  When there are no symbols the previous
+  // block already ended with its end-of-block symbol, and an empty block here
+  // would only cost bytes.
+  if (st->sym_buf_used > 0) {
+    s = use_fixed_huffman ? deflate_flush_fixed_block(st, 0)
+                          : deflate_flush_dynamic_block(st, 0);
+    if (s != GCOMP_OK) {
+      return s;
+    }
+  }
+
+  s = deflate_write_sync_marker(st);
+  if (s != GCOMP_OK) {
+    return s;
+  }
+
+  st->pending_used = gcomp_deflate_bitwriter_bytes_written(&st->bitwriter);
+  return GCOMP_OK;
+}
+
+/**
+ * @brief Forget the match history, so nothing after this point reaches back.
+ *
+ * What GCOMP_FLUSH_FULL adds to a sync flush.  Every back-reference this
+ * encoder can emit comes from a hash chain, so emptying the chains is what
+ * makes the guarantee -- except under the RLE strategy, which looks at the
+ * byte before the current position directly and asks `window_fill >
+ * lookahead` whether the window holds any history at all.  So the window has
+ * to be told it is empty too, which also stops a block being stored from
+ * bytes written before the flush.
+ */
+static void deflate_drop_history(gcomp_deflate_encoder_state_t * st) {
+  memset(st->hash_head, 0, DEFLATE_HASH_SIZE * sizeof(uint16_t));
+  memset(st->hash_prev, 0, st->window_size * sizeof(uint16_t));
+  memset(st->hash_pos, 0, st->window_size * sizeof(size_t));
+  memset(st->hash_at, 0, st->window_size * sizeof(uint16_t));
+  st->hash_value = 0;
+  st->window_fill = 0;
+}
+
+gcomp_status_t gcomp_deflate_encoder_flush(
+    gcomp_encoder_t * encoder, gcomp_buffer_t * output, gcomp_flush_t mode) {
+  if (!encoder || !output) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  if (output->size > 0 && !output->data) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  gcomp_deflate_encoder_state_t * st =
+      (gcomp_deflate_encoder_state_t *)encoder->method_state;
+  if (!st) {
+    return gcomp_encoder_set_error(
+        encoder, GCOMP_ERR_INTERNAL, "deflate encoder state is NULL");
+  }
+  if (st->final_block_written) {
+    return gcomp_encoder_set_error(encoder, GCOMP_ERR_INVALID_ARG,
+        "deflate encoder cannot flush after finish");
+  }
+
+  const gcomp_allocator_t * alloc =
+      gcomp_registry_get_allocator(encoder->registry);
+
+  if (!st->flush_staged) {
+    // Whatever update() staged but could not deliver goes first; the flush is
+    // rendered into the same buffer, so it has to be empty before we start.
+    if (st->pending_buf && st->pending_used > st->pending_copied) {
+      if (!deflate_drain_pending(st, output)) {
+        return GCOMP_ERR_LIMIT;
+      }
+    }
+
+    // A flush renders more than one batch can: every symbol still buffered,
+    // every byte of lookahead as a literal, and the marker.  That is what
+    // finish() sizes itself for, so size this the same way.
+    size_t need = deflate_estimate_finish_size(st) + 16u;
+    if (st->pending_size < need) {
+      uint8_t * grown = (uint8_t *)gcomp_malloc(alloc, need);
+      if (!grown) {
+        return gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
+            "failed to allocate deflate flush buffer (%zu bytes)", need);
+      }
+      gcomp_free(alloc, st->pending_buf);
+      st->pending_buf = grown;
+      st->pending_size = need;
+      st->pending_used = 0;
+      st->pending_copied = 0;
+    }
+
+    gcomp_status_t s = deflate_stage_flush(st);
+    if (s != GCOMP_OK) {
+      return gcomp_encoder_set_error(encoder, s, "deflate flush failed");
+    }
+    st->flush_staged = 1;
+
+    // Dropping the history is safe here and not before: the lookahead has
+    // been turned into symbols and those symbols are written, so nothing
+    // still to be emitted refers to what is being forgotten.
+    if (mode == GCOMP_FLUSH_FULL) {
+      deflate_drop_history(st);
+    }
+  }
+
+  if (!deflate_drain_pending(st, output)) {
+    return GCOMP_ERR_LIMIT;
+  }
+  st->flush_staged = 0;
+  return GCOMP_OK;
 }
 
 gcomp_status_t gcomp_deflate_encoder_finish(

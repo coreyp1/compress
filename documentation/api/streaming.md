@@ -72,6 +72,89 @@ status = gcomp_encoder_finish(encoder, &final_output);
 // Writes final block, flushes to byte boundary
 ```
 
+### Flushing
+
+`gcomp_encoder_finish()` ends the stream. When you need the *peer* to see what
+you have written so far but the stream is not over — a protocol message, a log
+record, a chunk on a socket — use `gcomp_encoder_flush()`:
+
+```c
+for (;;) {
+    gcomp_buffer_t out = { buf, sizeof(buf), 0 };
+    gcomp_status_t s = gcomp_encoder_flush(encoder, &out, GCOMP_FLUSH_SYNC);
+    write_out(buf, out.used);
+    if (s == GCOMP_OK) break;
+    if (s != GCOMP_ERR_LIMIT) return s;   // real error
+}
+// keep calling update(); end with finish() as usual
+```
+
+**The promise:** once flush returns `GCOMP_OK`, a decoder given the bytes
+produced so far will produce every byte the encoder has consumed so far.
+Without it an encoder may hold data indefinitely, waiting for a full block.
+
+The same `GCOMP_ERR_LIMIT` contract as `finish()` applies: drain and call again
+with the same mode until it returns `GCOMP_OK`. Stopping early leaves the peer
+without data the encoder has already taken.
+
+#### Modes
+
+| Mode | Keeps compression history? | Use when |
+|------|---------------------------|----------|
+| `GCOMP_FLUSH_SYNC` | Yes | You want the peer to see the data now. This is the common case, and corresponds to zlib's `Z_SYNC_FLUSH`. |
+| `GCOMP_FLUSH_FULL` | No | You want a decoder to be able to resume here after damage earlier in the stream. Costs ratio. Corresponds to zlib's `Z_FULL_FLUSH`. |
+
+#### Cost
+
+A flush ends a block early and pads to a byte boundary, so flushing often
+compresses worse than not flushing. Flush at message boundaries, not per
+write. Measured on 300 KB of mixed text, run and noise:
+
+| flush every | deflate | zstd | lz4 | lzw | rle |
+|---|---|---|---|---|---|
+| 60 KB | 113,576 | 116,154 | 140,354 | 155,172 | 203,339 |
+| 1 KB  | 117,989 | 120,895 | 150,306 | 160,563 | 203,382 |
+
+On 4 KB of the same data, flushing after *every byte* produces 28,002 bytes
+with deflate — seven times the input. The API will let you do it; do not.
+
+#### What each method does
+
+| Method | Sync flush | Full flush |
+|---|---|---|
+| **deflate**, **gzip** | Ends the block, writes the empty stored block (`00 00 FF FF`) that byte-aligns the output — zlib's `Z_SYNC_FLUSH` tail | Also empties the match history, so nothing afterwards reaches back |
+| **lz4** | Closes the block being filled; an ordinary LZ4 block, so the frame is unchanged | Identical with independent blocks (the default), which carry no history anyway. With `lz4.independent_blocks=false` it also drops the 64 KB window |
+| **zstd** | Emits the block being filled; the frame stays open | **Ends the frame and starts another.** Reading the result needs `zstd.concat` on the decoder — see below |
+| **lzw** | Emits the pending code followed by a `CLEAR`, which is the only way to push a partial code out where a decoder can read it | Identical — the `CLEAR` already resets the dictionary |
+| **rle** | Emits the pending run and literal packet | Identical — RLE keeps no history |
+
+Two consequences worth knowing before you rely on them:
+
+- **zstd's full flush ends the frame.** Repeat offsets are frame-level state
+  that the decoder tracks in step with the encoder, so an encoder cannot reset
+  them mid-frame; the unit of recovery in zstd is the frame. libzstd draws the
+  same line — it offers `ZSTD_e_flush` and `ZSTD_e_end` and nothing in
+  between. Decode such a stream with `zstd.concat` set.
+- **LZW's flush is not byte-aligned.** Codes are 9–12 bits and the partial byte
+  stays in the encoder to be continued. The data promise still holds; the
+  byte-boundary one does not. If you need aligned boundaries, use a framed
+  format.
+
+#### Minimum output space
+
+Every method but RLE can hand a flush out a byte at a time. A PackBits literal
+packet is a length byte plus up to 128 bytes written as a unit, so RLE needs
+**129 bytes** of free output space to flush; given less it returns
+`GCOMP_ERR_LIMIT` with an error detail saying so, rather than looping.
+
+#### Notes
+
+- Flushing with nothing buffered writes nothing (beyond any stream header not
+  yet emitted) and returns `GCOMP_OK`. It is not an error.
+- Flushing after `finish()` has completed the stream is an error.
+- Every method in this library supports flush. A method that did not would
+  return `GCOMP_ERR_UNSUPPORTED`, and would do so before writing anything.
+
 ### Reset (Optional)
 
 For compressing multiple independent streams with the same options, reuse the encoder instead of destroying and recreating:

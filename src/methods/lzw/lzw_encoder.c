@@ -563,6 +563,147 @@ gcomp_status_t lzw_encoder_finish(
   return GCOMP_OK;
 }
 
+/**
+ * @brief Render the flush tail into the staging buffer.
+ *
+ * WHY THIS EMITS A CLEAR, AND WHY IT DOES NOT BYTE-ALIGN
+ * =====================================================
+ *
+ * LZW is a bare bit stream.  Codes are 9 to 12 bits and do not stop on byte
+ * boundaries, so at any moment the last code written is partly in the bit
+ * writer and partly in the bytes already handed over.  A decoder given those
+ * bytes cannot decode that last code, and so cannot produce the bytes it
+ * stands for -- which is exactly what a flush has to deliver.
+ *
+ * The fix is to write one more code after it.  A code is at least 9 bits and
+ * a partial byte is at most 7, so writing anything at all pushes the previous
+ * code entirely into whole bytes.  The code to write is CLEAR: it is the one
+ * code that means something harmless here, and the format already uses it
+ * mid-stream when the dictionary fills, so every decoder handles it.
+ *
+ * That is also why LZW's flush is always a full flush.  CLEAR resets the
+ * dictionary and the code width; there is no way to push the pending code out
+ * without it, so there is no cheaper mode to offer.
+ *
+ * What this deliberately does NOT do is pad to a byte boundary.  Padding
+ * would put bits into the stream that the decoder would read as the start of
+ * the next code, and the encoder -- which resumes from its own bit position,
+ * not from a byte boundary -- would then be writing a code the decoder is
+ * already misreading.  So the partial byte stays in the writer and continues
+ * into the next output window, which is what lzw_bitwriter_set_buffer()
+ * preserves bit_buffer/bit_count for.  Callers who need byte-aligned
+ * boundaries need a framed format; GIF and TIFF get theirs from sub-block
+ * and strip lengths outside the LZW stream.
+ */
+static gcomp_status_t lzw_stage_flush_tail(
+    lzw_encoder_state_t * state, gcomp_encoder_t * encoder) {
+  state->stage_used = 0;
+  state->stage_copied = 0;
+  lzw_bitwriter_set_buffer(&state->writer, state->stage_buf, state->stage_size);
+
+  // A code update() could not fit goes first, or it would be lost.
+  if (state->pending_bits != 0) {
+    gcomp_status_t s = lzw_bitwriter_write_bits(
+        &state->writer, state->pending_code, state->pending_bits);
+    if (s != GCOMP_OK) {
+      return gcomp_encoder_set_error(
+          encoder, s, "LZW encoder flush pending code failed");
+    }
+    state->pending_code = 0;
+    state->pending_bits = 0;
+  }
+
+  // A stream that has emitted nothing still owes its opening CLEAR.
+  if (!state->header_emitted) {
+    gcomp_status_t s = emit_code(state, encoder, state->clear_code);
+    if (s != GCOMP_OK) {
+      return s;
+    }
+    state->header_emitted = 1;
+  }
+
+  // The string being built is input already consumed; it has to go out.
+  if (state->prefix_code != LZW_NO_PREFIX) {
+    gcomp_status_t s = emit_code(state, encoder, state->prefix_code);
+    if (s != GCOMP_OK) {
+      return s;
+    }
+    state->prefix_code = LZW_NO_PREFIX;
+  }
+
+  // The CLEAR that makes the codes above readable -- see above.
+  gcomp_status_t s = emit_code(state, encoder, state->clear_code);
+  if (s != GCOMP_OK) {
+    return s;
+  }
+  lzw_core_encoder_reset(&state->core, state->clear_code, state->eoi_code);
+  if (state->hash_table) {
+    lzw_encoder_hash_reset(state->hash_table);
+  }
+  state->current_bits = lzw_profile_initial_code_bits(
+      state->profile_id, (unsigned)state->lit_width);
+
+  // Whole bytes only.  The partial byte stays in the writer and continues
+  // into the next window; flushing it here is the one thing that would break
+  // the stream.
+  state->stage_used = lzw_bitwriter_bytes_written(&state->writer);
+  return GCOMP_OK;
+}
+
+gcomp_status_t lzw_encoder_flush(
+    gcomp_encoder_t * encoder, gcomp_buffer_t * output, gcomp_flush_t mode) {
+  // Always a full flush; see lzw_stage_flush_tail().
+  (void)mode;
+
+  if (!encoder || !encoder->method_state) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  if (output->size > 0 && output->data == NULL) {
+    return gcomp_encoder_set_error(
+        encoder, GCOMP_ERR_INVALID_ARG, "output->data is NULL but size > 0");
+  }
+
+  lzw_encoder_state_t * state = (lzw_encoder_state_t *)encoder->method_state;
+  if (state->finish_staged) {
+    return gcomp_encoder_set_error(encoder, GCOMP_ERR_INVALID_ARG,
+        "LZW encoder cannot flush after finish");
+  }
+
+  if (!state->stage_buf) {
+    state->stage_buf = gcomp_malloc(state->allocator, LZW_STAGE_SIZE);
+    if (!state->stage_buf) {
+      return gcomp_encoder_set_error(encoder, GCOMP_ERR_MEMORY,
+          "LZW encoder staging buffer allocation failed");
+    }
+    state->stage_size = LZW_STAGE_SIZE;
+    state->stage_used = 0;
+    state->stage_copied = 0;
+  }
+
+  // Anything update() staged but could not deliver goes first, ahead of the
+  // flush tail, and the tail is rendered once.  flush_staged is what keeps a
+  // second call from rendering a second tail -- the state it mutates is gone
+  // by then, so it would write a different and wrong one.
+  if (!state->flush_staged) {
+    if (state->stage_used > state->stage_copied) {
+      if (!lzw_drain_stage(state, output)) {
+        return GCOMP_ERR_LIMIT;
+      }
+    }
+    gcomp_status_t s = lzw_stage_flush_tail(state, encoder);
+    if (s != GCOMP_OK) {
+      return s;
+    }
+    state->flush_staged = 1;
+  }
+
+  if (!lzw_drain_stage(state, output)) {
+    return GCOMP_ERR_LIMIT;
+  }
+  state->flush_staged = 0;
+  return GCOMP_OK;
+}
+
 gcomp_status_t lzw_encoder_reset(gcomp_encoder_t * encoder) {
   if (!encoder || !encoder->method_state) {
     return GCOMP_ERR_INVALID_ARG;
@@ -584,6 +725,7 @@ gcomp_status_t lzw_encoder_reset(gcomp_encoder_t * encoder) {
   state->stage_used = 0;
   state->stage_copied = 0;
   state->finish_staged = 0;
+  state->flush_staged = 0;
   state->writer.bit_buffer = 0;
   state->writer.bit_count = 0;
   return GCOMP_OK;

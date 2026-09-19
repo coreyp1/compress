@@ -156,6 +156,57 @@ gcomp_status_t rle_encoder_finish(
     return gcomp_encoder_set_error(
         encoder, s, "RLE profile encode finish failed");
   }
+  state->finish_called = true;
+  return GCOMP_OK;
+}
+
+gcomp_status_t rle_encoder_flush(
+    gcomp_encoder_t * encoder, gcomp_buffer_t * output, gcomp_flush_t mode) {
+  // Both modes are the same work.  RLE has no history to drop: every packet
+  // is self-contained, so what follows a flush could never have referred to
+  // what preceded it anyway.
+  (void)mode;
+
+  if (!encoder || !encoder->method_state) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  if (output->size > 0 && output->data == NULL) {
+    return gcomp_encoder_set_error(
+        encoder, GCOMP_ERR_INVALID_ARG, "output->data is NULL but size > 0");
+  }
+
+  rle_encoder_state_t * state = (rle_encoder_state_t *)encoder->method_state;
+  if (state->finish_called) {
+    return gcomp_encoder_set_error(encoder, GCOMP_ERR_INVALID_ARG,
+        "RLE encoder cannot flush after finish");
+  }
+
+  // Closing out the pending run and literal block leaves exactly the state a
+  // fresh encoder starts in, so encoding simply continues afterwards.  The
+  // finish helper clears each piece as it emits it, so a short output buffer
+  // resumes where it stopped rather than emitting anything twice.
+  size_t before = output->used;
+  gcomp_status_t s = rle_profile_encode_finish(
+      state, (uint8_t *)output->data, output->size, &output->used);
+  if (s == GCOMP_ERR_LIMIT) {
+    // A PackBits literal packet is a length byte and up to 128 bytes, written
+    // as a unit; there is no way to hand out half of one.  So unlike the
+    // other methods, RLE cannot flush into an arbitrarily small buffer, and a
+    // caller that keeps offering one would loop forever waiting for progress
+    // that cannot come.  Say which it is: this is the same minimum
+    // rle_encoder_update() reports for the same reason.
+    if (output->used == before &&
+        output->size - before < RLE_MIN_OUTPUT_SPACE) {
+      return gcomp_encoder_set_error(encoder, GCOMP_ERR_LIMIT,
+          "RLE encoder needs at least %u bytes of free output space to flush; "
+          "%zu available",
+          (unsigned)RLE_MIN_OUTPUT_SPACE, output->size - before);
+    }
+    return GCOMP_ERR_LIMIT; // Caller drains and calls again.
+  }
+  if (s != GCOMP_OK) {
+    return gcomp_encoder_set_error(encoder, s, "RLE profile flush failed");
+  }
   return GCOMP_OK;
 }
 
@@ -166,5 +217,6 @@ gcomp_status_t rle_encoder_reset(gcomp_encoder_t * encoder) {
   rle_encoder_state_t * state = (rle_encoder_state_t *)encoder->method_state;
   state->literal_count = 0;
   state->run_len = 0;
+  state->finish_called = false;
   return GCOMP_OK;
 }

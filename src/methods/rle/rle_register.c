@@ -144,6 +144,7 @@ static gcomp_status_t rle_create_encoder(gcomp_registry_t * registry,
 
   (*encoder_out)->update_fn = rle_encoder_update_wrapper;
   (*encoder_out)->finish_fn = rle_encoder_finish_wrapper;
+  (*encoder_out)->flush_fn = rle_encoder_flush;
   (*encoder_out)->reset_fn = rle_encoder_reset;
   return GCOMP_OK;
 }

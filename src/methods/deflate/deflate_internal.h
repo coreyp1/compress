@@ -137,6 +137,18 @@ void gcomp_deflate_encoder_destroy(gcomp_encoder_t * encoder);
  * Resets all internal state so the encoder can be reused for a new stream.
  * Allocated buffers are retained (not freed and reallocated).
  */
+/**
+ * @brief Emit every symbol for the input consumed so far, without ending the
+ *        stream.
+ *
+ * See gcomp_encoder_flush().  Ends the current block and writes the empty
+ * stored block that byte-aligns the output -- zlib's Z_SYNC_FLUSH tail.
+ * GCOMP_FLUSH_FULL additionally empties the match history, so nothing after
+ * the flush point refers to anything before it.
+ */
+gcomp_status_t gcomp_deflate_encoder_flush(
+    gcomp_encoder_t * encoder, gcomp_buffer_t * output, gcomp_flush_t mode);
+
 gcomp_status_t gcomp_deflate_encoder_reset(gcomp_encoder_t * encoder);
 
 /**

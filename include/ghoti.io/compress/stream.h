@@ -152,6 +152,98 @@ GCOMP_API gcomp_status_t gcomp_encoder_finish(
     gcomp_encoder_t * encoder, gcomp_buffer_t * output);
 
 /**
+ * @brief What a flush should leave behind.
+ *
+ * Both modes guarantee the same thing about the *data*: once the flush
+ * completes, everything the encoder has consumed can be decoded from the
+ * bytes it has handed over.  They differ in what the encoder keeps.
+ */
+typedef enum {
+  /**
+   * @brief Deliver everything consumed so far; keep the compression history.
+   *
+   * The encoder may still match against data written before the flush, so
+   * this costs as little ratio as the format allows.  Use it to hand a
+   * complete message to a peer: a request/response protocol, a log line, a
+   * frame on a socket.
+   *
+   * This is the flush people mean when they say "flush", and it corresponds
+   * to zlib's `Z_SYNC_FLUSH`.
+   */
+  GCOMP_FLUSH_SYNC = 0,
+
+  /**
+   * @brief As @ref GCOMP_FLUSH_SYNC, and forget everything before this point.
+   *
+   * Nothing written after the flush refers to anything written before it, so
+   * a decoder that loses or mangles an earlier part of the stream can pick up
+   * again here instead of being lost for good.  That costs ratio -- the next
+   * bytes start from an empty history, as if the stream began there.
+   *
+   * Corresponds to zlib's `Z_FULL_FLUSH`.  It is not a promise that a fresh
+   * decoder can start reading at this offset: formats with a header still
+   * need their header.
+   */
+  GCOMP_FLUSH_FULL = 1,
+} gcomp_flush_t;
+
+/**
+ * @brief Emit everything consumed so far, without ending the stream.
+ *
+ * After this returns `GCOMP_OK`, a decoder given the bytes produced so far
+ * will produce every byte the encoder has consumed so far.  The stream is not
+ * finished: keep calling @ref gcomp_encoder_update, and end it with
+ * @ref gcomp_encoder_finish as usual.
+ *
+ * This is what makes the library usable for framing -- a protocol message, a
+ * log record, a chunk on a socket -- where the peer has to see the data
+ * before the sender has anything more to say.  Without it, an encoder may
+ * hold data indefinitely waiting for a full block.
+ *
+ * ## Cost
+ *
+ * A flush ends a block early and pads to a byte boundary, so flushing often
+ * compresses worse than not flushing -- a flush every few bytes can make the
+ * output larger than the input.  Flush at message boundaries, not per write.
+ * @ref GCOMP_FLUSH_FULL costs more again, because it drops the history.
+ *
+ * ## Output buffer too small
+ *
+ * Exactly the contract @ref gcomp_encoder_finish uses: if @p output cannot
+ * hold everything, flush writes what fits and returns `GCOMP_ERR_LIMIT`.
+ * Drain and call again with the same mode until it returns `GCOMP_OK`.
+ * Stopping early leaves the peer without data the encoder has already
+ * consumed.
+ *
+ * @code
+ * for (;;) {
+ *   gcomp_buffer_t out = {buf, sizeof(buf), 0};
+ *   gcomp_status_t s = gcomp_encoder_flush(encoder, &out, GCOMP_FLUSH_SYNC);
+ *   write_out(buf, out.used);
+ *   if (s == GCOMP_OK) break;
+ *   if (s != GCOMP_ERR_LIMIT) return s;
+ * }
+ * @endcode
+ *
+ * ## Notes
+ *
+ * - Flushing with nothing buffered writes nothing (beyond any stream header
+ *   not yet emitted) and returns `GCOMP_OK`.  It is not an error.
+ * - Flushing after @ref gcomp_encoder_finish has completed the stream is an
+ *   error: there is nothing left to flush into.
+ * - Every method in this library supports flush.  A method that did not would
+ *   return `GCOMP_ERR_UNSUPPORTED`, and would do so before writing anything.
+ *
+ * @param encoder The encoder
+ * @param output Output buffer
+ * @param mode @ref GCOMP_FLUSH_SYNC or @ref GCOMP_FLUSH_FULL
+ * @return GCOMP_OK when the flush is complete, GCOMP_ERR_LIMIT when more
+ *         output space is needed, otherwise an error code
+ */
+GCOMP_API gcomp_status_t gcomp_encoder_flush(
+    gcomp_encoder_t * encoder, gcomp_buffer_t * output, gcomp_flush_t mode);
+
+/**
  * @brief Reset encoder to initial state
  *
  * Resets the encoder to its initial state, allowing it to be reused for a

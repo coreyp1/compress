@@ -27,6 +27,7 @@
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
 #include <ghoti.io/compress/stream.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -57,6 +58,13 @@ typedef struct {
   size_t literal_count; ///< Current literal run length (0..128)
   uint8_t run_byte;     ///< Byte value of current run (if run_len > 0)
   size_t run_len;       ///< Current run length (0 = not in run)
+  /**
+   * Set by rle_encoder_finish().  RLE's finish is just "emit what is
+   * pending", which leaves nothing to tell a later flush that the stream is
+   * over -- so this does.  Without it, flushing a finished encoder quietly
+   * succeeded and returned nothing, which reads like success.
+   */
+  bool finish_called;
 } rle_encoder_state_t;
 
 //
@@ -106,6 +114,17 @@ gcomp_status_t rle_encoder_update(
 
 gcomp_status_t rle_encoder_finish(
     gcomp_encoder_t * encoder, gcomp_buffer_t * output);
+
+/**
+ * @brief Emit the pending run and literal block without ending the stream.
+ *
+ * See gcomp_encoder_flush().  RLE keeps no history across runs -- a PackBits
+ * or TGA packet stands entirely on its own -- so the two flush modes do the
+ * same thing here, and a flush costs nothing but the packet boundary it
+ * forces early.
+ */
+gcomp_status_t rle_encoder_flush(
+    gcomp_encoder_t * encoder, gcomp_buffer_t * output, gcomp_flush_t mode);
 
 gcomp_status_t rle_encoder_reset(gcomp_encoder_t * encoder);
 

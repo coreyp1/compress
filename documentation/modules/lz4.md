@@ -397,6 +397,27 @@ The parser returns `GCOMP_ERR_CORRUPT` for a magic number outside the skippable
 range and for a frame cut short of the size it declares, so it is safe to point
 at untrusted bytes.
 
+## Flushing
+
+`gcomp_encoder_flush()` closes the block being filled without ending the frame.
+See [Streaming API](../api/streaming.md#flushing) for the general contract.
+
+A flushed block is an ordinary LZ4 block, so nothing about the frame changes
+except where the block boundaries fall — and a flush costs only the short block
+it forces. The frame header goes out first if it has not already.
+
+With independent blocks (the default) a block already carries no history, so
+`GCOMP_FLUSH_SYNC` and `GCOMP_FLUSH_FULL` do the same thing. With
+`lz4.independent_blocks=false` a full flush additionally drops the 64 KB
+window, so nothing after the flush can match into anything before it. It resets
+to an empty window rather than back to the dictionary: with linked blocks the
+window slides and the frame's own output displaces the dictionary as it goes,
+so by then there is generally nothing of it left to restore.
+
+In [parallel mode](#parallel-compression) a flush submits the block being
+filled and then waits for every block still out with the workers — which is the
+point: nothing the caller handed over is left in flight.
+
 ## Parallel compression
 
 Set `threads.count` above 1 and the encoder compresses blocks on a pool of

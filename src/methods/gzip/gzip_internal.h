@@ -258,6 +258,17 @@ gcomp_status_t gzip_encoder_finish(
 /**
  * @brief Reset gzip encoder to initial state.
  */
+/**
+ * @brief Flush the deflate stream inside the gzip member.
+ *
+ * See gcomp_encoder_flush().  A gzip member is a header, a deflate stream and
+ * a trailer, so this is the deflate encoder's flush with the header emitted
+ * first if it has not gone out yet.  The CRC-32 and ISIZE are accumulated as
+ * input arrives, so they need nothing here.
+ */
+gcomp_status_t gzip_encoder_flush(
+    gcomp_encoder_t * encoder, gcomp_buffer_t * output, gcomp_flush_t mode);
+
 gcomp_status_t gzip_encoder_reset(gcomp_encoder_t * encoder);
 
 //

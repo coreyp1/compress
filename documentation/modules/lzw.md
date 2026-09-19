@@ -160,6 +160,32 @@ gcomp_decoder_destroy(dec);
 gcomp_options_destroy(opts);
 ```
 
+## Flushing
+
+`gcomp_encoder_flush()` emits every code for the input consumed so far. See
+[Streaming API](../api/streaming.md#flushing) for the general contract.
+
+Two things are specific to LZW, and both follow from it being a bare bit
+stream:
+
+**The flush emits a `CLEAR`.** Codes are 9–12 bits, so at any moment the last
+code written is partly in the bit writer and partly in the bytes already handed
+over — and a decoder cannot decode a code it only has part of. Writing one more
+code pushes the previous one entirely into whole bytes, and `CLEAR` is the code
+that means something harmless there. The format already uses it mid-stream when
+the dictionary fills, so every decoder handles it.
+
+**The flush is therefore always a full flush.** `CLEAR` resets the dictionary
+and the code width; there is no way to push the pending code out without it, so
+`GCOMP_FLUSH_SYNC` and `GCOMP_FLUSH_FULL` produce identical bytes.
+
+**The output is not byte-aligned.** Padding to a byte boundary would put bits
+into the stream that the decoder would read as the start of the next code, so
+the partial byte stays in the encoder and continues into the next output
+window. The data promise holds; the byte-boundary one does not. GIF and TIFF
+get aligned boundaries from sub-block and strip lengths *outside* the LZW
+stream, and a caller who needs them needs a framed format too.
+
 ## Reset
 
 Encoder and decoder support `gcomp_encoder_reset()` and `gcomp_decoder_reset()`. Reset clears dictionary state and partial bit state; options are retained. Use reset to reuse the same instance for another stream without destroy/create.

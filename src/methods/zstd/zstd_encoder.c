@@ -1118,6 +1118,316 @@ gcomp_status_t zstd_encoder_update(gcomp_encoder_t * encoder,
 }
 
 //
+// Flush
+//
+
+/**
+ * @brief Forget the match history, so nothing after this point reaches back.
+ *
+ * What GCOMP_FLUSH_FULL adds to a sync flush: the match finder's tables and
+ * the window they index are emptied, and the repeat offsets go back to their
+ * starting values (RFC 8878 3.1.1.3.2.1.1), so no sequence written afterwards
+ * can name a distance into what came before.
+ *
+ * The dictionary is history the *next* block is still entitled to, so it goes
+ * back in, exactly as zstd_encoder_reset() puts it back for a new stream.
+ *
+ * Nothing needs to be done about entropy tables: this encoder never writes
+ * Repeat_Mode, so no block ever depends on the tables of the one before it.
+ */
+static void zstd_encoder_drop_history(zstd_encoder_state_t * state) {
+  state->rep_offset_1 = ZSTD_REP_OFFSET_1_INIT;
+  state->rep_offset_2 = ZSTD_REP_OFFSET_2_INIT;
+  state->rep_offset_3 = ZSTD_REP_OFFSET_3_INIT;
+
+  if (state->match_finder) {
+    zstd_mf_reset(state->match_finder);
+  }
+  state->mf_window_len = 0;
+  if (state->mf_window && state->dict_parsed.content &&
+      state->dict_parsed.content_size > 0) {
+    size_t take = state->dict_parsed.content_size;
+    const uint8_t * from = state->dict_parsed.content;
+    if (take > state->mf_window_max) {
+      from += take - state->mf_window_max;
+      take = state->mf_window_max;
+    }
+    memcpy(state->mf_window, from, take);
+    state->mf_window_len = take;
+    zstd_mf_index_range(state->match_finder, state->mf_window, 0,
+        state->mf_window_len, state->mf_window_len);
+  }
+}
+
+/**
+ * @brief Start a fresh frame after a full flush has closed the previous one.
+ *
+ * A new frame is the only place zstd's frame-level state legitimately starts
+ * over, which is the whole reason GCOMP_FLUSH_FULL ends the frame.
+ */
+static gcomp_status_t zstd_encoder_rearm_frame(zstd_encoder_state_t * state) {
+  state->blocks_finished = false;
+  state->compressed_buffer_len = 0;
+  state->compressed_buffer_pos = 0;
+  state->block_buffer_pos = 0;
+
+  // The content checksum covers one frame's content, so the next frame's
+  // starts from nothing.
+  if (state->checksum_enabled) {
+    gcomp_xxhash64_reset(&state->content_hash, 0);
+  }
+
+  zstd_encoder_drop_history(state);
+
+  // Frame_Content_Size describes the frame it appears in (RFC 8878 3.1.1.1.2).
+  // The value the caller gave was for the whole content, which the first
+  // frame no longer holds on its own, so later frames declare nothing rather
+  // than repeat a number that is now wrong.
+  state->header.content_size_present = false;
+  state->header.content_size = 0;
+
+  gcomp_status_t status = zstd_write_frame_header(&state->header,
+      state->header_buf, sizeof(state->header_buf), &state->header_len);
+  state->header_pos = 0;
+  state->stage = ZSTD_ENC_STAGE_HEADER;
+  return status;
+}
+
+/**
+ * @brief Close the frame, so that a full flush really does start over.
+ *
+ * WHY A FULL FLUSH ENDS THE FRAME
+ * ===============================
+ * The other methods here can forget their history in place.  Zstd cannot:
+ * the repeat offsets are frame-level state that the decoder tracks in step
+ * with the encoder (RFC 8878 3.1.1.3.2.1.1), so an encoder that quietly reset
+ * them mid-frame would be describing distances the decoder computes
+ * differently.  That is not theoretical -- it is what the first version of
+ * this did, and the flush-invariant test caught it six flushes in, with the
+ * decoder producing the wrong bytes.
+ *
+ * Nor is there a cheaper fix.  Keeping the repeat offsets and clearing only
+ * the match finder still leaves a sequence free to name a repeat code whose
+ * value came from before the flush, which is exactly what a full flush
+ * promises will not happen.
+ *
+ * So the unit of recovery in zstd is the frame, and a full flush ends one.
+ * libzstd draws the same line: it offers ZSTD_e_flush and ZSTD_e_end, and no
+ * mid-frame equivalent of Z_FULL_FLUSH.
+ *
+ * The consequence for callers is that the output becomes more than one frame,
+ * and reading it needs `zstd.concat` on the decoder -- the same requirement
+ * parallel mode already carries.
+ */
+static gcomp_status_t zstd_encoder_flush_end_frame(gcomp_encoder_t * encoder,
+    zstd_encoder_state_t * state, gcomp_buffer_t * output) {
+  uint8_t * out_ptr = (uint8_t *)output->data;
+
+  if (state->stage == ZSTD_ENC_STAGE_BLOCKS) {
+    (void)zstd_emit_staged(state->compressed_buffer,
+        &state->compressed_buffer_pos, state->compressed_buffer_len, output);
+    if (state->compressed_buffer_pos < state->compressed_buffer_len) {
+      return GCOMP_ERR_LIMIT;
+    }
+
+    if (!state->blocks_finished) {
+      if (state->block_buffer_pos > 0) {
+        uint8_t block_type;
+        size_t compressed_len;
+        size_t input_len = state->block_buffer_pos;
+        gcomp_status_t status = zstd_block_compress(state, state->block_buffer,
+            input_len, state->compressed_buffer + 3,
+            state->compressed_buffer_capacity - 3, &compressed_len,
+            &block_type);
+        if (status != GCOMP_OK) {
+          state->stage = ZSTD_ENC_STAGE_ERROR;
+          return gcomp_encoder_set_error(
+              encoder, status, "final block compression failed");
+        }
+        uint32_t header_size = (block_type == ZSTD_BLOCK_TYPE_RLE)
+            ? (uint32_t)input_len
+            : (uint32_t)compressed_len;
+        zstd_write_block_header(
+            state->compressed_buffer, true, block_type, header_size);
+        state->compressed_buffer_len = 3 + compressed_len;
+        state->compressed_buffer_pos = 0;
+        state->block_buffer_pos = 0;
+      }
+      else {
+        // A frame must end with a block marked last, even an empty one.
+        zstd_write_block_header(
+            state->compressed_buffer, true, ZSTD_BLOCK_TYPE_RAW, 0);
+        state->compressed_buffer_len = 3;
+        state->compressed_buffer_pos = 0;
+      }
+      state->blocks_finished = true;
+    }
+
+    (void)zstd_emit_staged(state->compressed_buffer,
+        &state->compressed_buffer_pos, state->compressed_buffer_len, output);
+    if (state->compressed_buffer_pos < state->compressed_buffer_len) {
+      return GCOMP_ERR_LIMIT;
+    }
+
+    if (!state->checksum_enabled) {
+      return zstd_encoder_rearm_frame(state);
+    }
+    uint64_t hash = gcomp_xxhash64_finalize(&state->content_hash);
+    gcomp_write_le32(state->checksum_buf, (uint32_t)(hash & 0xFFFFFFFFu));
+    state->checksum_pos = 0;
+    state->stage = ZSTD_ENC_STAGE_CHECKSUM;
+  }
+
+  if (state->stage == ZSTD_ENC_STAGE_CHECKSUM) {
+    while (state->checksum_pos < ZSTD_CONTENT_CHECKSUM_SIZE &&
+        output->used < output->size) {
+      out_ptr[output->used++] = state->checksum_buf[state->checksum_pos++];
+    }
+    if (state->checksum_pos < ZSTD_CONTENT_CHECKSUM_SIZE) {
+      return GCOMP_ERR_LIMIT;
+    }
+    return zstd_encoder_rearm_frame(state);
+  }
+
+  return GCOMP_ERR_INTERNAL;
+}
+
+gcomp_status_t zstd_encoder_flush(gcomp_encoder_t * encoder,
+    gcomp_buffer_t * output, gcomp_flush_t mode) {
+  if (!encoder || !encoder->method_state || !output) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  if (output->size > 0 && !output->data) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  zstd_encoder_state_t * state = encoder->method_state;
+
+  if (state->stage == ZSTD_ENC_STAGE_ERROR) {
+    return gcomp_encoder_set_error(
+        encoder, GCOMP_ERR_INTERNAL, "encoder in error state");
+  }
+  // blocks_finished is set part-way through ending a frame as well as by
+  // finish(), so it cannot stand on its own here: a full flush that ran out
+  // of output mid-epilogue has to be allowed to come back and complete it.
+  if (state->stage == ZSTD_ENC_STAGE_DONE || state->finish_called) {
+    return gcomp_encoder_set_error(encoder, GCOMP_ERR_INVALID_ARG,
+        "zstd encoder cannot flush after finish");
+  }
+
+  if (state->parallel_ctx) {
+    // Parallel mode makes a whole frame per job, so a flush ends the frame in
+    // hand and the next input starts another.  That is the same concatenated
+    // stream parallel mode always produces -- a decoder reading it needs
+    // zstd.concat either way -- so a flush changes only where the seams fall.
+    if (!zstd_encoder_drain_parallel_output(state, output)) {
+      return GCOMP_ERR_LIMIT;
+    }
+
+    if (state->parallel_job && state->parallel_job->base.input_size > 0) {
+      bool submitted = false;
+      gcomp_status_t status =
+          zstd_encoder_submit_parallel_job(state, output, &submitted);
+      if (status != GCOMP_OK) {
+        return gcomp_encoder_set_error(
+            encoder, status, "parallel job submit failed");
+      }
+      if (!submitted) {
+        return GCOMP_ERR_LIMIT; // Output full with a result staged; drain.
+      }
+      status =
+          zstd_parallel_alloc_job(state->parallel_ctx, &state->parallel_job);
+      if (status != GCOMP_OK) {
+        return gcomp_encoder_set_error(
+            encoder, status, "failed to allocate parallel job");
+      }
+    }
+
+    // A flush has to wait: its whole point is that nothing the caller handed
+    // over is still sitting with a worker.
+    gcomp_status_t status = zstd_parallel_wait(state->parallel_ctx);
+    if (status != GCOMP_OK) {
+      return gcomp_encoder_set_error(encoder, status, "parallel wait failed");
+    }
+    status = zstd_encoder_collect_parallel_results(state, output);
+    if (status != GCOMP_OK) {
+      return gcomp_encoder_set_error(
+          encoder, status, "parallel compression failed");
+    }
+    if (!zstd_encoder_drain_parallel_output(state, output)) {
+      return GCOMP_ERR_LIMIT;
+    }
+    if (zstd_parallel_pending_count(state->parallel_ctx) > 0) {
+      return GCOMP_ERR_LIMIT; // Jobs remain; call again once drained.
+    }
+
+    // Each job is its own frame with its own window, so there is no history
+    // spanning the flush for GCOMP_FLUSH_FULL to drop.
+    return GCOMP_OK;
+  }
+
+  // The frame header comes before any block, so a flush before the first byte
+  // of input still has this much to hand over.
+  if (state->stage == ZSTD_ENC_STAGE_HEADER) {
+    (void)zstd_emit_staged(
+        state->header_buf, &state->header_pos, state->header_len, output);
+    if (state->header_pos < state->header_len) {
+      return GCOMP_ERR_LIMIT;
+    }
+    state->stage = ZSTD_ENC_STAGE_BLOCKS;
+  }
+
+  if (mode == GCOMP_FLUSH_FULL) {
+    // Ends the frame and starts another; see zstd_encoder_flush_end_frame().
+    return zstd_encoder_flush_end_frame(encoder, state, output);
+  }
+
+  // A block staged by an earlier call -- by update(), or by a flush that ran
+  // out of output -- goes first.  block_buffer_pos was zeroed when it was
+  // compressed, so the branch below will not compress it a second time.
+  if (state->compressed_buffer_pos < state->compressed_buffer_len) {
+    (void)zstd_emit_staged(state->compressed_buffer,
+        &state->compressed_buffer_pos, state->compressed_buffer_len, output);
+    if (state->compressed_buffer_pos < state->compressed_buffer_len) {
+      return GCOMP_ERR_LIMIT;
+    }
+  }
+  else if (state->block_buffer_pos > 0) {
+    // An ordinary block, not the last one: the frame stays open.  This is
+    // the same call update() makes when the block buffer fills, on a block
+    // that happens to be short of full.
+    uint8_t block_type;
+    size_t compressed_len;
+    size_t input_len = state->block_buffer_pos;
+    gcomp_status_t status = zstd_block_compress(state, state->block_buffer,
+        input_len, state->compressed_buffer + 3,
+        state->compressed_buffer_capacity - 3, &compressed_len, &block_type);
+    if (status != GCOMP_OK) {
+      state->stage = ZSTD_ENC_STAGE_ERROR;
+      return gcomp_encoder_set_error(
+          encoder, status, "block compression failed");
+    }
+
+    uint32_t header_size = (block_type == ZSTD_BLOCK_TYPE_RLE)
+        ? (uint32_t)input_len
+        : (uint32_t)compressed_len;
+    zstd_write_block_header(
+        state->compressed_buffer, false, block_type, header_size);
+    state->compressed_buffer_len = 3 + compressed_len;
+    state->compressed_buffer_pos = 0;
+    state->block_buffer_pos = 0;
+
+    (void)zstd_emit_staged(state->compressed_buffer,
+        &state->compressed_buffer_pos, state->compressed_buffer_len, output);
+    if (state->compressed_buffer_pos < state->compressed_buffer_len) {
+      return GCOMP_ERR_LIMIT;
+    }
+  }
+
+  return GCOMP_OK;
+}
+
+//
 // Finish
 //
 

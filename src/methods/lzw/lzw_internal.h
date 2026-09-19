@@ -122,6 +122,8 @@ typedef struct {
    * update().
    */
   int finish_staged;
+  /** Non-zero while a flush tail is staged but not yet fully delivered. */
+  int flush_staged;
   /** 1 after we've emitted CLEAR at start */
   int header_emitted;
   /** Encoder lookup: 1 = hash, 0 = linear */
@@ -178,6 +180,19 @@ gcomp_status_t lzw_encoder_update(
 
 gcomp_status_t lzw_encoder_finish(
     gcomp_encoder_t * encoder, gcomp_buffer_t * output);
+
+/**
+ * @brief Emit every code for the input consumed so far, without ending the
+ *        stream.
+ *
+ * See gcomp_encoder_flush().  LZW's flush is always a full flush: the only
+ * way to push the pending code out where a decoder can read it is to write
+ * another code after it, and the only code that can safely follow is CLEAR,
+ * which resets the dictionary.  Both modes therefore do the same thing.  See
+ * the implementation for why the output is *not* byte-aligned.
+ */
+gcomp_status_t lzw_encoder_flush(
+    gcomp_encoder_t * encoder, gcomp_buffer_t * output, gcomp_flush_t mode);
 
 gcomp_status_t lzw_encoder_reset(gcomp_encoder_t * encoder);
 

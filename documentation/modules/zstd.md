@@ -392,6 +392,43 @@ If any worker thread encounters an error:
 - Subsequent `update()` or `finish()` calls return the error
 - All in-flight jobs are cleaned up
 
+## Flushing
+
+`gcomp_encoder_flush()` emits the block being filled without ending the frame.
+See [Streaming API](../api/streaming.md#flushing) for the general contract.
+
+A zstd frame is a run of blocks, so a flushed block is an ordinary one and
+`GCOMP_FLUSH_SYNC` costs only the block boundary it forces early.
+
+### Why a full flush ends the frame
+
+`GCOMP_FLUSH_FULL` is different: **it ends the current frame and starts
+another**, and reading the result needs `zstd.concat` on the decoder.
+
+The repeat offsets are frame-level state that the decoder tracks in step with
+the encoder (RFC 8878 §3.1.1.3.2.1.1). An encoder that quietly reset them
+mid-frame would be describing distances the decoder computes differently — and
+that is not hypothetical, it is what the first version of this did, caught six
+flushes in by a decoder producing the wrong bytes. Nor is there a cheaper fix:
+keeping the repeat offsets and clearing only the match finder still leaves a
+sequence free to name a repeat code whose value came from before the flush,
+which is exactly what a full flush promises will not happen.
+
+So the unit of recovery in zstd is the frame. libzstd draws the same line: it
+offers `ZSTD_e_flush` and `ZSTD_e_end`, and no mid-frame equivalent of zlib's
+`Z_FULL_FLUSH`.
+
+Each frame after the first declares no `Frame_Content_Size`: the value the
+caller gave describes the whole content, which no single frame holds any more.
+The content checksum, when enabled, covers each frame's own content.
+
+### Parallel mode
+
+With `threads.count > 1` a job is already a whole frame, so a flush closes the
+frame in hand — the same concatenated stream parallel mode always produces.
+A flush waits for every block still out with the workers, which is the point:
+nothing the caller handed over is left in flight.
+
 ## Concatenated frames
 
 Multiple Zstd frames can be concatenated into a single stream. By default, the decoder stops after the first frame. Enable `zstd.concat` to decode all frames:

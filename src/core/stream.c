@@ -217,6 +217,28 @@ gcomp_status_t gcomp_decoder_finish(
   return decoder->finish_fn(decoder, output);
 }
 
+gcomp_status_t gcomp_encoder_flush(
+    gcomp_encoder_t * encoder, gcomp_buffer_t * output, gcomp_flush_t mode) {
+  if (!encoder || !output) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  if (output->size > 0 && !output->data) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  if (mode != GCOMP_FLUSH_SYNC && mode != GCOMP_FLUSH_FULL) {
+    return gcomp_encoder_set_error(
+        encoder, GCOMP_ERR_INVALID_ARG, "unknown flush mode %d", (int)mode);
+  }
+
+  // Checked before anything is written, so a caller that gets this back knows
+  // its output buffer is untouched and the encoder is where it left it.
+  if (!encoder->flush_fn) {
+    return GCOMP_ERR_UNSUPPORTED;
+  }
+
+  return encoder->flush_fn(encoder, output, mode);
+}
+
 gcomp_status_t gcomp_encoder_reset(gcomp_encoder_t * encoder) {
   if (!encoder) {
     return GCOMP_ERR_INVALID_ARG;

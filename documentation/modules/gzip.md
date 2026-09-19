@@ -272,6 +272,16 @@ The gzip format includes a CRC32 checksum of the original uncompressed data. The
 
 The trailer also includes ISIZE (original file size mod 2^32). The decoder validates this to catch truncation or corruption.
 
+## Flushing
+
+A gzip member is a header, a deflate stream and a trailer, so
+`gcomp_encoder_flush()` is the [deflate encoder's
+flush](deflate.md#flushing) with the gzip header emitted first if it has not
+gone out yet. The CRC-32 and ISIZE are accumulated as input arrives, so they
+need nothing at flush time and remain correct.
+
+See [Streaming API](../api/streaming.md#flushing) for the general contract.
+
 ## Streaming usage
 
 ### Encoding
