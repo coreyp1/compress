@@ -190,3 +190,7 @@ void my_function(int GCOMP_MAYBE_UNUSED(param)) {
     // param is intentionally unused
 }
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
