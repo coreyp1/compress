@@ -214,9 +214,33 @@ static gcomp_status_t zstd_encoder_take_parallel_result(
 /**
  * @brief Collect every result that is ready, without waiting for any.
  */
+/**
+ * @brief Is a collected job still part-way through being handed out?
+ *
+ * There is room for exactly one, so this is also the answer to "may another
+ * result be collected" -- collecting a second would write over the first.
+ */
+static bool zstd_encoder_has_staged_output(
+    const zstd_encoder_state_t * state) {
+  return state->parallel_output_buf_pos < state->parallel_output_buf_len;
+}
+
 static gcomp_status_t zstd_encoder_collect_parallel_results(
     zstd_encoder_state_t * state, gcomp_buffer_t * output) {
-  while (zstd_parallel_result_ready(state->parallel_ctx)) {
+  // Nothing may be collected while a job's output is still being handed out:
+  // the one staging buffer would be overwritten and those bytes would simply
+  // vanish from the stream.  The loop below breaks when it stages something,
+  // but that is not enough on its own -- a caller can reach here with a job
+  // already staged, because zstd_encoder_submit_parallel_job() collects one
+  // to make room and then returns to a caller that collects again.
+  //
+  // This was a live defect, not a hypothetical: two threads, a 1 KB output
+  // buffer and 2 MB of input produced a stream that would not decode at all,
+  // and its length varied from run to run.  Found while giving LZ4 the same
+  // parallel path, where it showed up as a frame 15% short that still
+  // decoded, to the wrong content.
+  while (!zstd_encoder_has_staged_output(state) &&
+      zstd_parallel_result_ready(state->parallel_ctx)) {
     zstd_parallel_job_t * completed = NULL;
     gcomp_status_t status =
         zstd_parallel_get_result(state->parallel_ctx, &completed);
@@ -303,7 +327,7 @@ static gcomp_status_t zstd_encoder_submit_parallel_job(
     if (status != GCOMP_ERR_LIMIT) {
       return status;
     }
-    if (state->parallel_output_buf_pos < state->parallel_output_buf_len) {
+    if (zstd_encoder_has_staged_output(state)) {
       return GCOMP_OK; // Nowhere to put a result; the caller must drain.
     }
     status = zstd_encoder_collect_one_parallel_result(state, output);

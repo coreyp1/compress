@@ -9,6 +9,7 @@
  */
 
 #include "../common/test_helpers.h"
+#include <algorithm>
 #include <cstring>
 #include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/errors.h>
@@ -1000,6 +1001,113 @@ TEST_F(ZstdParallelTest, RepeatOffsetsCarryAcrossTheBlocksOfAJob) {
   std::vector<uint8_t> data = WordyText(3u * 512u * 1024u);
   for (int level : {3, 9, 16, 19}) {
     ExpectThreadedRoundTrip(registry_, data, level, 2, 512u * 1024u);
+  }
+}
+
+
+/**
+ * A caller whose output buffer is smaller than one job's output must still
+ * get a stream that decodes to what it put in.
+ *
+ * It did not.  The encoder can hold back one job's output while the caller
+ * drains it, and it collected the next result straight over the top of it:
+ * the held-back bytes were gone, the stream would not decode, and its length
+ * varied from run to run.  Everything was fine as long as the output buffer
+ * was big enough to take a whole job at once, which is what every test here
+ * had done.
+ *
+ * The repeats are not decoration.  Whether a second result is ready at the
+ * moment the encoder collects is a race between this thread and the workers,
+ * so a single pass can miss it; before the fix, four passes never did.
+ */
+TEST(ZstdParallelStreamingTest, ASmallOutputBufferDoesNotLoseAJobsOutput) {
+  gcomp_registry_t * registry = gcomp_registry_default();
+  ASSERT_NE(registry, nullptr);
+
+  // Compressible, so jobs produce output worth losing.
+  std::vector<uint8_t> data(2 * 1024 * 1024);
+  static const char * words[] = {"the ", "quick ", "brown ", "fox ", "jumps ",
+      "over ", "lazy ", "dog ", "and then ", "again "};
+  unsigned state = 67;
+  size_t pos = 0;
+  while (pos < data.size()) {
+    state = state * 1103515245u + 12345u;
+    const char * w = words[(state >> 16) % 10];
+    size_t n = strlen(w);
+    if (pos + n > data.size()) {
+      n = data.size() - pos;
+    }
+    memcpy(data.data() + pos, w, n);
+    pos += n;
+  }
+
+  for (int repeat = 0; repeat < 4; repeat++) {
+    for (uint64_t threads : {2u, 4u}) {
+      gcomp_options_t * opts = nullptr;
+      ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+      ASSERT_EQ(gcomp_options_set_uint64(opts, "threads.count", threads),
+          GCOMP_OK);
+      ASSERT_EQ(
+          gcomp_options_set_uint64(opts, "zstd.job_size", 65536), GCOMP_OK);
+      ASSERT_EQ(gcomp_options_set_bool(opts, "zstd.concat", 1), GCOMP_OK);
+
+      gcomp_encoder_t * encoder = nullptr;
+      ASSERT_EQ(gcomp_encoder_create(registry, "zstd", opts, &encoder),
+          GCOMP_OK);
+
+      // A kilobyte at a time: far less than one job's compressed output, so
+      // every result has to be handed out across many calls.
+      std::vector<uint8_t> chunk(1024);
+      std::vector<uint8_t> stream;
+      size_t consumed = 0;
+      while (consumed < data.size()) {
+        size_t take = std::min<size_t>(4096, data.size() - consumed);
+        gcomp_buffer_t in_buf = {data.data() + consumed, take, 0};
+        while (in_buf.used < in_buf.size) {
+          gcomp_buffer_t out_buf = {chunk.data(), chunk.size(), 0};
+          size_t before = in_buf.used;
+          ASSERT_EQ(gcomp_encoder_update(encoder, &in_buf, &out_buf), GCOMP_OK);
+          stream.insert(
+              stream.end(), chunk.begin(), chunk.begin() + out_buf.used);
+          ASSERT_FALSE(in_buf.used == before && out_buf.used == 0)
+              << "update() made no progress";
+        }
+        consumed += take;
+      }
+      for (;;) {
+        gcomp_buffer_t out_buf = {chunk.data(), chunk.size(), 0};
+        gcomp_status_t status = gcomp_encoder_finish(encoder, &out_buf);
+        stream.insert(
+            stream.end(), chunk.begin(), chunk.begin() + out_buf.used);
+        if (status == GCOMP_OK) {
+          break;
+        }
+        ASSERT_EQ(status, GCOMP_ERR_LIMIT);
+        ASSERT_GT(out_buf.used, 0u) << "finish() made no progress";
+      }
+      gcomp_encoder_destroy(encoder);
+      gcomp_options_destroy(opts);
+
+      gcomp_options_t * dopts = nullptr;
+      ASSERT_EQ(gcomp_options_create(&dopts), GCOMP_OK);
+      ASSERT_EQ(gcomp_options_set_bool(dopts, "zstd.concat", 1), GCOMP_OK);
+      gcomp_decoder_t * decoder = nullptr;
+      ASSERT_EQ(gcomp_decoder_create(registry, "zstd", dopts, &decoder),
+          GCOMP_OK);
+      std::vector<uint8_t> back(data.size() + 4096);
+      gcomp_buffer_t din = {stream.data(), stream.size(), 0};
+      gcomp_buffer_t dout = {back.data(), back.size(), 0};
+      EXPECT_EQ(gcomp_decoder_update(decoder, &din, &dout), GCOMP_OK)
+          << "threads=" << threads << " repeat=" << repeat;
+      EXPECT_EQ(gcomp_decoder_finish(decoder, &dout), GCOMP_OK);
+      EXPECT_EQ(dout.used, data.size());
+      if (dout.used == data.size()) {
+        EXPECT_EQ(memcmp(back.data(), data.data(), data.size()), 0)
+            << "threads=" << threads << " repeat=" << repeat;
+      }
+      gcomp_decoder_destroy(decoder);
+      gcomp_options_destroy(dopts);
+    }
   }
 }
 
