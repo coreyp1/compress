@@ -241,6 +241,88 @@ TEST_F(LzwRoundtripTest, TiffRoundtripAcrossCodeWidthGrowth) {
   lzw_roundtrip_one(registry_, "tiff", data.data(), data.size());
 }
 
+
+// Regression: the last code in the stream was written at the wrong width.
+//
+// The encoder emits the final code without adding a dictionary entry -- there
+// is no following byte to extend the string with -- and so never ran its
+// widening check on the entry a decoder still adds when it reads that code.
+// The decoder does add it, applies its own rule, and can widen once more than
+// the encoder ever did, reading End_of_Information at a width the encoder did
+// not write it at.  The decoder produced the whole output correctly and then
+// reported GCOMP_ERR_CORRUPT on the trailing code.
+//
+// TIFF 6.0 section 13 is where this shows: the early change puts the boundary
+// one entry below GIF's, so these lengths land on it in the TIFF profile and
+// not in the GIF one.  The lengths below are every failure in 0..3000 for this
+// pattern; they are listed explicitly because the window is one to three bytes
+// wide and a coarser sweep steps over it.
+//
+// Verified against libtiff (via Pillow) after the fix: for every length from 1
+// to 2599 our encoder's output is byte-for-byte what libtiff produces, and
+// each library reads the other's streams.
+TEST_F(LzwRoundtripTest, TiffFinalCodeWidthMatchesTheDecoderAtEveryBoundary) {
+  struct Case {
+    uint64_t max_code_bits;
+    std::vector<size_t> lengths;
+  };
+  const std::vector<Case> cases = {
+      {10, {270, 1712}},
+      {11, {270, 1436, 1437, 1438}},
+      {12, {270, 1436, 1437, 1438}},
+  };
+
+  for (const auto & c : cases) {
+    for (size_t len : c.lengths) {
+      std::vector<uint8_t> data(len);
+      for (size_t i = 0; i < len; i++) {
+        data[i] = (uint8_t)(i * 7 + (i / 13));
+      }
+
+      gcomp_options_t * opts = nullptr;
+      ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+      ASSERT_EQ(gcomp_options_set_string(opts, "lzw.format", "tiff"), GCOMP_OK);
+      ASSERT_EQ(
+          gcomp_options_set_uint64(opts, "lzw.max_code_bits", c.max_code_bits),
+          GCOMP_OK);
+
+      gcomp_encoder_t * enc = nullptr;
+      ASSERT_EQ(gcomp_encoder_create(registry_, "lzw", opts, &enc), GCOMP_OK);
+      std::vector<uint8_t> encoded(len * 2 + 128);
+      gcomp_buffer_t in_buf = {data.data(), len, 0};
+      gcomp_buffer_t out_buf = {encoded.data(), encoded.size(), 0};
+      ASSERT_EQ(gcomp_encoder_update(enc, &in_buf, &out_buf), GCOMP_OK);
+      ASSERT_EQ(gcomp_encoder_finish(enc, &out_buf), GCOMP_OK);
+      size_t encoded_len = out_buf.used;
+      gcomp_encoder_destroy(enc);
+
+      gcomp_decoder_t * dec = nullptr;
+      ASSERT_EQ(gcomp_decoder_create(registry_, "lzw", opts, &dec), GCOMP_OK);
+      std::vector<uint8_t> decoded(len + 64);
+      gcomp_buffer_t enc_in = {encoded.data(), encoded_len, 0};
+      gcomp_buffer_t dec_out = {decoded.data(), decoded.size(), 0};
+
+      gcomp_status_t update_status = gcomp_decoder_update(dec, &enc_in, &dec_out);
+      gcomp_status_t finish_status = GCOMP_OK;
+      if (update_status == GCOMP_OK) {
+        finish_status = gcomp_decoder_finish(dec, &dec_out);
+      }
+      gcomp_decoder_destroy(dec);
+      gcomp_options_destroy(opts);
+
+      EXPECT_EQ(update_status, GCOMP_OK)
+          << "max_code_bits=" << c.max_code_bits << " len=" << len;
+      EXPECT_EQ(finish_status, GCOMP_OK)
+          << "max_code_bits=" << c.max_code_bits << " len=" << len;
+      EXPECT_EQ(dec_out.used, len)
+          << "max_code_bits=" << c.max_code_bits << " len=" << len;
+      EXPECT_TRUE(test_helpers_buffers_equal(
+          data.data(), len, decoded.data(), dec_out.used))
+          << "max_code_bits=" << c.max_code_bits << " len=" << len;
+    }
+  }
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

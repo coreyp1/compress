@@ -542,6 +542,30 @@ gcomp_status_t lzw_encoder_finish(
       state->prefix_code = LZW_NO_PREFIX;
     }
 
+    // The final code is emitted without adding a dictionary entry, because
+    // there is no following byte to extend the string with.  A decoder does
+    // not know that: reading that code it adds the entry it would have added
+    // anyway, and then applies its own widening rule to the result.  So it may
+    // widen once more than the loop above ever did, and read End_of_Information
+    // at that wider width.
+    //
+    // The loop's check is the encoder's (the widest code it can still emit,
+    // core.next_code - 1); this one is the decoder's (core.next_code), and it
+    // has to be made here or the two disagree on the width of the last code in
+    // the stream.  libtiff does the same thing in LZWPostEncode, which is why
+    // its streams carry a wider End_of_Information than ours did at the
+    // lengths where the final entry lands on a boundary.
+    //
+    // TIFF 6.0 section 13 makes this visible because of the early change: the
+    // boundary is one entry lower than GIF's, so a TIFF stream hits it on
+    // lengths a GIF stream does not.  The rule is the decoder's either way.
+    if (lzw_profile_should_increment_bits(
+            state->profile_id, state->core.next_code, state->current_bits)) {
+      if (state->current_bits < (unsigned)state->max_code_bits) {
+        state->current_bits++;
+      }
+    }
+
     gcomp_status_t s = emit_code(state, encoder, state->eoi_code);
     if (s != GCOMP_OK) {
       return s;
