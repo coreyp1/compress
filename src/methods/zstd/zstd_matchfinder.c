@@ -288,6 +288,15 @@ static const zstd_effort_t k_zstd_effort[23] = {
     {128, 0, 12288, 18, 1, 1, 16384, 512, 1} // 22
 };
 
+/// The sizes zstd_mf_plan() computes; see zstd_mf_memory_estimate().
+typedef struct {
+  unsigned hash_log; ///< Log2 of the hash table size, clamped to the window.
+  size_t hash_size;  ///< Hash table entries.
+  size_t chain_size; ///< Chain table entries, when the level uses a chain.
+  unsigned use_bt;   ///< Whether the level uses the tree instead.
+  size_t bt_size;    ///< Tree slots, when it does; zero when it does not.
+} zstd_mf_plan_t;
+
 /**
  * @brief The effort settings for @p level, clamped to the table.
  */
@@ -353,38 +362,38 @@ static inline int64_t zstd_mf_match_gain(uint32_t length, uint32_t offset) {
 //
 
 /**
- * @brief Initialize match finder.
+ * @brief How large each of the match finder's tables will be.
+ *
+ * Separated from zstd_mf_init() so that the size of a match finder can be
+ * known before one is built. The encoder needs that to answer
+ * limits.max_memory_bytes before it allocates rather than after: a window log
+ * the caller chose can ask for gigabytes, and refusing the request once the
+ * gigabytes are already allocated is not a limit.
+ *
+ * Nothing here allocates or reads memory, and zstd_mf_init() fills the match
+ * finder from this rather than repeating it, so the estimate cannot drift
+ * away from what is actually allocated.
+ *
+ * @param effort The level's effort settings
+ * @param window_size Bytes of history the match finder will search
+ * @param plan Receives the sizes
  */
-gcomp_status_t zstd_mf_init(zstd_match_finder_t * mf,
-    const gcomp_allocator_t * alloc, int level, size_t window_size,
-    gcomp_memory_tracker_t * mem_tracker) {
-  if (!mf || !alloc) {
-    return GCOMP_ERR_INVALID_ARG;
-  }
-
-  memset(mf, 0, sizeof(*mf));
-
-  const zstd_effort_t * effort = zstd_mf_effort(level);
-
+static void zstd_mf_plan(const zstd_effort_t * effort, size_t window_size,
+    zstd_mf_plan_t * plan) {
   // Clamp the hash table to the window size: there is no point having more
   // hash entries than there are positions to put in them.
   unsigned hash_log = effort->hash_log;
   while (hash_log > MF_HASH_LOG_MIN && ((size_t)1 << hash_log) > window_size) {
     hash_log--;
   }
-
-  mf->hash_log = hash_log;
-  mf->hash_size = (size_t)1 << hash_log;
-  mf->window_size = window_size;
-  mf->search_depth = effort->search_depth;
-  mf->lazy_depth = effort->lazy_depth;
-  mf->nice_length = effort->nice_length;
+  plan->hash_log = hash_log;
+  plan->hash_size = (size_t)1 << hash_log;
 
   // The chain table is indexed by position in the match finder's window, and
   // that window now holds the history carried across blocks as well as the
   // block being compressed.  Sizing it to one block, as it was, meant no
   // position past the first 128 KB could be chained at all.
-  mf->chain_size = (size_t)window_size + ZSTD_BLOCK_SIZE_MAX;
+  plan->chain_size = (size_t)window_size + ZSTD_BLOCK_SIZE_MAX;
 
   // How far back the tree can reach, and what it costs.
   //
@@ -407,18 +416,69 @@ gcomp_status_t zstd_mf_init(zstd_match_finder_t * mf,
   // what fits in its budget and the frame stays exactly as valid.  Without
   // it the top levels, which declare a 32 MB window, asked for 536 MB
   // against a 256 MiB budget and simply failed to encode.
+  plan->use_bt = effort->use_bt;
+  plan->bt_size = 0;
+  if (plan->use_bt) {
+    size_t n = 1;
+    while (n * 2u <= plan->chain_size && n * 2u <= MF_BT_MAX_ENTRIES) {
+      n <<= 1;
+    }
+    plan->bt_size = n;
+  }
+}
+
+size_t zstd_mf_memory_estimate(int level, size_t window_size) {
+  const zstd_effort_t * effort = zstd_mf_effort(level);
+  zstd_mf_plan_t plan;
+  zstd_mf_plan(effort, window_size, &plan);
+
+  // The same allocations zstd_mf_init() makes below, in the same order, and
+  // nothing else: a level uses the tree or the chain, never both.
+  size_t total = plan.hash_size * sizeof(uint32_t);
+  if (plan.use_bt) {
+    total += plan.bt_size * 2u * sizeof(uint32_t);
+    if (effort->use_opt) {
+      total += zstd_opt_memory_estimate(effort->opt_segment, effort->two_pass);
+    }
+  }
+  else {
+    total += plan.chain_size * sizeof(uint32_t);
+  }
+  return total;
+}
+
+/**
+ * @brief Initialize match finder.
+ */
+gcomp_status_t zstd_mf_init(zstd_match_finder_t * mf,
+    const gcomp_allocator_t * alloc, int level, size_t window_size,
+    gcomp_memory_tracker_t * mem_tracker) {
+  if (!mf || !alloc) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  memset(mf, 0, sizeof(*mf));
+
+  const zstd_effort_t * effort = zstd_mf_effort(level);
+  zstd_mf_plan_t plan;
+  zstd_mf_plan(effort, window_size, &plan);
+
+  mf->hash_log = plan.hash_log;
+  mf->hash_size = plan.hash_size;
+  mf->window_size = window_size;
+  mf->search_depth = effort->search_depth;
+  mf->lazy_depth = effort->lazy_depth;
+  mf->nice_length = effort->nice_length;
+  mf->chain_size = plan.chain_size;
+
   mf->use_bt = effort->use_bt;
   mf->use_opt = effort->use_opt;
   mf->opt_segment = effort->opt_segment;
   mf->opt_two_pass = effort->two_pass;
   mf->opt_budget = effort->opt_budget;
   if (mf->use_bt) {
-    size_t n = 1;
-    while (n * 2u <= mf->chain_size && n * 2u <= MF_BT_MAX_ENTRIES) {
-      n <<= 1;
-    }
-    mf->bt_size = n;
-    mf->bt_mask = n - 1;
+    mf->bt_size = plan.bt_size;
+    mf->bt_mask = plan.bt_size - 1;
   }
   mf->base_pos = 0;
 

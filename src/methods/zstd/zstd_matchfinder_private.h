@@ -141,6 +141,19 @@ void zstd_mf_insert_one(
     size_t data_size);
 
 /**
+ * @brief What zstd_opt_init() will allocate, without allocating it.
+ *
+ * Both zstd_opt_init() and zstd_opt_destroy() track with this, so the number
+ * the encoder projects with and the number the tracker records are the same
+ * number by construction.
+ *
+ * @param opt_segment Positions one shortest-path sweep covers
+ * @param two_pass Non-zero if the level parses each sweep twice
+ * @return Bytes zstd_opt_init() would allocate and track
+ */
+size_t zstd_opt_memory_estimate(uint32_t opt_segment, unsigned two_pass);
+
+/**
  * @brief Allocate the optimal parse's cost model and table.
  *
  * Reads mf->nice_length, which must already be set: it fixes how far a

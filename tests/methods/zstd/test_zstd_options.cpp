@@ -33,11 +33,12 @@ protected:
 //
 
 // Memcheck keeps validity and addressability bits for every allocated byte,
-// so a test that asks for a 2 GB window costs several gigabytes more here
-// than it does outside Valgrind, and the run is killed before it reports
-// anything. The window size is the point of those tests, so there is nothing
-// smaller for them to ask for: they skip instead, and the ordinary run and
-// the ASan run still cover them. The Makefile's valgrind targets set this.
+// so the one test here that actually takes a 2 GB window costs several
+// gigabytes more under Valgrind than it does outside it, and the run is
+// killed before it reports anything. The window size is the point of that
+// test, so there is nothing smaller for it to ask for: it skips instead, and
+// the ordinary run and the ASan run still cover it. The Makefile's valgrind
+// targets set this.
 static bool UnderValgrind() {
   const char * vg = std::getenv("GCOMP_UNDER_VALGRIND");
   return vg && vg[0] == '1';
@@ -265,17 +266,13 @@ TEST_F(ZstdOptionsTest, ValidWindowLogMax) {
 }
 
 TEST_F(ZstdOptionsTest, LargeWindowLogNeedsTheMemoryToBackIt) {
-  // This one asks to be *refused*, and still costs the memory: the encoder
-  // allocates the window, the block buffer and the match finder's tables and
-  // only then calls gcomp_memory_check_limit(), so the 2 GB is allocated
-  // before limits.max_memory_bytes turns it down. Outside Valgrind that is
-  // invisible - Linux does not back an untouched mapping with pages - which
-  // is why nothing noticed. Under Memcheck it is real, and it is why this
-  // test is skipped here rather than only the one above.
-  if (UnderValgrind()) {
-    GTEST_SKIP() << kValgrindWindowSkip;
-  }
-
+  // This one asks to be *refused*, and no longer costs the memory to be told
+  // so: the encoder projects what it is about to allocate and compares that
+  // against limits.max_memory_bytes before allocating any of it. It used to
+  // allocate the 2 GB and turn it down afterwards, which is why this test ran
+  // everywhere except under Valgrind, where the allocation was real enough to
+  // kill the process. It runs there now, and that it does is the evidence.
+  // ZstdAllocatorTest.ARefusedWindowIsNeverAllocated measures the bytes.
   gcomp_options_t * opts = nullptr;
   ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
   gcomp_options_set_uint64(opts, "zstd.window_log", 31);

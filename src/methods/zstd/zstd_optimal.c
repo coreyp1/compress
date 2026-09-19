@@ -293,6 +293,19 @@ static inline uint32_t zstd_opt_of_price(
 // Setup and teardown
 //
 
+size_t zstd_opt_memory_estimate(uint32_t opt_segment, unsigned two_pass) {
+  // One entry per position of a sweep, plus the one past its end; see
+  // zstd_opt_init(), which allocates exactly this.
+  size_t node_cap = (size_t)opt_segment + 1u;
+  size_t total =
+      sizeof(struct zstd_opt_state_s) + node_cap * sizeof(zstd_opt_node_t);
+  if (two_pass) {
+    total += node_cap * ZSTD_MF_MAX_CANDIDATES * sizeof(zstd_mf_candidate_t) +
+        node_cap * sizeof(uint32_t);
+  }
+  return total;
+}
+
 gcomp_status_t zstd_opt_init(zstd_match_finder_t * mf,
     const gcomp_allocator_t * alloc, gcomp_memory_tracker_t * mem_tracker) {
   struct zstd_opt_state_s * st =
@@ -310,11 +323,6 @@ gcomp_status_t zstd_opt_init(zstd_match_finder_t * mf,
     gcomp_free(alloc, st);
     return GCOMP_ERR_MEMORY;
   }
-  if (mem_tracker) {
-    gcomp_memory_track_alloc(mem_tracker,
-        sizeof(struct zstd_opt_state_s) +
-            st->node_cap * sizeof(zstd_opt_node_t));
-  }
 
   st->two_pass = (mf->opt_two_pass != 0u);
   if (st->two_pass) {
@@ -328,12 +336,15 @@ gcomp_status_t zstd_opt_init(zstd_match_finder_t * mf,
       gcomp_free(alloc, st);
       return GCOMP_ERR_MEMORY;
     }
-    if (mem_tracker) {
-      gcomp_memory_track_alloc(mem_tracker,
-          st->node_cap * ZSTD_MF_MAX_CANDIDATES
-                  * sizeof(zstd_mf_candidate_t) +
-              st->node_cap * sizeof(uint32_t));
-    }
+  }
+
+  // Tracked once, after everything is allocated, and through the same
+  // function the encoder projects with, so the three cannot disagree. It also
+  // used to be tracked in two steps, and the failure path between them freed
+  // the first without untracking it.
+  if (mem_tracker) {
+    gcomp_memory_track_alloc(mem_tracker,
+        zstd_opt_memory_estimate(mf->opt_segment, mf->opt_two_pass));
   }
 
   mf->opt = st;
@@ -349,14 +360,8 @@ void zstd_opt_destroy(zstd_match_finder_t * mf, const gcomp_allocator_t * alloc,
   }
   if (mem_tracker) {
     gcomp_memory_track_free(mem_tracker,
-        sizeof(struct zstd_opt_state_s) +
-            st->node_cap * sizeof(zstd_opt_node_t));
-    if (st->two_pass) {
-      gcomp_memory_track_free(mem_tracker,
-          st->node_cap * ZSTD_MF_MAX_CANDIDATES
-                  * sizeof(zstd_mf_candidate_t) +
-              st->node_cap * sizeof(uint32_t));
-    }
+        zstd_opt_memory_estimate(
+            (uint32_t)(st->node_cap - 1u), st->two_pass ? 1u : 0u));
   }
   gcomp_free(alloc, st->cand_store);
   gcomp_free(alloc, st->cand_count);

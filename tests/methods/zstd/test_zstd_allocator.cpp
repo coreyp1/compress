@@ -231,6 +231,60 @@ TEST_F(ZstdAllocatorTest, DecoderUsesCustomAllocator) {
   EXPECT_GT(tracker_.alloc_count, initial_allocs);
 }
 
+// A window the memory limit refuses must not be allocated on the way to
+// being refused.
+//
+// zstd.window_log is the caller's to choose and 31 is a legal choice, worth
+// 2 GB of history. The limit is what says this encoder may not have it. The
+// check used to run after every buffer was allocated, so the 2 GB was
+// allocated and then turned down - free on Linux, where an untouched mapping
+// is backed by no pages, and real under a cgroup cap, with overcommit off, on
+// Windows, and under Valgrind.
+//
+// The custom allocator is what makes this observable: total_allocated counts
+// every byte the encoder asked for, whether or not the system ever backed it.
+TEST_F(ZstdAllocatorTest, ARefusedWindowIsNeverAllocated) {
+  size_t before = tracker_.total_allocated;
+
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  // 2 GB of window against the default 256 MiB budget.
+  ASSERT_EQ(gcomp_options_set_uint64(opts, "zstd.window_log", 31), GCOMP_OK);
+
+  gcomp_encoder_t * encoder = nullptr;
+  EXPECT_EQ(gcomp_encoder_create(custom_registry_, "zstd", opts, &encoder),
+      GCOMP_ERR_LIMIT);
+  gcomp_encoder_destroy(encoder);
+  gcomp_options_destroy(opts);
+
+  // What a refusal is allowed to cost: the state structure and the options
+  // read into it. Before the projection this was over two gigabytes.
+  const size_t kRefusalBudget = 1u * 1024u * 1024u;
+  EXPECT_LT(tracker_.total_allocated - before, kRefusalBudget)
+      << "a refused encoder allocated "
+      << (tracker_.total_allocated - before)
+      << " bytes; limits.max_memory_bytes is being checked after the "
+         "allocation it is meant to prevent";
+}
+
+// The same request with the budget lifted is still allowed, so the projection
+// refuses what the limit refuses and nothing more.
+TEST_F(ZstdAllocatorTest, AnUnlimitedBudgetStillGetsItsWindow) {
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  // 64 MB of window, and a budget that allows it. Not the 2 GB above: this
+  // one actually allocates, and it runs under Valgrind too.
+  ASSERT_EQ(gcomp_options_set_uint64(opts, "zstd.window_log", 26), GCOMP_OK);
+  ASSERT_EQ(gcomp_options_set_uint64(opts, "limits.max_memory_bytes", 0),
+      GCOMP_OK);
+
+  gcomp_encoder_t * encoder = nullptr;
+  EXPECT_EQ(
+      gcomp_encoder_create(custom_registry_, "zstd", opts, &encoder), GCOMP_OK);
+  gcomp_encoder_destroy(encoder);
+  gcomp_options_destroy(opts);
+}
+
 TEST_F(ZstdAllocatorTest, EncoderCleansUpOnDestroy) {
   size_t initial_frees = tracker_.free_count;
 

@@ -682,9 +682,58 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
     gcomp_xxhash64_reset(&state->content_hash, 0);
   }
 
+  // No point holding more history than the stream can produce.  When the
+  // caller declares the content size, the window buys nothing past it, and
+  // sizing to it keeps a large declared window from costing a large buffer -
+  // and a much larger position table - for a small stream.
+  state->mf_window_max = state->header.window_size;
+  if (content_size_present && content_size < state->mf_window_max) {
+    state->mf_window_max = (size_t)content_size;
+  }
+
+  size_t block_buffer_size = ZSTD_BLOCK_SIZE_MAX;
+  // May be larger than the input for incompressible data.
+  size_t compressed_buffer_size =
+      block_buffer_size + ZSTD_BLOCK_HEADER_SIZE + 256;
+
+  // What the rest of this function will allocate, worked out before any of it
+  // is allocated.
+  //
+  // limits.max_memory_bytes was checked at the end, once every buffer below
+  // existed. zstd.window_log is the caller's to choose and a 2 GB window is a
+  // legal choice, so refusing it meant allocating the 2 GB first and turning
+  // it down afterwards - which is not a limit. It cost nothing visible on
+  // Linux, where an untouched mapping is backed by no pages, and was a real
+  // allocation under a cgroup cap, with overcommit off, on Windows, and under
+  // Valgrind, where it was found.
+  //
+  // Every size here is the one the code below uses, and the match finder's
+  // comes from the function that allocates it, so the projection cannot drift
+  // from the allocation. The dictionary buffers are already allocated by this
+  // point and are already in the tracker: they are bounded by the dictionary
+  // the caller handed in, so they cannot be what runs away.
+  {
+    uint64_t projected = (uint64_t)block_buffer_size +
+        (uint64_t)compressed_buffer_size + sizeof(zstd_match_finder_t) +
+        (uint64_t)zstd_mf_memory_estimate(
+            state->compression_level, state->mf_window_max) +
+        (uint64_t)state->mf_window_max + (uint64_t)block_buffer_size +
+        (uint64_t)(block_buffer_size / 3) * sizeof(zstd_sequence_t) +
+        (uint64_t)block_buffer_size;
+
+    gcomp_memory_tracker_t projection = state->mem_tracker;
+    gcomp_memory_track_alloc(&projection, projected);
+    if (gcomp_memory_check_limit(&projection, max_memory) != GCOMP_OK) {
+      status = GCOMP_ERR_LIMIT;
+      gcomp_encoder_set_error(encoder, status,
+          "memory limit exceeded during encoder init (%zu bytes, limit %zu)",
+          (size_t)projection.current_bytes, (size_t)max_memory);
+      goto cleanup;
+    }
+  }
+
   // Allocate block buffer (use calloc to satisfy valgrind - hash function
   // may read bytes before they're fully populated during streaming)
-  size_t block_buffer_size = ZSTD_BLOCK_SIZE_MAX;
   state->block_buffer = gcomp_calloc(alloc, 1, block_buffer_size);
   if (!state->block_buffer) {
     status = GCOMP_ERR_MEMORY;
@@ -695,9 +744,7 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
   state->block_buffer_capacity = block_buffer_size;
   gcomp_memory_track_alloc(&state->mem_tracker, block_buffer_size);
 
-  // Allocate compressed buffer (may be larger than input for incompressible)
-  size_t compressed_buffer_size =
-      block_buffer_size + ZSTD_BLOCK_HEADER_SIZE + 256; // Some overhead
+  // Allocate compressed buffer (sized above, with the projection)
   state->compressed_buffer = gcomp_malloc(alloc, compressed_buffer_size);
   if (!state->compressed_buffer) {
     status = GCOMP_ERR_MEMORY;
@@ -717,15 +764,6 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
     goto cleanup;
   }
   gcomp_memory_track_alloc(&state->mem_tracker, sizeof(zstd_match_finder_t));
-
-  // No point holding more history than the stream can produce.  When the
-  // caller declares the content size, the window buys nothing past it, and
-  // sizing to it keeps a large declared window from costing a large buffer -
-  // and a much larger position table - for a small stream.
-  state->mf_window_max = state->header.window_size;
-  if (content_size_present && content_size < state->mf_window_max) {
-    state->mf_window_max = (size_t)content_size;
-  }
 
   status = zstd_mf_init(state->match_finder, alloc, state->compression_level,
       state->mf_window_max, &state->mem_tracker);
@@ -799,9 +837,15 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
   gcomp_memory_track_alloc(
       &state->mem_tracker, state->literals_buffer_capacity);
 
-  // Check memory limits through the core helper, which treats 0 as
-  // unlimited as limits.h documents.  Comparing directly, as this did, made
-  // a zero limit mean a budget of zero and refused to start.
+  // The same check again, against what was actually allocated rather than
+  // against what was projected. The projection above is what refuses a
+  // request this large; this catches anything the projection did not account
+  // for - the dictionary buffers, or a future allocation added below it
+  // without being added to the projection.
+  //
+  // The core helper treats 0 as unlimited as limits.h documents. Comparing
+  // directly, as this did, made a zero limit mean a budget of zero and
+  // refused to start.
   if (gcomp_memory_check_limit(&state->mem_tracker, max_memory) != GCOMP_OK) {
     status = GCOMP_ERR_LIMIT;
     gcomp_encoder_set_error(encoder, status,

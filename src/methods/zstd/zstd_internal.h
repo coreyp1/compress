@@ -1087,6 +1087,21 @@ gcomp_status_t zstd_mf_init(zstd_match_finder_t * mf,
     gcomp_memory_tracker_t * mem_tracker);
 
 /**
+ * @brief What zstd_mf_init() will allocate, without allocating it.
+ *
+ * Exact, not approximate: it is computed from the same sizing zstd_mf_init()
+ * uses, so a caller can answer limits.max_memory_bytes before building a
+ * match finder rather than after. A window log the caller chose can ask for
+ * gigabytes, and a limit that is checked once those gigabytes are allocated
+ * has not limited anything.
+ *
+ * @param level Compression level, clamped the way zstd_mf_init() clamps it
+ * @param window_size Bytes of history the match finder would search
+ * @return Bytes zstd_mf_init() would allocate and track
+ */
+size_t zstd_mf_memory_estimate(int level, size_t window_size);
+
+/**
  * @brief Destroy match finder.
  */
 void zstd_mf_destroy(zstd_match_finder_t * mf, const gcomp_allocator_t * alloc,
