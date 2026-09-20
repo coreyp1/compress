@@ -1300,6 +1300,7 @@ test-quiet: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES)
 		else \
 			failures=$$(echo "$$output" | grep -oP '\[\s*FAILED\s*\]\s*\K\d+' | head -1); \
 			[ -z "$$failures" ] && failures=$$num_tests; \
+			[ "$$failures" -eq 0 ] && failures=1; \
 			total_failed=$$((total_failed + failures)); \
 			total_passed=$$((total_passed + num_tests - failures)); \
 			printf "%-30s %8d %8dms \033[0;31mFAIL\033[0m\n" "$$test_name" "$$num_tests" "$$time_ms"; \
@@ -1541,7 +1542,7 @@ ifeq ($(OS_NAME), Linux)
 	printf "\033[1;33m%-30s %8s %10s %s\033[0m\n" "------------------------------" "--------" "----------" "------"; \
 	for test_exe in $(ASAN_TEST_EXECUTABLES); do \
 		test_name=$$(basename $$test_exe $(EXE_EXTENSION)); \
-		output=$$(LD_LIBRARY_PATH="$(ASAN_APP_DIR)" ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 $$test_exe --gtest_brief=1 2>&1); \
+		output=$$(LD_LIBRARY_PATH="$(ASAN_APP_DIR)" LD_PRELOAD="$(ASAN_RUNTIME)" ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 $$test_exe --gtest_brief=1 2>&1); \
 		exit_code=$$?; \
 		num_tests=$$(echo "$$output" | grep -oP '\[\s*=+\s*\]\s*\K\d+(?=\s+tests?)' | head -1); \
 		time_ms=$$(echo "$$output" | grep -oP '\(\K\d+(?=\s*ms\s*total\))' | head -1); \
@@ -1555,6 +1556,7 @@ ifeq ($(OS_NAME), Linux)
 		else \
 			failures=$$(echo "$$output" | grep -oP '\[\s*FAILED\s*\]\s*\K\d+' | head -1); \
 			[ -z "$$failures" ] && failures=$$num_tests; \
+			[ "$$failures" -eq 0 ] && failures=1; \
 			total_failed=$$((total_failed + failures)); \
 			total_passed=$$((total_passed + num_tests - failures)); \
 			printf "%-30s %8d %8dms \033[0;31mFAIL\033[0m\n" "$$test_name" "$$num_tests" "$$time_ms"; \
