@@ -571,19 +571,23 @@ TEST_F(ZstdRobustnessTest, DecoderManySmallOutputBuffers) {
     }
   }
 
-  // Finish with 1-byte output buffer
-  bool done = false;
-  while (!done) {
+  // Finish with 1-byte output buffer.  GCOMP_ERR_LIMIT means there is more
+  // staged than fitted and finish() must be called again; GCOMP_OK means the
+  // stream is complete.  Looping until a call produces no output, and treating
+  // GCOMP_ERR_LIMIT as a failure, only worked while zstd's finish() wrongly
+  // reported GCOMP_OK with a block still staged.
+  for (;;) {
     uint8_t byte;
     gcomp_buffer_t out_buf = {&byte, 1, 0};
     gcomp_status_t status = gcomp_decoder_finish(decoder, &out_buf);
-    ASSERT_EQ(status, GCOMP_OK);
     if (out_buf.used > 0) {
       result.push_back(byte);
     }
-    else {
-      done = true;
+    if (status == GCOMP_OK) {
+      break;
     }
+    ASSERT_EQ(status, GCOMP_ERR_LIMIT);
+    ASSERT_GT(out_buf.used, 0u);
   }
 
   ASSERT_EQ(result.size(), input.size());

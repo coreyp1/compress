@@ -16,9 +16,20 @@
  * 4. CONTENT_CHECKSUM: Read content checksum (if enabled)
  * 5. DONE: Frame complete
  *
- * ## Concatenated Frames (zstd.concat=true)
+ * ## Concatenated Frames (zstd.concat, default true)
  *
- * When `zstd.concat` is enabled, the decoder can process multiple
+ * RFC 8878 section 3.1: "Zstandard compressed data is made up of one or more
+ * frames... The decompressed content of multiple concatenated frames is the
+ * concatenation of each frame's decompressed content."  Decoding every frame
+ * in the input is therefore the conformant behaviour and the default.
+ *
+ * This defaulted to false, so a decode of two frames returned the first
+ * frame's content and GCOMP_OK, with no way for the caller to tell that the
+ * rest of the input had been dropped.  The option is kept, now as an explicit
+ * opt-out for a caller that wants exactly one frame and intends to deal with
+ * whatever follows it itself.
+ *
+ * When `zstd.concat` is enabled, the decoder processes multiple
  * independent zstd frames concatenated together:
  *
  * ```
@@ -110,8 +121,10 @@ gcomp_status_t zstd_decoder_init(gcomp_registry_t * registry,
   // Initialize memory tracker
   gcomp_memory_track_alloc(&state->mem_tracker, sizeof(*state));
 
-  // Read options
-  int concat = 0;
+  // Read options.  These initialisers, not the option schema, are what a
+  // caller passing no options gets, so the conformant default has to be here
+  // as well as in the schema.
+  int concat = ZSTD_DEFAULT_CONCAT;
   uint64_t max_output = ZSTD_DEFAULT_MAX_OUTPUT_BYTES;
   uint64_t max_window = ZSTD_DEFAULT_MAX_WINDOW_BYTES;
   uint64_t max_memory = ZSTD_DEFAULT_MAX_MEMORY_BYTES;
@@ -638,6 +651,7 @@ static gcomp_status_t zstd_decoder_step(gcomp_decoder_t * decoder,
   // Handle concatenated frames: if DONE and concat enabled, check for more
   // frames
   if (state->stage == ZSTD_DEC_STAGE_DONE) {
+    state->saw_data_frame = 1;
     if (state->concat_enabled && input->used < input->size) {
       // Reset for next frame (keep buffers)
       state->stage = ZSTD_DEC_STAGE_HEADER;
@@ -669,6 +683,40 @@ static gcomp_status_t zstd_decoder_step(gcomp_decoder_t * decoder,
     return GCOMP_OK; // Need more output space
   }
 
+  // RFC 8878 section 3.1.2: a skippable frame is magic 0x184D2A5? followed by
+  // a four byte little-endian length and that many bytes of content a decoder
+  // must ignore.  They are how tools attach metadata to a zstd file -- the
+  // seekable format is built on them -- and they may appear anywhere a frame
+  // may, including before the first data frame and between data frames.
+  //
+  // Nothing here implemented them: the magic check below accepted only
+  // ZSTD_MAGIC, so any file carrying one was reported as corrupt even though
+  // the constants for recognising one had been defined.
+  if (state->stage == ZSTD_DEC_STAGE_SKIPPABLE) {
+    size_t avail = input->size - input->used;
+    size_t n = (avail < (size_t)state->skippable_remaining)
+        ? avail
+        : (size_t)state->skippable_remaining;
+    input->used += n;
+    state->total_input_bytes += n;
+    state->skippable_remaining -= (uint32_t)n;
+    if (state->skippable_remaining != 0) {
+      return GCOMP_OK; // need more input
+    }
+
+    state->frames_completed++;
+    state->header_accum_pos = 0;
+    state->header_stage = ZSTD_HEADER_MAGIC;
+    // A skippable frame carries no data, so it never counts as "the frame"
+    // the caller asked for.  Before any data frame we keep reading whatever
+    // the concat setting is -- otherwise a leading skippable frame would hide
+    // the frame behind it.  After one, hand back to the DONE path so the
+    // concat rule decides, exactly as it would between two data frames.
+    state->stage =
+        state->saw_data_frame ? ZSTD_DEC_STAGE_DONE : ZSTD_DEC_STAGE_HEADER;
+    return GCOMP_OK;
+  }
+
   // Parse header
   if (state->stage == ZSTD_DEC_STAGE_HEADER) {
     // Read magic number (4 bytes)
@@ -682,6 +730,20 @@ static gcomp_status_t zstd_decoder_step(gcomp_decoder_t * decoder,
 
     // Verify magic and determine header length
     uint32_t magic = gcomp_read_le32(state->header_accum);
+    if (magic >= ZSTD_MAGIC_SKIPPABLE_MIN &&
+        magic <= ZSTD_MAGIC_SKIPPABLE_MAX) {
+      // Skippable frame: four more bytes give the length of what to discard.
+      while (state->header_accum_pos < 8 && input->used < input->size) {
+        state->header_accum[state->header_accum_pos++] = in_ptr[input->used++];
+        state->total_input_bytes++;
+      }
+      if (state->header_accum_pos < 8) {
+        return GCOMP_OK; // need more input
+      }
+      state->skippable_remaining = gcomp_read_le32(state->header_accum + 4);
+      state->stage = ZSTD_DEC_STAGE_SKIPPABLE;
+      return GCOMP_OK;
+    }
     if (magic != ZSTD_MAGIC) {
       gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
           "invalid zstd magic: expected 0x%08X, got 0x%08X", ZSTD_MAGIC, magic);
@@ -984,6 +1046,7 @@ static gcomp_status_t zstd_decoder_step(gcomp_decoder_t * decoder,
       }
       else {
         state->stage = ZSTD_DEC_STAGE_DONE;
+        state->frames_completed++;
       }
     }
     else {
@@ -1017,6 +1080,7 @@ static gcomp_status_t zstd_decoder_step(gcomp_decoder_t * decoder,
     }
 
     state->stage = ZSTD_DEC_STAGE_DONE;
+    state->frames_completed++;
   }
 
   return GCOMP_OK;
@@ -1100,20 +1164,37 @@ gcomp_status_t zstd_decoder_finish(
   // Drain any remaining buffered output
   (void)zstd_drain_output(state, output);
 
+  // A block is decompressed whole into output_buffer and handed out as the
+  // caller's buffer allows, so reaching the end of the stream and having
+  // delivered it are different things.  This reported GCOMP_OK as soon as the
+  // stage was DONE, whatever was still staged, and a caller following the
+  // documented contract -- call finish() until it stops saying GCOMP_ERR_LIMIT
+  // -- stopped on the first call and silently lost the rest of the last block.
+  //
+  // With an output buffer at least one block (128 KB) wide nothing was ever
+  // left over and the defect was invisible; below that, every stream lost up
+  // to a block minus whatever fitted.  The DEFLATE decoder already draws this
+  // distinction, and finish() now behaves the same in both.
+  if (state->output_buffer_pos < state->output_buffer_len) {
+    return GCOMP_ERR_LIMIT;
+  }
+
   if (state->stage == ZSTD_DEC_STAGE_DONE) {
     return GCOMP_OK;
   }
 
-  // If we're not done and there's no more output to drain, we have truncated
-  // input
-  if (state->output_buffer_pos >= state->output_buffer_len) {
-    gcomp_decoder_set_error(
-        decoder, GCOMP_ERR_CORRUPT, "truncated zstd stream");
-    state->stage = ZSTD_DEC_STAGE_ERROR;
-    return GCOMP_ERR_CORRUPT;
+  // Sitting at a frame boundary with nothing part-read, having already
+  // finished at least one frame, is a complete stream -- a file whose last
+  // frame is skippable ends here, as does one made only of skippable frames.
+  if (state->stage == ZSTD_DEC_STAGE_HEADER && state->header_accum_pos == 0 &&
+      state->frames_completed > 0) {
+    return GCOMP_OK;
   }
 
-  return GCOMP_OK;
+  // Nothing staged and not done: the input really did stop early.
+  gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT, "truncated zstd stream");
+  state->stage = ZSTD_DEC_STAGE_ERROR;
+  return GCOMP_ERR_CORRUPT;
 }
 
 //
@@ -1149,6 +1230,9 @@ gcomp_status_t zstd_decoder_reset(gcomp_decoder_t * decoder) {
   state->total_input_bytes = 0;
   state->total_output_bytes = 0;
   state->frame_output_bytes = 0;
+  state->skippable_remaining = 0;
+  state->frames_completed = 0;
+  state->saw_data_frame = 0;
 
   // Reset repeat offsets
   state->rep_offset_1 = ZSTD_REP_OFFSET_1_INIT;

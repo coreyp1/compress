@@ -158,19 +158,23 @@ protected:
       result.insert(result.end(), out_buf.data(), out_buf.data() + ob.used);
     }
 
-    // Finish with small output buffer - keep calling until no more output
-    bool done = false;
-    while (!done) {
+    // Finish with a small output buffer.  GCOMP_ERR_LIMIT means the output
+    // buffer filled before everything buffered was handed over and finish()
+    // must be called again; GCOMP_OK means the stream is complete.  This used
+    // to loop until a call produced no output and treat GCOMP_ERR_LIMIT as a
+    // failure, which only worked while zstd's finish() wrongly reported
+    // GCOMP_OK with a block still staged -- see documentation/api/streaming.md
+    // and the same loop in the DEFLATE tests.
+    for (;;) {
       gcomp_buffer_t ob = {out_buf.data(), out_buf.size(), 0};
       gcomp_status_t status = gcomp_decoder_finish(dec, &ob);
-      if (status != GCOMP_OK) {
+      result.insert(result.end(), out_buf.data(), out_buf.data() + ob.used);
+      if (status == GCOMP_OK) {
+        break;
+      }
+      if (status != GCOMP_ERR_LIMIT || ob.used == 0) {
         gcomp_decoder_destroy(dec);
         return {};
-      }
-      result.insert(result.end(), out_buf.data(), out_buf.data() + ob.used);
-      // If no output produced, we're done
-      if (ob.used == 0) {
-        done = true;
       }
     }
 

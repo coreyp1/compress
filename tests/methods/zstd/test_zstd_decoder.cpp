@@ -61,7 +61,16 @@ protected:
       gcomp_decoder_destroy(dec);
       return {};
     }
-    st = gcomp_decoder_finish(dec, &ob);
+    // finish() reports GCOMP_ERR_LIMIT while it still has staged output the
+    // caller's buffer could not take; here the buffer is generously sized, so
+    // one call is normally enough, but the loop states the contract rather
+    // than assuming it.
+    for (;;) {
+      st = gcomp_decoder_finish(dec, &ob);
+      if (st != GCOMP_ERR_LIMIT || ob.used >= ob.size) {
+        break;
+      }
+    }
     if (status_out)
       *status_out = st;
     if (st != GCOMP_OK) {
@@ -238,15 +247,18 @@ TEST_F(ZstdDecoderTest, Decode1ByteOutputBuffer) {
       out.push_back(one_byte[0]);
   }
 
-  bool done = false;
-  while (!done) {
+  // finish() says GCOMP_ERR_LIMIT while a staged block is larger than the
+  // caller's buffer, and GCOMP_OK once everything has been handed over.  With
+  // a one byte buffer that is one call per byte.
+  for (;;) {
     gcomp_buffer_t ob = {one_byte, 1, 0};
     gcomp_status_t st = gcomp_decoder_finish(dec, &ob);
-    ASSERT_EQ(st, GCOMP_OK);
     if (ob.used > 0)
       out.push_back(one_byte[0]);
-    else
-      done = true;
+    if (st == GCOMP_OK)
+      break;
+    ASSERT_EQ(st, GCOMP_ERR_LIMIT);
+    ASSERT_GT(ob.used, 0u);
   }
 
   gcomp_decoder_destroy(dec);
