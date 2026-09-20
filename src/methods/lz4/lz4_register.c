@@ -39,6 +39,8 @@
 #include <ghoti.io/compress/macros.h>
 #include "../../autoreg/autoreg_platform.h"
 #include "../../core/bound_internal.h"
+#include <ghoti.io/compress/compress.h>
+#include <string.h>
 #include "../../core/stream_internal.h"
 #include "lz4_internal.h"
 #include <ghoti.io/compress/errors.h>
@@ -437,6 +439,63 @@ static gcomp_status_t lz4_encode_bound(
 }
 
 
+//
+// Peeking
+//
+
+/**
+ * @brief The LZ4 frame descriptor, through the parser the decoder uses.
+ *
+ * gcomp_lz4_peek_frame_info() is deliberately the same code path the decoder
+ * takes, so a caller cannot be told one thing and the decoder decide another.
+ * This maps its format-specific answer onto the common one.
+ */
+static gcomp_status_t lz4_peek(gcomp_options_t * options, const void * input,
+    size_t input_size, gcomp_stream_info_t * info_out, size_t * needed_out) {
+  (void)options;
+  if (!info_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  memset(info_out, 0, sizeof(*info_out));
+
+  gcomp_lz4_frame_info_t fi;
+  size_t needed = 0;
+  gcomp_status_t s =
+      gcomp_lz4_peek_frame_info(input, input_size, &fi, &needed);
+  if (s != GCOMP_OK) {
+    if (needed_out) {
+      *needed_out = needed;
+    }
+    return s;
+  }
+
+  if (fi.is_skippable) {
+    info_out->is_skippable = 1;
+    info_out->skippable_variant = fi.magic_variant;
+    info_out->skippable_size = (uint64_t)fi.frame_size;
+    info_out->header_size = fi.frame_header_size;
+    if (needed_out) {
+      *needed_out = fi.frame_header_size;
+    }
+    return GCOMP_OK;
+  }
+
+  info_out->header_size = fi.frame_header_size;
+  info_out->has_content_size = fi.content_size_present ? 1 : 0;
+  info_out->content_size = fi.content_size;
+  // A block may reference the 64 KB before it, which is the whole of LZ4's
+  // history whatever the block size.
+  info_out->window_size = 65536u;
+  info_out->has_checksum = fi.content_checksum ? 1 : 0;
+  info_out->has_dictionary = fi.dict_id_present ? 1 : 0;
+  info_out->dictionary_id = fi.dict_id;
+  if (needed_out) {
+    *needed_out = fi.frame_header_size;
+  }
+  return GCOMP_OK;
+}
+
+
 static const gcomp_method_t g_lz4_method = {
     .abi_version = GCOMP_METHOD_ABI_VERSION,
     .size = sizeof(gcomp_method_t),
@@ -448,6 +507,7 @@ static const gcomp_method_t g_lz4_method = {
     .destroy_decoder = lz4_destroy_decoder_wrapper,
     .get_schema = lz4_get_schema,
     .encode_bound = lz4_encode_bound,
+    .peek = lz4_peek,
 };
 
 //

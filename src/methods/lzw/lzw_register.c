@@ -36,6 +36,8 @@
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
 #include "../../core/bound_internal.h"
+#include <ghoti.io/compress/compress.h>
+#include <string.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -308,6 +310,34 @@ static gcomp_status_t lzw_encode_bound(
 }
 
 
+//
+// Peeking
+//
+
+/**
+ * @brief LZW has no header: the stream opens with a Clear code.
+ *
+ * Neither the TIFF nor the GIF framing puts anything in front of the codes -
+ * what surrounds them belongs to the container, not to this stream - so there
+ * is nothing to report.  There is no window either: LZW refers to its
+ * dictionary, not to a distance behind the current position.
+ */
+static gcomp_status_t lzw_peek(gcomp_options_t * options, const void * input,
+    size_t input_size, gcomp_stream_info_t * info_out, size_t * needed_out) {
+  (void)options;
+  (void)input;
+  (void)input_size;
+  if (!info_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  memset(info_out, 0, sizeof(*info_out));
+  if (needed_out) {
+    *needed_out = 0;
+  }
+  return GCOMP_OK;
+}
+
+
 static const gcomp_method_t g_lzw_method = {
     .abi_version = GCOMP_METHOD_ABI_VERSION,
     .size = sizeof(gcomp_method_t),
@@ -319,6 +349,7 @@ static const gcomp_method_t g_lzw_method = {
     .destroy_decoder = lzw_destroy_decoder_wrapper,
     .get_schema = lzw_get_schema,
     .encode_bound = lzw_encode_bound,
+    .peek = lzw_peek,
 };
 
 gcomp_status_t gcomp_method_lzw_register(gcomp_registry_t * registry) {

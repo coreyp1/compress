@@ -24,6 +24,7 @@ extern "C" {
  * @brief Forward declarations
  */
 typedef struct gcomp_registry_s gcomp_registry_t;
+typedef struct gcomp_stream_info_s gcomp_stream_info_t;
 typedef struct gcomp_options_s gcomp_options_t;
 typedef struct gcomp_encoder_s gcomp_encoder_t;
 typedef struct gcomp_decoder_s gcomp_decoder_t;
@@ -229,6 +230,29 @@ struct gcomp_method_s {
    */
   gcomp_status_t (*encode_bound)(
       gcomp_options_t * options, size_t input_size, size_t * bound_out);
+
+  /**
+   * @brief Read what this stream's header says, without decoding it.
+   *
+   * Added in method ABI version 2.  A method that does not implement it
+   * leaves it @c NULL, and gcomp_peek() then reports ::GCOMP_ERR_UNSUPPORTED
+   * rather than passing an empty answer off as a real one.
+   *
+   * @p info_out has already been cleared when this is called, so a field the
+   * format does not carry can simply be left alone.  A format with no header
+   * at all succeeds and reports nothing, which is the truth about it.
+   *
+   * @param options Configuration options (may be NULL for defaults)
+   * @param input Start of the compressed stream
+   * @param input_size How much of it is available
+   * @param info_out Receives what the header says
+   * @param needed_out Receives how many bytes are needed when there are not
+   *        enough yet; may be NULL
+   * @return ::GCOMP_OK; ::GCOMP_ERR_LIMIT when more input is needed;
+   *         ::GCOMP_ERR_CORRUPT for a malformed header
+   */
+  gcomp_status_t (*peek)(gcomp_options_t * options, const void * input,
+      size_t input_size, gcomp_stream_info_t * info_out, size_t * needed_out);
 };
 
 /**

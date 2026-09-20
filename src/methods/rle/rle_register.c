@@ -22,6 +22,8 @@
 #include <ghoti.io/compress/registry.h>
 #include <ghoti.io/compress/rle.h>
 #include "../../core/bound_internal.h"
+#include <ghoti.io/compress/compress.h>
+#include <string.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -240,6 +242,32 @@ static gcomp_status_t rle_encode_bound(
   return GCOMP_OK;
 }
 
+//
+// Peeking
+//
+
+/**
+ * @brief RLE has no header: the stream opens with a control byte.
+ *
+ * Nothing precedes the first packet in either profile, and a run refers only
+ * to the byte beside it, so there is no window to report either.
+ */
+static gcomp_status_t rle_peek(gcomp_options_t * options, const void * input,
+    size_t input_size, gcomp_stream_info_t * info_out, size_t * needed_out) {
+  (void)options;
+  (void)input;
+  (void)input_size;
+  if (!info_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  memset(info_out, 0, sizeof(*info_out));
+  if (needed_out) {
+    *needed_out = 0;
+  }
+  return GCOMP_OK;
+}
+
+
 static const gcomp_method_t g_rle_method = {
     .abi_version = GCOMP_METHOD_ABI_VERSION,
     .size = sizeof(gcomp_method_t),
@@ -251,6 +279,7 @@ static const gcomp_method_t g_rle_method = {
     .destroy_decoder = rle_destroy_decoder_wrapper,
     .get_schema = rle_get_schema,
     .encode_bound = rle_encode_bound,
+    .peek = rle_peek,
 };
 
 gcomp_status_t gcomp_method_rle_register(gcomp_registry_t * registry) {

@@ -32,6 +32,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <string>
@@ -122,9 +123,38 @@ struct Config {
   OptionSetter set_options;
 };
 
+/**
+ * @brief Whether this run is under Memcheck.
+ *
+ * The sweep below is thousands of encodes, some of them a third of a megabyte.
+ * Outside valgrind that is under a minute; under it, where every byte carries
+ * validity and addressability bits and every instruction is instrumented, it
+ * runs for hours - long enough that the valgrind gate stops being something
+ * anyone waits for, which is the same as not having it.
+ *
+ * So under valgrind the sweep keeps every method and every option set and
+ * trims the sizes: the point of running this here is that the bound arithmetic
+ * and the encoders' framing are watched for uninitialised reads and overruns,
+ * and that happens on the first few encodes as well as the ten-thousandth.
+ * The full sweep runs in the ordinary build and under ASan.
+ *
+ * The Makefile's valgrind targets set this.
+ */
+static bool UnderValgrind() {
+  const char * vg = std::getenv("GCOMP_UNDER_VALGRIND");
+  return vg && vg[0] == '1';
+}
+
 /// Sizes to try: the boundaries every format counts blocks at, and a spread.
 std::vector<size_t> sizes_to_try() {
   std::vector<size_t> v;
+  if (UnderValgrind()) {
+    // Small, but still across a block boundary and either side of one.
+    for (size_t n : {0u, 1u, 129u, 1000u, 65534u, 65535u, 65536u, 70000u}) {
+      v.push_back(n);
+    }
+    return v;
+  }
   // Degenerate and tiny.
   for (size_t n : {0u, 1u, 2u, 3u, 127u, 128u, 129u, 130u, 255u, 256u, 257u}) {
     v.push_back(n);
@@ -375,7 +405,7 @@ TEST(EncodeBound, Threaded) {
  * produces and asks the bound to be near it.
  */
 TEST(EncodeBound, IsNotWildlyLoose) {
-  const size_t n = 100000;
+  const size_t n = UnderValgrind() ? 20000 : 100000;
   const std::vector<std::vector<uint8_t>> shapes = {incompressible(n),
       never_repeats(n), alternating_runs(n), literal_run_alternating(n),
       all_one(n)};
@@ -423,8 +453,10 @@ TEST(EncodeBound, RejectsBadArguments) {
       GCOMP_ERR_INVALID_ARG);
   EXPECT_EQ(gcomp_encode_bound(nullptr, "deflate", nullptr, 10, nullptr),
       GCOMP_ERR_INVALID_ARG);
+  // An unregistered name is GCOMP_ERR_UNSUPPORTED, which is what
+  // gcomp_encoder_create() answers for the same mistake.
   EXPECT_EQ(gcomp_encode_bound(nullptr, "no-such-method", nullptr, 10, &bound),
-      GCOMP_ERR_INVALID_ARG);
+      GCOMP_ERR_UNSUPPORTED);
 }
 
 /// Zero in, something out: every framed format still writes its frame.

@@ -19,6 +19,8 @@
 #include <ghoti.io/compress/method.h>
 #include <ghoti.io/compress/zlib.h>
 #include "../../core/bound_internal.h"
+#include <ghoti.io/compress/compress.h>
+#include <string.h>
 
 //
 // Option schema
@@ -213,6 +215,54 @@ static gcomp_status_t zlib_encode_bound(
 }
 
 
+//
+// Peeking
+//
+
+/**
+ * @brief The two header bytes RFC 1950 section 2.2 defines.
+ *
+ * Reuses gcomp_zlib_peek_header(), which is the same parser the decoder runs,
+ * so the two cannot come to different conclusions about one stream.
+ */
+static gcomp_status_t zlib_peek(gcomp_options_t * options, const void * input,
+    size_t input_size, gcomp_stream_info_t * info_out, size_t * needed_out) {
+  (void)options;
+  if (!info_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  memset(info_out, 0, sizeof(*info_out));
+
+  // Two bytes, or six when FDICT names a dictionary.
+  if (input_size < 2) {
+    if (needed_out) {
+      *needed_out = 2;
+    }
+    return GCOMP_ERR_LIMIT;
+  }
+
+  gcomp_zlib_header_info_t zh;
+  gcomp_status_t s = gcomp_zlib_peek_header(input, input_size, &zh);
+  if (s != GCOMP_OK) {
+    if (s == GCOMP_ERR_LIMIT && needed_out) {
+      *needed_out = 6; // the FDICT form is the only longer one
+    }
+    return s;
+  }
+
+  info_out->header_size = zh.header_size;
+  info_out->window_size = (uint64_t)1u << zh.window_bits;
+  // The Adler-32 of the uncompressed data, always present (section 2.2).
+  info_out->has_checksum = 1;
+  info_out->has_dictionary = zh.has_dictionary ? 1 : 0;
+  info_out->dictionary_id = zh.dictionary_id;
+  if (needed_out) {
+    *needed_out = zh.header_size;
+  }
+  return GCOMP_OK;
+}
+
+
 static const gcomp_method_t g_zlib_method = {
     .abi_version = GCOMP_METHOD_ABI_VERSION,
     .size = sizeof(gcomp_method_t),
@@ -224,6 +274,7 @@ static const gcomp_method_t g_zlib_method = {
     .destroy_decoder = zlib_destroy_decoder_wrapper,
     .get_schema = zlib_get_schema,
     .encode_bound = zlib_encode_bound,
+    .peek = zlib_peek,
 };
 
 gcomp_status_t gcomp_method_zlib_register(gcomp_registry_t * registry) {

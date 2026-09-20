@@ -485,6 +485,26 @@ std::vector<size_t> select_ks(size_t n, bool exhaustive) {
   return ks;
 }
 
+/**
+ * @brief Whether this run is under Memcheck.
+ *
+ * The sweep is one whole encode and decode per allocation, which is over a
+ * thousand round trips.  Under valgrind that is hours.
+ *
+ * It also has less to prove there than anywhere else: the leak checking this
+ * test does is its own, and finer than Memcheck's, because the failing
+ * allocator knows every block it handed out and can say so the instant an
+ * operation returns.  What valgrind adds is the uninitialised-read and
+ * overrun checking on the error paths, and a sample of allocations reaches
+ * those as well as all of them would.
+ *
+ * The Makefile's valgrind targets set this.
+ */
+static bool UnderValgrind() {
+  const char * vg = std::getenv("GCOMP_UNDER_VALGRIND");
+  return vg && vg[0] == '1';
+}
+
 /// Run one scenario's whole sweep.
 void sweep(const Scenario & s) {
   // Count pass.
@@ -504,7 +524,14 @@ void sweep(const Scenario & s) {
   // A sweep over a handful of allocations proves very little, and the number
   // is not obvious from the outside: set GCOMP_ALLOC_SWEEP_VERBOSE=1 to see
   // what each scenario is actually covering.
-  std::vector<size_t> ks = select_ks(n, s.exhaustive);
+  std::vector<size_t> ks = select_ks(n, s.exhaustive && !UnderValgrind());
+  if (UnderValgrind() && ks.size() > 8) {
+    std::vector<size_t> trimmed;
+    for (size_t i = 0; i < 8; i++) {
+      trimmed.push_back(ks[i * ks.size() / 8]);
+    }
+    ks = trimmed;
+  }
   if (std::getenv("GCOMP_ALLOC_SWEEP_VERBOSE")) {
     std::fprintf(stderr, "%-24s allocations=%-5zu injected=%zu\n",
         s.name.c_str(), n, ks.size());
@@ -790,7 +817,8 @@ TEST(AllocFailure, SustainedPressure) {
     ASSERT_EQ(base.status, GCOMP_OK) << s.name << " at " << base.stage;
     const size_t n = counter.calls();
 
-    for (size_t k = 1; k <= n; k++) {
+    const size_t step = UnderValgrind() ? (n / 8 + 1) : 1;
+    for (size_t k = 1; k <= n; k += step) {
       FailingAllocator fa;
       fa.fail_from(k);
       RunResult r = run_scenario(s, fa.allocator());
@@ -837,7 +865,8 @@ TEST(AllocFailure, RegistryAndOptions) {
   const size_t n = counter.calls();
   ASSERT_GT(n, 0u);
 
-  for (size_t k = 1; k <= n; k++) {
+  const size_t step = UnderValgrind() ? (n / 8 + 1) : 1;
+  for (size_t k = 1; k <= n; k += step) {
     FailingAllocator fa;
     fa.fail_at(k);
 

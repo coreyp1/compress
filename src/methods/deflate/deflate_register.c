@@ -50,6 +50,8 @@
 #include <ghoti.io/compress/macros.h>
 #include "../../autoreg/autoreg_platform.h"
 #include "../../core/bound_internal.h"
+#include <ghoti.io/compress/compress.h>
+#include <string.h>
 #include "../../core/stream_internal.h"
 #include "deflate_internal.h"
 #include <ghoti.io/compress/deflate.h>
@@ -339,6 +341,36 @@ static gcomp_status_t deflate_encode_bound(
 }
 
 
+//
+// Peeking
+//
+
+/**
+ * @brief DEFLATE has no header, so there is nothing to read.
+ *
+ * RFC 1951 begins with the first block, whose three-bit header is not a frame
+ * header and says nothing about the stream as a whole.  Reporting a header
+ * size of zero is the honest answer; the window is the largest the format
+ * allows, because nothing in the stream narrows it.
+ */
+static gcomp_status_t deflate_peek(gcomp_options_t * options,
+    const void * input, size_t input_size, gcomp_stream_info_t * info_out,
+    size_t * needed_out) {
+  (void)input;
+  (void)input_size;
+  if (!info_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  memset(info_out, 0, sizeof(*info_out));
+  info_out->window_size =
+      (uint64_t)1u << gcomp_bound_deflate_window_bits(options);
+  if (needed_out) {
+    *needed_out = 0;
+  }
+  return GCOMP_OK;
+}
+
+
 static const gcomp_method_t g_deflate_method = {
     .abi_version = GCOMP_METHOD_ABI_VERSION,
     .size = sizeof(gcomp_method_t),
@@ -350,6 +382,7 @@ static const gcomp_method_t g_deflate_method = {
     .destroy_decoder = deflate_destroy_decoder,
     .get_schema = deflate_get_schema,
     .encode_bound = deflate_encode_bound,
+    .peek = deflate_peek,
 };
 
 //

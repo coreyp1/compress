@@ -38,6 +38,7 @@
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
 #include "../../core/bound_internal.h"
+#include <ghoti.io/compress/compress.h>
 #include <stddef.h>
 #include <string.h>
 #include <stdint.h>
@@ -475,6 +476,115 @@ static gcomp_status_t gzip_encode_bound(
 }
 
 
+//
+// Peeking
+//
+
+/**
+ * @brief Walk the gzip member header, RFC 1952 section 2.3.
+ *
+ * Ten fixed bytes, then the optional fields FLG selects, in the order the
+ * specification lists them: FEXTRA's two-byte length and its bytes, then the
+ * NUL-terminated FNAME and FCOMMENT, then FHCRC's two bytes.
+ *
+ * ISIZE is deliberately not reported as a content size.  It sits in the
+ * trailer rather than the header, it is only the size modulo 2^32, and a gzip
+ * file may hold several members - so reading it here would mean seeking to the
+ * end and would still be wrong for a multi-member file and for anything above
+ * 4 GB.  has_content_size stays zero, which is the truth about the header.
+ */
+static gcomp_status_t gzip_peek(gcomp_options_t * options, const void * input,
+    size_t input_size, gcomp_stream_info_t * info_out, size_t * needed_out) {
+  (void)options;
+  if (!info_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  memset(info_out, 0, sizeof(*info_out));
+  // Deflate's window, which is what a gzip member holds: RFC 1952 section 2.3
+  // fixes CM to 8 and defers to RFC 1951 for the stream itself.
+  info_out->window_size = 32768u;
+
+  const uint8_t * p = (const uint8_t *)input;
+  if (input_size < GZIP_HEADER_MIN_SIZE) {
+    if (needed_out) {
+      *needed_out = GZIP_HEADER_MIN_SIZE;
+    }
+    return GCOMP_ERR_LIMIT;
+  }
+  if (p[0] != 0x1Fu || p[1] != 0x8Bu) {
+    return GCOMP_ERR_CORRUPT;
+  }
+  if (p[2] != 8u) {
+    // Section 2.3.1: CM 0-7 are reserved and 8 is deflate.  Anything else is
+    // a compression method this format does not define.
+    return GCOMP_ERR_UNSUPPORTED;
+  }
+  uint8_t flg = p[3];
+  if (flg & GZIP_FLG_RESERVED) {
+    return GCOMP_ERR_CORRUPT;
+  }
+
+  size_t pos = GZIP_HEADER_MIN_SIZE;
+
+  if (flg & GZIP_FLG_FEXTRA) {
+    if (input_size < pos + 2) {
+      if (needed_out) {
+        *needed_out = pos + 2;
+      }
+      return GCOMP_ERR_LIMIT;
+    }
+    size_t xlen = (size_t)p[pos] | ((size_t)p[pos + 1] << 8);
+    pos += 2;
+    if (input_size < pos + xlen) {
+      if (needed_out) {
+        *needed_out = pos + xlen;
+      }
+      return GCOMP_ERR_LIMIT;
+    }
+    pos += xlen;
+  }
+
+  for (int field = 0; field < 2; field++) {
+    uint8_t bit = field == 0 ? GZIP_FLG_FNAME : GZIP_FLG_FCOMMENT;
+    if (!(flg & bit)) {
+      continue;
+    }
+    size_t start = pos;
+    while (pos < input_size && p[pos] != 0) {
+      pos++;
+    }
+    if (pos >= input_size) {
+      if (needed_out) {
+        // The string has no end in what we have; one more byte at least, and
+        // the caller will be asked again if that is still not enough.
+        *needed_out = input_size + 1;
+      }
+      return GCOMP_ERR_LIMIT;
+    }
+    pos++; // the NUL
+    (void)start;
+  }
+
+  if (flg & GZIP_FLG_FHCRC) {
+    if (input_size < pos + 2) {
+      if (needed_out) {
+        *needed_out = pos + 2;
+      }
+      return GCOMP_ERR_LIMIT;
+    }
+    pos += 2;
+  }
+
+  info_out->header_size = pos;
+  // The trailer always carries a CRC-32 of the uncompressed data.
+  info_out->has_checksum = 1;
+  if (needed_out) {
+    *needed_out = pos;
+  }
+  return GCOMP_OK;
+}
+
+
 static const gcomp_method_t g_gzip_method = {
     .abi_version = GCOMP_METHOD_ABI_VERSION,
     .size = sizeof(gcomp_method_t),
@@ -486,6 +596,7 @@ static const gcomp_method_t g_gzip_method = {
     .destroy_decoder = gzip_destroy_decoder_wrapper,
     .get_schema = gzip_get_schema,
     .encode_bound = gzip_encode_bound,
+    .peek = gzip_peek,
 };
 
 //

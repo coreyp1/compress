@@ -38,7 +38,9 @@ gcomp_status_t gcomp_encode_bound(gcomp_registry_t * registry,
 
   const gcomp_method_t * method = gcomp_registry_find(registry, method_name);
   if (!method) {
-    return GCOMP_ERR_INVALID_ARG;
+    // What gcomp_encoder_create() and gcomp_decoder_create() answer for a name
+    // that is not registered (stream.c).  One convention, not two.
+    return GCOMP_ERR_UNSUPPORTED;
   }
   if ((method->capabilities & GCOMP_CAP_ENCODE) == 0) {
     return GCOMP_ERR_UNSUPPORTED;

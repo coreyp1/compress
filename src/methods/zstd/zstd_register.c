@@ -39,6 +39,8 @@
 #include "../../autoreg/autoreg_platform.h"
 #include "../../core/stream_internal.h"
 #include "../../core/bound_internal.h"
+#include <ghoti.io/compress/compress.h>
+#include <string.h>
 #include "zstd_internal.h"
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/method.h>
@@ -461,6 +463,79 @@ static gcomp_status_t zstd_encode_bound(
 }
 
 
+//
+// Peeking
+//
+
+/**
+ * @brief The Zstandard frame header, through the parser the decoder uses.
+ *
+ * zstd_frame_header_parse() is shared with zstd_decoder.c so that the answer a
+ * caller is given here and the reading the decoder acts on are the same one.
+ * Skippable frames (RFC 8878 section 3.1.2) are reported as themselves rather
+ * than being stepped over: the magic range belongs to LZ4 as well, so what
+ * follows one is not this function's to assume.
+ */
+static gcomp_status_t zstd_peek(gcomp_options_t * options, const void * input,
+    size_t input_size, gcomp_stream_info_t * info_out, size_t * needed_out) {
+  (void)options;
+  if (!info_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  memset(info_out, 0, sizeof(*info_out));
+
+  const uint8_t * p = (const uint8_t *)input;
+  if (input_size < 4) {
+    if (needed_out) {
+      *needed_out = 4;
+    }
+    return GCOMP_ERR_LIMIT;
+  }
+
+  uint32_t magic = gcomp_read_le32(p);
+  if (magic >= ZSTD_MAGIC_SKIPPABLE_MIN && magic <= ZSTD_MAGIC_SKIPPABLE_MAX) {
+    if (input_size < 8) {
+      if (needed_out) {
+        *needed_out = 8;
+      }
+      return GCOMP_ERR_LIMIT;
+    }
+    info_out->is_skippable = 1;
+    info_out->skippable_variant = (unsigned)(magic & 0x0Fu);
+    info_out->header_size = 8;
+    info_out->skippable_size = 8u + (uint64_t)gcomp_read_le32(p + 4);
+    if (needed_out) {
+      *needed_out = 8;
+    }
+    return GCOMP_OK;
+  }
+
+  zstd_frame_header_t h;
+  uint64_t window_size = 0;
+  size_t needed = 0;
+  gcomp_status_t s =
+      zstd_frame_header_parse(p, input_size, &h, &window_size, &needed);
+  if (s != GCOMP_OK) {
+    if (needed_out) {
+      *needed_out = needed;
+    }
+    return s;
+  }
+
+  info_out->header_size = needed;
+  info_out->has_content_size = h.content_size_present ? 1 : 0;
+  info_out->content_size = h.content_size;
+  info_out->window_size = window_size;
+  info_out->has_checksum = h.content_checksum ? 1 : 0;
+  info_out->has_dictionary = (h.dict_id_flag != 0) ? 1 : 0;
+  info_out->dictionary_id = h.dict_id;
+  if (needed_out) {
+    *needed_out = needed;
+  }
+  return GCOMP_OK;
+}
+
+
 static const gcomp_method_t g_zstd_method = {
     .abi_version = GCOMP_METHOD_ABI_VERSION,
     .size = sizeof(gcomp_method_t),
@@ -472,6 +547,7 @@ static const gcomp_method_t g_zstd_method = {
     .destroy_decoder = zstd_destroy_decoder_wrapper,
     .get_schema = zstd_get_schema,
     .encode_bound = zstd_encode_bound,
+    .peek = zstd_peek,
 };
 
 //
