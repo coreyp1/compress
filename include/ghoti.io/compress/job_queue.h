@@ -119,6 +119,15 @@ GCOMP_API gcomp_status_t gcomp_job_queue_create(
  *
  * Note: All jobs must be retrieved or cancelled before destroying the queue.
  *
+ * Threads blocked in gcomp_job_queue_submit() or
+ * gcomp_job_queue_get_next_result() are released, return
+ * GCOMP_ERR_INVALID_ARG, and are waited for before any memory is freed.
+ * Calls that arrive after teardown begins are refused the same way.
+ *
+ * That is the only concurrency this call tolerates.  A thread part-way
+ * through any other queue function when this is called reads memory that is
+ * being freed; stop the callers first.
+ *
  * @param queue Queue to destroy.
  */
 GCOMP_API void gcomp_job_queue_destroy(gcomp_job_queue_t * queue);

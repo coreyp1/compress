@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/job_queue.h>
@@ -455,6 +456,7 @@ TEST_F(JobQueueTest, TwoBlockedConsumersBothGetAResult) {
   }
   EXPECT_EQ(returned.load(), 2)
       << "a consumer was never woken; only one signal was sent";
+  fflush(stdout);
 
   a.join();
   b.join();
@@ -507,10 +509,110 @@ TEST_F(JobQueueTest, TwoBlockedProducersBothProceed) {
 
   EXPECT_EQ(submitted.load(), 2)
       << "a producer was never woken; only one signal was sent";
+  fflush(stdout);
 
   b.join();
   c.join();
   gcomp_job_queue_destroy(queue);
+}
+
+//
+// Teardown with threads still blocked.
+//
+// Destroy used to free the queue and the semaphores out from under anyone
+// sleeping on them.  Under ASan that is a use-after-free; without it, a
+// crash or a silent corruption.  Both of these run the teardown on another
+// thread and check a deadline, because the failure is a hang if the release
+// never happens.  The flush after each check matters: the join that follows
+// blocks forever on failure, and a buffered diagnosis would never be written.
+//
+
+TEST_F(JobQueueTest, DestroyReleasesABlockedConsumer) {
+  gcomp_job_queue_config_t config = {.capacity = 0, .allocator = nullptr};
+  gcomp_job_queue_t * queue = nullptr;
+  ASSERT_EQ(gcomp_job_queue_create(&config, &queue), GCOMP_OK);
+
+  gcomp_block_job_t job{};
+  ASSERT_EQ(gcomp_job_queue_submit(queue, &job), GCOMP_OK);
+
+  // Blocks: the job is submitted but never completed.
+  std::atomic<bool> refused{false};
+  std::atomic<bool> running{false};
+  std::thread consumer([&] {
+    running.store(true);
+    gcomp_block_job_t * result = nullptr;
+    if (gcomp_job_queue_get_next_result(queue, &result) != GCOMP_OK) {
+      refused.store(true);
+    }
+  });
+
+  while (!running.load()) {
+    std::this_thread::yield();
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  std::atomic<bool> destroyed{false};
+  std::thread teardown([&] {
+    gcomp_job_queue_destroy(queue);
+    destroyed.store(true);
+  });
+
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!destroyed.load() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+
+  EXPECT_TRUE(destroyed.load())
+      << "destroy hung: a blocked consumer was never released";
+  fflush(stdout);
+
+  consumer.join();
+  teardown.join();
+  EXPECT_TRUE(refused.load()) << "the released consumer should report failure";
+}
+
+TEST_F(JobQueueTest, DestroyReleasesABlockedProducer) {
+  // Capacity one, filled, so the second submit blocks for space that never
+  // frees.
+  gcomp_job_queue_config_t config = {.capacity = 1, .allocator = nullptr};
+  gcomp_job_queue_t * queue = nullptr;
+  ASSERT_EQ(gcomp_job_queue_create(&config, &queue), GCOMP_OK);
+
+  std::vector<gcomp_block_job_t> jobs(2);
+  ASSERT_EQ(gcomp_job_queue_submit(queue, &jobs[0]), GCOMP_OK);
+
+  std::atomic<bool> refused{false};
+  std::atomic<bool> running{false};
+  std::thread producer([&] {
+    running.store(true);
+    if (gcomp_job_queue_submit(queue, &jobs[1]) != GCOMP_OK) {
+      refused.store(true);
+    }
+  });
+
+  while (!running.load()) {
+    std::this_thread::yield();
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  std::atomic<bool> destroyed{false};
+  std::thread teardown([&] {
+    gcomp_job_queue_destroy(queue);
+    destroyed.store(true);
+  });
+
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!destroyed.load() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+
+  EXPECT_TRUE(destroyed.load())
+      << "destroy hung: a blocked producer was never released";
+  fflush(stdout);
+
+  producer.join();
+  teardown.join();
+  EXPECT_TRUE(refused.load()) << "the released producer should report failure";
 }
 
 int main(int argc, char ** argv) {

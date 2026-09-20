@@ -35,6 +35,7 @@
 
 #include <ghoti.io/cutil/mutex.h>
 #include <ghoti.io/cutil/semaphore.h>
+#include <ghoti.io/cutil/thread.h>
 
 #include "alloc_internal.h"
 
@@ -80,6 +81,7 @@ struct gcomp_job_queue_s {
   // would signal for the thread still blocked behind it.
   uint32_t space_waiters;        ///< Threads blocked in submit()
   uint32_t result_waiters;       ///< Threads blocked in get_next_result()
+  bool shutting_down;            ///< Teardown has begun; refuse and release
 };
 
 //
@@ -191,6 +193,7 @@ gcomp_status_t gcomp_job_queue_create(
   queue->active_count = 0;
   queue->space_waiters = 0;
   queue->result_waiters = 0;
+  queue->shutting_down = false;
 
   // Initialize synchronization
   if (GCU_MUTEX_CREATE(queue->mutex) != 0) {
@@ -220,8 +223,27 @@ void gcomp_job_queue_destroy(gcomp_job_queue_t * queue) {
     return;
   }
 
-  // Free any remaining slots
   GCU_MUTEX_LOCK(queue->mutex);
+
+  // Refuse anyone who arrives from here on, and release anyone already
+  // blocked.  Without this, teardown destroyed the semaphores those threads
+  // were sleeping on and freed the queue underneath them.
+  queue->shutting_down = true;
+  gcomp_job_queue_wake_all(&queue->result_ready, queue->result_waiters);
+  gcomp_job_queue_wake_all(&queue->space_available, queue->space_waiters);
+
+  // Wait for them to leave the queue's memory before any of it is released.
+  // A released waiter decrements its count under this mutex and touches
+  // nothing afterwards, so counts of zero observed while holding it mean they
+  // are all gone.  No new waiter can appear behind them: registering requires
+  // this mutex, and shutting_down is already set.
+  while (queue->space_waiters || queue->result_waiters) {
+    GCU_MUTEX_UNLOCK(queue->mutex);
+    gcu_thread_yield();
+    GCU_MUTEX_LOCK(queue->mutex);
+  }
+
+  // Free any remaining slots
   while (queue->slots_head) {
     gcomp_job_slot_t * slot = queue->slots_head;
     queue->slots_head = slot->next;
@@ -253,6 +275,11 @@ static gcomp_status_t gcomp_job_queue_submit_internal(
 
   GCU_MUTEX_LOCK(queue->mutex);
 
+  if (queue->shutting_down) {
+    GCU_MUTEX_UNLOCK(queue->mutex);
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
   // Check capacity (if bounded)
   while (queue->capacity > 0 && queue->active_count >= queue->capacity) {
     if (!blocking) {
@@ -264,6 +291,13 @@ static gcomp_status_t gcomp_job_queue_submit_internal(
     gcu_semaphore_wait(&queue->space_available);
     GCU_MUTEX_LOCK(queue->mutex);
     queue->space_waiters--;
+
+    // Released by teardown rather than by a slot freeing.  Return without
+    // touching anything else: the queue is about to be freed.
+    if (queue->shutting_down) {
+      GCU_MUTEX_UNLOCK(queue->mutex);
+      return GCOMP_ERR_INVALID_ARG;
+    }
   }
 
   // Allocate a new slot
@@ -344,6 +378,11 @@ gcomp_status_t gcomp_job_queue_get_next_result(
 
   GCU_MUTEX_LOCK(queue->mutex);
 
+  if (queue->shutting_down) {
+    GCU_MUTEX_UNLOCK(queue->mutex);
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
   // Wait until next-in-sequence result is ready
   while (!gcomp_job_queue_next_ready_locked(queue)) {
     // Check if there are any pending jobs
@@ -357,6 +396,12 @@ gcomp_status_t gcomp_job_queue_get_next_result(
     gcu_semaphore_wait(&queue->result_ready);
     GCU_MUTEX_LOCK(queue->mutex);
     queue->result_waiters--;
+
+    // Released by teardown rather than by a result arriving.
+    if (queue->shutting_down) {
+      GCU_MUTEX_UNLOCK(queue->mutex);
+      return GCOMP_ERR_INVALID_ARG;
+    }
   }
 
   // Find and remove the slot
