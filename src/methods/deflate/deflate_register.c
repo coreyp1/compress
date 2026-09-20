@@ -125,6 +125,24 @@ static const gcomp_option_schema_t g_deflate_option_schemas[] = {
         "LZ77 window size in bits (8..15, 32KiB max)", // help
     },
     {
+        // RFC 1950 section 2.2's preset dictionary, which is history rather
+        // than anything RFC 1951 defines: the bytes are loaded into the
+        // window and the first block's distances reach back into them.  The
+        // decoder accepts one; the encoder does not write one yet and says so
+        // rather than ignoring it.
+        "deflate.dictionary", // key
+        GCOMP_OPT_BYTES,      // type
+        0,                    // has_default
+        {.ui64 = 0},          // default_value
+        0,                    // has_min
+        0,                    // has_max
+        0,                    // min_int
+        0,                    // max_int
+        0,                    // min_uint
+        0,                    // max_uint
+        "Preset dictionary: decoding only, not yet written by the encoder",
+    },
+    {
         "deflate.strategy",                // key
         GCOMP_OPT_STRING,                  // type
         1,                                 // has_default
@@ -198,6 +216,7 @@ static const gcomp_option_schema_t g_deflate_option_schemas[] = {
 static const char * const g_deflate_option_keys[] = {
     "deflate.level",
     "deflate.window_bits",
+    "deflate.dictionary",
     "deflate.strategy",
     "limits.max_output_bytes",
     "limits.max_memory_bytes",

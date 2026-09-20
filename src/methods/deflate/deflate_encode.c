@@ -2319,6 +2319,24 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
     }
   }
 
+  // The decoder accepts a preset dictionary; this does not write one yet.
+  // Refusing is the only honest answer, and it is the same one zlib's encoder
+  // gives for zlib.dictionary: quietly encoding without it would produce a
+  // stream that decodes to the wrong bytes for anyone who supplied it.
+  if (options) {
+    const void * dict = NULL;
+    size_t dict_len = 0;
+    if (gcomp_options_get_bytes(options, "deflate.dictionary", &dict,
+            &dict_len) == GCOMP_OK &&
+        dict && dict_len > 0) {
+      status = GCOMP_ERR_UNSUPPORTED;
+      gcomp_encoder_set_error(encoder, status,
+          "deflate.dictionary is read by the decoder but not yet written by "
+          "the encoder");
+      goto cleanup;
+    }
+  }
+
   // Read window bits
   st->window_bits = DEFLATE_WINDOW_BITS_DEFAULT;
   if (options) {

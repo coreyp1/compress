@@ -30,6 +30,7 @@
 #include <ghoti.io/compress/macros.h>
 
 #include "zlib_internal.h"
+#include "../deflate/deflate_internal.h"
 
 #include "../../core/alloc_internal.h"
 #include "../../core/registry_internal.h"
@@ -157,15 +158,42 @@ static gcomp_status_t zlib_take_header(
   if (state->header.fdict) {
     state->header.dict_id =
         zlib_read_be32(state->header_accum + ZLIB_HEADER_SIZE);
-    state->stage = ZLIB_DEC_STAGE_ERROR;
-    // Decoding this needs the dictionary it names loaded into deflate's
-    // window before the first block, and the deflate decoder has no way to be
-    // given one.  Say which dictionary, so a caller can at least recognise
-    // the stream; do not guess and produce plausible wrong bytes.
-    return gcomp_decoder_set_error(decoder, GCOMP_ERR_UNSUPPORTED,
-        "zlib stream needs preset dictionary 0x%08X (FDICT), which this "
-        "library cannot supply to the deflate decoder yet",
-        (unsigned)state->header.dict_id);
+
+    // RFC 1950 section 2.2: the stream was compressed against a dictionary the
+    // decompressor "must be presented with", and DICTID is the Adler-32 of
+    // that dictionary, so the caller has to supply the right one and we can
+    // check that they did.  Without it there is nothing to do but say which
+    // one is wanted - guessing would produce plausible wrong bytes.
+    const void * dict = NULL;
+    size_t dict_len = 0;
+    if (!decoder->options ||
+        gcomp_options_get_bytes(
+            decoder->options, "zlib.dictionary", &dict, &dict_len) != GCOMP_OK ||
+        !dict || dict_len == 0) {
+      state->stage = ZLIB_DEC_STAGE_ERROR;
+      return gcomp_decoder_set_error(decoder, GCOMP_ERR_UNSUPPORTED,
+          "zlib stream needs preset dictionary 0x%08X (FDICT); supply it as "
+          "zlib.dictionary",
+          (unsigned)state->header.dict_id);
+    }
+
+    uint32_t have = gcomp_adler32((const uint8_t *)dict, dict_len);
+    if (have != state->header.dict_id) {
+      state->stage = ZLIB_DEC_STAGE_ERROR;
+      return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+          "zlib stream names preset dictionary 0x%08X but the one supplied is "
+          "0x%08X",
+          (unsigned)state->header.dict_id, (unsigned)have);
+    }
+
+    gcomp_status_t ds = gcomp_deflate_decoder_set_dictionary(
+        state->inner_decoder, dict, dict_len);
+    if (ds != GCOMP_OK) {
+      state->stage = ZLIB_DEC_STAGE_ERROR;
+      return gcomp_decoder_set_error(decoder, ds,
+          "could not load preset dictionary 0x%08X into the deflate decoder",
+          (unsigned)state->header.dict_id);
+    }
   }
 
   state->stage = ZLIB_DEC_STAGE_BODY;

@@ -1330,6 +1330,29 @@ gcomp_status_t gcomp_deflate_decoder_init(gcomp_registry_t * registry,
   decoder->update_fn = gcomp_deflate_decoder_update;
   decoder->finish_fn = gcomp_deflate_decoder_finish;
   decoder->reset_fn = gcomp_deflate_decoder_reset;
+
+  // A raw deflate stream has no way to say that it needs a dictionary, so the
+  // caller has to.  The zlib decoder does not come through here: it learns
+  // from FDICT and calls gcomp_deflate_decoder_set_dictionary() once it has
+  // checked DICTID, which is the only way to know the dictionary is the right
+  // one.  The state is attached first because that function reads it.
+  if (options) {
+    const void * dict = NULL;
+    size_t dict_len = 0;
+    if (gcomp_options_get_bytes(options, "deflate.dictionary", &dict,
+            &dict_len) == GCOMP_OK &&
+        dict && dict_len > 0) {
+      status = gcomp_deflate_decoder_set_dictionary(decoder, dict, dict_len);
+      if (status != GCOMP_OK) {
+        decoder->method_state = NULL;
+        decoder->update_fn = NULL;
+        decoder->finish_fn = NULL;
+        decoder->reset_fn = NULL;
+        goto cleanup;
+      }
+    }
+  }
+
   return GCOMP_OK;
 
 cleanup:
@@ -1379,6 +1402,44 @@ void gcomp_deflate_decoder_destroy(gcomp_decoder_t * decoder) {
       &st->mem_tracker, sizeof(gcomp_deflate_decoder_state_t));
   gcomp_free(alloc, st);
   decoder->method_state = NULL;
+}
+
+gcomp_status_t gcomp_deflate_decoder_set_dictionary(
+    gcomp_decoder_t * decoder, const void * dict, size_t dict_len) {
+  if (!decoder || !decoder->method_state) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  if (!dict && dict_len > 0) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  gcomp_deflate_decoder_state_t * st =
+      (gcomp_deflate_decoder_state_t *)decoder->method_state;
+  if (!st->window || st->window_size == 0) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  // The history a stream starts from cannot be changed once it has started.
+  if (st->total_output_bytes != 0 || st->window_filled != 0) {
+    return gcomp_decoder_set_error(decoder, GCOMP_ERR_INVALID_ARG,
+        "a preset dictionary must be set before decoding begins");
+  }
+  if (dict_len == 0) {
+    return GCOMP_OK;
+  }
+
+  // Only the tail is reachable: RFC 1951 section 3.2.5 bounds a distance by
+  // the window, so bytes further back than that could never be referenced.
+  size_t take = dict_len;
+  if (take > st->window_size) {
+    take = st->window_size;
+  }
+  memcpy(st->window, (const uint8_t *)dict + (dict_len - take), take);
+
+  // The window is circular: a dictionary that exactly fills it leaves the
+  // write position back at zero.
+  st->window_filled = take;
+  st->window_pos = take & st->window_mask;
+  return GCOMP_OK;
 }
 
 gcomp_status_t gcomp_deflate_decoder_reset(gcomp_decoder_t * decoder) {

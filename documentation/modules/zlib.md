@@ -83,7 +83,7 @@ Compression is configured with the deflate keys, which pass straight through:
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `zlib.dictionary` | bytes | none | Preset dictionary. **Not supported**; see below. |
+| `zlib.dictionary` | bytes | none | Preset dictionary. Decoding only; see below. |
 
 ### Limits
 
@@ -96,21 +96,54 @@ Compression is configured with the deflate keys, which pass straight through:
 ## Preset dictionaries (FDICT)
 
 RFC 1950 allows a stream to be compressed against a preset dictionary, flagged
-by FDICT and identified by a four-byte Adler-32 of that dictionary. That needs
-the *deflate* encoder and decoder to accept a dictionary, and this library's do
-not yet.
+by FDICT and identified by a four-byte Adler-32 of that dictionary. RFC 1951
+has no notion of one: a dictionary is simply history, so decoding such a stream
+means loading those bytes into deflate's window before the first block and
+letting the first distances reach back into them.
 
-This is the one part of RFC 1950 not covered, and it is refused rather than
-fudged:
+**Decoding is supported. Encoding is not.**
 
-- Setting `zlib.dictionary` on an encoder fails at creation with
-  `GCOMP_ERR_UNSUPPORTED`. Quietly clearing FDICT would produce a stream that
-  decodes to the wrong bytes for anyone who had the dictionary.
-- Decoding a stream with FDICT set fails with `GCOMP_ERR_UNSUPPORTED` and an
-  error naming the dictionary id, rather than producing plausible nonsense.
+### Decoding
 
-FDICT is rare in practice: PNG forbids it outright (PNG §10.3), and HTTP and
-PDF do not use it.
+Supply the dictionary as `zlib.dictionary` and the stream decodes normally:
+
+```c
+gcomp_options_set_bytes(opts, "zlib.dictionary", dict, dict_len);
+gcomp_decode_alloc(NULL, "zlib", opts, stream, len, &out, &out_len);
+```
+
+Only the last 32 KB of a dictionary is reachable, because a deflate distance
+cannot exceed the window; a longer one is loaded from its tail, as zlib's
+`inflateSetDictionary` does.
+
+The identifier is checked, which is what it is there for:
+
+| | |
+| --- | --- |
+| no `zlib.dictionary` supplied | `GCOMP_ERR_UNSUPPORTED`, naming the id wanted |
+| the wrong dictionary | `GCOMP_ERR_CORRUPT`, naming both ids |
+| the right one | decodes |
+
+`gcomp_peek()` reports the requirement before you commit to anything —
+`has_dictionary` and `dictionary_id`.
+
+A raw deflate stream has no FDICT bit to announce the need, so for those the
+caller says so with `deflate.dictionary`, which the deflate decoder loads at
+creation.
+
+### Encoding
+
+Setting `zlib.dictionary` or `deflate.dictionary` on an **encoder** fails at
+creation with `GCOMP_ERR_UNSUPPORTED`. The deflate encoder cannot yet be primed
+with history, and quietly encoding without the dictionary would produce a
+stream that decodes to the wrong bytes for whoever supplied it — a failure
+landing on the reader, who did nothing wrong.
+
+### Where it matters
+
+FDICT is rare: PNG forbids it outright (PNG §10.3), and HTTP and PDF do not use
+it. It turns up where many small, similar messages are compressed
+independently — the case a dictionary exists for.
 
 ## Flushing
 
@@ -141,7 +174,7 @@ cheapest way to tell a zlib stream from a raw deflate one.
 | Status | Cause |
 |---|---|
 | `GCOMP_ERR_CORRUPT` | CM is not 8, CINFO above 7, the FCHECK modulus fails, the Adler-32 does not match, or the stream is truncated |
-| `GCOMP_ERR_UNSUPPORTED` | FDICT is set, or `zlib.dictionary` was given to an encoder |
+| `GCOMP_ERR_UNSUPPORTED` | FDICT is set and no `zlib.dictionary` was supplied, or one was given to an encoder |
 | `GCOMP_ERR_LIMIT` | An output or expansion-ratio limit was exceeded |
 
 The Adler-32 is checked at the end, against output the caller has already been

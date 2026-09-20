@@ -65,6 +65,33 @@ void gcomp_deflate_decoder_destroy(gcomp_decoder_t * decoder);
 gcomp_status_t gcomp_deflate_decoder_reset(gcomp_decoder_t * decoder);
 
 /**
+ * @brief Load a preset dictionary as the history the stream starts from.
+ *
+ * RFC 1950 section 2.2 lets a zlib stream be compressed against a dictionary
+ * the decompressor "must be presented with" before decoding.  RFC 1951 itself
+ * has no notion of one: the dictionary is simply history, so this puts it in
+ * the window and the first block's distances reach back into it like any
+ * other.
+ *
+ * Only the last @c window_size bytes are reachable - a distance cannot exceed
+ * the window - so a longer dictionary is loaded from its tail, which is what
+ * zlib's @c inflateSetDictionary does.
+ *
+ * Must be called before any output has been produced; the history a stream
+ * starts from cannot be changed once it has started.  Called by the zlib
+ * decoder when it sees FDICT, and at creation time when the caller sets
+ * `deflate.dictionary` on a raw deflate stream.
+ *
+ * @param decoder The decoder
+ * @param dict The dictionary bytes (may be NULL when @p dict_len is 0)
+ * @param dict_len How many
+ * @return ::GCOMP_OK; ::GCOMP_ERR_INVALID_ARG if output has already been
+ *         produced or the arguments are wrong
+ */
+GCOMP_INTERNAL_API gcomp_status_t gcomp_deflate_decoder_set_dictionary(
+    gcomp_decoder_t * decoder, const void * dict, size_t dict_len);
+
+/**
  * @brief Deflate decoder update implementation.
  */
 gcomp_status_t gcomp_deflate_decoder_update(
