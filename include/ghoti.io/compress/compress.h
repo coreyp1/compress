@@ -107,6 +107,53 @@ GCOMP_API gcomp_status_t gcomp_decode_buffer(gcomp_registry_t * registry,
     const void * input_data, size_t input_size, void * output_data,
     size_t output_capacity, size_t * output_size_out);
 
+/**
+ * @brief Largest output gcomp_encode_buffer() can produce for this input size
+ *
+ * An output buffer of at least this size is always enough: encoding
+ * @p input_size bytes with @p method_name and @p options into a buffer this
+ * large cannot fail for want of room, whatever those bytes turn out to be.
+ * Data that does not compress is the case that matters - every method here
+ * falls back to storing such data verbatim, and the bound is what that costs,
+ * which is the input plus the framing around it.
+ *
+ * Use it to size a buffer before a one-shot encode:
+ *
+ * @code
+ * size_t cap = 0;
+ * if (gcomp_encode_bound(NULL, "zstd", opts, len, &cap) != GCOMP_OK) { ... }
+ * void * buf = malloc(cap);
+ * size_t written = 0;
+ * gcomp_encode_buffer(NULL, "zstd", opts, data, len, buf, cap, &written);
+ * @endcode
+ *
+ * ## What it does not cover
+ *
+ * One whole stream: create, update as often as you like, finish. It does
+ * **not** account for gcomp_encoder_flush(). A flush ends a block early and
+ * pads to a byte boundary, so it adds output every time it is called and the
+ * total depends on how often a caller chooses to call it - which is not
+ * knowable from the input size. A caller that flushes must size its own
+ * buffer, or stream into one it can refill.
+ *
+ * The options matter and are read: a gzip name and comment, an LZ4 block size
+ * and its checksums, a zstd window that lowers the maximum block size all move
+ * the answer. Pass the same options you will pass to the encoder.
+ *
+ * @param registry The registry to use (can be NULL to use default registry)
+ * @param method_name The name of the compression method (e.g., "deflate")
+ * @param options Configuration options (can be NULL for defaults)
+ * @param input_size Number of input bytes that will be encoded
+ * @param bound_out Receives the worst-case encoded size
+ * @return GCOMP_OK; GCOMP_ERR_INVALID_ARG for a NULL name or output pointer;
+ *         GCOMP_ERR_UNSUPPORTED if the method cannot encode or does not
+ *         implement a bound; GCOMP_ERR_LIMIT if the bound is too large to
+ *         represent in a size_t
+ */
+GCOMP_API gcomp_status_t gcomp_encode_bound(gcomp_registry_t * registry,
+    const char * method_name, gcomp_options_t * options, size_t input_size,
+    size_t * bound_out);
+
 #ifdef __cplusplus
 }
 #endif

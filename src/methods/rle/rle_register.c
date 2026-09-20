@@ -21,6 +21,7 @@
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
 #include <ghoti.io/compress/rle.h>
+#include "../../core/bound_internal.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -178,8 +179,69 @@ static void rle_destroy_decoder_wrapper(gcomp_decoder_t * decoder) {
 // Method descriptor
 //
 
+//
+// Worst-case encoded size
+//
+
+/**
+ * @brief Largest RLE stream this encoder can produce for @p input_size.
+ *
+ * Not "every byte a literal", which is the number TIFF 6.0 section 9 suggests
+ * allocating and which is wrong for this encoder.  A literal packet costs one
+ * control byte and carries up to 128 bytes, and a run packet costs two bytes
+ * and carries from two bytes upward - and this encoder starts a run at a
+ * length of two, so a two-byte run interrupts the literal packet it is sitting
+ * in and forces a second control byte.
+ *
+ * The worst case is therefore data that alternates: one byte that cannot run,
+ * then two that can.  Three bytes in, four bytes out.
+ *
+ * Writing L for the number of literal packets and R for run packets, with Lb
+ * and Rb the input bytes each carries:
+ *
+ *   output = L + Lb + 2R,   input = Lb + Rb,   Rb >= 2R
+ *
+ * so output <= L + Lb + Rb = L + n.  Two literal packets cannot be adjacent -
+ * they would have been one - so L <= R + 1 <= Rb/2 + 1, and L <= Lb.  Both
+ * bounds on L are largest together when Lb = Rb/2, which with Lb + Rb = n puts
+ * L at n/3.
+ *
+ * Hence n + n/3, rounded up, plus one for the final partial packet.  Both
+ * profiles have the same shape - the TGA packet header carries the same 7-bit
+ * count, and its run packet is likewise a header and one byte - so the bound
+ * is the same for each.
+ */
+static gcomp_status_t rle_encode_bound(
+    gcomp_options_t * options, size_t input_size, size_t * bound_out) {
+  (void)options;
+  if (!bound_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  if (input_size == 0) {
+    *bound_out = 0;
+    return GCOMP_OK;
+  }
+
+  size_t packets = 0;
+  gcomp_status_t s = gcomp_bound_block_count(input_size, 3u, &packets);
+  if (s != GCOMP_OK) {
+    return s;
+  }
+
+  size_t bound = input_size;
+  s = gcomp_bound_add(&bound, packets);
+  if (s == GCOMP_OK) {
+    s = gcomp_bound_add(&bound, 1u);
+  }
+  if (s != GCOMP_OK) {
+    return s;
+  }
+  *bound_out = bound;
+  return GCOMP_OK;
+}
+
 static const gcomp_method_t g_rle_method = {
-    .abi_version = 1,
+    .abi_version = GCOMP_METHOD_ABI_VERSION,
     .size = sizeof(gcomp_method_t),
     .name = "rle",
     .capabilities = GCOMP_CAP_ENCODE | GCOMP_CAP_DECODE,
@@ -188,6 +250,7 @@ static const gcomp_method_t g_rle_method = {
     .destroy_encoder = rle_destroy_encoder_wrapper,
     .destroy_decoder = rle_destroy_decoder_wrapper,
     .get_schema = rle_get_schema,
+    .encode_bound = rle_encode_bound,
 };
 
 gcomp_status_t gcomp_method_rle_register(gcomp_registry_t * registry) {

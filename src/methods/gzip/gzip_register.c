@@ -37,7 +37,9 @@
 #include <ghoti.io/compress/method.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
+#include "../../core/bound_internal.h"
 #include <stddef.h>
+#include <string.h>
 #include <stdint.h>
 
 //
@@ -396,8 +398,85 @@ static void gzip_destroy_decoder_wrapper(gcomp_decoder_t * decoder) {
 // Method Descriptor
 //
 
+//
+// Worst-case encoded size
+//
+
+/**
+ * @brief DEFLATE's bound plus RFC 1952's member framing.
+ *
+ * Section 2.3: a ten-byte fixed header and an eight-byte trailer (CRC32 and
+ * ISIZE).  The optional fields are counted from the options that produce them,
+ * because each is written verbatim: FEXTRA costs two bytes of XLEN plus the
+ * bytes themselves, FNAME and FCOMMENT cost their length plus the NUL that
+ * terminates them, and FHCRC costs two.
+ */
+static gcomp_status_t gzip_encode_bound(
+    gcomp_options_t * options, size_t input_size, size_t * bound_out) {
+  if (!bound_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  size_t bound = 0;
+  gcomp_status_t s = gcomp_bound_deflate_raw(
+      input_size, gcomp_bound_deflate_window_bits(options), &bound);
+  if (s != GCOMP_OK) {
+    return s;
+  }
+  s = gcomp_bound_add(&bound, GZIP_HEADER_MIN_SIZE + GZIP_TRAILER_SIZE);
+  if (s != GCOMP_OK) {
+    return s;
+  }
+
+  if (options) {
+    const void * extra = NULL;
+    size_t extra_len = 0;
+    if (gcomp_options_get_bytes(options, "gzip.extra", &extra, &extra_len) ==
+            GCOMP_OK &&
+        extra && extra_len > 0) {
+      s = gcomp_bound_add(&bound, 2u);
+      if (s == GCOMP_OK) {
+        s = gcomp_bound_add(&bound, extra_len);
+      }
+      if (s != GCOMP_OK) {
+        return s;
+      }
+    }
+
+    const char * str = NULL;
+    if (gcomp_options_get_string(options, "gzip.name", &str) == GCOMP_OK &&
+        str) {
+      s = gcomp_bound_add(&bound, strlen(str) + 1u);
+      if (s != GCOMP_OK) {
+        return s;
+      }
+    }
+    str = NULL;
+    if (gcomp_options_get_string(options, "gzip.comment", &str) == GCOMP_OK &&
+        str) {
+      s = gcomp_bound_add(&bound, strlen(str) + 1u);
+      if (s != GCOMP_OK) {
+        return s;
+      }
+    }
+
+    int header_crc = 0;
+    if (gcomp_options_get_bool(options, "gzip.header_crc", &header_crc) ==
+            GCOMP_OK &&
+        header_crc) {
+      s = gcomp_bound_add(&bound, 2u);
+      if (s != GCOMP_OK) {
+        return s;
+      }
+    }
+  }
+
+  *bound_out = bound;
+  return GCOMP_OK;
+}
+
+
 static const gcomp_method_t g_gzip_method = {
-    .abi_version = 1,
+    .abi_version = GCOMP_METHOD_ABI_VERSION,
     .size = sizeof(gcomp_method_t),
     .name = "gzip",
     .capabilities = GCOMP_CAP_ENCODE | GCOMP_CAP_DECODE,
@@ -406,6 +485,7 @@ static const gcomp_method_t g_gzip_method = {
     .destroy_encoder = gzip_destroy_encoder_wrapper,
     .destroy_decoder = gzip_destroy_decoder_wrapper,
     .get_schema = gzip_get_schema,
+    .encode_bound = gzip_encode_bound,
 };
 
 //

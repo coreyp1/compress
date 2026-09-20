@@ -206,7 +206,40 @@ struct gcomp_method_s {
    * @return Pointer to the method's schema, or NULL if not available.
    */
   const gcomp_method_schema_t * (*get_schema)(void);
+
+  /**
+   * @brief Worst-case encoded size for @p input_size bytes.
+   *
+   * Added in method ABI version 2.  A method that does not implement it
+   * leaves it @c NULL, and gcomp_encode_bound() then reports
+   * ::GCOMP_ERR_UNSUPPORTED for that method rather than guessing.
+   *
+   * The value must be large enough that gcomp_encode_buffer() with these
+   * options cannot return ::GCOMP_ERR_LIMIT for any input of that length -
+   * including an input the method cannot compress at all, which is what
+   * makes the stored or raw block fallback part of the contract rather than
+   * an optimisation.  It covers one whole stream and not the extra output a
+   * gcomp_encoder_flush() forces; see gcomp_encode_bound().
+   *
+   * @param options Configuration options (may be NULL for defaults)
+   * @param input_size Number of input bytes to bound
+   * @param bound_out Receives the worst-case encoded size
+   * @return ::GCOMP_OK, or ::GCOMP_ERR_LIMIT when the bound cannot be
+   *         represented in a @c size_t, or ::GCOMP_ERR_INVALID_ARG
+   */
+  gcomp_status_t (*encode_bound)(
+      gcomp_options_t * options, size_t input_size, size_t * bound_out);
 };
+
+/**
+ * @brief Method ABI version this build of the library defines.
+ *
+ * Version 1 ends at @ref gcomp_method_s::get_schema.  Version 2 adds
+ * @ref gcomp_method_s::encode_bound.  A descriptor is registered by pointer
+ * and read through @ref gcomp_method_s::size, so a version-1 method still
+ * registers and works; only the hooks it does not define are unavailable.
+ */
+#define GCOMP_METHOD_ABI_VERSION 2u
 
 /**
  * @brief List all option keys supported by a method.

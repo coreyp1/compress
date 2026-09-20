@@ -102,6 +102,7 @@
 #define gcomp_deflate_huffman_build_decode_table GHOTIIO_COMPRESS(gcomp_deflate_huffman_build_decode_table)
 #define gcomp_deflate_huffman_decode_table_cleanup GHOTIIO_COMPRESS(gcomp_deflate_huffman_decode_table_cleanup)
 #define gcomp_deflate_huffman_validate GHOTIIO_COMPRESS(gcomp_deflate_huffman_validate)
+#define gcomp_encode_bound GHOTIIO_COMPRESS(gcomp_encode_bound)
 #define gcomp_encode_buffer GHOTIIO_COMPRESS(gcomp_encode_buffer)
 #define gcomp_encoder_create GHOTIIO_COMPRESS(gcomp_encoder_create)
 #define gcomp_encoder_destroy GHOTIIO_COMPRESS(gcomp_encoder_destroy)

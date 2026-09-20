@@ -28,12 +28,14 @@
 #include <ghoti.io/compress/macros.h>
 #include "../../autoreg/autoreg_platform.h"
 #include "../../core/stream_internal.h"
+#include "lzw_core.h"
 #include "lzw_internal.h"
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/lzw.h>
 #include <ghoti.io/compress/method.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
+#include "../../core/bound_internal.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -234,8 +236,80 @@ static void lzw_destroy_decoder_wrapper(gcomp_decoder_t * decoder) {
 // Method descriptor
 //
 
+//
+// Worst-case encoded size
+//
+
+/**
+ * @brief Largest LZW stream this encoder can produce for @p input_size.
+ *
+ * LZW can expand, and the worst case is the input that never lets a dictionary
+ * entry be reused: every byte is emitted as its own code, at the widest code
+ * the stream ever reaches.
+ *
+ * The codes counted are one per input byte, plus the Clear that opens the
+ * stream and the End_of_Information that closes it (TIFF 6.0 section 13; GIF89a
+ * appendix F), plus one Clear for each time the table fills.  A table of
+ * 2^max_code_bits entries holds (1 << lit_width) + 2 reserved codes before any
+ * string is added, so that many new entries fit between Clears.
+ *
+ * One byte is added at the end because the last code need not finish on a byte
+ * boundary and the encoder pads.
+ */
+static gcomp_status_t lzw_encode_bound(
+    gcomp_options_t * options, size_t input_size, size_t * bound_out) {
+  if (!bound_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  uint64_t max_code_bits = 12u;
+  uint64_t lit_width = 8u;
+  if (options) {
+    uint64_t v = 0;
+    if (gcomp_options_get_uint64(options, "lzw.max_code_bits", &v) ==
+            GCOMP_OK &&
+        v > 0) {
+      max_code_bits = v;
+    }
+    if (gcomp_options_get_uint64(options, "lzw.lit_width", &v) == GCOMP_OK &&
+        v > 0) {
+      lit_width = v;
+    }
+  }
+  // The same range lzw_core_encoder_init() enforces.  A bound that accepted a
+  // width the encoder rejects would answer a question about a stream that
+  // cannot exist.
+  if (max_code_bits == 0u || max_code_bits > LZW_CORE_MAX_CODE_BITS) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  if (max_code_bits < 9u) {
+    max_code_bits = 9u;
+  }
+  if (lit_width >= max_code_bits) {
+    lit_width = max_code_bits - 1u;
+  }
+
+  // Entries available between one Clear and the next.
+  uint64_t table = ((uint64_t)1u << max_code_bits);
+  uint64_t reserved = ((uint64_t)1u << lit_width) + 2u;
+  uint64_t span = (table > reserved) ? table - reserved : 1u;
+
+  uint64_t codes = (uint64_t)input_size;
+  codes += 2u;                              // opening Clear, closing EOI
+  codes += ((uint64_t)input_size / span) + 1u; // Clears as the table refills
+
+  uint64_t bits = codes * max_code_bits;
+  uint64_t bytes = (bits + 7u) / 8u + 1u;
+  if (bytes > (uint64_t)(size_t)-1) {
+    return GCOMP_ERR_LIMIT;
+  }
+  *bound_out = (size_t)bytes;
+  return GCOMP_OK;
+}
+
+
 static const gcomp_method_t g_lzw_method = {
-    .abi_version = 1,
+    .abi_version = GCOMP_METHOD_ABI_VERSION,
     .size = sizeof(gcomp_method_t),
     .name = "lzw",
     .capabilities = GCOMP_CAP_ENCODE | GCOMP_CAP_DECODE,
@@ -244,6 +318,7 @@ static const gcomp_method_t g_lzw_method = {
     .destroy_encoder = lzw_destroy_encoder_wrapper,
     .destroy_decoder = lzw_destroy_decoder_wrapper,
     .get_schema = lzw_get_schema,
+    .encode_bound = lzw_encode_bound,
 };
 
 gcomp_status_t gcomp_method_lzw_register(gcomp_registry_t * registry) {

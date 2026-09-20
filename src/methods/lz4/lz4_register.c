@@ -38,6 +38,7 @@
 
 #include <ghoti.io/compress/macros.h>
 #include "../../autoreg/autoreg_platform.h"
+#include "../../core/bound_internal.h"
 #include "../../core/stream_internal.h"
 #include "lz4_internal.h"
 #include <ghoti.io/compress/errors.h>
@@ -368,8 +369,76 @@ static void lz4_destroy_decoder_wrapper(gcomp_decoder_t * decoder) {
 // Method Descriptor
 //
 
+//
+// Worst-case encoded size
+//
+
+/**
+ * @brief Largest LZ4 frame this encoder can produce for @p input_size.
+ *
+ * From the LZ4 Frame Format.  The frame descriptor is at most nineteen bytes:
+ * a four-byte magic number, FLG and BD, an eight-byte Content Size, a
+ * four-byte Dictionary ID and the one-byte header checksum.  The maximum is
+ * charged whether or not the optional fields are asked for, because they cost
+ * nothing to allow for and the exact set is not worth a second reading of the
+ * options.
+ *
+ * Every block costs four bytes of Block Size, and four more when
+ * lz4.block_checksum asks for one.  A block that does not compress is written
+ * uncompressed with the high bit of that size set, so a block never carries
+ * more than its own input and the blocks together never carry more than
+ * @p input_size.  The frame ends with a four-byte EndMark and, when
+ * lz4.content_checksum is set, a four-byte xxHash32.
+ */
+static gcomp_status_t lz4_encode_bound(
+    gcomp_options_t * options, size_t input_size, size_t * bound_out) {
+  if (!bound_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  size_t block_size = LZ4_DEFAULT_BLOCK_SIZE;
+  int block_checksum = LZ4_DEFAULT_BLOCK_CHECKSUM;
+  int content_checksum = LZ4_DEFAULT_CONTENT_CHECKSUM;
+  if (options) {
+    uint64_t v = 0;
+    if (gcomp_options_get_uint64(options, "lz4.block_size", &v) == GCOMP_OK &&
+        v > 0) {
+      block_size = (size_t)v;
+    }
+    int b = 0;
+    if (gcomp_options_get_bool(options, "lz4.block_checksum", &b) == GCOMP_OK) {
+      block_checksum = b;
+    }
+    if (gcomp_options_get_bool(options, "lz4.content_checksum", &b) ==
+        GCOMP_OK) {
+      content_checksum = b;
+    }
+  }
+
+  size_t blocks = 0;
+  gcomp_status_t s = gcomp_bound_block_count(input_size, block_size, &blocks);
+  if (s != GCOMP_OK) {
+    return s;
+  }
+
+  size_t bound = input_size;
+  s = gcomp_bound_add(&bound, 19u); // frame descriptor, maximum
+  if (s == GCOMP_OK) {
+    s = gcomp_bound_add_mul(&bound, blocks, block_checksum ? 8u : 4u);
+  }
+  if (s == GCOMP_OK) {
+    s = gcomp_bound_add(&bound, content_checksum ? 8u : 4u); // EndMark [+ hash]
+  }
+  if (s != GCOMP_OK) {
+    return s;
+  }
+  *bound_out = bound;
+  return GCOMP_OK;
+}
+
+
 static const gcomp_method_t g_lz4_method = {
-    .abi_version = 1,
+    .abi_version = GCOMP_METHOD_ABI_VERSION,
     .size = sizeof(gcomp_method_t),
     .name = "lz4",
     .capabilities = GCOMP_CAP_ENCODE | GCOMP_CAP_DECODE,
@@ -378,6 +447,7 @@ static const gcomp_method_t g_lz4_method = {
     .destroy_encoder = lz4_destroy_encoder_wrapper,
     .destroy_decoder = lz4_destroy_decoder_wrapper,
     .get_schema = lz4_get_schema,
+    .encode_bound = lz4_encode_bound,
 };
 
 //

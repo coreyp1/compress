@@ -96,8 +96,11 @@ TEST(AutoRegistrationTest, DeflateMethodProperties) {
   const gcomp_method_t * method = gcomp_registry_find(reg, "deflate");
   ASSERT_NE(method, nullptr);
 
-  // Check ABI version
-  EXPECT_EQ(method->abi_version, 1);
+  // Check ABI version.  Against the constant the headers define rather than a
+  // literal: a built-in method is compiled with those headers, so the two move
+  // together, and pinning the number here only records which version was
+  // current when the test was written.
+  EXPECT_EQ(method->abi_version, GCOMP_METHOD_ABI_VERSION);
 
   // Check size
   EXPECT_EQ(method->size, sizeof(gcomp_method_t));

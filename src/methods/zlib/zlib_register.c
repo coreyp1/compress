@@ -18,6 +18,7 @@
 #include "../../autoreg/autoreg_platform.h"
 #include <ghoti.io/compress/method.h>
 #include <ghoti.io/compress/zlib.h>
+#include "../../core/bound_internal.h"
 
 //
 // Option schema
@@ -180,8 +181,40 @@ static gcomp_status_t zlib_create_decoder(gcomp_registry_t * registry,
 // Method descriptor
 //
 
+//
+// Worst-case encoded size
+//
+
+/**
+ * @brief DEFLATE's bound plus RFC 1950's wrapper.
+ *
+ * Section 2.2: the two-byte CMF/FLG header and the four-byte Adler-32 of the
+ * uncompressed data.  The four-byte DICTID is not counted because this encoder
+ * does not write FDICT - zlib.dictionary is rejected rather than ignored - so
+ * a stream that carries one cannot come from here.
+ */
+static gcomp_status_t zlib_encode_bound(
+    gcomp_options_t * options, size_t input_size, size_t * bound_out) {
+  if (!bound_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  size_t bound = 0;
+  gcomp_status_t s = gcomp_bound_deflate_raw(
+      input_size, gcomp_bound_deflate_window_bits(options), &bound);
+  if (s != GCOMP_OK) {
+    return s;
+  }
+  s = gcomp_bound_add(&bound, 2u + 4u);
+  if (s != GCOMP_OK) {
+    return s;
+  }
+  *bound_out = bound;
+  return GCOMP_OK;
+}
+
+
 static const gcomp_method_t g_zlib_method = {
-    .abi_version = 1,
+    .abi_version = GCOMP_METHOD_ABI_VERSION,
     .size = sizeof(gcomp_method_t),
     .name = "zlib",
     .capabilities = GCOMP_CAP_ENCODE | GCOMP_CAP_DECODE,
@@ -190,6 +223,7 @@ static const gcomp_method_t g_zlib_method = {
     .destroy_encoder = zlib_destroy_encoder_wrapper,
     .destroy_decoder = zlib_destroy_decoder_wrapper,
     .get_schema = zlib_get_schema,
+    .encode_bound = zlib_encode_bound,
 };
 
 gcomp_status_t gcomp_method_zlib_register(gcomp_registry_t * registry) {

@@ -49,6 +49,7 @@
 
 #include <ghoti.io/compress/macros.h>
 #include "../../autoreg/autoreg_platform.h"
+#include "../../core/bound_internal.h"
 #include "../../core/stream_internal.h"
 #include "deflate_internal.h"
 #include <ghoti.io/compress/deflate.h>
@@ -315,8 +316,31 @@ static void deflate_destroy_decoder(gcomp_decoder_t * decoder) {
 // static storage duration.
 //
 
+//
+// Worst-case encoded size
+//
+
+/**
+ * @brief Largest DEFLATE stream this encoder can produce for @p input_size.
+ *
+ * Entirely RFC 1951 section 3.2.4's non-compressed block; see
+ * gcomp_bound_deflate_raw(), which explains why the window size is the one
+ * option that changes the answer.  deflate.level and deflate.strategy only
+ * choose how hard the encoder tries, which cannot make the stored fallback
+ * larger than storing.
+ */
+static gcomp_status_t deflate_encode_bound(
+    gcomp_options_t * options, size_t input_size, size_t * bound_out) {
+  if (!bound_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  return gcomp_bound_deflate_raw(
+      input_size, gcomp_bound_deflate_window_bits(options), bound_out);
+}
+
+
 static const gcomp_method_t g_deflate_method = {
-    .abi_version = 1,
+    .abi_version = GCOMP_METHOD_ABI_VERSION,
     .size = sizeof(gcomp_method_t),
     .name = "deflate",
     .capabilities = GCOMP_CAP_ENCODE | GCOMP_CAP_DECODE,
@@ -325,6 +349,7 @@ static const gcomp_method_t g_deflate_method = {
     .destroy_encoder = deflate_destroy_encoder,
     .destroy_decoder = deflate_destroy_decoder,
     .get_schema = deflate_get_schema,
+    .encode_bound = deflate_encode_bound,
 };
 
 //

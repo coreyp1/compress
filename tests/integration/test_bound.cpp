@@ -1,0 +1,453 @@
+/**
+ * @file test_bound.cpp
+ *
+ * gcomp_encode_bound() promises an output buffer that cannot be too small.
+ * This is the half of that promise the library has to keep.
+ *
+ * A bound is only useful if it holds for the input that compresses worst, so
+ * the inputs here are chosen to defeat each method rather than to flatter it:
+ * random bytes, which nothing can compress; data whose every byte is distinct
+ * from its neighbours, which is LZW's worst case; and runs just too short to
+ * pay for a run packet, which is RLE's.
+ *
+ * Two things are asserted for every combination:
+ *
+ * - encoding into a buffer of exactly the bound succeeds, and
+ * - what it wrote is no larger than the bound.
+ *
+ * The first is the one that matters. A bound that is never reached proves
+ * nothing about a bound that is too small, and `GCOMP_ERR_LIMIT` from an
+ * encode at exactly the bound is the failure this exists to catch.
+ *
+ * The sizes are not random for their own sake: each format's block boundary is
+ * tested at the boundary and on either side of it, because that is where a
+ * per-block overhead gets counted once too few.
+ *
+ * Copyright 2026 by Corey Pennycuff
+ */
+
+#include <ghoti.io/compress/compress.h>
+#include <ghoti.io/compress/options.h>
+#include <ghoti.io/compress/registry.h>
+#include <gtest/gtest.h>
+
+#include <cstdint>
+#include <cstring>
+#include <functional>
+#include <string>
+#include <vector>
+
+namespace {
+
+//
+// Inputs that defeat compression
+//
+
+/// Bytes with no structure at all: every method must store these verbatim.
+std::vector<uint8_t> incompressible(size_t len, uint32_t seed = 2463534242u) {
+  std::vector<uint8_t> v(len);
+  uint32_t s = seed;
+  for (size_t i = 0; i < len; i++) {
+    s ^= s << 13;
+    s ^= s >> 17;
+    s ^= s << 5;
+    v[i] = (uint8_t)(s >> 24);
+  }
+  return v;
+}
+
+/**
+ * @brief A counter widened to three bytes per step.
+ *
+ * Every three-byte window is distinct, so LZW's dictionary never gets a second
+ * use out of an entry and each byte costs a full-width code - which is how LZW
+ * expands, and the case its bound has to cover.
+ */
+std::vector<uint8_t> never_repeats(size_t len) {
+  std::vector<uint8_t> v(len);
+  for (size_t i = 0; i < len; i++) {
+    size_t k = i / 3;
+    switch (i % 3) {
+    case 0: v[i] = (uint8_t)(k & 0xFF); break;
+    case 1: v[i] = (uint8_t)((k >> 8) & 0xFF); break;
+    default: v[i] = (uint8_t)((k >> 16) & 0xFF); break;
+    }
+  }
+  return v;
+}
+
+/**
+ * @brief Pairs of equal bytes, then a change.
+ *
+ * A run of two is the shortest PackBits will encode as a run, and alternating
+ * like this keeps the encoder switching between literal and run packets, which
+ * is where its per-packet control byte is spent most often.
+ */
+std::vector<uint8_t> alternating_runs(size_t len) {
+  std::vector<uint8_t> v(len);
+  for (size_t i = 0; i < len; i++) {
+    v[i] = (uint8_t)((i / 2) & 0xFF);
+  }
+  return v;
+}
+
+/// One byte repeated: the case every method compresses best.
+std::vector<uint8_t> all_one(size_t len) {
+  return std::vector<uint8_t>(len, 0x5A);
+}
+
+/**
+ * @brief RLE's worst case exactly: one byte that cannot run, then two that can.
+ *
+ * Every three bytes cost four - a one-byte literal packet and a two-byte run
+ * packet - which is the ratio rle_encode_bound() is derived from.  The first
+ * byte of each triple is never zero, so it can never join the run beside it and
+ * the pattern never lets two triples merge.
+ */
+std::vector<uint8_t> literal_run_alternating(size_t len) {
+  std::vector<uint8_t> v(len);
+  for (size_t i = 0; i < len; i++) {
+    size_t k = i / 3;
+    v[i] = (i % 3 == 0) ? (uint8_t)(1u + (k % 255u)) : (uint8_t)0;
+  }
+  return v;
+}
+
+using Generator = std::vector<uint8_t> (*)(size_t);
+using OptionSetter = std::function<void(gcomp_options_t *)>;
+
+struct Config {
+  std::string name;
+  const char * method;
+  OptionSetter set_options;
+};
+
+/// Sizes to try: the boundaries every format counts blocks at, and a spread.
+std::vector<size_t> sizes_to_try() {
+  std::vector<size_t> v;
+  // Degenerate and tiny.
+  for (size_t n : {0u, 1u, 2u, 3u, 127u, 128u, 129u, 130u, 255u, 256u, 257u}) {
+    v.push_back(n);
+  }
+  // DEFLATE's stored block is 65535 bytes; LZ4's smallest frame block 65536;
+  // zstd's largest 131072.  Each is counted at the boundary and either side.
+  for (size_t b : {65535u, 65536u, 131072u, 262144u}) {
+    v.push_back(b - 1);
+    v.push_back(b);
+    v.push_back(b + 1);
+  }
+  // A spread through the middle, deterministic so a failure reproduces.
+  uint32_t s = 22695477u;
+  for (int i = 0; i < 50; i++) {
+    s = s * 1103515245u + 12345u;
+    v.push_back((size_t)(s % 300000u));
+  }
+  return v;
+}
+
+std::vector<Config> configurations() {
+  std::vector<Config> c;
+
+  c.push_back({"deflate/default", "deflate", nullptr});
+  for (int lvl : {1, 6, 9}) {
+    c.push_back({"deflate/L" + std::to_string(lvl), "deflate",
+        [lvl](gcomp_options_t * o) {
+          gcomp_options_set_int64(o, "deflate.level", lvl);
+        }});
+  }
+  for (uint64_t wb : {8u, 15u}) {
+    c.push_back({"deflate/win" + std::to_string(wb), "deflate",
+        [wb](gcomp_options_t * o) {
+          gcomp_options_set_uint64(o, "deflate.window_bits", wb);
+        }});
+  }
+
+  c.push_back({"zlib/default", "zlib", nullptr});
+  c.push_back({"gzip/default", "gzip", nullptr});
+  c.push_back({"gzip/fields", "gzip", [](gcomp_options_t * o) {
+                 gcomp_options_set_string(
+                     o, "gzip.name", "a-file-with-a-fairly-long-name.bin");
+                 gcomp_options_set_string(o, "gzip.comment",
+                     "a comment that is also not especially short");
+                 gcomp_options_set_bool(o, "gzip.header_crc", 1);
+               }});
+
+  c.push_back({"lz4/default", "lz4", nullptr});
+  for (uint64_t bs : {65536u, 262144u, 1048576u, 4194304u}) {
+    c.push_back({"lz4/block" + std::to_string(bs), "lz4",
+        [bs](gcomp_options_t * o) {
+          gcomp_options_set_uint64(o, "lz4.block_size", bs);
+        }});
+  }
+  c.push_back({"lz4/checksums", "lz4", [](gcomp_options_t * o) {
+                 gcomp_options_set_uint64(o, "lz4.block_size", 65536);
+                 gcomp_options_set_bool(o, "lz4.block_checksum", 1);
+                 gcomp_options_set_bool(o, "lz4.content_checksum", 1);
+               }});
+  c.push_back({"lz4/linked", "lz4", [](gcomp_options_t * o) {
+                 gcomp_options_set_bool(o, "lz4.independent_blocks", 0);
+               }});
+
+  c.push_back({"zstd/default", "zstd", nullptr});
+  for (int64_t lvl : {1, 3, 9, 11, 19}) {
+    c.push_back({"zstd/L" + std::to_string(lvl), "zstd",
+        [lvl](gcomp_options_t * o) {
+          gcomp_options_set_int64(o, "zstd.level", lvl);
+        }});
+  }
+  for (uint64_t wl : {10u, 17u, 24u}) {
+    c.push_back({"zstd/win" + std::to_string(wl), "zstd",
+        [wl](gcomp_options_t * o) {
+          gcomp_options_set_uint64(o, "zstd.window_log", wl);
+        }});
+  }
+  c.push_back({"zstd/checksum", "zstd", [](gcomp_options_t * o) {
+                 gcomp_options_set_bool(o, "zstd.checksum", 1);
+               }});
+
+  c.push_back({"lzw/default", "lzw", nullptr});
+  for (const char * fmt : {"tiff", "gif"}) {
+    std::string f = fmt;
+    c.push_back({"lzw/" + f, "lzw", [f](gcomp_options_t * o) {
+                   gcomp_options_set_string(o, "lzw.format", f.c_str());
+                 }});
+  }
+  // lzw_core.h caps the code width at LZW_CORE_MAX_CODE_BITS (12).
+  for (uint64_t bits : {9u, 10u, 12u}) {
+    c.push_back({"lzw/bits" + std::to_string(bits), "lzw",
+        [bits](gcomp_options_t * o) {
+          gcomp_options_set_uint64(o, "lzw.max_code_bits", bits);
+        }});
+  }
+
+  c.push_back({"rle/default", "rle", nullptr});
+  for (const char * fmt : {"packbits", "tga"}) {
+    std::string f = fmt;
+    c.push_back({"rle/" + f, "rle", [f](gcomp_options_t * o) {
+                   gcomp_options_set_string(o, "rle.format", f.c_str());
+                 }});
+  }
+
+  return c;
+}
+
+/// Build the options object a configuration describes.
+gcomp_options_t * make_options(const Config & c) {
+  gcomp_options_t * o = nullptr;
+  if (gcomp_options_create(&o) != GCOMP_OK) {
+    return nullptr;
+  }
+  if (c.set_options) {
+    c.set_options(o);
+  }
+  return o;
+}
+
+/// Check one method, one option set, one input.
+void check(const Config & c, const std::vector<uint8_t> & input,
+    const char * shape) {
+  gcomp_options_t * opts = make_options(c);
+  ASSERT_NE(opts, nullptr);
+
+  size_t bound = 0;
+  gcomp_status_t s = gcomp_encode_bound(
+      nullptr, c.method, opts, input.size(), &bound);
+  ASSERT_EQ(s, GCOMP_OK) << c.name << "/" << shape << " n=" << input.size()
+                         << ": bound failed: " << gcomp_status_to_string(s);
+
+  // A buffer of exactly the bound must be enough.  gcomp_encode_buffer()
+  // rejects a zero capacity outright, so an empty input still gets one byte.
+  std::vector<uint8_t> out(bound ? bound : 1);
+  size_t written = 0;
+  s = gcomp_encode_buffer(nullptr, c.method, opts, input.data(), input.size(),
+      out.data(), out.size(), &written);
+  EXPECT_EQ(s, GCOMP_OK) << c.name << "/" << shape << " n=" << input.size()
+                         << ": encoding into a buffer of exactly the bound ("
+                         << bound << ") returned "
+                         << gcomp_status_to_string(s);
+  if (s == GCOMP_OK) {
+    EXPECT_LE(written, bound)
+        << c.name << "/" << shape << " n=" << input.size() << ": wrote "
+        << written << " bytes into a bound of " << bound;
+  }
+
+  gcomp_options_destroy(opts);
+}
+
+void sweep_method(const char * method) {
+  const std::vector<size_t> sizes = sizes_to_try();
+  const struct {
+    const char * name;
+    Generator gen;
+  } shapes[] = {
+      {"incompressible", nullptr}, // handled below, it takes a seed
+      {"never_repeats", &never_repeats},
+      {"alternating_runs", &alternating_runs},
+      {"literal_run_alternating", &literal_run_alternating},
+      {"all_one", &all_one},
+  };
+
+  for (const Config & c : configurations()) {
+    if (std::strcmp(c.method, method) != 0) {
+      continue;
+    }
+    for (size_t n : sizes) {
+      for (const auto & shape : shapes) {
+        std::vector<uint8_t> input =
+            shape.gen ? shape.gen(n) : incompressible(n);
+        check(c, input, shape.name);
+        if (::testing::Test::HasFatalFailure()) {
+          return;
+        }
+      }
+    }
+  }
+}
+
+TEST(EncodeBound, Deflate) {
+  sweep_method("deflate");
+}
+TEST(EncodeBound, Zlib) {
+  sweep_method("zlib");
+}
+TEST(EncodeBound, Gzip) {
+  sweep_method("gzip");
+}
+TEST(EncodeBound, Lz4) {
+  sweep_method("lz4");
+}
+TEST(EncodeBound, Zstd) {
+  sweep_method("zstd");
+}
+TEST(EncodeBound, Lzw) {
+  sweep_method("lzw");
+}
+TEST(EncodeBound, Rle) {
+  sweep_method("rle");
+}
+
+/**
+ * @brief The parallel encoders must sit under the same bound.
+ *
+ * They frame differently - jobs, an overlap, an epilogue - and a bound that
+ * only held for one thread would be a trap for exactly the caller who most
+ * wants a buffer sized in advance.
+ */
+TEST(EncodeBound, Threaded) {
+  for (const char * method : {"zstd", "lz4"}) {
+    for (uint64_t threads : {2u, 4u}) {
+      for (size_t n : {1000u, 70000u, 200000u, 600000u}) {
+        gcomp_options_t * o = nullptr;
+        ASSERT_EQ(gcomp_options_create(&o), GCOMP_OK);
+        ASSERT_EQ(gcomp_options_set_uint64(o, "threads.count", threads),
+            GCOMP_OK);
+
+        size_t bound = 0;
+        ASSERT_EQ(gcomp_encode_bound(nullptr, method, o, n, &bound), GCOMP_OK);
+
+        std::vector<uint8_t> input = incompressible(n);
+        std::vector<uint8_t> out(bound ? bound : 1);
+        size_t written = 0;
+        gcomp_status_t s = gcomp_encode_buffer(nullptr, method, o,
+            input.data(), input.size(), out.data(), out.size(), &written);
+        EXPECT_EQ(s, GCOMP_OK)
+            << method << " threads=" << threads << " n=" << n
+            << ": encoding into exactly the bound (" << bound << ") returned "
+            << gcomp_status_to_string(s);
+        EXPECT_LE(written, bound) << method << " threads=" << threads
+                                  << " n=" << n;
+        gcomp_options_destroy(o);
+      }
+    }
+  }
+}
+
+/**
+ * @brief The bound must be close to what the worst input actually produces.
+ *
+ * Otherwise the sweep above proves only that the bound is large, not that it is
+ * the right size - a bound of SIZE_MAX would pass every test here.
+ *
+ * "Worst input" is per method and is not the random one: random bytes are the
+ * worst case for the LZ77 family, but RLE's worst case is data that alternates
+ * between a byte that cannot run and a pair that can, and LZW's is data whose
+ * every substring is new. So this takes the largest output any of the shapes
+ * produces and asks the bound to be near it.
+ */
+TEST(EncodeBound, IsNotWildlyLoose) {
+  const size_t n = 100000;
+  const std::vector<std::vector<uint8_t>> shapes = {incompressible(n),
+      never_repeats(n), alternating_runs(n), literal_run_alternating(n),
+      all_one(n)};
+
+  for (const char * method :
+      {"deflate", "zlib", "gzip", "zstd", "lz4", "rle", "lzw"}) {
+    size_t bound = 0;
+    ASSERT_EQ(gcomp_encode_bound(nullptr, method, nullptr, n, &bound),
+        GCOMP_OK);
+
+    size_t worst = 0;
+    for (const std::vector<uint8_t> & input : shapes) {
+      std::vector<uint8_t> out(bound);
+      size_t written = 0;
+      ASSERT_EQ(gcomp_encode_buffer(nullptr, method, nullptr, input.data(), n,
+                    out.data(), out.size(), &written),
+          GCOMP_OK)
+          << method;
+      if (written > worst) {
+        worst = written;
+      }
+    }
+
+    // Within a fifth of the worst these inputs achieve, plus a kilobyte of
+    // framing. Generous for two reasons: no fixed set of inputs is guaranteed
+    // to reach a method's true worst case, and LZW's bound is honestly loose -
+    // it charges the widest code for every byte, where a real stream starts at
+    // nine bits and widens as the table fills, so about a tenth of the gap
+    // there is the ramp rather than slack. Tight enough that a bound which had
+    // stopped tracking the format would show.
+    //
+    // For reference, at the time of writing: deflate, zlib, gzip, lz4 and zstd
+    // land within a fraction of a percent, RLE within one byte of the
+    // literal/run worst case, and LZW about 10% above what any of these shapes
+    // reaches.
+    EXPECT_LE(bound, worst + worst / 5 + 1024)
+        << method << ": bound " << bound << " against " << worst
+        << " bytes for the worst of " << shapes.size() << " input shapes";
+  }
+}
+
+TEST(EncodeBound, RejectsBadArguments) {
+  size_t bound = 0;
+  EXPECT_EQ(gcomp_encode_bound(nullptr, nullptr, nullptr, 10, &bound),
+      GCOMP_ERR_INVALID_ARG);
+  EXPECT_EQ(gcomp_encode_bound(nullptr, "deflate", nullptr, 10, nullptr),
+      GCOMP_ERR_INVALID_ARG);
+  EXPECT_EQ(gcomp_encode_bound(nullptr, "no-such-method", nullptr, 10, &bound),
+      GCOMP_ERR_INVALID_ARG);
+}
+
+/// Zero in, something out: every framed format still writes its frame.
+TEST(EncodeBound, EmptyInput) {
+  for (const char * method :
+      {"deflate", "zlib", "gzip", "lz4", "zstd", "lzw", "rle"}) {
+    size_t bound = 0;
+    ASSERT_EQ(gcomp_encode_bound(nullptr, method, nullptr, 0, &bound),
+        GCOMP_OK)
+        << method;
+    std::vector<uint8_t> out(bound ? bound : 1);
+    size_t written = 0;
+    EXPECT_EQ(gcomp_encode_buffer(nullptr, method, nullptr, nullptr, 0,
+                  out.data(), out.size(), &written),
+        GCOMP_OK)
+        << method << ": bound " << bound;
+    EXPECT_LE(written, bound ? bound : 1) << method;
+  }
+}
+
+} // namespace
+
+int main(int argc, char ** argv) {
+  ::testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}

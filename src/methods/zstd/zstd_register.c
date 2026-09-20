@@ -38,6 +38,7 @@
 #include <ghoti.io/compress/macros.h>
 #include "../../autoreg/autoreg_platform.h"
 #include "../../core/stream_internal.h"
+#include "../../core/bound_internal.h"
 #include "zstd_internal.h"
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/method.h>
@@ -386,8 +387,82 @@ static void zstd_destroy_decoder_wrapper(gcomp_decoder_t * decoder) {
 // Method Descriptor
 //
 
+//
+// Worst-case encoded size
+//
+
+/**
+ * @brief Largest Zstandard frame this encoder can produce for @p input_size.
+ *
+ * RFC 8878 section 3.1.1.1 puts the Frame_Header at no more than fourteen
+ * bytes, which with the four-byte Magic_Number makes eighteen: the maximum is
+ * charged rather than working out which optional fields these options select.
+ *
+ * Every block costs a three-byte Block_Header (section 3.1.1.2), and a block
+ * that does not compress is written as a Raw_Block carrying its input
+ * verbatim, so the blocks together carry no more than @p input_size.  The
+ * number of blocks follows from Block_Maximum_Size, which section 3.1.1.2.4
+ * gives as the smaller of Window_Size and 128 KB.  One extra block is charged
+ * for the empty last block the parallel encoder writes to close the frame.
+ *
+ * Four more bytes when zstd.checksum asks for a Content_Checksum.
+ */
+static gcomp_status_t zstd_encode_bound(
+    gcomp_options_t * options, size_t input_size, size_t * bound_out) {
+  if (!bound_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  int64_t level = ZSTD_LEVEL_DEFAULT;
+  uint64_t window_log = 0;
+  int checksum = 0;
+  if (options) {
+    gcomp_options_get_int64(options, "zstd.level", &level);
+    gcomp_options_get_uint64(options, "zstd.window_log", &window_log);
+    gcomp_options_get_bool(options, "zstd.checksum", &checksum);
+  }
+  if (window_log == 0) {
+    window_log = zstd_level_to_window_log((int)level);
+  }
+  if (window_log < ZSTD_WINDOW_LOG_MIN) {
+    window_log = ZSTD_WINDOW_LOG_MIN;
+  }
+  if (window_log > ZSTD_WINDOW_LOG_MAX) {
+    window_log = ZSTD_WINDOW_LOG_MAX;
+  }
+
+  size_t block_max = ZSTD_BLOCK_SIZE_MAX;
+  if (window_log < 31 && ((uint64_t)1u << window_log) < (uint64_t)block_max) {
+    block_max = (size_t)((uint64_t)1u << window_log);
+  }
+
+  size_t blocks = 0;
+  gcomp_status_t s = gcomp_bound_block_count(input_size, block_max, &blocks);
+  if (s != GCOMP_OK) {
+    return s;
+  }
+  if (!gcu_safe_add_size(blocks, 1u, &blocks)) {
+    return GCOMP_ERR_LIMIT;
+  }
+
+  size_t bound = input_size;
+  s = gcomp_bound_add(&bound, 18u); // Magic_Number + Frame_Header, maximum
+  if (s == GCOMP_OK) {
+    s = gcomp_bound_add_mul(&bound, blocks, ZSTD_BLOCK_HEADER_SIZE);
+  }
+  if (s == GCOMP_OK && checksum) {
+    s = gcomp_bound_add(&bound, 4u);
+  }
+  if (s != GCOMP_OK) {
+    return s;
+  }
+  *bound_out = bound;
+  return GCOMP_OK;
+}
+
+
 static const gcomp_method_t g_zstd_method = {
-    .abi_version = 1,
+    .abi_version = GCOMP_METHOD_ABI_VERSION,
     .size = sizeof(gcomp_method_t),
     .name = "zstd",
     .capabilities = GCOMP_CAP_ENCODE | GCOMP_CAP_DECODE,
@@ -396,6 +471,7 @@ static const gcomp_method_t g_zstd_method = {
     .destroy_encoder = zstd_destroy_encoder_wrapper,
     .destroy_decoder = zstd_destroy_decoder_wrapper,
     .get_schema = zstd_get_schema,
+    .encode_bound = zstd_encode_bound,
 };
 
 //
