@@ -12,32 +12,32 @@
  * implementation puts 4096 such bytes in 21 bytes; anything in the hundreds
  * means the dictionary content is not reaching the match finder.
  *
- * ## What this found, and what it did not
+ * ## What this found, and what was done about it
  *
- * The mechanism is sound: with content whose four-byte prefixes are mostly
- * distinct, a dictionary works at every level, taking 4096 bytes to 18.
+ * The mechanism was sound for content whose four-byte prefixes are mostly
+ * distinct - a dictionary worked at every level there, taking 4096 bytes to
+ * 18 - and useless at the low levels on data with very few distinct prefixes.
+ * With a twelve-word vocabulary, 4091 bytes measured 739 at level 1 and 655 at
+ * level 3, the default, against 17 from level 6 up.
  *
- * What it does not do is help at the lowest levels on data with very few
- * distinct prefixes. With a twelve-word vocabulary, 4096 bytes measured:
+ * That was the chain running out of attempts rather than the dictionary
+ * failing to load. The chain is walked newest-first for at most `search_depth`
+ * candidates - four at level 1, sixteen at level 3 - and where thousands of
+ * positions share a hash, every one of those is recent and none is in the
+ * dictionary.
  *
- * | level | no dictionary | with dictionary |
- * | --- | --- | --- |
- * | 1 | 803 | 739 |
- * | 3 (the default) | 750 | 657 |
- * | 6 | 731 | 23 |
- * | 9 | 731 | 18 |
+ * The dictionary now has a search budget of its own and a way into its part of
+ * the chain that does not run through the recent part first
+ * (`zstd_mf_note_dictionary`, and ZSTD_MF_DICT_MIN_DEPTH in
+ * zstd_matchfinder.c). On that same twelve-word input every level from 1 to 19
+ * now reaches 17 bytes.
  *
- * That is the hash chain running out of attempts, not the dictionary failing
- * to load: levels 1 to 8 walk a bounded chain (four candidates at level 1,
- * sixteen at level 3), and on data where thousands of positions share a hash,
- * all of them are recent and none is in the dictionary. Level 6 has sixty-four
- * and gets there; level 9 searches a tree instead.
- *
- * libzstd does better here because it builds a search structure dedicated to
- * the dictionary for exactly these levels. We do not, and until we do, a
- * caller whose data is highly repetitive should ask for level 6 or above when
- * passing a dictionary. That is recorded rather than asserted - a test that
- * demanded the present behaviour would have to be deleted to improve it.
+ * Worth recording, because it was measured rather than assumed: libzstd is
+ * erratic on this shape. On the identical dictionary and payload it produces
+ * 810 bytes at level 1, 810 at level 2, 21 at level 3, 661 at level 4 - worse
+ * than level 3 - 345 at level 5, and 23 at level 6. An earlier version of this
+ * comment said libzstd handled these levels properly and we did not; that was
+ * wrong, and the measurement is above.
  *
  * Copyright 2026 by Corey Pennycuff
  */
@@ -45,6 +45,7 @@
 #include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
+#include <ghoti.io/compress/stream.h>
 #include <gtest/gtest.h>
 
 #include <cstdint>
@@ -222,6 +223,150 @@ TEST(DictionaryEffect, DecodingWithoutTheDictionaryFails) {
 }
 
 } // namespace
+
+/// Text drawn from a tiny vocabulary: thousands of positions per hash.
+static std::vector<uint8_t> colliding_prefixes(size_t cap, unsigned seed) {
+  static const char * const words[12] = {"alpha", "bravo", "charlie", "delta",
+      "echo", "foxtrot", "golf", "hotel", "india", "juliet", "kilo", "lima"};
+  std::vector<uint8_t> v;
+  unsigned s = seed;
+  while (v.size() < cap) {
+    s = s * 1103515245u + 12345u;
+    const char * w = words[(s >> 16) % 12];
+    const size_t l = std::strlen(w);
+    if (v.size() + l + 1 > cap) {
+      break;
+    }
+    v.insert(v.end(), w, w + l);
+    v.push_back(' ');
+  }
+  return v;
+}
+
+/**
+ * @brief The dictionary is reached even where every position collides.
+ *
+ * This is the case the header describes. Before the dictionary had a budget of
+ * its own it failed at levels 1 to 4 - 739 bytes at level 1 where 17 was
+ * available - because the level's whole search_depth went on recent positions
+ * that share a hash with the one being matched, and the dictionary sits behind
+ * all of them.
+ *
+ * The threshold is a fortieth of the input, as elsewhere in this file: the
+ * question is whether the dictionary is being searched at all, and the answer
+ * differs by a factor of forty, not by a few percent.
+ */
+TEST(DictionaryEffect, ZstdReachesTheDictionaryWhenEveryPrefixCollides) {
+  const std::vector<uint8_t> dict = colliding_prefixes(4096, 7);
+  const std::vector<uint8_t> payload = dict;
+  ASSERT_GT(dict.size(), 4000u);
+
+  for (int64_t level : {1, 2, 3, 4, 5, 6, 9, 19}) {
+    const size_t without = encode_with_dict("zstd", payload, nullptr, level);
+    const size_t with = encode_with_dict("zstd", payload, &dict, level);
+
+    EXPECT_LT(with, payload.size() / 40)
+        << "zstd level " << level << ": " << with
+        << " bytes for a payload identical to its dictionary; the level's own "
+           "search budget is being spent before the dictionary is reached";
+    EXPECT_LT(with * 10, without)
+        << "zstd level " << level << ": " << with << " with a dictionary "
+        << "against " << without << " without";
+  }
+}
+
+/**
+ * @brief A dictionary that slides out of the window stays decodable.
+ *
+ * The shortcut into the dictionary's part of the chain names window positions,
+ * and the window moves. If those entries were left behind after a slide they
+ * would name bytes that are no longer there, and the encoder would emit an
+ * offset reaching past the window it declared - which RFC 8878 section
+ * 3.1.1.1.2 does not allow and no decoder can honour.
+ *
+ * So: a window far smaller than the payload, a dictionary larger than some of
+ * those windows, and input fed in chunks of a size that is not a factor of
+ * anything, so block and chunk edges fall in different places.
+ */
+TEST(DictionaryEffect, ADictionaryThatSlidesOutOfTheWindowStaysCorrect) {
+  const size_t dict_len = 24000;
+  const size_t body_len = 512u * 1024u;
+  std::vector<uint8_t> dict(dict_len);
+  uint32_t s = 4242u;
+  for (size_t i = 0; i < dict_len; i++) {
+    s ^= s << 13;
+    s ^= s >> 17;
+    s ^= s << 5;
+    dict[i] = (uint8_t)(s >> 24);
+  }
+  // Quotes the dictionary at the start, then drifts away from it, so the
+  // encoder has reason to reach back early and none later.
+  std::vector<uint8_t> body(body_len);
+  for (size_t i = 0; i < body_len; i++) {
+    if (i < dict_len) {
+      body[i] = dict[i];
+    }
+    else {
+      s ^= s << 13;
+      s ^= s >> 17;
+      s ^= s << 5;
+      body[i] = (uint8_t)((s >> 24) ^ (i & 0x3F));
+    }
+  }
+
+  gcomp_registry_t * reg = gcomp_registry_default();
+  ASSERT_NE(reg, nullptr);
+
+  for (int64_t level : {1, 3, 6, 9}) {
+    for (uint64_t window_log : {10u, 14u, 18u}) {
+      gcomp_options_t * o = nullptr;
+      ASSERT_EQ(gcomp_options_create(&o), GCOMP_OK);
+      ASSERT_EQ(gcomp_options_set_int64(o, "zstd.level", level), GCOMP_OK);
+      ASSERT_EQ(gcomp_options_set_uint64(o, "zstd.window_log", window_log),
+          GCOMP_OK);
+      ASSERT_EQ(gcomp_options_set_bytes(
+                    o, "zstd.dictionary", dict.data(), dict.size()),
+          GCOMP_OK);
+
+      gcomp_encoder_t * enc = nullptr;
+      ASSERT_EQ(gcomp_encoder_create(reg, "zstd", o, &enc), GCOMP_OK)
+          << "level " << level << " window_log " << window_log;
+
+      std::vector<uint8_t> out(body_len + body_len / 4 + 65536);
+      gcomp_buffer_t ob = {out.data(), out.size(), 0};
+      size_t fed = 0;
+      const size_t chunk = 7919; // prime: chunk edges land everywhere
+      while (fed < body_len) {
+        const size_t take =
+            (body_len - fed < chunk) ? (body_len - fed) : chunk;
+        gcomp_buffer_t ib = {body.data() + fed, take, 0};
+        while (ib.used < ib.size) {
+          ASSERT_EQ(gcomp_encoder_update(enc, &ib, &ob), GCOMP_OK)
+              << "level " << level << " window_log " << window_log;
+        }
+        fed += take;
+      }
+      ASSERT_EQ(gcomp_encoder_finish(enc, &ob), GCOMP_OK);
+      gcomp_encoder_destroy(enc);
+
+      // Back through our own decoder with the same dictionary.  An offset
+      // reaching past the declared window fails here.
+      ASSERT_EQ(gcomp_options_set_uint64(o, "limits.max_expansion_ratio", 0),
+          GCOMP_OK);
+      std::vector<uint8_t> back(body_len + 1024);
+      size_t produced = 0;
+      ASSERT_EQ(gcomp_decode_buffer(reg, "zstd", o, out.data(), ob.used,
+                    back.data(), back.size(), &produced),
+          GCOMP_OK)
+          << "level " << level << " window_log " << window_log;
+      ASSERT_EQ(produced, body_len)
+          << "level " << level << " window_log " << window_log;
+      ASSERT_EQ(std::memcmp(back.data(), body.data(), body_len), 0)
+          << "level " << level << " window_log " << window_log;
+      gcomp_options_destroy(o);
+    }
+  }
+}
 
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);

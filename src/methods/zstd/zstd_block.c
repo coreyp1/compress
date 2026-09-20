@@ -284,6 +284,8 @@ gcomp_status_t zstd_block_compress(zstd_encoder_state_t * state,
     if (index_prefix) {
       zstd_mf_index_range(
           state->match_finder, mf_data, 0, start_pos, mf_data_size);
+      zstd_mf_note_dictionary(state->match_finder, state->allocator, start_pos,
+          &state->mem_tracker);
     }
 
     gcomp_status_t status =

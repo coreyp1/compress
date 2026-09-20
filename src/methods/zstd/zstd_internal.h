@@ -223,6 +223,32 @@ typedef struct {
 typedef struct {
   uint32_t * hash_table;  ///< Hash table: hash -> position
   uint32_t * chain_table; ///< Chain table: position -> previous position
+
+  /**
+   * @brief Where the chain enters the dictionary, per hash.  NULL if none.
+   *
+   * A copy of @ref hash_table taken once the dictionary has been indexed and
+   * before any stream position has been, so each entry is the latest
+   * dictionary position with that hash rather than the latest position of any
+   * kind.  @ref chain_table is shared: a link from a dictionary position
+   * already points at an earlier dictionary position, so following it from
+   * here stays inside the dictionary.
+   *
+   * Only the chain levels allocate it.  The tree levels reach the dictionary
+   * on their own - a descent is logarithmic, so a bounded number of steps
+   * gets there - and levels 6 to 8 have chain budgets deep enough to walk
+   * back into it unaided.
+   */
+  uint32_t * dict_hash_table;
+
+  /**
+   * @brief One past the last dictionary position, in window coordinates.
+   *
+   * Zero when there is no dictionary or when sliding has pushed all of it out
+   * of the window - at which point the decoder cannot reach it either, so a
+   * match against it would not be decodable.
+   */
+  size_t dict_end;
   unsigned hash_log;      ///< Log2 of hash table size
   size_t hash_size;       ///< Hash table size
   size_t chain_size;      ///< Chain table size (= window size)
@@ -1213,6 +1239,28 @@ void zstd_mf_slide(zstd_match_finder_t * mf, size_t shift);
  * @param to One past the last position to index.
  * @param data_size Total bytes in @p data.
  */
+/**
+ * @brief Record where the dictionary ends, so its part of the chain can be
+ *        entered directly.
+ *
+ * Call once, after indexing the dictionary and before indexing anything else:
+ * the snapshot it takes is only correct while every head still names a
+ * dictionary position.
+ *
+ * Does nothing for a tree level, which reaches the dictionary unaided, and
+ * nothing when @p dict_end is zero.  Failing to allocate is not an error -
+ * the dictionary is still in the shared chain and still found by a deep
+ * enough search, so the encoder carries on without the shortcut.
+ *
+ * @param mf Match finder
+ * @param alloc Allocator for the one extra table
+ * @param dict_end One past the last dictionary position, in window coordinates
+ * @param mem_tracker Optional; charged for the table
+ */
+void zstd_mf_note_dictionary(zstd_match_finder_t * mf,
+    const gcomp_allocator_t * alloc, size_t dict_end,
+    gcomp_memory_tracker_t * mem_tracker);
+
 void zstd_mf_index_range(zstd_match_finder_t * mf, const uint8_t * data,
     size_t from, size_t to, size_t data_size);
 

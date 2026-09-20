@@ -186,6 +186,14 @@ typedef struct {
   unsigned two_pass;     ///< Parse each sweep twice; see zstd_optimal.c.
 } zstd_effort_t;
 
+/**
+ * @brief Fewest dictionary candidates a search will examine.
+ *
+ * See the dictionary walk in zstd_mf_find_match() for why the level's own
+ * search_depth is the wrong number here.
+ */
+#define ZSTD_MF_DICT_MIN_DEPTH 64u
+
 /// Indexed by compression level; entry 0 is unused (level 0 means "default").
 // `search_depth` counts candidates examined, and what a candidate costs
 // changes at level 9 where the chain gives way to the tree -- so the numbers
@@ -565,6 +573,16 @@ void zstd_mf_destroy(zstd_match_finder_t * mf, const gcomp_allocator_t * alloc,
     mf->bt_table = NULL;
   }
 
+  if (mf->dict_hash_table) {
+    if (mem_tracker) {
+      gcomp_memory_track_free(
+          mem_tracker, mf->hash_size * sizeof(uint32_t));
+    }
+    gcomp_free(alloc, mf->dict_hash_table);
+    mf->dict_hash_table = NULL;
+    mf->dict_end = 0;
+  }
+
   zstd_opt_destroy(mf, alloc, mem_tracker);
 }
 
@@ -590,6 +608,14 @@ void zstd_mf_reset_positions(zstd_match_finder_t * mf) {
   if (mf->bt_table) {
     memset(mf->bt_table, 0, mf->bt_size * 2u * sizeof(uint32_t));
   }
+  // The dictionary heads named positions in those same tables.  The table
+  // itself is kept - the caller may be about to index a dictionary into a new
+  // buffer and will note it again - but nothing in it is true any more.
+  if (mf->dict_hash_table) {
+    memset(mf->dict_hash_table, 0, mf->hash_size * sizeof(uint32_t));
+  }
+  mf->dict_end = 0;
+
   // Nothing refers to any position any more, so where data[0] sits in the
   // stream stops mattering and counting can start again.
   mf->base_pos = 0;
@@ -763,6 +789,66 @@ static bool zstd_mf_find_match(zstd_match_finder_t * mf, const uint8_t * data,
     }
 
     depth--;
+  }
+
+  // The dictionary, with a budget of its own.
+  //
+  // Everything above walks newest-first, so on data where thousands of
+  // positions share a hash the whole budget goes on recent ones and the
+  // dictionary at the front of the window is never reached - which is how a
+  // dictionary that is loaded, indexed and correct can still buy nothing.
+  // dict_hash_table enters that part of the chain directly, so the two
+  // searches cannot starve each other.
+  //
+  // The links are the same chain_table: every link from a dictionary position
+  // points at an earlier dictionary position, because the dictionary was
+  // indexed before anything else was.  Walking stops at dict_end for the same
+  // reason it stops at min_chain_pos - beyond it is not this dictionary.
+  if (mf->dict_hash_table && mf->dict_end > 0 && pos >= mf->dict_end) {
+    uint32_t dict_chain = mf->dict_hash_table[hash];
+    if (dict_chain != 0) {
+      size_t dict_pos = dict_chain - 1u;
+      // A budget of its own, and a floor under it.  The level's own
+      // search_depth is what the stream deserves; the dictionary is not the
+      // stream.  A caller who supplied one has said this content matters, and
+      // at level 1 the level's four candidates are nowhere near enough to
+      // find it on data where everything collides - 4091 bytes whose
+      // dictionary is the payload itself came out at 628 bytes with four and
+      // 17 with sixty-four.  Measured across the levels, sixty-four is where
+      // it stops mattering.
+      //
+      // Nothing without a dictionary pays for this: the walk is reached only
+      // when dict_hash_table exists, which is only when one was supplied.
+      unsigned dict_depth = mf->search_depth < ZSTD_MF_DICT_MIN_DEPTH
+          ? (unsigned)ZSTD_MF_DICT_MIN_DEPTH
+          : mf->search_depth;
+      while (dict_depth > 0 && dict_pos < mf->dict_end &&
+          dict_pos >= min_chain_pos) {
+        if (probe_ok && data[dict_pos] == cur_byte &&
+            data[dict_pos + best_len] == probe_byte) {
+          size_t match_len =
+              zstd_mf_count_match(data + pos, data + dict_pos, limit);
+          if (match_len > best_len) {
+            best_len = match_len;
+            best_offset = pos - dict_pos;
+            if (match_len >= mf->nice_length) {
+              break;
+            }
+            probe_ok = (pos + best_len < data_size);
+            probe_byte = probe_ok ? data[pos + best_len] : 0u;
+          }
+        }
+        if (dict_pos >= mf->chain_size) {
+          break;
+        }
+        uint32_t next = mf->chain_table[dict_pos];
+        if (next == 0 || next - 1 >= dict_pos) {
+          break;
+        }
+        dict_pos = next - 1u;
+        dict_depth--;
+      }
+    }
   }
 
   if (best_len >= MF_MIN_MATCH && best_offset > 0) {
@@ -1077,6 +1163,24 @@ void zstd_mf_slide(zstd_match_finder_t * mf, size_t shift) {
     mf->hash_table[i] = (v > shift) ? (uint32_t)(v - shift) : 0u;
   }
 
+  // The dictionary heads name window positions too, so they move with
+  // everything else.  Once the last of the dictionary has gone off the front
+  // the decoder cannot reach it either - a sequence may not point past the
+  // declared window (RFC 8878 section 3.1.1.1.2) - so the shortcut is
+  // switched off rather than left pointing at bytes that are no longer there.
+  if (mf->dict_hash_table) {
+    if (mf->dict_end > shift) {
+      mf->dict_end -= shift;
+      for (size_t i = 0; i < mf->hash_size; i++) {
+        uint32_t v = mf->dict_hash_table[i];
+        mf->dict_hash_table[i] = (v > shift) ? (uint32_t)(v - shift) : 0u;
+      }
+    }
+    else {
+      mf->dict_end = 0;
+    }
+  }
+
   if (shift >= mf->chain_size) {
     memset(mf->chain_table, 0, mf->chain_size * sizeof(uint32_t));
     return;
@@ -1093,6 +1197,36 @@ void zstd_mf_slide(zstd_match_finder_t * mf, size_t shift) {
     mf->chain_table[i] = (v > shift) ? (uint32_t)(v - shift) : 0u;
   }
   memset(mf->chain_table + kept, 0, shift * sizeof(uint32_t));
+}
+
+void zstd_mf_note_dictionary(zstd_match_finder_t * mf,
+    const gcomp_allocator_t * alloc, size_t dict_end,
+    gcomp_memory_tracker_t * mem_tracker) {
+  if (!mf || !alloc || dict_end == 0) {
+    return;
+  }
+  // A tree level descends to the dictionary in a bounded number of steps, so
+  // there is nothing here for it to gain and a second table would be paid for
+  // and never read.
+  if (mf->use_bt || !mf->hash_table) {
+    return;
+  }
+  if (!mf->dict_hash_table) {
+    mf->dict_hash_table =
+        gcomp_calloc(alloc, mf->hash_size, sizeof(uint32_t));
+    if (!mf->dict_hash_table) {
+      // The dictionary is still in the shared chain; only the shortcut is
+      // missing, and a deep enough search still finds it.
+      return;
+    }
+    if (mem_tracker) {
+      gcomp_memory_track_alloc(
+          mem_tracker, mf->hash_size * sizeof(uint32_t));
+    }
+  }
+  memcpy(mf->dict_hash_table, mf->hash_table,
+      mf->hash_size * sizeof(uint32_t));
+  mf->dict_end = dict_end;
 }
 
 void zstd_mf_index_range(zstd_match_finder_t * mf, const uint8_t * data,

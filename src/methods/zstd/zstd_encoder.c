@@ -916,6 +916,10 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
     }
     zstd_mf_index_range(state->match_finder, state->mf_window, 0,
         state->mf_window_len, state->mf_window_len);
+    // Taken now, while every hash head still names a dictionary position:
+    // the first block's positions are about to replace them.
+    zstd_mf_note_dictionary(state->match_finder, state->allocator,
+        state->mf_window_len, &state->mem_tracker);
   }
 
   // Allocate sequence buffer
@@ -1348,6 +1352,10 @@ static void zstd_encoder_drop_history(zstd_encoder_state_t * state) {
     state->mf_window_len = take;
     zstd_mf_index_range(state->match_finder, state->mf_window, 0,
         state->mf_window_len, state->mf_window_len);
+    // Taken now, while every hash head still names a dictionary position:
+    // the first block's positions are about to replace them.
+    zstd_mf_note_dictionary(state->match_finder, state->allocator,
+        state->mf_window_len, &state->mem_tracker);
   }
 }
 
@@ -1862,6 +1870,8 @@ gcomp_status_t zstd_encoder_reset(gcomp_encoder_t * encoder) {
       state->mf_window_len = take;
       zstd_mf_index_range(state->match_finder, state->mf_window, 0,
           state->mf_window_len, state->mf_window_len);
+      zstd_mf_note_dictionary(state->match_finder, state->allocator,
+          state->mf_window_len, &state->mem_tracker);
     }
 
     // Rebuild frame header
