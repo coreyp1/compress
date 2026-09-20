@@ -121,6 +121,32 @@ jobs:
         run: make test-asan -j"$(nproc)" PREFIX="$PREFIX"
 
   # ---------------------------------------------------------------------------
+  # ThreadSanitizer, in a third build directory: it cannot share objects with
+  # the ASan build because the two sanitizers cannot be combined.
+  #
+  # Neither of the jobs around it looks for a race.  ASan sees a use-after-free
+  # only on a run where the timing actually produced one, and a race that a
+  # runner happens to win every time leaves nothing behind; valgrind's memcheck
+  # does not look for races at all.  Four paths here are threaded - parallel
+  # encode and parallel decode, for LZ4 and for Zstandard - and a CI machine is
+  # exactly where an interleaving this developer's machine never picks will
+  # first show up.
+  # ---------------------------------------------------------------------------
+  thread-sanitizer:
+    name: ThreadSanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: compress
+
+      - uses: ./compress/.github/actions/setup
+
+      - name: Tests under ThreadSanitizer
+        working-directory: compress
+        run: make test-tsan -j"$(nproc)" PREFIX="$PREFIX"
+
+  # ---------------------------------------------------------------------------
   # Valgrind finds what the sanitizers do not: uninitialised reads that happen
   # to be harmless, and leaks in code the sanitizers' interceptors do not see.
   # The -quiet variant is the one that treats a leak as a failure.

@@ -598,6 +598,7 @@ FUZZ_DEPFILES := $(patsubst fuzz/%.c,$(APP_DIR)/fuzz/%.d,$(FUZZ_SOURCES))
 .PHONY: fuzz-zlib-decoder fuzz-zlib-roundtrip
 # Sanitizer commands
 .PHONY: test-asan test-asan-quiet test-ubsan sanitizer-help
+.PHONY: test-tsan test-tsan-quiet test-tsan-threads
 watch: ## Watch the file directory for changes and compile the target
 	@while true; do \
 		make --no-print-directory all; \
@@ -1597,6 +1598,193 @@ else
 	@exit 1
 endif
 
+####################################################################
+# Sanitizer Builds (TSan)
+####################################################################
+
+# ThreadSanitizer is a separate tree from the ASan one because the two cannot
+# be combined: both replace the allocator, and a build asking for either after
+# the other is rejected by the compiler.
+#
+# It answers a question nothing else in this Makefile asks.  Valgrind's
+# memcheck does not look for races; helgrind does, but the library is not run
+# under it.  ASan finds a use-after-free only once the timing that produces it
+# has actually happened, so a race that the test machine happens to lose
+# leaves no trace.  TSan reports the race itself, from a single interleaving,
+# whether or not that interleaving corrupted anything - which is the only way
+# to have any confidence in a threaded path that passes because the scheduler
+# has been kind.
+#
+# There are four such paths now: parallel encode for lz4 and Zstandard, and
+# parallel decode for both.
+TSAN_FLAGS := -fsanitize=thread -fno-omit-frame-pointer -g
+
+TSAN_BUILD_DIR := ./build/$(BUILD)-tsan
+TSAN_OBJ_DIR := $(TSAN_BUILD_DIR)/objects
+TSAN_APP_DIR := $(TSAN_BUILD_DIR)/apps
+
+TSAN_LIBOBJECTS := $(patsubst src/%.c,$(TSAN_OBJ_DIR)/%.o,$(SOURCES))
+TSAN_TARGET := $(BASE_NAME_PREFIX)-tsan.so
+
+TSAN_TEST_HELPER_OBJ := $(TSAN_OBJ_DIR)/tests/common/test_helpers.o
+TSAN_TEST_EXECUTABLES := $(addprefix $(TSAN_APP_DIR)/,$(addsuffix $(EXE_EXTENSION),$(TEST_NAMES)))
+
+TSAN_CFLAGS := $(CFLAGS) $(TSAN_FLAGS) -DGCOMP_BUILD -DGCOMP_TEST_BUILD
+TSAN_CXXFLAGS := $(CXXFLAGS) $(TSAN_FLAGS)
+TSAN_LDFLAGS := $(LDFLAGS) $(TSAN_FLAGS)
+TSAN_COMPRESSLIBRARY := -L $(TSAN_APP_DIR) -l$(SUITE)-$(PROJECT)$(BRANCH)-tsan
+
+# For the same reason the ASan build names its runtime: see the comment there.
+TSAN_RUNTIME := $(shell $(CC) -print-file-name=libtsan.so)
+
+# TSan requires position-independent code and refuses to start without it.
+ifeq ($(UNAME_S), Linux)
+	TSAN_CFLAGS += -fPIC
+	TSAN_CXXFLAGS += -fPIE
+endif
+
+# Every TSan compile writes a .d file and every one is included below, for the
+# reason spelled out above the first ASan compile rule: a sanitizer build
+# assembled from objects that disagree about a struct can invent a failure and
+# can hide a real one.
+$(TSAN_OBJ_DIR)/%.o: src/%.c
+	@printf "\n### Compiling (TSan instrumented): $< ###\n"
+	@mkdir -p $(@D)
+	$(CC) $(TSAN_CFLAGS) $(INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
+
+$(TSAN_APP_DIR)/$(TSAN_TARGET): $(TSAN_LIBOBJECTS)
+	@printf "\n### Compiling TSan-instrumented Shared Library ###\n"
+	@mkdir -p $(@D)
+	$(CXX) $(TSAN_CXXFLAGS) -shared -o $@ $^ $(TSAN_LDFLAGS)
+
+$(TSAN_OBJ_DIR)/tests/common/test_helpers.o: tests/common/test_helpers.cpp
+	@mkdir -p $(@D)
+	$(CXX) $(TSAN_CXXFLAGS) $(TEST_INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
+
+$(TSAN_OBJ_DIR)/tests/%.o: tests/%.cpp
+	@printf "\n### Compiling TSan Test Object: $* ###\n"
+	@mkdir -p $(@D)
+	$(CXX) $(TSAN_CXXFLAGS) $(TEST_INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
+
+TSAN_TEST_OBJECTS := $(patsubst tests/%.cpp,$(TSAN_OBJ_DIR)/tests/%.o,$(TEST_SOURCES))
+TSAN_DEPFILES := $(TSAN_LIBOBJECTS:.o=.d) $(TSAN_TEST_HELPER_OBJ:.o=.d) \
+	$(TSAN_TEST_OBJECTS:.o=.d)
+-include $(TSAN_DEPFILES)
+
+define tsan-test-executable-rule
+TSAN_TEST_OBJ_$1 := $(TSAN_OBJ_DIR)/tests/$(patsubst tests/%.cpp,%.o,$1)
+
+$(TSAN_APP_DIR)/$2$(EXE_EXTENSION): \
+		$$(TSAN_TEST_OBJ_$1) \
+		$(TSAN_TEST_HELPER_OBJ) \
+		$(TSAN_APP_DIR)/$(TSAN_TARGET)
+	@printf "\n### Linking TSan %s Test ###\n" "$2"
+	@mkdir -p $$(@D)
+	$$(CXX) $$(TSAN_CXXFLAGS) -o $$@ $$(TSAN_TEST_OBJ_$1) $$(TSAN_TEST_HELPER_OBJ) $$(TSAN_LDFLAGS) $$(TESTFLAGS) $$(TSAN_COMPRESSLIBRARY)
+endef
+
+$(foreach pair,$(TEST_PAIRS),$(eval $(call tsan-test-executable-rule,$(word 1,$(subst |, ,$(pair))),$(word 2,$(subst |, ,$(pair))))))
+
+# halt_on_error stops at the first race rather than reporting the same one from
+# every subsequent test, and history_size buys a deeper record of the other
+# thread's accesses - the shallow default frequently reports a race with no
+# stack for one side, which is not enough to act on.
+TSAN_RUN_ENV := LD_LIBRARY_PATH="$(TSAN_APP_DIR)" LD_PRELOAD="$(TSAN_RUNTIME)" \
+	TSAN_OPTIONS="halt_on_error=1:history_size=7:second_deadlock_stack=1"
+
+test-tsan: ## Run all tests with ThreadSanitizer (Linux only)
+test-tsan: $(TSAN_APP_DIR)/$(TSAN_TARGET) $(TSAN_TEST_EXECUTABLES)
+ifeq ($(OS_NAME), Linux)
+	@printf "\033[0;36m\n"
+	@printf "###########################################\n"
+	@printf "### Running tests with ThreadSanitizer  ###\n"
+	@printf "###########################################\n"
+	@printf "\033[0m\n"
+	@for test_exe in $(TSAN_TEST_EXECUTABLES); do \
+		test_name=$$(basename $$test_exe $(EXE_EXTENSION) | sed 's/test/\u&/'); \
+		printf "\033[0;30;43m\n"; \
+		printf "############################\n"; \
+		printf "### Running %s tests (TSan) ###\n" "$$test_name"; \
+		printf "############################"; \
+		printf "\033[0m\n\n"; \
+		$(TSAN_RUN_ENV) $$test_exe --gtest_brief=1 || exit 1; \
+	done
+	@printf "\033[0;32m\n"
+	@printf "###########################################\n"
+	@printf "### All tests passed with ThreadSanitizer ###\n"
+	@printf "###########################################\n"
+	@printf "\033[0m\n"
+else
+	@printf "\033[0;31m\n"
+	@printf "Sanitizer builds are currently only supported on Linux\n"
+	@printf "\033[0m\n"
+	@exit 1
+endif
+
+test-tsan-quiet: ## Run ThreadSanitizer tests with minimal output (Linux only)
+test-tsan-quiet: $(TSAN_APP_DIR)/$(TSAN_TARGET) $(TSAN_TEST_EXECUTABLES)
+ifeq ($(OS_NAME), Linux)
+	@total_tests=0; total_passed=0; total_failed=0; total_time=0; failed_suites=""; \
+	printf "\n\033[1;33m%-30s %8s %10s %s\033[0m\n" "Test Suite (TSan)" "Tests" "Time" "Status"; \
+	printf "\033[1;33m%-30s %8s %10s %s\033[0m\n" "------------------------------" "--------" "----------" "------"; \
+	for test_exe in $(TSAN_TEST_EXECUTABLES); do \
+		test_name=$$(basename $$test_exe $(EXE_EXTENSION)); \
+		output=$$($(TSAN_RUN_ENV) $$test_exe --gtest_brief=1 2>&1); \
+		exit_code=$$?; \
+		num_tests=$$(echo "$$output" | grep -oP '\[\s*=+\s*\]\s*\K\d+(?=\s+tests?)' | head -1); \
+		time_ms=$$(echo "$$output" | grep -oP '\(\K\d+(?=\s*ms\s*total\))' | head -1); \
+		[ -z "$$num_tests" ] && num_tests=0; \
+		[ -z "$$time_ms" ] && time_ms=0; \
+		total_tests=$$((total_tests + num_tests)); \
+		total_time=$$((total_time + time_ms)); \
+		if [ $$exit_code -eq 0 ]; then \
+			total_passed=$$((total_passed + num_tests)); \
+			printf "%-30s %8d %8dms \033[0;32mPASS\033[0m\n" "$$test_name" "$$num_tests" "$$time_ms"; \
+		else \
+			failures=$$(echo "$$output" | grep -oP '\[\s*FAILED\s*\]\s*\K\d+' | head -1); \
+			[ -z "$$failures" ] && failures=$$num_tests; \
+			[ "$$failures" -eq 0 ] && failures=1; \
+			total_failed=$$((total_failed + failures)); \
+			total_passed=$$((total_passed + num_tests - failures)); \
+			printf "%-30s %8d %8dms \033[0;31mFAIL\033[0m\n" "$$test_name" "$$num_tests" "$$time_ms"; \
+			failed_suites="$$failed_suites\n\033[0;31m=== $$test_name FAILURES ===\033[0m\n$$output\n"; \
+		fi; \
+	done; \
+	printf "\033[1;33m%-30s %8s %10s %s\033[0m\n" "------------------------------" "--------" "----------" "------"; \
+	if [ $$total_failed -eq 0 ]; then \
+		printf "\033[0;32m%-30s %8d %6dms PASS\033[0m\n\n" "TOTAL" "$$total_tests" "$$total_time"; \
+	else \
+		printf "\033[0;31m%-30s %8d %6dms FAIL (%d failed)\033[0m\n" "TOTAL" "$$total_tests" "$$total_time" "$$total_failed"; \
+		printf "$$failed_suites\n"; \
+		exit 1; \
+	fi
+else
+	@printf "\033[0;31m\n"
+	@printf "Sanitizer builds are currently only supported on Linux\n"
+	@printf "\033[0m\n"
+	@exit 1
+endif
+
+# The threaded suites on their own.  The full run is the gate; this is what a
+# change to an encoder's job scheduling gets run against while it is being
+# written.
+TSAN_THREADED_NAMES := testLz4_parallel testLz4_parallel_decode \
+	testZstd_parallel testZstd_parallel_decode testThread_safety
+TSAN_THREADED_EXECUTABLES := $(addprefix $(TSAN_APP_DIR)/,$(addsuffix $(EXE_EXTENSION),$(TSAN_THREADED_NAMES)))
+
+test-tsan-threads: ## Run only the threaded suites under ThreadSanitizer
+test-tsan-threads: $(TSAN_APP_DIR)/$(TSAN_TARGET) $(TSAN_THREADED_EXECUTABLES)
+ifeq ($(OS_NAME), Linux)
+	@for test_exe in $(TSAN_THREADED_EXECUTABLES); do \
+		printf "\n\033[0;36m### %s (TSan) ###\033[0m\n" "$$(basename $$test_exe)"; \
+		$(TSAN_RUN_ENV) $$test_exe --gtest_brief=1 || exit 1; \
+	done
+	@printf "\033[0;32m\nThreaded suites clean under ThreadSanitizer\n\033[0m\n"
+else
+	@printf "\033[0;31m\nSanitizer builds are currently only supported on Linux\n\033[0m\n"
+	@exit 1
+endif
+
 sanitizer-help: ## Show sanitizer build help
 	@printf "\033[0;36m"
 	@printf "###########################################\n"
@@ -1606,6 +1794,8 @@ sanitizer-help: ## Show sanitizer build help
 	@printf "Available targets:\n"
 	@printf "  make test-asan   - Run tests with AddressSanitizer + UndefinedBehaviorSanitizer\n"
 	@printf "  make test-ubsan  - Alias for test-asan (both run together)\n"
+	@printf "  make test-tsan   - Run tests with ThreadSanitizer\n"
+	@printf "  make test-tsan-threads - ThreadSanitizer, threaded suites only\n"
 	@printf "\n"
 	@printf "What these sanitizers detect:\n"
 	@printf "  ASan (AddressSanitizer):\n"
@@ -1621,6 +1811,14 @@ sanitizer-help: ## Show sanitizer build help
 	@printf "    - Invalid shift operations\n"
 	@printf "    - Out-of-bounds array access\n"
 	@printf "    - Misaligned memory access\n"
+	@printf "  TSan (ThreadSanitizer):\n"
+	@printf "    - Data races between threads\n"
+	@printf "    - Lock-order inversions (potential deadlocks)\n"
+	@printf "    - Unsafe use of a thread-unsafe object from two threads\n"
+	@printf "\n"
+	@printf "TSan cannot be combined with ASan; it builds into its own tree.\n"
+	@printf "It reports a race from one interleaving whether or not that run\n"
+	@printf "corrupted anything, which is what ASan and valgrind cannot do.\n"
 	@printf "\n"
 	@printf "Note: Sanitizer builds are slower than regular builds but catch\n"
 	@printf "bugs that may not cause immediate crashes in release builds.\n"
@@ -1631,7 +1829,7 @@ clean: ## Remove all contents of the build directories.
 # directory rather than a child, so a clean that names only the ordinary one
 # leaves instrumented objects behind - and they are the ones a stale-binary
 # mistake is hardest to notice with, because they still run.
-	-@rm -rvf $(BUILD_DIR) $(ASAN_BUILD_DIR)
+	-@rm -rvf $(BUILD_DIR) $(ASAN_BUILD_DIR) $(TSAN_BUILD_DIR)
 
 # Files will be as follows:
 # /usr/local/lib/(SUITE)/

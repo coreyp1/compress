@@ -170,6 +170,7 @@ but the targets above, run in six jobs:
 | Build and test (gcc) | `make`, `check-symbols`, `test`, `examples`, `install`, `tools/check-install.sh` |
 | Build and test (clang) | the same, with `CC=clang CXX=clang++` |
 | ASan + UBSan | `make test-asan` |
+| ThreadSanitizer | `make test-tsan`, in its own build tree |
 | Valgrind | `make test-valgrind-quiet`, which fails on a leak |
 | Fuzz corpus replay | `make fuzz-replay AFL_CC=clang` over the tracked `fuzz/regression` corpus |
 | Coverage floor | `make coverage COVERAGE_MIN=...`, which fails if line coverage drops below the floor |

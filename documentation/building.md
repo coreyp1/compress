@@ -62,6 +62,7 @@ sudo make install
 | `make test-quiet` | Run tests with minimal output |
 | `make test-debug` | Run tests in debug mode |
 | `make test-asan` | Run tests with AddressSanitizer + UBSan |
+| `make test-tsan` | Run tests with ThreadSanitizer |
 | `make test-valgrind` | Run tests under Valgrind |
 
 ### Documentation Targets

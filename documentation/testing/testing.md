@@ -12,6 +12,8 @@ This document describes how to run tests for the compress library, including uni
 | `make test-valgrind-debug` | Run all tests under valgrind (debug) |
 | `make test-asan` | Run tests with AddressSanitizer + UBSan |
 | `make test-ubsan` | Alias for `test-asan` |
+| `make test-tsan` | Run tests with ThreadSanitizer |
+| `make test-tsan-threads` | ThreadSanitizer, threaded suites only |
 
 ## Unit Tests
 
@@ -165,6 +167,41 @@ make sanitizer-help
 - Division by zero
 - Out-of-bounds array access
 - Invalid enum values
+
+**ThreadSanitizer (TSan):**
+- Data races between threads
+- Lock-order inversions, which are potential deadlocks
+- A thread-unsafe object used from two threads at once
+
+### ThreadSanitizer
+
+TSan builds into its own tree (`build/<platform>-tsan`) because it cannot be
+combined with ASan: both replace the allocator, and asking for one after the
+other is rejected by the compiler.
+
+```bash
+# Every suite
+make test-tsan
+
+# Just the threaded ones, which is what a change to job scheduling
+# gets run against while it is being written
+make test-tsan-threads
+```
+
+It answers a question none of the other tools ask. Valgrind's memcheck does
+not look for races. ASan reports a use-after-free only once the timing that
+produces it has actually occurred, so a race the machine happens to win on
+every run leaves no trace at all. TSan reports the race itself, from a single
+interleaving, whether or not that interleaving corrupted anything.
+
+Four paths in this library are threaded: parallel encode and parallel decode,
+for both LZ4 and Zstandard. `test-tsan-threads` covers those five suites;
+`test-tsan` covers everything, because shared state does not have to live in
+a file whose name says "parallel".
+
+A run is slower than a release run by roughly an order of magnitude, and
+`halt_on_error=1` stops at the first race rather than repeating it from every
+test that follows.
 
 ### Understanding Sanitizer Output
 
