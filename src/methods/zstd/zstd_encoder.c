@@ -310,6 +310,53 @@ static gcomp_status_t zstd_encoder_collect_one_parallel_result(
  * @param submitted_out Receives whether the job was handed over.
  * @return GCOMP_OK on success, error code on failure.
  */
+/**
+ * @brief Put the previous job's tail in front of a freshly allocated job.
+ *
+ * Jobs are compressed independently, so a job with nothing before it starts
+ * cold: its first bytes have no history to match against.  Copying the tail of
+ * the job just submitted to the front of the next one gives the match finder
+ * the same view the single-threaded encoder would have had at that point,
+ * without making the jobs depend on each other's RESULTS -- only on their
+ * input, which the encoder already holds.
+ */
+static void zstd_encoder_seed_parallel_job(zstd_encoder_state_t * state) {
+  if (!state->parallel_job) {
+    return;
+  }
+  uint32_t n = state->parallel_overlap_len;
+  if (n == 0u || !state->parallel_overlap_buf) {
+    state->parallel_job->overlap_len = 0u;
+    state->parallel_job->base.input_size = 0u;
+    return;
+  }
+  memcpy((void *)state->parallel_job->base.input, state->parallel_overlap_buf, n);
+  state->parallel_job->overlap_len = n;
+  state->parallel_job->base.input_size = n;
+}
+
+/**
+ * @brief Remember the tail of the job about to be handed over.
+ *
+ * Must run BEFORE the job is submitted: once it is, the context owns it and
+ * may free its buffer as soon as the result is taken.
+ */
+static void zstd_encoder_save_parallel_overlap(zstd_encoder_state_t * state) {
+  if (!state->parallel_job || !state->parallel_overlap_buf) {
+    return;
+  }
+  const uint8_t * in = (const uint8_t *)state->parallel_job->base.input;
+  size_t total = state->parallel_job->base.input_size;
+  uint32_t cap = state->parallel_overlap_cap;
+  // The whole buffer is fair game as context, the job's own overlap included:
+  // it is simply the data that came before, wherever it came from.
+  size_t n = (total < (size_t)cap) ? total : (size_t)cap;
+  if (n > 0u) {
+    memcpy(state->parallel_overlap_buf, in + total - n, n);
+  }
+  state->parallel_overlap_len = (uint32_t)n;
+}
+
 static gcomp_status_t zstd_encoder_submit_parallel_job(
     zstd_encoder_state_t * state, gcomp_buffer_t * output,
     bool * submitted_out) {
@@ -317,6 +364,8 @@ static gcomp_status_t zstd_encoder_submit_parallel_job(
   if (!state->parallel_job) {
     return GCOMP_ERR_INTERNAL;
   }
+
+  zstd_encoder_save_parallel_overlap(state);
 
   for (;;) {
     gcomp_status_t status =
@@ -386,8 +435,12 @@ static gcomp_status_t zstd_encoder_update_parallel(gcomp_encoder_t * encoder,
       return GCOMP_ERR_INTERNAL;
     }
 
-    // How much space in current job?
-    size_t job_space = job_size - state->parallel_job->base.input_size;
+    // How much space in current job?  input_size counts the overlap sitting
+    // in front of the content, so the room left is the job size less what
+    // content is already there.
+    const size_t used_content =
+        state->parallel_job->base.input_size - state->parallel_job->overlap_len;
+    size_t job_space = job_size - used_content;
     size_t input_avail = input->size - input->used;
     size_t to_copy = (input_avail < job_space) ? input_avail : job_space;
 
@@ -412,7 +465,8 @@ static gcomp_status_t zstd_encoder_update_parallel(gcomp_encoder_t * encoder,
     }
 
     // If job is full, submit it
-    if (state->parallel_job->base.input_size >= job_size) {
+    if (state->parallel_job->base.input_size - state->parallel_job->overlap_len >=
+        job_size) {
       bool submitted = false;
       status = zstd_encoder_submit_parallel_job(state, output, &submitted);
       if (status != GCOMP_OK) {
@@ -434,6 +488,7 @@ static gcomp_status_t zstd_encoder_update_parallel(gcomp_encoder_t * encoder,
             encoder, status, "failed to allocate parallel job");
         return status;
       }
+      zstd_encoder_seed_parallel_job(state);
 
       // Try to collect results and drain output
       status = zstd_encoder_collect_parallel_results(state, output);
@@ -476,7 +531,8 @@ static gcomp_status_t zstd_encoder_finish_parallel(gcomp_encoder_t * encoder,
   // Submit final partial job if not already done
   if (!state->blocks_finished && state->parallel_job) {
     // Only submit if there's data in the job
-    if (state->parallel_job->base.input_size > 0) {
+    if (state->parallel_job->base.input_size >
+            state->parallel_job->overlap_len) {
       bool submitted = false;
       status = zstd_encoder_submit_parallel_job(state, output, &submitted);
       if (status != GCOMP_OK) {
@@ -952,6 +1008,26 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
     gcomp_memory_track_alloc(
         &state->mem_tracker, state->parallel_output_buf_cap);
 
+    // Somewhere to keep the tail of each job for the next one to look back
+    // into.  It is filled just before a job is handed over, which is the last
+    // moment its buffer is still ours.
+    state->parallel_overlap_cap =
+        zstd_parallel_get_overlap_size(state->parallel_ctx);
+    state->parallel_overlap_len = 0;
+    if (state->parallel_overlap_cap > 0) {
+      state->parallel_overlap_buf =
+          gcomp_malloc(alloc, state->parallel_overlap_cap);
+      if (!state->parallel_overlap_buf) {
+        status = GCOMP_ERR_MEMORY;
+        gcomp_encoder_set_error(encoder, status,
+            "failed to allocate %u bytes for the job overlap",
+            state->parallel_overlap_cap);
+        goto cleanup;
+      }
+      gcomp_memory_track_alloc(
+          &state->mem_tracker, state->parallel_overlap_cap);
+    }
+
     // Parallel jobs emit blocks only, so the frame header is this encoder's
     // to write, exactly as in single-threaded mode.  Staging it as the first
     // thing in the parallel output buffer puts it ahead of every job's blocks
@@ -1016,6 +1092,9 @@ cleanup:
     }
     if (state->parallel_output_buf) {
       gcomp_free(alloc, state->parallel_output_buf);
+    }
+    if (state->parallel_overlap_buf) {
+      gcomp_free(alloc, state->parallel_overlap_buf);
     }
     if (state->parallel_job) {
       zstd_parallel_free_job(state->parallel_ctx, state->parallel_job);
@@ -1092,6 +1171,10 @@ void zstd_encoder_destroy(gcomp_encoder_t * encoder) {
     gcomp_memory_track_free(
         &state->mem_tracker, state->parallel_output_buf_cap);
     gcomp_free(alloc, state->parallel_output_buf);
+  }
+  if (state->parallel_overlap_buf) {
+    gcomp_memory_track_free(&state->mem_tracker, state->parallel_overlap_cap);
+    gcomp_free(alloc, state->parallel_overlap_buf);
   }
   if (state->parallel_job) {
     zstd_parallel_free_job(state->parallel_ctx, state->parallel_job);
@@ -1433,7 +1516,8 @@ gcomp_status_t zstd_encoder_flush(gcomp_encoder_t * encoder,
       return GCOMP_ERR_LIMIT;
     }
 
-    if (state->parallel_job && state->parallel_job->base.input_size > 0) {
+    if (state->parallel_job && state->parallel_job->base.input_size >
+            state->parallel_job->overlap_len) {
       bool submitted = false;
       gcomp_status_t status =
           zstd_encoder_submit_parallel_job(state, output, &submitted);
@@ -1722,6 +1806,7 @@ gcomp_status_t zstd_encoder_reset(gcomp_encoder_t * encoder) {
     if (status != GCOMP_OK) {
       return status;
     }
+    zstd_encoder_seed_parallel_job(state);
 
     // A reset starts a new frame, so the header goes back at the front of the
     // output buffer exactly as it did at create time, and the terminator this
@@ -1729,6 +1814,8 @@ gcomp_status_t zstd_encoder_reset(gcomp_encoder_t * encoder) {
     // produced a second stream with no frame header and no final block --
     // headerless bytes that decoded to nothing.
     state->parallel_epilogue_staged = false;
+    // A reset starts a new frame, so nothing precedes its first job.
+    state->parallel_overlap_len = 0;
     status = zstd_write_frame_header(&state->header, state->parallel_output_buf,
         state->parallel_output_buf_cap, &state->header_len);
     if (status != GCOMP_OK) {

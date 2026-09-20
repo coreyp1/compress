@@ -114,6 +114,7 @@ struct zstd_parallel_ctx_s {
   gcomp_parallel_block_ctx_t * block_ctx;
 
   uint64_t job_size;
+  uint32_t overlap_size;
   bool checksum_enabled;
   int compression_level;
   uint8_t window_log;
@@ -210,25 +211,42 @@ static gcomp_status_t zstd_parallel_compress_blocks(
       .rep_offset_3 = 0u,
   };
 
-  // Compress input as a single block (or multiple blocks if large)
-  size_t remaining = input_len;
-  const uint8_t * inp = input;
+  // Give the job the same sliding window the single-threaded encoder uses:
+  // the block compressor's stream path appends each block to it, slides it
+  // when it outgrows one window, and keeps the finder's tables describing
+  // exactly what is in it.  That makes every block of a job history for the
+  // next one, which per-block calls on their own could never do.
+  temp_state.mf_window = job->mf_window;
+  temp_state.mf_window_capacity = job->mf_window_capacity;
+  temp_state.mf_window_max = job->mf_window_max;
+  temp_state.mf_window_len = 0;
+
+  // The finder is reused between jobs, so it starts clean.  Then the overlap
+  // -- the tail of the job before this one -- goes in as history and is
+  // indexed, which is what stops each job starting cold.
+  if (temp_state.match_finder) {
+    zstd_mf_reset(temp_state.match_finder);
+    uint32_t ov = job->overlap_len;
+    if (ov > job->mf_window_max) {
+      ov = job->mf_window_max; // never more history than a window
+    }
+    if (ov > 0u) {
+      memcpy(temp_state.mf_window,
+          input + job->overlap_len - ov, ov);
+      temp_state.mf_window_len = ov;
+      zstd_mf_index_range(temp_state.match_finder, temp_state.mf_window, 0, ov, ov);
+    }
+  }
+
+  // Compress the content, which begins after the overlap.
+  size_t remaining = input_len - job->overlap_len;
+  const uint8_t * inp = input + job->overlap_len;
 
   while (remaining > 0) {
     size_t block_input_len = (remaining > block_max) ? block_max : remaining;
     // Never the last block of the frame: only the encoder knows where the
     // content ends, and it marks that with a block of its own.
     const bool is_last = false;
-
-    // The finder's positions go, because it is given each block on its own
-    // with positions counted from that block's first byte and carrying them
-    // over would make every offset it reported wrong.  What the optimal
-    // parse has learned about the data stays: that describes the data, not
-    // where it sat, and a job's later blocks are the same kind of thing as
-    // its first.
-    if (temp_state.match_finder) {
-      zstd_mf_reset_positions(temp_state.match_finder);
-    }
 
     // The repeat offsets are NOT reset here, and resetting them was a bug
     // that corrupted every job longer than one block.  RFC 8878 section
@@ -339,6 +357,21 @@ gcomp_status_t zstd_parallel_create(
     ctx->window_log = zstd_level_to_window_log(ctx->compression_level);
   }
 
+  // How much of the previous job each job gets to look back into.
+  //
+  // A job with no context starts cold: its first bytes have nothing to match
+  // and its entropy tables are built from a short sample.  Over 2 MB of
+  // synthetic input that cost 2.4x the output of the single-threaded encoder,
+  // while the reference encoder pays nothing for threading -- it gives each
+  // job a slice of what came before, and so does this now.
+  //
+  // A whole window, and NOT capped by the job size: the encoder keeps the
+  // overlap in a buffer of its own, so how much history it can offer has
+  // nothing to do with how big a job is.  Capping it at the job size left
+  // 64 KB jobs with half a window of context and 2.7% worse output, while
+  // every job size at or above the window was already at parity.
+  ctx->overlap_size = zstd_window_log_to_size(ctx->window_log);
+
   uint32_t max_in_flight = 1;
   if (num_threads > 1) {
     max_in_flight = config && config->max_in_flight > 0
@@ -346,7 +379,11 @@ gcomp_status_t zstd_parallel_create(
         : num_threads * ZSTD_PARALLEL_DEFAULT_MAX_IN_FLIGHT_MULTIPLIER;
     if (ctx->max_memory_bytes > 0) {
       uint32_t window_size = zstd_window_log_to_size(ctx->window_log);
-      size_t per_job_memory = job_size + (job_size + ZSTD_FRAME_OVERHEAD) +
+      // Each job now carries a copy of the preceding overlap as well.
+      size_t overlap_estimate = (size_t)ctx->overlap_size;
+      size_t per_job_memory = job_size + overlap_estimate +
+          (size_t)window_size + ZSTD_BLOCK_SIZE_MAX +
+          (job_size + ZSTD_FRAME_OVERHEAD) +
           (sizeof(uint32_t) * (1UL << 14)) + (sizeof(uint32_t) * window_size) +
           (job_size / 3 * sizeof(zstd_sequence_t)) + job_size;
       uint32_t mem_limited_jobs =
@@ -410,13 +447,14 @@ gcomp_status_t zstd_parallel_alloc_job(
   }
 
   // Allocate input buffer
-  uint8_t * input_buf = gcomp_malloc(ctx->allocator, ctx->job_size);
+  const size_t input_cap = (size_t)ctx->job_size + (size_t)ctx->overlap_size;
+  uint8_t * input_buf = gcomp_malloc(ctx->allocator, input_cap);
   if (!input_buf) {
     status = GCOMP_ERR_MEMORY;
     goto cleanup;
   }
   if (ctx->mem_tracker) {
-    gcomp_memory_track_alloc(ctx->mem_tracker, (size_t)ctx->job_size);
+    gcomp_memory_track_alloc(ctx->mem_tracker, input_cap);
   }
 
   // Allocate output buffer (worst case: input size + frame overhead)
@@ -425,7 +463,7 @@ gcomp_status_t zstd_parallel_alloc_job(
   uint8_t * output_buf = gcomp_malloc(ctx->allocator, output_cap);
   if (!output_buf) {
     if (ctx->mem_tracker) {
-      gcomp_memory_track_free(ctx->mem_tracker, (size_t)ctx->job_size);
+      gcomp_memory_track_free(ctx->mem_tracker, input_cap);
     }
     gcomp_free(ctx->allocator, input_buf);
     status = GCOMP_ERR_MEMORY;
@@ -441,7 +479,7 @@ gcomp_status_t zstd_parallel_alloc_job(
   if (!mf) {
     if (ctx->mem_tracker) {
       gcomp_memory_track_free(ctx->mem_tracker, output_cap);
-      gcomp_memory_track_free(ctx->mem_tracker, (size_t)ctx->job_size);
+      gcomp_memory_track_free(ctx->mem_tracker, input_cap);
     }
     gcomp_free(ctx->allocator, output_buf);
     gcomp_free(ctx->allocator, input_buf);
@@ -455,7 +493,7 @@ gcomp_status_t zstd_parallel_alloc_job(
   if (status != GCOMP_OK) {
     if (ctx->mem_tracker) {
       gcomp_memory_track_free(ctx->mem_tracker, output_cap);
-      gcomp_memory_track_free(ctx->mem_tracker, (size_t)ctx->job_size);
+      gcomp_memory_track_free(ctx->mem_tracker, input_cap);
     }
     gcomp_free(ctx->allocator, mf);
     gcomp_free(ctx->allocator, output_buf);
@@ -464,6 +502,39 @@ gcomp_status_t zstd_parallel_alloc_job(
   }
   if (ctx->mem_tracker) {
     gcomp_memory_track_alloc(ctx->mem_tracker, sizeof(zstd_match_finder_t));
+  }
+
+  // A sliding match window, sized exactly as the single-threaded encoder
+  // sizes its own: one window of history plus room for the block being added.
+  //
+  // Pointing the match finder at the job's input buffer instead looks
+  // tempting -- the overlap and the content are already contiguous there --
+  // but the finder's tables are built for window_size, so handing it a job
+  // several windows long makes its positions alias and it silently loses
+  // matches.  Measured on 2 MB: a 512 KB job came out 47% larger than the
+  // same data compressed serially, and the loss tracked job size rather than
+  // anything about the data.
+  uint32_t mf_win_max = zstd_window_log_to_size(ctx->window_log);
+  size_t mf_block_max = ZSTD_BLOCK_SIZE_MAX;
+  if ((uint64_t)mf_win_max < (uint64_t)mf_block_max) {
+    mf_block_max = mf_win_max;
+  }
+  size_t mf_win_cap = (size_t)mf_win_max + mf_block_max;
+  uint8_t * mf_window_buf = gcomp_malloc(ctx->allocator, mf_win_cap);
+  if (!mf_window_buf) {
+    if (ctx->mem_tracker) {
+      gcomp_memory_track_free(ctx->mem_tracker, output_cap);
+      gcomp_memory_track_free(ctx->mem_tracker, input_cap);
+    }
+    zstd_mf_destroy(mf, ctx->allocator, ctx->mem_tracker);
+    gcomp_free(ctx->allocator, mf);
+    gcomp_free(ctx->allocator, output_buf);
+    gcomp_free(ctx->allocator, input_buf);
+    status = GCOMP_ERR_MEMORY;
+    goto cleanup;
+  }
+  if (ctx->mem_tracker) {
+    gcomp_memory_track_alloc(ctx->mem_tracker, mf_win_cap);
   }
 
   // Allocate sequence buffer
@@ -475,7 +546,7 @@ gcomp_status_t zstd_parallel_alloc_job(
     if (ctx->mem_tracker) {
       gcomp_memory_track_free(ctx->mem_tracker, sizeof(zstd_match_finder_t));
       gcomp_memory_track_free(ctx->mem_tracker, output_cap);
-      gcomp_memory_track_free(ctx->mem_tracker, (size_t)ctx->job_size);
+      gcomp_memory_track_free(ctx->mem_tracker, input_cap);
     }
     gcomp_free(ctx->allocator, mf);
     gcomp_free(ctx->allocator, output_buf);
@@ -498,7 +569,7 @@ gcomp_status_t zstd_parallel_alloc_job(
     if (ctx->mem_tracker) {
       gcomp_memory_track_free(ctx->mem_tracker, sizeof(zstd_match_finder_t));
       gcomp_memory_track_free(ctx->mem_tracker, output_cap);
-      gcomp_memory_track_free(ctx->mem_tracker, (size_t)ctx->job_size);
+      gcomp_memory_track_free(ctx->mem_tracker, input_cap);
     }
     gcomp_free(ctx->allocator, mf);
     gcomp_free(ctx->allocator, output_buf);
@@ -512,6 +583,10 @@ gcomp_status_t zstd_parallel_alloc_job(
 
   // Initialize job
   job->base.input = input_buf;
+  job->overlap_len = 0;
+  job->mf_window = mf_window_buf;
+  job->mf_window_capacity = mf_win_cap;
+  job->mf_window_max = mf_win_max;
   job->base.input_size = 0;
   job->base.output = output_buf;
   job->base.output_capacity = output_cap;
@@ -546,11 +621,20 @@ void zstd_parallel_free_job(
 
   if (ctx->mem_tracker) {
     if (job->base.user_data) {
-      gcomp_memory_track_free(ctx->mem_tracker, (size_t)ctx->job_size);
+      gcomp_memory_track_free(
+          ctx->mem_tracker, (size_t)ctx->job_size + (size_t)ctx->overlap_size);
     }
     if (job->base.output) {
       gcomp_memory_track_free(ctx->mem_tracker, job->base.output_capacity);
     }
+  }
+
+  if (job->mf_window) {
+    if (ctx->mem_tracker) {
+      gcomp_memory_track_free(ctx->mem_tracker, job->mf_window_capacity);
+    }
+    gcomp_free(ctx->allocator, job->mf_window);
+    job->mf_window = NULL;
   }
 
   // Free buffers (input pointer stored in user_data)
@@ -640,6 +724,10 @@ gcomp_status_t zstd_parallel_reset(zstd_parallel_ctx_t * ctx) {
     return GCOMP_ERR_INVALID_ARG;
   }
   return gcomp_parallel_block_reset(ctx->block_ctx);
+}
+
+uint32_t zstd_parallel_get_overlap_size(const zstd_parallel_ctx_t * ctx) {
+  return ctx ? ctx->overlap_size : 0u;
 }
 
 uint64_t zstd_parallel_get_job_size(const zstd_parallel_ctx_t * ctx) {

@@ -67,7 +67,14 @@ struct zstd_parallel_job_s {
   size_t literals_buffer_capacity; ///< Literals buffer capacity
   bool checksum_enabled;     ///< Whether checksum was requested
   int compression_level;     ///< Compression level for this job
-  uint8_t window_log;        ///< Window log for this job
+  uint8_t window_log; ///< Window log for this job
+  /// Leading bytes of `base.input` that are context from the previous job,
+  /// not content of this one.  The job compresses input[overlap_len ..
+  /// input_size) and may match back into the bytes before it.
+  uint32_t overlap_len;
+  uint8_t * mf_window;          ///< Sliding match window for this job
+  size_t mf_window_capacity;    ///< window_size + one block
+  uint32_t mf_window_max;       ///< How much history the window may hold
   zstd_parallel_job_t * next_inline; ///< Next job in inline result queue
 };
 
@@ -219,6 +226,20 @@ GCOMP_INTERNAL_API gcomp_status_t zstd_parallel_reset(
  * @param ctx Parallel context.
  * @return Job size in bytes.
  */
+/**
+ * @brief How many bytes of the previous job each job wants in front of it.
+ *
+ * Jobs are compressed independently, so without this a job's first bytes have
+ * nothing to match against and every job pays a cold start.  The encoder
+ * copies this many trailing bytes of the previous job's content to the front
+ * of the next job's buffer and sets job->overlap_len to match.
+ *
+ * @param ctx The parallel context.
+ * @return Overlap in bytes (0 if the context is NULL).
+ */
+GCOMP_INTERNAL_API uint32_t zstd_parallel_get_overlap_size(
+    const zstd_parallel_ctx_t * ctx);
+
 GCOMP_INTERNAL_API uint64_t zstd_parallel_get_job_size(
     const zstd_parallel_ctx_t * ctx);
 

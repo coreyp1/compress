@@ -255,7 +255,13 @@ gcomp_status_t zstd_block_compress(zstd_encoder_state_t * state,
             state->mf_window_len + input_len - state->mf_window_capacity;
         zstd_block_slide_window(state, shift);
       }
-      memcpy(state->mf_window + state->mf_window_len, input, input_len);
+      // A parallel job hands its own buffer over as the window, with the
+      // block already sitting at mf_window_len inside it -- there is nothing
+      // to copy and the source and destination are the same address, which
+      // memcpy is not allowed to be given.
+      if (state->mf_window + state->mf_window_len != input) {
+        memcpy(state->mf_window + state->mf_window_len, input, input_len);
+      }
       mf_data = state->mf_window;
       start_pos = state->mf_window_len;
       mf_data_size = state->mf_window_len + input_len;

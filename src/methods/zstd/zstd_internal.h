@@ -456,6 +456,9 @@ typedef struct {
   uint8_t *
       parallel_output_buf; ///< Buffer for compressed frames awaiting output
   size_t parallel_output_buf_cap; ///< Allocated capacity of parallel_output_buf
+  uint8_t * parallel_overlap_buf; ///< Tail of the job just submitted
+  uint32_t parallel_overlap_cap;  ///< Capacity of parallel_overlap_buf
+  uint32_t parallel_overlap_len;  ///< Bytes of it currently valid
   size_t
       parallel_output_buf_pos; ///< Current read position (bytes already output)
   size_t parallel_output_buf_len; ///< Valid bytes in buffer (write position)
