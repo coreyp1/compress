@@ -95,27 +95,31 @@ static inline gcomp_status_t gcomp_bound_add_mul(
  * one byte holding the three header bits and up to five bits of padding, and
  * four bytes of LEN/NLEN.
  *
- * ## Why the window size comes into it
+ * ## How small a block can get
  *
- * A stored block is written back out of the sliding window, so the encoder can
- * only store a block whose bytes are all still in it.  That makes the window,
- * not RFC 1951's 65535-byte LEN field, the thing that limits how much input a
- * stored block can carry - and on data that will not compress, where the
- * encoder wants to store every block, it closes each one early to keep it
- * storable (`deflate_encode.c`, `out_of_window_reach`).
+ * Five bytes of overhead per block only matters if blocks can be short, and
+ * what makes them short is the encoder closing one early.  Two things bound
+ * that: the symbol buffer filling, and a stored block needing its bytes to
+ * still be in the history it is written from.
  *
- * So a small window means many small blocks and five bytes of overhead on each
- * one.  Measured on incompressible input, the overhead is about 0.02% at
- * `window_bits` 15, 2% at 9, and 21% at 8 - which is why this cannot be a
- * single ratio the way zlib's `deflateBound()` is.  (zlib does not have the
- * problem to solve: `deflateInit2()` quietly raises a `windowBits` of 8 to 9.)
+ * Both used to come from `window_size`, which made a small window mean many
+ * small blocks - measured at 21% overhead at `window_bits` 8 - so this had to
+ * be window-aware where zlib's `deflateBound()` is a single ratio.  Neither
+ * does any more: the symbol buffer has a floor of its own
+ * (`DEFLATE_SYM_BUF_MIN`) and a stored block is written from a ring kept for
+ * the purpose (`DEFLATE_STORED_RING_SIZE`), both independent of the window.
+ * Measured overhead is now 0.122% at every `window_bits` from 8 to 12 and
+ * smaller above that.
  *
  * The divisor below says the encoder never cuts a storable block smaller than
- * a sixteenth of its window.  That is not the encoder's own arithmetic - it is
- * a floor underneath it, chosen with room to spare against what the smallest
- * windows actually produce, so that a change to the block-closing heuristic
- * cannot quietly invalidate the bound.  `tests/integration/test_bound.cpp`
- * sweeps every window size, level and input shape against it.
+ * a sixteenth of the smallest span it is allowed to work in.  That is not the
+ * encoder's own arithmetic - it is a floor underneath it, with room to spare
+ * against what is actually produced, so that a change to the block-closing
+ * heuristic cannot quietly invalidate the bound.  The window is still a
+ * parameter because it still caps the span from above at `window_bits` 13 and
+ * up, where no ring is allocated and the window serves the block directly.
+ * `tests/integration/test_bound.cpp` sweeps every window size, level and input
+ * shape against it.
  */
 static inline gcomp_status_t gcomp_bound_deflate_raw(
     size_t n, unsigned window_bits, size_t * bound_out) {
@@ -127,8 +131,14 @@ static inline gcomp_status_t gcomp_bound_deflate_raw(
   }
   size_t window_size = (size_t)1u << window_bits;
 
-  // The floor under the encoder's block-closing rule; see above.
-  size_t min_block = window_size / 16u;
+  // The floor under the encoder's block-closing rule; see above.  The span a
+  // block may cover is at least DEFLATE_SYM_BUF_MIN whatever the window, so
+  // the smallest window no longer means the smallest blocks.  Kept in step
+  // with deflate_encode.c by tests/integration/test_bound.cpp, which sweeps
+  // every window size rather than trusting this to stay true.
+  const size_t kDeflateSymBufMin = 4096u;
+  size_t span = window_size < kDeflateSymBufMin ? kDeflateSymBufMin : window_size;
+  size_t min_block = span / 16u;
   if (min_block < 8u) {
     min_block = 8u;
   }

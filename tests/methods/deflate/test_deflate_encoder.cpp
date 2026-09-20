@@ -2259,3 +2259,72 @@ TEST_F(DeflateEncoderTest, BlocksWithoutDistanceOneStillGetTheirOwnCode) {
   ASSERT_EQ(back.size(), data.size());
   EXPECT_EQ(memcmp(back.data(), data.data(), data.size()), 0);
 }
+
+/**
+ * @brief A small window must not make the encoder expand its input.
+ *
+ * RFC 1951 section 3.2.4's stored block exists so that an encoder never has to
+ * pay more than about five bytes per block on data it cannot compress. Ours
+ * used to fail to collect that at small windows, because two separate things
+ * were sized from `window_size`: the symbol buffer, which decides how long a
+ * block may be, and the history a stored block is written from. At
+ * `window_bits` 8 the second was hopeless - a single match can be 258 bytes
+ * and the whole window is 256 - so a block was closed on nearly every symbol
+ * and 200000 incompressible bytes came out 21% larger.
+ *
+ * Measured on this data against zlib at the same window: zlib expands by
+ * 0.217% to 0.232% from `windowBits` 9 to 13, and refuses a raw `windowBits`
+ * of 8 outright. One percent is therefore a loose ceiling - the point is to
+ * catch a return to per-symbol blocks, not to pin the current figure, which is
+ * 0.122% at every window from 8 to 12 and lower above that.
+ */
+TEST_F(DeflateEncoderTest, ASmallWindowDoesNotExpandIncompressibleInput) {
+  const size_t n = 200000;
+  std::vector<uint8_t> in(n);
+  uint32_t s = 0x9E3779B9u;
+  for (size_t i = 0; i < n; i++) {
+    s ^= s << 13;
+    s ^= s >> 17;
+    s ^= s << 5;
+    in[i] = static_cast<uint8_t>(s >> 24);
+  }
+
+  for (uint64_t window_bits = 8; window_bits <= 15; window_bits++) {
+    for (int64_t level : {1, 6, 9}) {
+      gcomp_options_t * opts = nullptr;
+      ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+      ASSERT_EQ(
+          gcomp_options_set_uint64(opts, "deflate.window_bits", window_bits),
+          GCOMP_OK);
+      ASSERT_EQ(gcomp_options_set_int64(opts, "deflate.level", level),
+          GCOMP_OK);
+
+      size_t bound = 0;
+      ASSERT_EQ(gcomp_encode_bound(registry_, "deflate", opts, n, &bound),
+          GCOMP_OK);
+      std::vector<uint8_t> enc(bound);
+      size_t used = 0;
+      ASSERT_EQ(gcomp_encode_buffer(registry_, "deflate", opts, in.data(), n,
+                    enc.data(), enc.size(), &used),
+          GCOMP_OK)
+          << "window_bits " << window_bits << " level " << level;
+      gcomp_options_destroy(opts);
+
+      const double expansion = 100.0 * (double)(used - n) / (double)n;
+      EXPECT_LT(used, n + n / 100u)
+          << "window_bits " << window_bits << " level " << level << ": "
+          << used << " bytes from " << n << ", " << expansion
+          << "% larger; the stored block is not being reached";
+
+      // Expanding by little is worth nothing if the bytes are wrong.
+      std::vector<uint8_t> back;
+      ASSERT_EQ(decode_data(enc.data(), used, back, n), GCOMP_OK)
+          << "window_bits " << window_bits << " level " << level;
+      ASSERT_EQ(back.size(), n);
+      ASSERT_EQ(memcmp(back.data(), in.data(), n), 0)
+          << "window_bits " << window_bits << " level " << level;
+      gcomp_decoder_destroy(decoder_);
+      decoder_ = nullptr;
+    }
+  }
+}

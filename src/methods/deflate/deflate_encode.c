@@ -42,6 +42,35 @@
 #define DEFLATE_WINDOW_BITS_MAX 15u
 
 #define DEFLATE_MAX_STORED_BLOCK 65535u
+
+/**
+ * @brief Fewest symbols a block may be allowed to hold, whatever the window.
+ *
+ * The symbol buffer used to be exactly `window_size` entries, which tied the
+ * length of a block to the reach of the match finder although the two have
+ * nothing to do with each other.  The cost falls on incompressible data at a
+ * small window: a block that covers 256 bytes pays five bytes of RFC 1951
+ * section 3.2.4 framing on them, which is 2%, and the framing is the whole
+ * point of storing the block.
+ *
+ * zlib separates the same two things - its symbol buffer comes from
+ * `memLevel`, its window from `windowBits` - and that is why its expansion on
+ * incompressible input is about 0.23% at every window size.  4096 symbols is a
+ * quarter of what zlib's default asks for and brings the framing to about
+ * 0.12%.
+ */
+#define DEFLATE_SYM_BUF_MIN 4096u
+
+/**
+ * @brief Size of the ring a stored block is written from, when one is needed.
+ *
+ * A stored block covers at most DEFLATE_SYM_BUF_MIN bytes of literal-heavy
+ * input, and the lookahead standing in front of it is bounded by
+ * DEFLATE_REFILL_LOOKAHEAD, so twice the symbol floor holds both with room to
+ * spare.  A window at least this large can serve the block itself and no ring
+ * is allocated, which is every window_bits from 13 up.
+ */
+#define DEFLATE_STORED_RING_SIZE (2u * DEFLATE_SYM_BUF_MIN)
 #define DEFLATE_MAX_LITLEN_SYMBOLS 288u
 #define DEFLATE_MAX_DIST_SYMBOLS 32u
 #define DEFLATE_MIN_MATCH_LENGTH 3u
@@ -559,6 +588,26 @@ typedef struct gcomp_deflate_encoder_state_s {
   size_t lookahead;   ///< Bytes available for matching.
 
   /**
+   * @brief Recent input kept only so that a stored block can be written.
+   *
+   * NULL whenever the window is already at least DEFLATE_STORED_RING_SIZE, in
+   * which case the window serves and this costs nothing.  Below that the
+   * window cannot hold a block and its lookahead at once - at window_bits 8 it
+   * cannot hold even one maximum-length match - so the bytes are kept here
+   * instead.
+   *
+   * It holds stream bytes only.  A preset dictionary is laid into the window
+   * because the match finder may reference it (RFC 1950 section 2.2), but a
+   * stored block never covers dictionary bytes, so priming this would only
+   * make @ref stored_fill claim history the block cannot use.
+   */
+  uint8_t * stored_buf;
+  size_t stored_size; ///< Power of two; DEFLATE_STORED_RING_SIZE.
+  size_t stored_mask; ///< stored_size - 1.
+  size_t stored_pos;  ///< Next write position, mirroring window_pos.
+  size_t stored_fill; ///< Stream bytes written (capped at stored_size).
+
+  /**
    * @brief A match found at the previous position and not yet emitted.
    *
    * Lazy matching asks whether the byte at p is better spent as a literal,
@@ -819,7 +868,56 @@ static size_t deflate_block_input_length(
 }
 
 /**
- * @brief Write the block as a stored block, taking the bytes from the window.
+ * @brief Where a stored block's bytes are kept, and how far back they go.
+ *
+ * The ring when there is one, the window otherwise.  Collected in one place so
+ * that the writer and the test deciding whether to call it cannot disagree
+ * about which buffer is in play.
+ */
+typedef struct {
+  const uint8_t * data;
+  size_t size; ///< Capacity, a power of two.
+  size_t mask; ///< size - 1.
+  size_t pos;  ///< One past the most recent byte.
+  size_t fill; ///< Bytes actually held, capped at size.
+} deflate_stored_source_t;
+
+static deflate_stored_source_t deflate_stored_source(
+    const gcomp_deflate_encoder_state_t * st) {
+  deflate_stored_source_t s;
+  if (st->stored_buf) {
+    s.data = st->stored_buf;
+    s.size = st->stored_size;
+    s.mask = st->stored_mask;
+    s.pos = st->stored_pos;
+    s.fill = st->stored_fill;
+  }
+  else {
+    s.data = st->window;
+    s.size = st->window_size;
+    s.mask = st->window_mask;
+    s.pos = st->window_pos;
+    s.fill = st->window_fill;
+  }
+  return s;
+}
+
+/**
+ * @brief The longest stored block that could be written right now.
+ *
+ * What the source holds, less the lookahead sitting in front of the encoder's
+ * position - those bytes have been read but not yet encoded, so they are not
+ * part of any block yet.
+ */
+static size_t deflate_stored_reachable(
+    const gcomp_deflate_encoder_state_t * st) {
+  const deflate_stored_source_t s = deflate_stored_source(st);
+  size_t held = (s.fill < s.size) ? s.fill : s.size;
+  return (held > st->lookahead) ? held - st->lookahead : 0u;
+}
+
+/**
+ * @brief Write the block as a stored block, taking the bytes from history.
  *
  * RFC 1951 section 3.2.4: three header bits, padding to the next byte
  * boundary, LEN and its complement, then the bytes themselves.  Nothing is
@@ -827,10 +925,12 @@ static size_t deflate_block_input_length(
  * bytes over its own length - and it is the answer whenever the coded forms
  * would cost more.
  *
- * The bytes come from the sliding window.  They are the @p data_len bytes
- * ending where the encoder has reached, which is @ref gcomp_deflate_encoder_state_t::lookahead
- * bytes before the end of what has been read.  The caller checks that they
- * are still in the window before asking.
+ * The bytes are the @p data_len ending where the encoder has reached, which is
+ * @ref gcomp_deflate_encoder_state_t::lookahead bytes before the end of what
+ * has been read.  They come from @ref gcomp_deflate_encoder_state_t::stored_buf
+ * when the window is too small to have kept them, and from the window
+ * otherwise; deflate_stored_source() decides which, and
+ * deflate_stored_reachable() is what the caller checks first.
  *
  * @param st Encoder state.
  * @param final Non-zero if this is the last block in the stream.
@@ -866,13 +966,13 @@ static gcomp_status_t deflate_flush_stored_block_from_window(
   }
 
   // The block ends at the encoder's position, which is `lookahead` bytes
-  // behind where the window has been filled to.
-  size_t end = (st->window_pos + st->window_size - st->lookahead) &
-      st->window_mask;
-  size_t start = (end + st->window_size - data_len) & st->window_mask;
+  // behind where history has been filled to.
+  const deflate_stored_source_t src = deflate_stored_source(st);
+  size_t end = (src.pos + src.size - st->lookahead) & src.mask;
+  size_t start = (end + src.size - data_len) & src.mask;
   for (size_t i = 0; i < data_len; i++) {
     s = gcomp_deflate_bitwriter_write_bits(
-        &st->bitwriter, st->window[(start + i) & st->window_mask], 8);
+        &st->bitwriter, src.data[(start + i) & src.mask], 8);
     if (s != GCOMP_OK) {
       return s;
     }
@@ -2172,21 +2272,16 @@ static gcomp_status_t deflate_flush_dynamic_block(
     // can expand its input: level 1 used to make a JPEG 1.6% larger, and
     // nothing prevented it in general.
     //
-    // The bytes come from the sliding window, so they have to still be in it,
-    // and a stored block's length field is sixteen bits.  Neither bound binds
-    // in the case that matters - incompressible data is nearly all literals,
-    // so the block covers about one byte per symbol - but a block of long
-    // matches can exceed both, and then there is nothing to store from.
+    // The bytes come from history, so they have to still be in it, and a
+    // stored block's length field is sixteen bits.  Neither bound binds in the
+    // case that matters - incompressible data is nearly all literals, so the
+    // block covers about one byte per symbol - but a block of long matches can
+    // exceed both, and then there is nothing to store from.
     uint64_t stored_bits = 0;
     size_t block_input = deflate_block_input_length(st);
-    size_t window_behind = (st->window_fill < st->window_size)
-        ? st->window_fill
-        : st->window_size;
-    window_behind = (window_behind > st->lookahead)
-        ? window_behind - st->lookahead
-        : 0u;
+    const size_t reachable = deflate_stored_reachable(st);
     if (block_input > 0 && block_input <= 65535u &&
-        block_input <= window_behind) {
+        block_input <= reachable) {
       stored_bits = 3u + 7u + 32u + 8u * (uint64_t)block_input;
     }
 
@@ -2502,6 +2597,23 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
   // dictionary needs to be laid into.
   deflate_prime_dictionary(st);
 
+  // A window smaller than the ring cannot hold a block and its lookahead at
+  // once, so the bytes a stored block is written from are kept separately.  At
+  // window_bits 13 and above the window is already at least this large and
+  // serves directly, so nothing is allocated and nothing is copied.
+  if (st->window_size < DEFLATE_STORED_RING_SIZE) {
+    st->stored_size = DEFLATE_STORED_RING_SIZE;
+    st->stored_mask = st->stored_size - 1u;
+    st->stored_pos = 0;
+    st->stored_fill = 0;
+    st->stored_buf = (uint8_t *)gcomp_malloc(alloc, st->stored_size);
+    if (!st->stored_buf) {
+      status = GCOMP_ERR_MEMORY;
+      goto cleanup;
+    }
+    gcomp_memory_track_alloc(&st->mem_tracker, st->stored_size);
+  }
+
   // For level 0, allocate block buffer
   if (st->level == 0) {
     st->block_buffer_size = DEFLATE_MAX_STORED_BLOCK;
@@ -2516,8 +2628,13 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
 
   // For levels > 0, allocate symbol buffers
   if (st->level > 0) {
-    // Allocate enough for a full window worth of literals
-    st->sym_buf_size = st->window_size;
+    // A window's worth of literals, but never fewer than DEFLATE_SYM_BUF_MIN:
+    // the length of a block and the reach of the match finder are unrelated,
+    // and tying them together made a small window pay RFC 1951 section 3.2.4's
+    // five bytes of framing on a very short block.
+    st->sym_buf_size = st->window_size < DEFLATE_SYM_BUF_MIN
+        ? (size_t)DEFLATE_SYM_BUF_MIN
+        : st->window_size;
     size_t sym_buf_bytes = st->sym_buf_size * sizeof(uint16_t);
 
     st->lit_buf = (uint16_t *)gcomp_malloc(alloc, sym_buf_bytes);
@@ -2613,6 +2730,7 @@ cleanup:
   gcomp_free(alloc, st->dist_buf);
   gcomp_free(alloc, st->lit_buf);
   gcomp_free(alloc, st->block_buffer);
+  gcomp_free(alloc, st->stored_buf);
   gcomp_free(alloc, st->dict_bytes);
   gcomp_free(alloc, st->hash_at);
   gcomp_free(alloc, st->hash_pos);
@@ -2645,6 +2763,7 @@ void gcomp_deflate_encoder_destroy(gcomp_encoder_t * encoder) {
   gcomp_free(alloc, st->dist_buf);
   gcomp_free(alloc, st->lit_buf);
   gcomp_free(alloc, st->block_buffer);
+  gcomp_free(alloc, st->stored_buf);
   gcomp_free(alloc, st->dict_bytes);
   gcomp_free(alloc, st->hash_at);
   gcomp_free(alloc, st->hash_pos);
@@ -2708,6 +2827,12 @@ gcomp_status_t gcomp_deflate_encoder_reset(gcomp_encoder_t * encoder) {
   if (st->block_buffer) {
     st->block_buffer_used = 0;
   }
+
+  // A new stream carries no history a block could be stored from.  Unlike the
+  // window, this is not primed from the dictionary: a stored block covers
+  // stream bytes only.
+  st->stored_pos = 0;
+  st->stored_fill = 0;
 
   // Reset symbol buffers (levels > 0)
   if (st->lit_buf) {
@@ -3292,6 +3417,22 @@ static gcomp_status_t deflate_encode_batch(
           st->window[st->window_pos] = src[input->used + i];
           st->window_pos = (st->window_pos + 1) & st->window_mask;
         }
+        // The same bytes, kept a second time when the window is too small to
+        // hold a block and its lookahead together.  One pass rather than a
+        // branch per byte, and nothing to do at all for the window sizes that
+        // can serve the block themselves.
+        if (st->stored_buf) {
+          for (size_t i = 0; i < copy; i++) {
+            st->stored_buf[st->stored_pos] = src[input->used + i];
+            st->stored_pos = (st->stored_pos + 1) & st->stored_mask;
+          }
+          if (st->stored_fill < st->stored_size) {
+            st->stored_fill += copy;
+            if (st->stored_fill > st->stored_size) {
+              st->stored_fill = st->stored_size;
+            }
+          }
+        }
         st->lookahead += copy;
         st->total_in += copy;
         if (st->window_fill < st->window_size) {
@@ -3343,12 +3484,29 @@ static gcomp_status_t deflate_encode_batch(
         // most the block can grow by before it is asked again.  For the
         // greedy parse a step is a match; for a sweep it is the whole
         // stretch swept, which is why this is not DEFLATE_MAX_MATCH_LENGTH.
+        //
+        // Both figures used to be flat constants, and both were wrong below a
+        // 2 KiB window.  The refill above will not ask for more lookahead than
+        // half the window, so `held` cannot be DEFLATE_REFILL_LOOKAHEAD there;
+        // and a match cannot be longer than the lookahead holding it, so
+        // `step` cannot be DEFLATE_MAX_MATCH_LENGTH either.  Overstating both
+        // made the test fire on every symbol at window_bits 8, where a single
+        // assumed step of 258 already exceeded the whole 256-byte window.
         size_t held = st->use_opt ? deflate_opt_lookahead(st->window_size)
                                   : (size_t)DEFLATE_REFILL_LOOKAHEAD;
+        if (held > st->window_size / 2u) {
+          held = st->window_size / 2u;
+        }
         size_t step = st->use_opt ? held : (size_t)DEFLATE_MAX_MATCH_LENGTH;
-        size_t stored_reach = (st->window_size > 4u * held)
-            ? st->window_size - 2u * held
-            : st->window_size;
+        if (step > held) {
+          step = held;
+        }
+        // Measured against what a stored block can actually be written from,
+        // which is the ring when the window is too small to serve.
+        const size_t span =
+            st->stored_buf ? st->stored_size : st->window_size;
+        size_t stored_reach =
+            (span > 4u * held) ? span - 2u * held : span;
         // Within an eighth of one byte per symbol: essentially nothing is
         // matching.  A looser test - twice a byte per symbol - also fires on
         // data that compresses a little, such as a JPEG, where the extra
@@ -3992,6 +4150,9 @@ static void deflate_drop_history(gcomp_deflate_encoder_state_t * st) {
   memset(st->hash_at, 0, st->window_size * sizeof(uint16_t));
   st->hash_value = 0;
   st->window_fill = 0;
+  // Same reason the window is emptied: after a full flush the decoder has no
+  // history either, so nothing written before it may be stored from.
+  st->stored_fill = 0;
 }
 
 gcomp_status_t gcomp_deflate_encoder_flush(
