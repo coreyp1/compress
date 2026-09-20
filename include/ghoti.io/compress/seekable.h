@@ -135,6 +135,57 @@ GCOMP_API gcomp_status_t gcomp_seekable_read(gcomp_seekable_t * s,
  */
 GCOMP_API void gcomp_seekable_close(gcomp_seekable_t * s);
 
+/**
+ * @brief Largest seekable file gcomp_seekable_write_buffer() can produce.
+ *
+ * The frames, plus the seek table: eight bytes of skippable-frame header,
+ * twelve per frame with checksums or eight without, and a nine-byte footer.
+ *
+ * @param registry Registry to find the method in (NULL for the default)
+ * @param method_name Method name; only `"zstd"` supports this today
+ * @param options Configuration options (may be NULL)
+ * @param input_size Bytes that will be written
+ * @param bound_out Receives the bound
+ * @return ::GCOMP_OK; ::GCOMP_ERR_UNSUPPORTED for a method without seek
+ *         support; ::GCOMP_ERR_LIMIT when the bound does not fit a `size_t`
+ */
+GCOMP_API gcomp_status_t gcomp_seekable_write_bound(
+    gcomp_registry_t * registry, const char * method_name,
+    gcomp_options_t * options, uint64_t input_size, size_t * bound_out);
+
+/**
+ * @brief Write a seekable file: independent frames, then a seek table.
+ *
+ * Each frame holds `zstd.seekable_frame_size` decompressed bytes (the last
+ * holds what is left) and declares that size in its own header, so the file is
+ * indexable even by a reader that ignores the table.
+ *
+ * `zstd.seekable_checksum` adds the low 32 bits of the XXH64 of each frame's
+ * decompressed content to its table entry. It is on by default: the table is
+ * what a reader trusts to place a frame, and a table that has been edited
+ * while the frames have not is otherwise undetectable.
+ *
+ * The result is an ordinary Zstandard stream to anything that does not know
+ * about seek tables - the table is a skippable frame (RFC 8878 section 3.1.2),
+ * which every decoder steps over.
+ *
+ * @param registry Registry to find the method in (NULL for the default)
+ * @param method_name Method name; only `"zstd"` supports this today
+ * @param options Configuration options (may be NULL)
+ * @param input_data Bytes to compress
+ * @param input_size How many
+ * @param output Where the file goes
+ * @param output_capacity How much room there is; see
+ *        gcomp_seekable_write_bound()
+ * @param output_size_out Receives how much was written
+ * @return ::GCOMP_OK; ::GCOMP_ERR_UNSUPPORTED for a method without seek
+ *         support; ::GCOMP_ERR_LIMIT when @p output_capacity is too small
+ */
+GCOMP_API gcomp_status_t gcomp_seekable_write_buffer(
+    gcomp_registry_t * registry, const char * method_name,
+    gcomp_options_t * options, const void * input_data, size_t input_size,
+    void * output, size_t output_capacity, size_t * output_size_out);
+
 #ifdef __cplusplus
 }
 #endif

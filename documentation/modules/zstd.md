@@ -100,6 +100,8 @@ Compressed blocks contain two sections:
 | `zstd.dictionary` | bytes | (none) | Optional dictionary (raw content or formatted per RFC 8878 §5) |
 | `zstd.dictionary_id` | uint64 | (none) | Dictionary ID to write (encoder) or validate (decoder); used when dictionary provided. The format carries at most 32 bits |
 | `zstd.content_size` | uint64 | (none) | Content size to write in header (optional) |
+| `zstd.seekable_frame_size` | uint64 | 1 MiB | Decompressed bytes per frame when writing a seekable file with `gcomp_seekable_write_buffer()`. See [Seekable](../api/seekable.md). |
+| `zstd.seekable_checksum` | bool | true | Record each frame's checksum in the seek table. |
 | `zstd.concat` | bool | true | Decoder: decode every frame in the input (RFC 8878 §3.1). Set false to stop after the first frame |
 | `zstd.job_size` | uint64 | 0 (auto) | Encoder: job size for parallel compression (64KB–16MB, 0=auto) |
 

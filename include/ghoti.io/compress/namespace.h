@@ -116,6 +116,8 @@
 #define gcomp_seekable_has_table GHOTIIO_COMPRESS(gcomp_seekable_has_table)
 #define gcomp_seekable_read GHOTIIO_COMPRESS(gcomp_seekable_read)
 #define gcomp_seekable_close GHOTIIO_COMPRESS(gcomp_seekable_close)
+#define gcomp_seekable_write_bound GHOTIIO_COMPRESS(gcomp_seekable_write_bound)
+#define gcomp_seekable_write_buffer GHOTIIO_COMPRESS(gcomp_seekable_write_buffer)
 #define gcomp_encode_buffer GHOTIIO_COMPRESS(gcomp_encode_buffer)
 #define gcomp_encoder_create GHOTIIO_COMPRESS(gcomp_encoder_create)
 #define gcomp_encoder_destroy GHOTIIO_COMPRESS(gcomp_encoder_destroy)

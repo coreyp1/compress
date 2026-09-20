@@ -85,6 +85,40 @@ static const gcomp_option_schema_t g_zstd_option_schemas[] = {
         "Enable xxHash64 content checksum", // help
         NULL, // allowed
     },
+    // zstd.seekable_frame_size - Frame length when writing a seekable file
+    {
+        "zstd.seekable_frame_size",  // key
+        GCOMP_OPT_UINT64,            // type
+        1,                           // has_default
+        {.ui64 = 1048576},           // default_value
+        1,                           // has_min
+        1,                           // has_max
+        0,                           // min_int
+        0,                           // max_int
+        1024,                        // min_uint
+        // The seek table records each frame's sizes in 32 bits, so a frame
+        // decompressing to more than 4 GiB could not be described by one. Half
+        // of that is the practical ceiling and keeps the arithmetic plainly in
+        // range.
+        2147483647u,                 // max_uint
+        "Decompressed bytes per frame when writing a seekable file", // help
+        NULL, // allowed
+    },
+    // zstd.seekable_checksum - Per-frame checksums in the seek table
+    {
+        "zstd.seekable_checksum", // key
+        GCOMP_OPT_BOOL,           // type
+        1,                        // has_default
+        {.b = true},              // default_value
+        0,                        // has_min
+        0,                        // has_max
+        0,                        // min_int
+        0,                        // max_int
+        0,                        // min_uint
+        0,                        // max_uint
+        "Record a checksum per frame in the seek table", // help
+        NULL, // allowed
+    },
     // zstd.window_log - Window log (10-31, or 0 for auto)
     {
         "zstd.window_log",                       // key
@@ -257,6 +291,8 @@ static const gcomp_option_schema_t g_zstd_option_schemas[] = {
 static const char * const g_zstd_option_keys[] = {
     "zstd.level",
     "zstd.checksum",
+    "zstd.seekable_frame_size",
+    "zstd.seekable_checksum",
     "zstd.window_log",
     "zstd.content_size",
     "zstd.concat",

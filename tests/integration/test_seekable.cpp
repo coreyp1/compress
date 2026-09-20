@@ -362,6 +362,166 @@ TEST(Seekable, RefusesATableThatDoesNotDescribeItsFile) {
   EXPECT_EQ(s, nullptr);
 }
 
+/**
+ * @brief What we write, we read.
+ *
+ * The cheap half of the round trip, and the one that would pass even if our
+ * idea of the format were wrong - which is why the reference test below
+ * exists. Worth having anyway: it covers the option combinations quickly.
+ */
+TEST(Seekable, WritesFilesItCanReadBack) {
+  const std::vector<uint8_t> in = make_data(500000);
+
+  for (uint64_t frame_size : {(uint64_t)1024, (uint64_t)65536,
+           (uint64_t)200000, (uint64_t)1000000}) {
+    for (int checksum : {0, 1}) {
+      gcomp_options_t * o = nullptr;
+      ASSERT_EQ(gcomp_options_create(&o), GCOMP_OK);
+      ASSERT_EQ(
+          gcomp_options_set_uint64(o, "zstd.seekable_frame_size", frame_size),
+          GCOMP_OK);
+      ASSERT_EQ(gcomp_options_set_bool(o, "zstd.seekable_checksum", checksum),
+          GCOMP_OK);
+
+      size_t bound = 0;
+      ASSERT_EQ(
+          gcomp_seekable_write_bound(nullptr, "zstd", o, in.size(), &bound),
+          GCOMP_OK)
+          << "frame " << frame_size << " checksum " << checksum;
+      std::vector<uint8_t> file(bound);
+      size_t written = 0;
+      ASSERT_EQ(gcomp_seekable_write_buffer(nullptr, "zstd", o, in.data(),
+                    in.size(), file.data(), file.size(), &written),
+          GCOMP_OK)
+          << "frame " << frame_size << " checksum " << checksum;
+      ASSERT_LE(written, bound)
+          << "frame " << frame_size << ": the file is larger than the bound";
+      file.resize(written);
+      gcomp_options_destroy(o);
+
+      gcomp_seekable_t * s = nullptr;
+      ASSERT_EQ(gcomp_seekable_open_buffer(
+                    nullptr, "zstd", nullptr, file.data(), file.size(), &s),
+          GCOMP_OK)
+          << "frame " << frame_size << " checksum " << checksum;
+      EXPECT_TRUE(gcomp_seekable_has_table(s));
+      const uint64_t want_frames =
+          (in.size() + frame_size - 1u) / frame_size;
+      EXPECT_EQ((uint64_t)gcomp_seekable_frame_count(s), want_frames)
+          << "frame " << frame_size;
+      check_reads_against(s, in);
+      gcomp_seekable_close(s);
+    }
+  }
+}
+
+/**
+ * @brief What we write, the reference reads - both ways round.
+ *
+ * Two separate claims, and a file can satisfy one without the other:
+ *
+ * - libzstd's own seekable reader seeks in it and gets the right bytes, which
+ *   says the table means what the format says it means.
+ * - libzstd decompresses it as an ordinary stream, which says the table is a
+ *   skippable frame and not something a plain decoder would choke on. That is
+ *   the property the whole format choice exists to keep, and it is easy to
+ *   lose by writing a table that is correct but framed wrongly.
+ */
+TEST(Seekable, TheReferenceReadsWhatWeWrite) {
+  if (skip_oracle()) {
+    GTEST_SKIP() << "Oracle tests disabled via GCOMP_SKIP_ORACLE_TESTS";
+  }
+  if (!has_pyzstd_seekable()) {
+    GTEST_SKIP() << "pyzstd with SeekableZstdFile not available";
+  }
+
+  const std::vector<uint8_t> in = make_data(500000);
+  size_t ran = 0;
+
+  for (uint64_t frame_size : {(uint64_t)16384, (uint64_t)65536,
+           (uint64_t)250000}) {
+    for (int checksum : {0, 1}) {
+      gcomp_options_t * o = nullptr;
+      ASSERT_EQ(gcomp_options_create(&o), GCOMP_OK);
+      ASSERT_EQ(
+          gcomp_options_set_uint64(o, "zstd.seekable_frame_size", frame_size),
+          GCOMP_OK);
+      ASSERT_EQ(gcomp_options_set_bool(o, "zstd.seekable_checksum", checksum),
+          GCOMP_OK);
+      size_t bound = 0;
+      ASSERT_EQ(
+          gcomp_seekable_write_bound(nullptr, "zstd", o, in.size(), &bound),
+          GCOMP_OK);
+      std::vector<uint8_t> file(bound);
+      size_t written = 0;
+      ASSERT_EQ(gcomp_seekable_write_buffer(nullptr, "zstd", o, in.data(),
+                    in.size(), file.data(), file.size(), &written),
+          GCOMP_OK);
+      file.resize(written);
+      gcomp_options_destroy(o);
+
+      const std::string zst_path = temp_path("ours");
+      {
+        FILE * f = std::fopen(zst_path.c_str(), "wb");
+        ASSERT_NE(f, nullptr);
+        ASSERT_EQ(std::fwrite(file.data(), 1, file.size(), f), file.size());
+        std::fclose(f);
+      }
+
+      // The reference seeks in it, reads it whole, and decompresses it as a
+      // plain stream. Any of the three failing is a different defect.
+      char cmd[1400];
+      std::snprintf(cmd, sizeof(cmd),
+          "python3 -c \"import pyzstd; "
+          "d=bytes(((i*7 + (i//997)) %% 251) for i in range(500000)); "
+          "f=pyzstd.SeekableZstdFile('%s','r'); f.seek(123456); "
+          "assert f.read(1000)==d[123456:124456], 'seek'; f.seek(0); "
+          "assert f.read()==d, 'whole'; f.close(); "
+          "assert pyzstd.decompress(open('%s','rb').read())==d, 'plain'\" "
+          "2>/dev/null",
+          zst_path.c_str(), zst_path.c_str());
+      EXPECT_EQ(std::system(cmd), 0)
+          << "frame " << frame_size << " checksum " << checksum
+          << ": the reference could not read a file we wrote";
+      std::remove(zst_path.c_str());
+      ran++;
+    }
+  }
+  EXPECT_EQ(ran, 6u);
+}
+
+/// A buffer too small to hold the file is refused rather than half-filled.
+TEST(Seekable, ASmallOutputBufferIsRefused) {
+  const std::vector<uint8_t> in = make_data(200000);
+  gcomp_options_t * o = nullptr;
+  ASSERT_EQ(gcomp_options_create(&o), GCOMP_OK);
+  ASSERT_EQ(gcomp_options_set_uint64(o, "zstd.seekable_frame_size", 16384),
+      GCOMP_OK);
+
+  size_t bound = 0;
+  ASSERT_EQ(gcomp_seekable_write_bound(nullptr, "zstd", o, in.size(), &bound),
+      GCOMP_OK);
+  std::vector<uint8_t> full(bound);
+  size_t written = 0;
+  ASSERT_EQ(gcomp_seekable_write_buffer(nullptr, "zstd", o, in.data(),
+                in.size(), full.data(), full.size(), &written),
+      GCOMP_OK);
+  ASSERT_GT(written, 64u);
+
+  // Just short of what it needs, and far short.
+  for (size_t cap : {written - 1, written / 2, (size_t)16, (size_t)1}) {
+    std::vector<uint8_t> out(cap);
+    size_t w = 0;
+    EXPECT_NE(gcomp_seekable_write_buffer(nullptr, "zstd", o, in.data(),
+                  in.size(), out.data(), out.size(), &w),
+        GCOMP_OK)
+        << "capacity " << cap << " of " << written << " was accepted";
+    EXPECT_EQ(w, 0u) << "capacity " << cap
+                     << ": a failed write reported bytes written";
+  }
+  gcomp_options_destroy(o);
+}
+
 /// Say so if the reference is missing.
 TEST(Seekable, OracleIsActuallyAvailable) {
   if (skip_oracle()) {

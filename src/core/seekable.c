@@ -30,6 +30,7 @@
 #include "../methods/zstd/zstd_walk.h"
 #include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/seekable.h>
+#include <ghoti.io/compress/xxhash64.h>
 #include <ghoti.io/cutil/safemath.h>
 #include <string.h>
 
@@ -464,5 +465,246 @@ gcomp_status_t gcomp_seekable_read(gcomp_seekable_t * s, uint64_t offset,
   }
 
   *read_out = done;
+  return GCOMP_OK;
+}
+
+//
+// Writing
+//
+
+/// Default decompressed bytes per frame; `zstd.seekable_frame_size`.
+#define GCOMP_SEEK_DEFAULT_FRAME_SIZE (1024u * 1024u)
+
+/**
+ * @brief Read the two options that shape a seekable file.
+ */
+static void gcomp_seek_write_settings(
+    gcomp_options_t * options, uint64_t * frame_size_out, int * checksum_out) {
+  uint64_t frame_size = GCOMP_SEEK_DEFAULT_FRAME_SIZE;
+  int checksum = 1;
+  if (options) {
+    uint64_t v = 0;
+    if (gcomp_options_get_uint64(options, "zstd.seekable_frame_size", &v) ==
+            GCOMP_OK &&
+        v > 0) {
+      frame_size = v;
+    }
+    int b = 0;
+    if (gcomp_options_get_bool(options, "zstd.seekable_checksum", &b) ==
+        GCOMP_OK) {
+      checksum = b ? 1 : 0;
+    }
+  }
+  *frame_size_out = frame_size;
+  *checksum_out = checksum;
+}
+
+/// Frames a file of @p input_size bytes will be cut into.
+static uint64_t gcomp_seek_frame_count_for(
+    uint64_t input_size, uint64_t frame_size) {
+  if (input_size == 0) {
+    return 0;
+  }
+  return (input_size + frame_size - 1u) / frame_size;
+}
+
+gcomp_status_t gcomp_seekable_write_bound(gcomp_registry_t * registry,
+    const char * method_name, gcomp_options_t * options, uint64_t input_size,
+    size_t * bound_out) {
+  if (!method_name || !bound_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  if (strcmp(method_name, "zstd") != 0) {
+    return GCOMP_ERR_UNSUPPORTED;
+  }
+  if (!registry) {
+    registry = gcomp_registry_default();
+    if (!registry) {
+      return GCOMP_ERR_INTERNAL;
+    }
+  }
+
+  uint64_t frame_size = 0;
+  int checksum = 0;
+  gcomp_seek_write_settings(options, &frame_size, &checksum);
+  const uint64_t frames = gcomp_seek_frame_count_for(input_size, frame_size);
+
+  // Each frame is bounded on its own, because that is what the encoder will be
+  // asked for: a bound taken over the whole input would be smaller than the
+  // sum of the per-frame bounds, and smaller is the wrong direction.
+  uint64_t total = 0;
+  if (frames > 0) {
+    size_t full_bound = 0;
+    gcomp_status_t s = gcomp_encode_bound(
+        registry, "zstd", options, (size_t)frame_size, &full_bound);
+    if (s != GCOMP_OK) {
+      return s;
+    }
+    const uint64_t last_len = input_size - (frames - 1u) * frame_size;
+    size_t last_bound = 0;
+    s = gcomp_encode_bound(
+        registry, "zstd", options, (size_t)last_len, &last_bound);
+    if (s != GCOMP_OK) {
+      return s;
+    }
+    if (!gcu_safe_mul_u64(frames - 1u, (uint64_t)full_bound, &total) ||
+        !gcu_safe_add_u64(total, (uint64_t)last_bound, &total)) {
+      return GCOMP_ERR_LIMIT;
+    }
+  }
+
+  const uint64_t entry_size = checksum ? 12u : 8u;
+  uint64_t table = 0;
+  if (!gcu_safe_mul_u64(frames, entry_size, &table) ||
+      !gcu_safe_add_u64(table, 8u + GCOMP_SEEK_FOOTER_SIZE, &table) ||
+      !gcu_safe_add_u64(total, table, &total)) {
+    return GCOMP_ERR_LIMIT;
+  }
+  if (total > (uint64_t)(size_t)-1) {
+    return GCOMP_ERR_LIMIT;
+  }
+  *bound_out = (size_t)total;
+  return GCOMP_OK;
+}
+
+gcomp_status_t gcomp_seekable_write_buffer(gcomp_registry_t * registry,
+    const char * method_name, gcomp_options_t * options,
+    const void * input_data, size_t input_size, void * output,
+    size_t output_capacity, size_t * output_size_out) {
+  if (!method_name || !output || !output_size_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  if (!input_data && input_size > 0) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  if (strcmp(method_name, "zstd") != 0) {
+    return GCOMP_ERR_UNSUPPORTED;
+  }
+  *output_size_out = 0;
+
+  if (!registry) {
+    registry = gcomp_registry_default();
+    if (!registry) {
+      return GCOMP_ERR_INTERNAL;
+    }
+  }
+  const gcomp_allocator_t * alloc = gcomp_registry_get_allocator(registry);
+
+  uint64_t frame_size = 0;
+  int checksum = 0;
+  gcomp_seek_write_settings(options, &frame_size, &checksum);
+  const uint64_t frames =
+      gcomp_seek_frame_count_for((uint64_t)input_size, frame_size);
+  if (frames > 0xFFFFFFFFu) {
+    return GCOMP_ERR_LIMIT; // Number_Of_Frames is four bytes.
+  }
+
+  const uint64_t entry_size = checksum ? 12u : 8u;
+  uint32_t * table = NULL;
+  if (frames > 0) {
+    // Three words per frame regardless of the checksum flag; the unused one
+    // simply is not written out.
+    table = gcomp_calloc(alloc, (size_t)frames * 3u, sizeof(uint32_t));
+    if (!table) {
+      return GCOMP_ERR_MEMORY;
+    }
+  }
+
+  // Each frame declares its own decompressed size, so the file is indexable by
+  // walking even if the table is lost or ignored. That redundancy is the
+  // point: the table makes opening cheap, the headers make it possible.
+  gcomp_options_t * frame_options = NULL;
+  if (options) {
+    if (gcomp_options_clone(options, &frame_options) != GCOMP_OK) {
+      gcomp_free(alloc, table);
+      return GCOMP_ERR_MEMORY;
+    }
+  }
+  else if (gcomp_options_create(&frame_options) != GCOMP_OK) {
+    gcomp_free(alloc, table);
+    return GCOMP_ERR_MEMORY;
+  }
+
+  const uint8_t * in = (const uint8_t *)input_data;
+  uint8_t * out = (uint8_t *)output;
+  size_t written = 0;
+  gcomp_status_t status = GCOMP_OK;
+
+  for (uint64_t i = 0; i < frames; i++) {
+    const uint64_t at = i * frame_size;
+    uint64_t len = frame_size;
+    if (at + len > (uint64_t)input_size) {
+      len = (uint64_t)input_size - at;
+    }
+
+    if (gcomp_options_set_uint64(frame_options, "zstd.content_size", len) !=
+        GCOMP_OK) {
+      status = GCOMP_ERR_INTERNAL;
+      break;
+    }
+
+    size_t produced = 0;
+    status = gcomp_encode_buffer(registry, "zstd", frame_options, in + at,
+        (size_t)len, out + written, output_capacity - written, &produced);
+    if (status != GCOMP_OK) {
+      break;
+    }
+    if (produced > 0xFFFFFFFFu || len > 0xFFFFFFFFu) {
+      status = GCOMP_ERR_LIMIT;
+      break;
+    }
+
+    table[i * 3u + 0u] = (uint32_t)produced;
+    table[i * 3u + 1u] = (uint32_t)len;
+    if (checksum) {
+      // The format records the low 32 bits of the XXH64 of the frame's
+      // decompressed content.
+      gcomp_xxhash64_state_t h;
+      gcomp_xxhash64_reset(&h, 0);
+      gcomp_xxhash64_update(&h, in + at, (size_t)len);
+      table[i * 3u + 2u] = (uint32_t)(gcomp_xxhash64_finalize(&h) & 0xFFFFFFFFu);
+    }
+    written += produced;
+  }
+
+  if (status == GCOMP_OK) {
+    uint64_t table_bytes = 0;
+    if (!gcu_safe_mul_u64(frames, entry_size, &table_bytes) ||
+        !gcu_safe_add_u64(table_bytes, 8u + GCOMP_SEEK_FOOTER_SIZE,
+            &table_bytes)) {
+      status = GCOMP_ERR_LIMIT;
+    }
+    else if (table_bytes > (uint64_t)(output_capacity - written)) {
+      status = GCOMP_ERR_LIMIT;
+    }
+    else {
+      uint8_t * p = out + written;
+      gcomp_write_le32(p, GCOMP_SEEK_TABLE_MAGIC);
+      gcomp_write_le32(p + 4u, (uint32_t)(table_bytes - 8u));
+      p += 8u;
+      for (uint64_t i = 0; i < frames; i++) {
+        gcomp_write_le32(p, table[i * 3u + 0u]);
+        gcomp_write_le32(p + 4u, table[i * 3u + 1u]);
+        p += 8u;
+        if (checksum) {
+          gcomp_write_le32(p, table[i * 3u + 2u]);
+          p += 4u;
+        }
+      }
+      gcomp_write_le32(p, (uint32_t)frames);
+      p[4] = checksum ? GCOMP_SEEK_DESC_CHECKSUM : 0u;
+      gcomp_write_le32(p + 5u, GCOMP_SEEK_FOOTER_MAGIC);
+      written += (size_t)table_bytes;
+    }
+  }
+
+  gcomp_options_destroy(frame_options);
+  gcomp_free(alloc, table);
+
+  if (status != GCOMP_OK) {
+    *output_size_out = 0;
+    return status;
+  }
+  *output_size_out = written;
   return GCOMP_OK;
 }
