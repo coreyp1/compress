@@ -31,6 +31,7 @@ extern "C" {
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -161,8 +162,8 @@ std::vector<uint8_t> skippable(uint32_t variant, size_t payload) {
 }
 
 /// Every block of an independent-block frame, decoded on its own.
-void check_blocks_decode_alone(
-    const std::vector<uint8_t> & s, const std::vector<uint8_t> & in) {
+void check_blocks_decode_alone(const std::vector<uint8_t> & s,
+    const std::vector<uint8_t> & in, size_t max_block = 65536) {
   std::vector<gcomp_walk_event_t> ev(8192);
   size_t n = 0, used = 0;
   ASSERT_EQ(lz4_walk_all(s.data(), s.size(), ev.data(), ev.size(), &n, &used),
@@ -187,7 +188,7 @@ void check_blocks_decode_alone(
       rebuilt.insert(rebuilt.end(), s.begin() + off, s.begin() + off + payload);
       continue;
     }
-    std::vector<uint8_t> out(65536 + 1024);
+    std::vector<uint8_t> out(max_block + 1024);
     size_t produced = 0;
     // No history: an independent block must not need any, which is the
     // property being checked.
@@ -387,19 +388,11 @@ TEST(Lz4Walk, RubbishIsRefused) {
  * starts means every offset after it is wrong too, without anything looking
  * obviously broken.
  *
- * ## The reference this file does not have
- *
- * The Zstandard walker is checked against streams the `zstd` CLI produced.
- * There is no equivalent here: no `lz4` binary and no Python `lz4` module is
- * installed on this machine, and the LZ4 suite's existing oracle
- * (test_lz4_spec_oracle.cpp) is a reference for the *block* format, not the
- * frame format. So the frames below are ours, and what keeps that from being
- * circular is that each block is decoded standalone in
- * EachIndependentBlockDecodesOnItsOwn - the walker's offsets have to be right
- * for a separate decoder to accept them.
- *
- * Recorded rather than papered over: an external frame-level LZ4 reference
- * would be worth installing.
+ * The frames below are ours. What keeps that from being circular is that each
+ * block is decoded standalone in EachIndependentBlockDecodesOnItsOwn - the
+ * walker's offsets have to be right for a separate decoder to accept them -
+ * and that the same walk is checked against frames liblz4 wrote, at the end of
+ * this file.
  */
 TEST(Lz4Walk, DescriptorVariationsMoveTheFirstBlock) {
   const std::vector<uint8_t> in = make_data(200000, 5150, 2);
@@ -484,4 +477,417 @@ TEST(Lz4Walk, DescriptorVariationsMoveTheFirstBlock) {
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
+}
+
+//
+// Frames a different implementation wrote
+//
+// Everything above walks frames our own encoder produced. That checks the
+// walker against the encoder, and both were written from the same reading of
+// the same specification by the same person - a round trip with one more step
+// in it. A walker that misread the frame descriptor in exactly the way the
+// encoder writes it would pass every test above.
+//
+// liblz4 closes that. The runtime library is present on most systems without
+// its development header, so these bind to it at runtime rather than at build
+// time - the same approach test_lz4_spec_oracle.cpp takes - and no new build
+// dependency comes with them.
+//
+// Note for anyone who reads the LZ4 sources looking for a block-level API
+// here: LZ4F_* *is* the frame API. LZ4_compress_default and friends are the
+// block API. An earlier version of this file claimed the installed library
+// offered only the latter and skipped the cross-check on that basis, which
+// was simply wrong.
+//
+
+namespace {
+
+/**
+ * @brief Mirrors LZ4F_preferences_t, whose header is not installed here.
+ *
+ * Declaring another project's struct by hand is worth being nervous about: a
+ * layout that has drifted would be written to silently and read back as
+ * rubbish. Two things catch that rather than one. LZ4F_getFrameInfo reads the
+ * frame back and has to report the settings that were asked for; and
+ * LZ4F_headerSize, which takes no struct at all, has to agree about how long
+ * the resulting header is - a content size adds eight bytes to it and a
+ * dictionary ID four, so a preferences block that did not land where liblz4
+ * expected would disagree there too.
+ */
+struct RealFrameInfo {
+  int block_size_id;        ///< 0 default, 4 = 64 KB ... 7 = 4 MB.
+  int block_mode;           ///< 0 linked, 1 independent.
+  int content_checksum;     ///< 0 off, 1 on.
+  int frame_type;           ///< 0 frame, 1 skippable.
+  unsigned long long content_size;
+  unsigned dict_id;
+  int block_checksum;       ///< 0 off, 1 on.
+};
+
+struct RealPreferences {
+  RealFrameInfo frame_info;
+  int compression_level;
+  unsigned auto_flush;
+  unsigned favor_dec_speed;
+  unsigned reserved[3];
+};
+
+struct RealLz4F {
+  void * handle = nullptr;
+  unsigned (*isError)(size_t) = nullptr;
+  const char * (*errorName)(size_t) = nullptr;
+  size_t (*compressFrameBound)(size_t, const RealPreferences *) = nullptr;
+  size_t (*compressFrame)(void *, size_t, const void *, size_t,
+      const RealPreferences *) = nullptr;
+  size_t (*headerSize)(const void *, size_t) = nullptr;
+  size_t (*createDctx)(void **, unsigned) = nullptr;
+  size_t (*freeDctx)(void *) = nullptr;
+  size_t (*getFrameInfo)(void *, RealFrameInfo *, const void *,
+      size_t *) = nullptr;
+
+  bool ok() const {
+    return handle && compressFrame && compressFrameBound && headerSize &&
+        createDctx && freeDctx && getFrameInfo && isError;
+  }
+};
+
+const RealLz4F & realLz4f() {
+  static RealLz4F r = [] {
+    RealLz4F out;
+    static const char * kNames[] = {"liblz4.so.1", "liblz4.so",
+        "liblz4.1.dylib", "liblz4.dylib"};
+    for (const char * name : kNames) {
+      out.handle = dlopen(name, RTLD_NOW);
+      if (out.handle) {
+        break;
+      }
+    }
+    if (!out.handle) {
+      return out;
+    }
+    auto sym = [&](const char * n) { return dlsym(out.handle, n); };
+    out.isError = (unsigned (*)(size_t))sym("LZ4F_isError");
+    out.errorName = (const char * (*)(size_t))sym("LZ4F_getErrorName");
+    out.compressFrameBound = (size_t (*)(size_t,
+        const RealPreferences *))sym("LZ4F_compressFrameBound");
+    out.compressFrame = (size_t (*)(void *, size_t, const void *, size_t,
+        const RealPreferences *))sym("LZ4F_compressFrame");
+    out.headerSize = (size_t (*)(const void *, size_t))sym("LZ4F_headerSize");
+    out.createDctx = (size_t (*)(void **, unsigned))sym(
+        "LZ4F_createDecompressionContext");
+    out.freeDctx = (size_t (*)(void *))sym("LZ4F_freeDecompressionContext");
+    out.getFrameInfo = (size_t (*)(void *, RealFrameInfo *, const void *,
+        size_t *))sym("LZ4F_getFrameInfo");
+    return out;
+  }();
+  return r;
+}
+
+/// What a foreign frame is being asked to look like.
+struct ForeignShape {
+  const char * name;
+  int block_size_id;    ///< 4 = 64 KB, 5 = 256 KB, 6 = 1 MB.
+  int independent;
+  int block_checksum;
+  int content_checksum;
+  int declare_size;     ///< Put Content_Size in the descriptor.
+  unsigned dict_id;     ///< Non-zero puts Dictionary_ID in the descriptor.
+};
+
+const ForeignShape k_foreign[] = {
+    {"64K linked plain", 4, 0, 0, 0, 0, 0},
+    {"64K independent", 4, 1, 0, 0, 0, 0},
+    {"64K independent, block checksums", 4, 1, 1, 0, 0, 0},
+    {"64K independent, both checksums", 4, 1, 1, 1, 0, 0},
+    {"64K independent, content size", 4, 1, 0, 0, 1, 0},
+    {"64K independent, size and dict id", 4, 1, 1, 1, 1, 0xABCDEF01u},
+    {"256K independent", 5, 1, 0, 1, 0, 0},
+    {"1M linked, both checksums", 6, 0, 1, 1, 1, 0},
+};
+
+size_t foreign_block_bytes(int block_size_id) {
+  switch (block_size_id) {
+  case 4: return 64u * 1024u;
+  case 5: return 256u * 1024u;
+  case 6: return 1024u * 1024u;
+  default: return 4u * 1024u * 1024u;
+  }
+}
+
+/**
+ * @brief Compress with liblz4, and report the frame it actually made.
+ *
+ * ## Preferences are a request, not an instruction
+ *
+ * LZ4F_compressFrame normalises what it is given, and two of those
+ * normalisations showed up the first time this ran:
+ *
+ * - A frame whose whole content fits in one block is marked B.Indep even when
+ *   blockLinked was asked for. Nothing precedes the only block, so linking it
+ *   to history would describe history that does not exist.
+ * - The block size is reduced to the smallest one that still holds the input,
+ *   so 150 KB asked for in 1 MB blocks comes back as 256 KB.
+ *
+ * So the effective frame info is handed back and the walker is checked against
+ * *that*, not against the request. What stays an exact check is everything
+ * liblz4 does not normalise - both checksum flags, the dictionary ID, the
+ * declared content size - together with the header length, which crosses no
+ * struct at all. Those are what would break if the mirrored
+ * LZ4F_preferences_t above stopped matching its header, and they would break
+ * loudly.
+ *
+ * Returns false only when the library is absent.
+ */
+bool foreign_encode(const ForeignShape & shape, const std::vector<uint8_t> & in,
+    std::vector<uint8_t> * out, size_t * header_size_out,
+    RealFrameInfo * effective_out) {
+  const RealLz4F & lib = realLz4f();
+  if (!lib.ok()) {
+    return false;
+  }
+
+  // Oversized and zeroed: if the real preferences block is longer than the
+  // mirror above, liblz4 reads defaults rather than stack rubbish.
+  alignas(16) unsigned char prefs_storage[256];
+  std::memset(prefs_storage, 0, sizeof(prefs_storage));
+  RealPreferences * prefs = (RealPreferences *)prefs_storage;
+  prefs->frame_info.block_size_id = shape.block_size_id;
+  prefs->frame_info.block_mode = shape.independent;
+  prefs->frame_info.content_checksum = shape.content_checksum;
+  prefs->frame_info.block_checksum = shape.block_checksum;
+  prefs->frame_info.dict_id = shape.dict_id;
+  prefs->frame_info.content_size = shape.declare_size ? in.size() : 0;
+
+  const size_t bound = lib.compressFrameBound(in.size(), prefs);
+  EXPECT_FALSE(lib.isError(bound)) << shape.name;
+  out->assign(bound ? bound : 1, 0);
+  const size_t written = lib.compressFrame(out->data(), out->size(),
+      in.data(), in.size(), prefs);
+  EXPECT_FALSE(lib.isError(written))
+      << shape.name << ": "
+      << (lib.errorName ? lib.errorName(written) : "compressFrame failed");
+  if (lib.isError(written)) {
+    return false;
+  }
+  out->resize(written);
+
+  // Read the descriptor back through liblz4's own parser. This is the check
+  // that the mirrored struct landed where the library expected it to.
+  void * dctx = nullptr;
+  const size_t cr = lib.createDctx(&dctx, 100 /* LZ4F_VERSION */);
+  EXPECT_FALSE(lib.isError(cr)) << shape.name;
+  RealFrameInfo got;
+  std::memset(&got, 0, sizeof(got));
+  size_t consumed = out->size();
+  const size_t gr = lib.getFrameInfo(dctx, &got, out->data(), &consumed);
+  EXPECT_FALSE(lib.isError(gr)) << shape.name;
+  lib.freeDctx(dctx);
+
+  // Never normalised: these are the layout check.
+  EXPECT_EQ(got.block_checksum, shape.block_checksum)
+      << shape.name << ": liblz4 did not make the frame that was asked for, "
+      << "which means the mirrored LZ4F_preferences_t no longer matches its "
+      << "header";
+  EXPECT_EQ(got.content_checksum, shape.content_checksum) << shape.name;
+  EXPECT_EQ(got.dict_id, shape.dict_id) << shape.name;
+  if (shape.declare_size) {
+    EXPECT_EQ(got.content_size, (unsigned long long)in.size()) << shape.name;
+  }
+
+  // Normalised, but only ever downwards, and only in the two ways above.
+  EXPECT_LE(got.block_size_id, shape.block_size_id)
+      << shape.name << ": liblz4 enlarged the block size, which it has no "
+      << "reason to do";
+  if (in.size() > foreign_block_bytes(shape.block_size_id)) {
+    EXPECT_EQ(got.block_size_id, shape.block_size_id)
+        << shape.name << ": the input does not fit in one block, so there was "
+        << "nothing to shrink to";
+  }
+  if (in.size() > foreign_block_bytes(got.block_size_id)) {
+    EXPECT_EQ(got.block_mode, shape.independent)
+        << shape.name << ": a multi-block frame kept the block mode asked for";
+  }
+  else {
+    EXPECT_EQ(got.block_mode, 1)
+        << shape.name << ": a single-block frame is independent whatever was "
+        << "asked for";
+  }
+
+  // Layout-independent corroboration: no struct crosses this call.
+  const size_t hs = lib.headerSize(out->data(), out->size());
+  EXPECT_FALSE(lib.isError(hs)) << shape.name;
+  // Magic (4) + FLG + BD (2) + HC (1), plus the optional fields.
+  const size_t expect_hs =
+      7u + (shape.declare_size ? 8u : 0u) + (shape.dict_id ? 4u : 0u);
+  EXPECT_EQ(hs, expect_hs)
+      << shape.name << ": the descriptor liblz4 wrote is not the length the "
+      << "requested options call for";
+  *header_size_out = hs;
+  *effective_out = got;
+  return true;
+}
+
+} // namespace
+
+/**
+ * @brief The walk of a frame written by liblz4.
+ *
+ * Tiling, the position of the first block, and a round trip through our own
+ * decoder - on bytes nothing in this project produced.
+ */
+TEST(Lz4Walk, AFrameLiblz4WroteWalksToItsParts) {
+  if (!realLz4f().ok()) {
+    GTEST_SKIP() << "liblz4 is not present";
+  }
+
+  for (const ForeignShape & shape : k_foreign) {
+    SCOPED_TRACE(shape.name);
+    const std::vector<uint8_t> in = make_data(300000, 9001, 2);
+    std::vector<uint8_t> s;
+    size_t header = 0;
+    RealFrameInfo eff;
+    if (!foreign_encode(shape, in, &s, &header, &eff)) {
+      continue;
+    }
+
+    std::vector<gcomp_walk_event_t> ev(8192);
+    size_t n = 0, used = 0;
+    ASSERT_EQ(lz4_walk_all(s.data(), s.size(), ev.data(), ev.size(), &n, &used),
+        GCOMP_OK);
+    EXPECT_EQ(used, s.size());
+
+    // Top-level units tile the stream.
+    uint64_t at = 0;
+    for (size_t i = 0; i < n; i++) {
+      if (ev[i].kind == GCOMP_WALK_BLOCK) {
+        continue;
+      }
+      EXPECT_EQ(ev[i].offset, at) << "unit " << i;
+      at = ev[i].offset + ev[i].size;
+    }
+    EXPECT_EQ(at, s.size());
+
+    // The first block begins where liblz4 says the header ends. This is the
+    // assertion the descriptor variations above could not make: there, both
+    // sides of the comparison were ours.
+    bool saw_block = false;
+    uint64_t blocks = 0, last_end = 0;
+    for (size_t i = 0; i < n; i++) {
+      if (ev[i].kind != GCOMP_WALK_BLOCK) {
+        continue;
+      }
+      if (!saw_block) {
+        EXPECT_EQ(ev[i].offset, (uint64_t)header)
+            << "the walker put the first block somewhere other than the end "
+            << "of the descriptor liblz4 wrote";
+        saw_block = true;
+      }
+      else {
+        EXPECT_EQ(ev[i].offset, last_end) << "block " << blocks << " does not "
+            << "begin where the one before it ended";
+      }
+      // The payload has to sit inside the unit, and the difference between
+      // them is the block header and any B.Checksum.
+      EXPECT_GE(ev[i].payload_offset, ev[i].offset);
+      EXPECT_LE(ev[i].payload_offset + ev[i].payload_size,
+          ev[i].offset + ev[i].size);
+      EXPECT_EQ(ev[i].offset + ev[i].size - ev[i].payload_offset -
+              ev[i].payload_size,
+          (uint64_t)(eff.block_checksum ? 4u : 0u))
+          << "block " << blocks << ": wrong number of trailing bytes for a "
+          << "frame that " << (eff.block_checksum ? "sets" : "clears")
+          << " B.Checksum";
+      last_end = ev[i].offset + ev[i].size;
+      blocks++;
+    }
+    EXPECT_TRUE(saw_block);
+    if (in.size() > foreign_block_bytes(eff.block_size_id)) {
+      EXPECT_GT(blocks, 1u) << in.size() << " bytes should be more than one "
+                            << foreign_block_bytes(eff.block_size_id)
+                            << "-byte block";
+    }
+    else {
+      EXPECT_EQ(blocks, 1u) << "the input fits in one block";
+    }
+
+    // And it decodes, which is the coarse check the fine ones are built on.
+    const std::vector<uint8_t> back = decode_all(s, in.size());
+    ASSERT_EQ(back.size(), in.size());
+    EXPECT_EQ(std::memcmp(back.data(), in.data(), in.size()), 0);
+  }
+}
+
+/**
+ * @brief Blocks of a foreign independent-block frame decode on their own.
+ *
+ * This is the claim parallel decode rests on, made against bytes our encoder
+ * did not write: if liblz4's idea of B.Indep and ours differed, a job handed
+ * to a worker would decode to something other than its slice of the output.
+ */
+TEST(Lz4Walk, BlocksOfAForeignIndependentFrameDecodeAlone) {
+  if (!realLz4f().ok()) {
+    GTEST_SKIP() << "liblz4 is not present";
+  }
+
+  for (const ForeignShape & shape : k_foreign) {
+    if (!shape.independent) {
+      continue;
+    }
+    SCOPED_TRACE(shape.name);
+    // Two shapes, because an incompressible one makes liblz4 store its blocks
+    // verbatim and a compressible one does not.
+    for (int shape_of_data : {1, 2}) {
+      const std::vector<uint8_t> in = make_data(300000, 4242, shape_of_data);
+      std::vector<uint8_t> s;
+      size_t header = 0;
+      RealFrameInfo eff;
+      if (!foreign_encode(shape, in, &s, &header, &eff)) {
+        continue;
+      }
+      ASSERT_GT(in.size(), foreign_block_bytes(eff.block_size_id))
+          << "a single-block frame would make this test vacuous";
+      check_blocks_decode_alone(s, in, foreign_block_bytes(eff.block_size_id));
+    }
+  }
+}
+
+/// A foreign frame fed in pieces walks to the same events as a whole one.
+TEST(Lz4Walk, ChunkingDoesNotChangeTheWalkOfAForeignFrame) {
+  if (!realLz4f().ok()) {
+    GTEST_SKIP() << "liblz4 is not present";
+  }
+
+  for (const ForeignShape & shape : k_foreign) {
+    SCOPED_TRACE(shape.name);
+    const std::vector<uint8_t> in = make_data(150000, 77, 2);
+    std::vector<uint8_t> s;
+    size_t header = 0;
+    RealFrameInfo eff;
+    if (!foreign_encode(shape, in, &s, &header, &eff)) {
+      continue;
+    }
+
+    size_t whole_used = 0;
+    const std::vector<gcomp_walk_event_t> whole =
+        walk_chunked(s, s.size(), &whole_used);
+
+    for (size_t chunk : {(size_t)1, (size_t)5, (size_t)4096}) {
+      size_t used = 0;
+      const std::vector<gcomp_walk_event_t> got = walk_chunked(s, chunk, &used);
+      ASSERT_EQ(got.size(), whole.size()) << "chunk " << chunk;
+      EXPECT_EQ(used, whole_used) << "chunk " << chunk;
+      for (size_t i = 0; i < got.size(); i++) {
+        EXPECT_EQ((int)got[i].kind, (int)whole[i].kind)
+            << "chunk " << chunk << " event " << i;
+        EXPECT_EQ(got[i].offset, whole[i].offset)
+            << "chunk " << chunk << " event " << i;
+        EXPECT_EQ(got[i].size, whole[i].size)
+            << "chunk " << chunk << " event " << i;
+        EXPECT_EQ(got[i].payload_offset, whole[i].payload_offset)
+            << "chunk " << chunk << " event " << i;
+        EXPECT_EQ(got[i].payload_size, whole[i].payload_size)
+            << "chunk " << chunk << " event " << i;
+      }
+    }
+  }
 }
