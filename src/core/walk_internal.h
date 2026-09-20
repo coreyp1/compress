@@ -87,8 +87,37 @@ typedef struct {
   /// Byte offset from the start of the stream.
   uint64_t offset;
 
-  /// Bytes it occupies on the wire.
+  /// Bytes it occupies on the wire, header and any trailing checksum included.
   uint64_t size;
+
+  /**
+   * @brief Where this unit's payload begins, and how much of it there is.
+   *
+   * @ref offset and @ref size describe the unit as it sits in the stream;
+   * these describe the part a decoder is given. They differ by the unit's own
+   * header and by any checksum after it - four bytes per block when an LZ4
+   * frame sets B.Checksum, four after a Zstandard frame's last block when it
+   * sets Content_Checksum_Flag.
+   *
+   * Without these a consumer has to know each format's framing to find the
+   * bytes, which is the thing the walker exists to save it from. Leaving them
+   * out was a real gap: a test that sliced `offset + header` and
+   * `size - header` was right only for streams with no checksums and no
+   * stored blocks, and silently wrong for everything else.
+   */
+  uint64_t payload_offset;
+  uint64_t payload_size;
+
+  /**
+   * @brief Non-zero when the payload is the output bytes verbatim.
+   *
+   * An LZ4 block with the high bit set in its size, or a Zstandard
+   * `Raw_Block`. A consumer can copy those instead of calling a decoder.
+   *
+   * A Zstandard `RLE_Block` is *not* stored: its single byte is not the
+   * output, it is what the output repeats - see @ref content_size.
+   */
+  int stored;
 
   /**
    * @brief Decompressed bytes it stands for, or 0 when the stream does not

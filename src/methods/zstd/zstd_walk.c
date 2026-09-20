@@ -122,6 +122,11 @@ gcomp_status_t zstd_walk_update(zstd_walk_t * w, const uint8_t * data,
       events[n].kind = GCOMP_WALK_FRAME;
       events[n].offset = w->frame_start;
       events[n].size = w->pos - w->frame_start;
+      // A frame is handed to a decoder whole - header, blocks and checksum -
+      // so its payload is itself.
+      events[n].payload_offset = w->frame_start;
+      events[n].payload_size = w->pos - w->frame_start;
+      events[n].stored = 0;
       events[n].content_size = w->frame_content_size;
       events[n].last = 0;
       n++;
@@ -154,6 +159,9 @@ gcomp_status_t zstd_walk_update(zstd_walk_t * w, const uint8_t * data,
         w->pending.kind = GCOMP_WALK_SKIPPABLE;
         w->pending.offset = w->pos;
         w->pending.size = 8u + (uint64_t)payload;
+        w->pending.payload_offset = w->pos + 8u;
+        w->pending.payload_size = payload;
+        w->pending.stored = 1; // Its contents are whatever the writer put there.
         w->pending.content_size = 0;
         w->pending.last = 0;
         w->has_pending = 1;
@@ -219,6 +227,10 @@ gcomp_status_t zstd_walk_update(zstd_walk_t * w, const uint8_t * data,
     w->pending.kind = GCOMP_WALK_BLOCK;
     w->pending.offset = w->pos;
     w->pending.size = (uint64_t)ZSTD_BLOCK_HEADER_SIZE + on_wire;
+    w->pending.payload_offset = w->pos + ZSTD_BLOCK_HEADER_SIZE;
+    w->pending.payload_size = on_wire;
+    // A Raw_Block's payload is the output; an RLE_Block's one byte is not.
+    w->pending.stored = (type == ZSTD_BLOCK_TYPE_RAW) ? 1 : 0;
     // Only a raw or RLE block says how much output it stands for; a compressed
     // one does not, and guessing would make this a promise rather than a hint.
     w->pending.content_size =
