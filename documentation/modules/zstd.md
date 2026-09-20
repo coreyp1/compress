@@ -118,7 +118,7 @@ When `threads.count > 1`, the encoder uses parallel compression where input is s
 | `limits.max_output_bytes` | uint64 | 512 MiB | Maximum decompressed output (decoder) |
 | `limits.max_window_bytes` | uint64 | 128 MiB | Maximum window a frame may declare |
 | `limits.max_memory_bytes` | uint64 | 256 MiB | Maximum working memory |
-| `limits.max_expansion_ratio` | uint64 | 1000 | Maximum output/input ratio (decoder) |
+| `limits.max_expansion_ratio` | uint64 | 32768 | Maximum output/input ratio (decoder). The default is the format's own ceiling: RFC 8878 §3.1.1.2.2's four-byte RLE_Block carries at most 128 KB, so no valid stream can exceed it. |
 
 Limits are enforced by the infrastructure; the decoder returns `GCOMP_ERR_LIMIT` when exceeded.
 

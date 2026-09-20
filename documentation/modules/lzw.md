@@ -40,7 +40,7 @@ See [Auto-Registration](../auto-registration.md) for details.
 |-----|------|---------|-------------|
 | `lzw.format` | string | `"gif"` | Profile: `"gif"` (LSB) or `"tiff"` (MSB) |
 | `lzw.lit_width` | uint64 | (format default) | Literal width in bits. If unset: 8 for `"gif"`, 9 for `"tiff"` |
-| `lzw.max_code_bits` | uint64 | 12 | Maximum code width in bits (max 12 → 4096 entries) |
+| `lzw.max_code_bits` | uint64 | 12 | Maximum code width in bits, 9 to 12 (12 → 4096 entries). Declared in the schema, so it is refused at create rather than from inside the method. |
 | `lzw.encoder_lookup` | string | `"hash"` | Encoder dictionary lookup: `"linear"` (O(n) scan) or `"hash"` (O(1), faster). Decoder is unchanged. |
 
 ### Core limit options
@@ -49,7 +49,7 @@ See [Auto-Registration](../auto-registration.md) for details.
 |-----|------|---------|-------------|
 | `limits.max_output_bytes` | uint64 | 0 (unlimited) | Maximum decompressed output (decoder) |
 | `limits.max_memory_bytes` | uint64 | 0 (unlimited) | Maximum working memory (encoder and decoder) |
-| `limits.max_expansion_ratio` | uint64 | 0 (unlimited) | Maximum output/input ratio; decompression bomb protection (decoder) |
+| `limits.max_expansion_ratio` | uint64 | 2560 | Maximum output/input ratio (decoder). The default is the format's own ceiling: TIFF 6.0 §13 caps a code at twelve bits and the longest table entry at 3839 bytes. It was documented as 0 and *was* 0, because the decoder never initialised the field. |
 
 Limits are enforced by the method; exceeding any limit returns `GCOMP_ERR_LIMIT`. Unknown option keys yield `GCOMP_ERR_INVALID_ARG` at create time (schema policy: `GCOMP_UNKNOWN_KEY_ERROR`).
 

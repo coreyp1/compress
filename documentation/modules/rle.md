@@ -41,7 +41,7 @@ See [Auto-Registration](../auto-registration.md) for details.
 |-----|------|---------|-------------|
 | `limits.max_output_bytes` | uint64 | 0 (unlimited) | Maximum decompressed output (decoder) |
 | `limits.max_memory_bytes` | uint64 | 0 (unlimited) | Maximum working memory |
-| `limits.max_expansion_ratio` | uint64 | 0 (unlimited) | Maximum output/input ratio; decompression bomb protection (decoder) |
+| `limits.max_expansion_ratio` | uint64 | 64 | Maximum output/input ratio (decoder). The default is the format's own ceiling: a two-byte run token carries at most 128 bytes in both profiles. It was documented as 0 and *was* 0, because the decoder never initialised the field. |
 
 Limits are enforced by the decoder; exceeding any limit returns `GCOMP_ERR_LIMIT`. Unknown option keys yield `GCOMP_ERR_INVALID_ARG` at create time (schema policy: `GCOMP_UNKNOWN_KEY_ERROR`).
 

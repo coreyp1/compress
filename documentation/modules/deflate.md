@@ -35,7 +35,7 @@ See [Auto-Registration](../auto-registration.md) for details on disabling auto-r
 | `limits.max_output_bytes` | uint64 | 512 MiB | 0 = unlimited | Max decompressed size (decoder). |
 | `limits.max_memory_bytes` | uint64 | 256 MiB | 0 = unlimited | Max working memory (decoder). |
 | `limits.max_window_bytes` | uint64 | window size | — | Max window (format-constrained). |
-| `limits.max_expansion_ratio` | uint64 | 1000 | 0 = unlimited | Max output/input ratio (decoder). |
+| `limits.max_expansion_ratio` | uint64 | 1032 | 0 = unlimited | Max output/input ratio (decoder). The default is the format's own ceiling: RFC 1951 §3.2.5 allows a 258-byte match in as little as two bits, so no valid stream exceeds it. |
 
 Limits are enforced by the core; the decoder returns `GCOMP_ERR_LIMIT` when any limit is exceeded.
 

@@ -120,7 +120,7 @@ See [Parallel compression](#parallel-compression) below.
 | `limits.max_output_bytes` | uint64 | 512 MiB | Maximum decompressed output (decoder) |
 | `limits.max_block_bytes` | uint64 | 4 MiB | Maximum block size during decode |
 | `limits.max_memory_bytes` | uint64 | 256 MiB | Maximum working memory |
-| `limits.max_expansion_ratio` | uint64 | 1000 | Maximum output/input ratio (decoder) |
+| `limits.max_expansion_ratio` | uint64 | 255 | Maximum output/input ratio (decoder). The default is the format's own ceiling: a sequence buys 255 bytes of match per extension byte. |
 
 Limits are enforced by the infrastructure; the decoder returns `GCOMP_ERR_LIMIT` when exceeded.
 

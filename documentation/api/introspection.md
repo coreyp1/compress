@@ -56,19 +56,22 @@ For incompressible input, roughly:
 | zstd | ~0.003% | 3 bytes per 128 KB block |
 | lz4 | ~0.001% at 4 MB blocks | 4 bytes per block |
 | gzip, zlib | ~0.03% | 5 bytes per stored block, plus a fixed header |
-| deflate | 0.02% at `window_bits` 15 | as above |
-| deflate | **21%** at `window_bits` 8 | see below |
+| deflate | 0.018% at `window_bits` 15 | as above |
+| deflate | 0.122% at `window_bits` 8 to 12 | see below |
 | LZW | up to ~50% | a full-width code per byte |
 | RLE | up to 33% | one control byte per three input bytes |
 
-**deflate's window size matters more than you would expect.** A stored block is
-written back out of the sliding window, so the window — not RFC 1951's
-65535-byte `LEN` field — limits how much input one stored block can carry, and
-on data that will not compress the encoder closes blocks early to keep them
-storable. A small window therefore means many small blocks, each paying five
-bytes. At `window_bits` 8 that reaches 21%. If you do not need a small window,
-do not ask for one. (zlib does not have this to solve: `deflateInit2()` quietly
-raises a `windowBits` of 8 to 9.)
+**A small window costs a little, and used to cost a lot.** RFC 1951 §3.2.4's
+stored block is the fallback that keeps the overhead to about five bytes per
+block, and reaching it needs two things that have nothing to do with the match
+finder's reach: a block long enough to be worth storing, and the block's bytes
+still being somewhere the encoder can read them. Both used to be sized from
+`window_bits`, so a 256-byte window meant very short blocks — 21% overhead at
+`window_bits` 8, and the series was not even monotonic. Both now have floors of
+their own, and the measured overhead on incompressible input is 0.122% from
+`window_bits` 8 through 12 and lower above that — below zlib's 0.217% to
+0.232% over the same range. (zlib refuses a raw `windowBits` of 8 outright and
+silently writes 9 for the wrapped form.)
 
 LZW and RLE expand on data that suits them badly, which is what their bounds
 describe. RLE's worst case is not "every byte a literal" — it is data that

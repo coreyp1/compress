@@ -504,7 +504,7 @@ The library provides several safety limits to protect against resource exhaustio
 |--------|---------|-------------|
 | `limits.max_output_bytes` | 512 MiB | Maximum decompressed output size |
 | `limits.max_memory_bytes` | 256 MiB | Maximum working memory for decoder |
-| `limits.max_expansion_ratio` | 1000 | Maximum output/input byte ratio |
+| `limits.max_expansion_ratio` | the format's own ceiling | Maximum output/input byte ratio; see [Limits](limits.md) |
 
 ### Expansion ratio protection
 

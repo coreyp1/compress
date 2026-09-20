@@ -119,7 +119,7 @@ Options prefixed with `deflate.*` or `limits.*` are automatically forwarded to t
 |-----|------|---------|-------------|
 | `limits.max_output_bytes` | uint64 | 512 MiB | Max decompressed output (decoder) |
 | `limits.max_memory_bytes` | uint64 | 256 MiB | Max working memory |
-| `limits.max_expansion_ratio` | uint64 | 1000 | Max output/input ratio (decoder) |
+| `limits.max_expansion_ratio` | uint64 | 1032 | Max output/input ratio (decoder). The default is the format's own ceiling; the payload is deflate, so RFC 1951 §3.2.5's bound applies. |
 
 Limits are enforced by the infrastructure; the decoder returns `GCOMP_ERR_LIMIT` when exceeded.
 

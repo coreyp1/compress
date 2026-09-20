@@ -91,7 +91,7 @@ Compression is configured with the deflate keys, which pass straight through:
 |---|---|---|---|
 | `limits.max_output_bytes` | uint64 | 512 MiB | Maximum decompressed output |
 | `limits.max_memory_bytes` | uint64 | 256 MiB | Maximum working memory |
-| `limits.max_expansion_ratio` | uint64 | 1000 | Decompression bomb protection |
+| `limits.max_expansion_ratio` | uint64 | 1032 | Maximum output/input ratio (decoder). The default is the format's own ceiling: RFC 1951 §3.2.5 allows a 258-byte match in as little as two bits. |
 
 ## Preset dictionaries (FDICT)
 
