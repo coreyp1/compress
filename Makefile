@@ -1234,6 +1234,32 @@ ifeq ($(OS_NAME), Linux)
 		printf "notice; a consumer linking the .so gets an undefined reference.\n" >&2; \
 		exit 1; \
 	fi
+# A type has no linkage, so nothing in the built library can be inspected to
+# find one that was never renamed - the checks above read `nm` output and are
+# structurally blind to this. Read the headers instead, and require every type
+# name and struct tag a public header declares to have a line in namespace.h.
+#
+# The gap was real: gcomp_seekable_t and its _s tag went un-renamed when
+# seekable.h was added, while all eight of its functions were listed, and every
+# check-symbols run in between passed. Two versions of this library would have
+# shared one spelling for a struct whose layout is free to differ between them,
+# which is the exact confusion CONVENTIONS.md section 4 exists to prevent.
+	@untyped=$$( { \
+		grep -hoE 'typedef +(struct|enum|union) +gcomp_[a-z0-9_]+ +gcomp_[a-z0-9_]+' include/ghoti.io/$(PROJECT)/*.h | grep -oE 'gcomp_[a-z0-9_]+'; \
+		grep -hoE '(struct|enum|union) +gcomp_[a-z0-9_]+' include/ghoti.io/$(PROJECT)/*.h | awk '{print $$2}'; \
+		grep -hoE '^\} *gcomp_[a-z0-9_]+' include/ghoti.io/$(PROJECT)/*.h | grep -oE 'gcomp_[a-z0-9_]+'; \
+		grep -hoE 'typedef +[a-z0-9_ ]*\(\* *gcomp_[a-z0-9_]+\)' include/ghoti.io/$(PROJECT)/*.h | grep -oE 'gcomp_[a-z0-9_]+'; \
+	} | sort -u | while read -r t; do \
+		grep -q "^#define $$t " include/ghoti.io/$(PROJECT)/namespace.h || printf '%s\n' "$$t"; \
+	done); \
+	if [ -n "$$untyped" ]; then \
+		printf "\033[0;31m\n### Public types missing the $(LIBVER_SYMBOL)_ namespace ###\033[0m\n" >&2; \
+		printf "%s\n" "$$untyped" >&2; \
+		printf "\nEach needs a '#define <name> GHOTIIO_COMPRESS(<name>)' line in\n" >&2; \
+		printf "include/ghoti.io/$(PROJECT)/namespace.h. A type produces no symbol, so\n" >&2; \
+		printf "the nm checks above cannot see this one. See CONVENTIONS.md section 4.\n" >&2; \
+		exit 1; \
+	fi
 	@split=$$(nm -D --undefined-only $(APP_DIR)/$(TARGET) \
 		| awk '{print $$2}' | grep '^$(LIBVER_SYMBOL)_' || true); \
 	if [ -n "$$split" ]; then \
@@ -1276,6 +1302,7 @@ ifeq ($(OS_NAME), Linux)
 		exit 1; \
 	fi
 	@printf "\033[0;32mEvery exported symbol carries the $(LIBVER_SYMBOL)_ namespace.\033[0m\n"
+	@printf "\033[0;32mEvery public type carries it too.\033[0m\n"
 	@printf "\033[0;32mEvery public declaration carries GCOMP_API.\033[0m\n"
 	@printf "\033[0;32mEvery header includes macros.h.\033[0m\n"
 	@printf "\033[0;32mEvery include guard is unique and correctly prefixed.\033[0m\n"

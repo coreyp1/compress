@@ -19,6 +19,18 @@
  *
  * Add a line here whenever you add a function, type, or variable.
  * `make check-symbols` fails the build if you forget.
+ *
+ * It checks the two in different ways, because it has to.  A function that is
+ * not renamed shows up in `nm -D` without the namespace prefix, so the linker's
+ * own output is the evidence.  A type has no linkage and produces no symbol at
+ * all, so nothing in the built library can be inspected to find one missing;
+ * that half is checked by reading the public headers and requiring every type
+ * name and struct tag they declare to appear below.
+ *
+ * That gap was not theoretical.  `gcomp_seekable_t` and its `_s` tag went
+ * un-renamed when seekable.h was added - every one of its eight functions was
+ * listed here, and the type they all take was not - and check-symbols passed
+ * on every run in between.
  */
 
 #ifndef GHOTI_IO_GCOMP_NAMESPACE_H
@@ -63,6 +75,8 @@
 #define gcomp_read_cb GHOTIIO_COMPRESS(gcomp_read_cb)
 #define gcomp_registry_s GHOTIIO_COMPRESS(gcomp_registry_s)
 #define gcomp_registry_t GHOTIIO_COMPRESS(gcomp_registry_t)
+#define gcomp_seekable_s GHOTIIO_COMPRESS(gcomp_seekable_s)
+#define gcomp_seekable_t GHOTIIO_COMPRESS(gcomp_seekable_t)
 #define gcomp_stream_info_s GHOTIIO_COMPRESS(gcomp_stream_info_s)
 #define gcomp_stream_info_t GHOTIIO_COMPRESS(gcomp_stream_info_t)
 #define gcomp_status_t GHOTIIO_COMPRESS(gcomp_status_t)
