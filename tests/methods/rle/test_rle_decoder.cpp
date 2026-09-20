@@ -288,6 +288,192 @@ TEST_F(RleDecoderTest, ErrorDetailSetOnInvalidArg) {
   gcomp_decoder_destroy(dec);
 }
 
+//
+// Small output buffers
+//
+// gcomp_decoder_update() says a small output buffer is ordinary: "Decompression
+// expands, so a small output buffer fills long before the input is used up, and
+// the call returns having consumed only part of it."  RLE decoding expands more
+// than most - one run packet is two bytes in and up to 128 out - so it is the
+// method most likely to meet a buffer it cannot empty in one call.
+//
+
+/// Decode `input` in `chunk`-sized bites and return everything produced.
+static std::vector<uint8_t> decode_in_chunks(gcomp_registry_t * reg,
+    const char * format, const std::vector<uint8_t> & input, size_t chunk,
+    gcomp_status_t * status_out) {
+  std::vector<uint8_t> result;
+  *status_out = GCOMP_OK;
+
+  gcomp_options_t * opts = nullptr;
+  gcomp_options_create(&opts);
+  gcomp_options_set_string(opts, "rle.format", format);
+
+  gcomp_decoder_t * dec = nullptr;
+  gcomp_status_t s = gcomp_decoder_create(reg, "rle", opts, &dec);
+  if (s != GCOMP_OK) {
+    *status_out = s;
+    gcomp_options_destroy(opts);
+    return result;
+  }
+
+  std::vector<uint8_t> buf(chunk);
+  gcomp_buffer_t in = {input.data(), input.size(), 0};
+  for (;;) {
+    gcomp_buffer_t out = {buf.data(), chunk, 0};
+    size_t before = in.used;
+    s = gcomp_decoder_update(dec, &in, &out);
+    if (s != GCOMP_OK) {
+      *status_out = s;
+      break;
+    }
+    result.insert(result.end(), buf.begin(), buf.begin() + out.used);
+    if (out.used == 0 && in.used == before) {
+      break;
+    }
+  }
+  if (*status_out == GCOMP_OK) {
+    for (;;) {
+      gcomp_buffer_t out = {buf.data(), chunk, 0};
+      s = gcomp_decoder_finish(dec, &out);
+      result.insert(result.end(), buf.begin(), buf.begin() + out.used);
+      if (s == GCOMP_OK) {
+        break;
+      }
+      if (s != GCOMP_ERR_LIMIT) {
+        *status_out = s;
+        break;
+      }
+    }
+  }
+
+  gcomp_decoder_destroy(dec);
+  gcomp_options_destroy(opts);
+  return result;
+}
+
+/**
+ * @brief A run longer than the output buffer is written across several calls.
+ *
+ * The decoder used to clamp a span to the available input and not to the
+ * available output, so rle_emit_repeat() refused the whole write and returned
+ * GCOMP_ERR_LIMIT having produced nothing - with no way to make progress,
+ * whatever the caller did next.
+ */
+TEST_F(RleDecoderTest, RunLongerThanOutputBuffer) {
+  // PackBits: control 257-128 = 129 means a run of 128.
+  const std::vector<uint8_t> encoded = {129, 0xAB};
+  const std::vector<uint8_t> expected(128, 0xAB);
+
+  for (size_t chunk : {1u, 2u, 7u, 63u, 127u, 128u, 129u}) {
+    gcomp_status_t s = GCOMP_OK;
+    std::vector<uint8_t> got =
+        decode_in_chunks(reg_, "packbits", encoded, chunk, &s);
+    EXPECT_EQ(s, GCOMP_OK) << "chunk=" << chunk;
+    EXPECT_EQ(got, expected) << "chunk=" << chunk << ": got " << got.size()
+                             << " bytes, expected " << expected.size();
+  }
+}
+
+/// The same for a literal packet, which is bounded by the input as well.
+TEST_F(RleDecoderTest, LiteralLongerThanOutputBuffer) {
+  std::vector<uint8_t> encoded = {127}; // literal of 128 bytes
+  std::vector<uint8_t> expected;
+  for (size_t i = 0; i < 128; i++) {
+    encoded.push_back((uint8_t)i);
+    expected.push_back((uint8_t)i);
+  }
+
+  for (size_t chunk : {1u, 3u, 16u, 127u, 128u}) {
+    gcomp_status_t s = GCOMP_OK;
+    std::vector<uint8_t> got =
+        decode_in_chunks(reg_, "packbits", encoded, chunk, &s);
+    EXPECT_EQ(s, GCOMP_OK) << "chunk=" << chunk;
+    EXPECT_EQ(got, expected) << "chunk=" << chunk;
+  }
+}
+
+/**
+ * @brief The last run in a stream is not left behind.
+ *
+ * With the input exhausted and a run still part-written, update() had nothing
+ * left to drive it out and finish() was a no-op, so the tail of the stream went
+ * missing and the decoder reported success: 24,544 bytes of a 24,576-byte
+ * stream, with GCOMP_OK.
+ */
+TEST_F(RleDecoderTest, TailRunIsDeliveredByFinish) {
+  // Runs of 97, which no small buffer can hold in one call, repeated so that
+  // the stream ends part way through one.
+  std::vector<uint8_t> raw;
+  std::vector<uint8_t> encoded;
+  for (int i = 0; i < 40; i++) {
+    encoded.push_back((uint8_t)(257 - 97));
+    encoded.push_back((uint8_t)i);
+    raw.insert(raw.end(), 97, (uint8_t)i);
+  }
+
+  for (size_t chunk : {1u, 5u, 16u, 96u, 97u, 1024u}) {
+    gcomp_status_t s = GCOMP_OK;
+    std::vector<uint8_t> got =
+        decode_in_chunks(reg_, "packbits", encoded, chunk, &s);
+    EXPECT_EQ(s, GCOMP_OK) << "chunk=" << chunk;
+    EXPECT_EQ(got.size(), raw.size()) << "chunk=" << chunk;
+    EXPECT_EQ(got, raw) << "chunk=" << chunk;
+  }
+}
+
+/// Both profiles, since both had the same defect in the same shape.
+TEST_F(RleDecoderTest, TgaRunLongerThanOutputBuffer) {
+  // TGA: bit 7 set means a run, count is (h & 0x7F) + 1.
+  const std::vector<uint8_t> encoded = {(uint8_t)(0x80 | 127), 0x3C};
+  const std::vector<uint8_t> expected(128, 0x3C);
+
+  for (size_t chunk : {1u, 9u, 64u, 128u}) {
+    gcomp_status_t s = GCOMP_OK;
+    std::vector<uint8_t> got =
+        decode_in_chunks(reg_, "tga", encoded, chunk, &s);
+    EXPECT_EQ(s, GCOMP_OK) << "chunk=" << chunk;
+    EXPECT_EQ(got, expected) << "chunk=" << chunk;
+  }
+}
+
+/**
+ * @brief A stream that stops part way through a token is corrupt, not complete.
+ *
+ * RLE has no end-of-stream marker, so finish() used to accept anything.  A
+ * control byte that promised bytes which never arrived is the one case it can
+ * still detect, and silently accepting it loses data without saying so.
+ */
+TEST_F(RleDecoderTest, TruncatedTokenIsReportedByFinish) {
+  struct Case {
+    const char * what;
+    std::vector<uint8_t> encoded;
+  };
+  const Case cases[] = {
+      {"literal cut short", {4, 1, 2}},   // promises 5 bytes, supplies 2
+      {"run byte missing", {(uint8_t)(257 - 50)}}, // run of 50, no byte
+  };
+
+  for (const Case & c : cases) {
+    gcomp_options_t * opts = nullptr;
+    gcomp_options_create(&opts);
+    gcomp_options_set_string(opts, "rle.format", "packbits");
+    gcomp_decoder_t * dec = nullptr;
+    ASSERT_EQ(gcomp_decoder_create(reg_, "rle", opts, &dec), GCOMP_OK);
+
+    uint8_t buf[256];
+    gcomp_buffer_t in = {c.encoded.data(), c.encoded.size(), 0};
+    gcomp_buffer_t out = {buf, sizeof(buf), 0};
+    EXPECT_EQ(gcomp_decoder_update(dec, &in, &out), GCOMP_OK) << c.what;
+
+    gcomp_buffer_t fin = {buf, sizeof(buf), 0};
+    EXPECT_EQ(gcomp_decoder_finish(dec, &fin), GCOMP_ERR_CORRUPT) << c.what;
+
+    gcomp_decoder_destroy(dec);
+    gcomp_options_destroy(opts);
+  }
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

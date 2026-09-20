@@ -104,21 +104,32 @@ gcomp_status_t rle_decoder_update(gcomp_decoder_t * decoder,
   rle_decoder_state_t * state = (rle_decoder_state_t *)decoder->method_state;
   size_t input_avail = input->size - input->used;
   size_t output_avail = output->size - output->used;
-  if (input_avail == 0 || output_avail == 0) {
+  if (output_avail == 0) {
+    return GCOMP_OK;
+  }
+  // An exhausted input does not mean there is nothing to do: a run whose
+  // control and run bytes were both consumed while the output buffer was full
+  // is still owed to the caller, and only the profile can write it.
+  if (input_avail == 0 && state->partial.phase != RLE_DEC_RUN_EMIT) {
     return GCOMP_OK;
   }
 
-  const uint8_t * in_ptr = (const uint8_t *)input->data;
+  const uint8_t * in_ptr =
+      input->data ? (const uint8_t *)input->data + input->used : NULL;
   uint8_t * out_ptr = (uint8_t *)output->data;
   size_t input_consumed = 0;
 
-  gcomp_status_t s = rle_profile_decode(state, in_ptr + input->used,
-      input_avail, &input_consumed, out_ptr, output->size, &output->used);
+  gcomp_status_t s = rle_profile_decode(state, in_ptr, input_avail,
+      &input_consumed, out_ptr, output->size, &output->used);
+  // The profile reports what it consumed and produced whether or not it
+  // failed, so the caller's buffers are advanced either way: bytes already
+  // decoded are the caller's, and re-offering the input that produced them
+  // would duplicate them.
+  input->used += input_consumed;
   if (s != GCOMP_OK) {
     return gcomp_decoder_set_error(decoder, s, "RLE profile decode failed");
   }
 
-  input->used += input_consumed;
   return GCOMP_OK;
 }
 
@@ -132,7 +143,40 @@ gcomp_status_t rle_decoder_finish(
         decoder, GCOMP_ERR_INVALID_ARG, "output->data is NULL but size > 0");
   }
 
-  (void)output;
+  rle_decoder_state_t * state = (rle_decoder_state_t *)decoder->method_state;
+
+  // RLE has no end-of-stream token, but finish is still not a no-op: the last
+  // run in the stream can be left part-written when the output buffer filled,
+  // and up to 128 bytes of it are owed to the caller.  gcomp_decoder_finish()
+  // (stream.h) reserves GCOMP_OK for a complete stream and asks for
+  // GCOMP_ERR_LIMIT while there is more to give and nowhere to put it, so that
+  // a caller draining in a loop cannot stop early and silently lose the tail.
+  if (state->partial.phase == RLE_DEC_RUN_EMIT &&
+      state->partial.pending_count > 0) {
+    size_t input_consumed = 0;
+    gcomp_status_t s = rle_profile_decode(state, NULL, 0, &input_consumed,
+        (uint8_t *)output->data, output->size, &output->used);
+    if (s != GCOMP_OK) {
+      return gcomp_decoder_set_error(decoder, s, "RLE profile decode failed");
+    }
+    if (state->partial.pending_count > 0) {
+      return GCOMP_ERR_LIMIT;
+    }
+  }
+
+  // A token the input never finished is a truncated stream, not a complete
+  // one: the control byte promised literal bytes or a run byte that never
+  // arrived.  GCOMP_ERR_CORRUPT is the code for "the input ended part way
+  // through the stream" (stream.h).
+  if (state->partial.phase == RLE_DEC_LITERAL_BYTES ||
+      state->partial.phase == RLE_DEC_RUN_BYTE) {
+    return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+        "RLE stream ends part way through a token: %u more %s expected",
+        (unsigned)state->partial.pending_count,
+        state->partial.phase == RLE_DEC_RUN_BYTE ? "run byte"
+                                                 : "literal bytes");
+  }
+
   return GCOMP_OK;
 }
 

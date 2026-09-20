@@ -77,12 +77,13 @@ typedef enum {
   RLE_DEC_CONTROL = 0,   ///< Need control/header byte
   RLE_DEC_LITERAL_BYTES, ///< Need N more literal bytes
   RLE_DEC_RUN_BYTE,      ///< Need the run byte (then emit N copies)
+  RLE_DEC_RUN_EMIT,      ///< Have the run byte; N copies still to write
 } rle_decoder_phase_t;
 
 typedef struct {
   rle_decoder_phase_t phase;
   uint32_t pending_count; ///< Literal bytes to read, or run length to emit
-  uint8_t pending_byte;   ///< Run byte (when phase == RLE_DEC_RUN_BYTE)
+  uint8_t pending_byte;   ///< Run byte (once phase == RLE_DEC_RUN_EMIT)
 } rle_decoder_partial_t;
 
 //

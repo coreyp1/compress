@@ -81,12 +81,41 @@ static gcomp_status_t decode_packbits(rle_decoder_state_t * state,
       if (want > input_size - in_pos) {
         want = input_size - in_pos;
       }
+      // The output buffer bounds the span too.  gcomp_decoder_update()
+      // (stream.h) promises that a small output buffer is ordinary -- "a small
+      // output buffer fills long before the input is used up, and the call
+      // returns having consumed only part of it" -- so a literal run longer
+      // than the buffer is written across several calls, with pending_count
+      // carrying the remainder.  Refusing it instead, which is what this did,
+      // made a 16-byte output buffer fail outright.
+      if (want > output_size - out_used) {
+        want = output_size - out_used;
+      }
+      // limits.max_output_bytes is a whole-stream ceiling, so it is measured
+      // against the running total rather than against this buffer's offset.
+      if (max_out != 0) {
+        uint64_t remaining = (max_out > state->total_output_bytes)
+            ? max_out - state->total_output_bytes
+            : 0;
+        if (remaining == 0) {
+          *input_used_out = in_pos;
+          *output_used_inout = out_used;
+          return GCOMP_ERR_LIMIT;
+        }
+        if ((uint64_t)want > remaining) {
+          want = (size_t)remaining;
+        }
+      }
       if (want == 0) {
         break;
       }
+      // The budget above is the whole-stream one, so the emit helper is asked
+      // for no ceiling of its own; its check is against this buffer's offset.
       gcomp_status_t s = rle_emit_literal(output_data, output_size, &out_used,
-          input_data + in_pos, want, max_out);
+          input_data + in_pos, want, 0);
       if (s != GCOMP_OK) {
+        *input_used_out = in_pos;
+        *output_used_inout = out_used;
         return s;
       }
       in_pos += want;
@@ -100,6 +129,8 @@ static gcomp_status_t decode_packbits(rle_decoder_state_t * state,
       gcomp_status_t lim = gcomp_limits_check_expansion_ratio(
           state->total_input_bytes, state->total_output_bytes, max_ratio);
       if (lim != GCOMP_OK) {
+        *input_used_out = in_pos;
+        *output_used_inout = out_used;
         return lim;
       }
       continue;
@@ -111,20 +142,53 @@ static gcomp_status_t decode_packbits(rle_decoder_state_t * state,
       }
       p->pending_byte = input_data[in_pos++];
       state->total_input_bytes++;
+      // The byte is consumed exactly once; everything after it is output, and
+      // the run may need more than one call to write.
+      p->phase = RLE_DEC_RUN_EMIT;
+    }
 
-      gcomp_status_t s = rle_emit_repeat(output_data, output_size, &out_used,
-          p->pending_byte, (size_t)p->pending_count, max_out);
+    if (p->phase == RLE_DEC_RUN_EMIT) {
+      size_t want = (size_t)p->pending_count;
+      if (want > output_size - out_used) {
+        want = output_size - out_used;
+      }
+      if (max_out != 0) {
+        uint64_t remaining = (max_out > state->total_output_bytes)
+            ? max_out - state->total_output_bytes
+            : 0;
+        if (remaining == 0) {
+          *input_used_out = in_pos;
+          *output_used_inout = out_used;
+          return GCOMP_ERR_LIMIT;
+        }
+        if ((uint64_t)want > remaining) {
+          want = (size_t)remaining;
+        }
+      }
+      if (want == 0) {
+        break;
+      }
+      gcomp_status_t s = rle_emit_repeat(
+          output_data, output_size, &out_used, p->pending_byte, want, 0);
       if (s != GCOMP_OK) {
+        *input_used_out = in_pos;
+        *output_used_inout = out_used;
         return s;
       }
-      state->total_output_bytes += (uint64_t)p->pending_count;
-      p->phase = RLE_DEC_CONTROL;
+      state->total_output_bytes += (uint64_t)want;
+      p->pending_count -= (uint32_t)want;
+      if (p->pending_count == 0) {
+        p->phase = RLE_DEC_CONTROL;
+      }
 
       gcomp_status_t lim = gcomp_limits_check_expansion_ratio(
           state->total_input_bytes, state->total_output_bytes, max_ratio);
       if (lim != GCOMP_OK) {
+        *input_used_out = in_pos;
+        *output_used_inout = out_used;
         return lim;
       }
+      continue;
     }
   }
 
@@ -167,12 +231,41 @@ static gcomp_status_t decode_tga(rle_decoder_state_t * state,
       if (want > input_size - in_pos) {
         want = input_size - in_pos;
       }
+      // The output buffer bounds the span too.  gcomp_decoder_update()
+      // (stream.h) promises that a small output buffer is ordinary -- "a small
+      // output buffer fills long before the input is used up, and the call
+      // returns having consumed only part of it" -- so a literal run longer
+      // than the buffer is written across several calls, with pending_count
+      // carrying the remainder.  Refusing it instead, which is what this did,
+      // made a 16-byte output buffer fail outright.
+      if (want > output_size - out_used) {
+        want = output_size - out_used;
+      }
+      // limits.max_output_bytes is a whole-stream ceiling, so it is measured
+      // against the running total rather than against this buffer's offset.
+      if (max_out != 0) {
+        uint64_t remaining = (max_out > state->total_output_bytes)
+            ? max_out - state->total_output_bytes
+            : 0;
+        if (remaining == 0) {
+          *input_used_out = in_pos;
+          *output_used_inout = out_used;
+          return GCOMP_ERR_LIMIT;
+        }
+        if ((uint64_t)want > remaining) {
+          want = (size_t)remaining;
+        }
+      }
       if (want == 0) {
         break;
       }
+      // The budget above is the whole-stream one, so the emit helper is asked
+      // for no ceiling of its own; its check is against this buffer's offset.
       gcomp_status_t s = rle_emit_literal(output_data, output_size, &out_used,
-          input_data + in_pos, want, max_out);
+          input_data + in_pos, want, 0);
       if (s != GCOMP_OK) {
+        *input_used_out = in_pos;
+        *output_used_inout = out_used;
         return s;
       }
       in_pos += want;
@@ -186,6 +279,8 @@ static gcomp_status_t decode_tga(rle_decoder_state_t * state,
       gcomp_status_t lim = gcomp_limits_check_expansion_ratio(
           state->total_input_bytes, state->total_output_bytes, max_ratio);
       if (lim != GCOMP_OK) {
+        *input_used_out = in_pos;
+        *output_used_inout = out_used;
         return lim;
       }
       continue;
@@ -197,20 +292,53 @@ static gcomp_status_t decode_tga(rle_decoder_state_t * state,
       }
       p->pending_byte = input_data[in_pos++];
       state->total_input_bytes++;
+      // The byte is consumed exactly once; everything after it is output, and
+      // the run may need more than one call to write.
+      p->phase = RLE_DEC_RUN_EMIT;
+    }
 
-      gcomp_status_t s = rle_emit_repeat(output_data, output_size, &out_used,
-          p->pending_byte, (size_t)p->pending_count, max_out);
+    if (p->phase == RLE_DEC_RUN_EMIT) {
+      size_t want = (size_t)p->pending_count;
+      if (want > output_size - out_used) {
+        want = output_size - out_used;
+      }
+      if (max_out != 0) {
+        uint64_t remaining = (max_out > state->total_output_bytes)
+            ? max_out - state->total_output_bytes
+            : 0;
+        if (remaining == 0) {
+          *input_used_out = in_pos;
+          *output_used_inout = out_used;
+          return GCOMP_ERR_LIMIT;
+        }
+        if ((uint64_t)want > remaining) {
+          want = (size_t)remaining;
+        }
+      }
+      if (want == 0) {
+        break;
+      }
+      gcomp_status_t s = rle_emit_repeat(
+          output_data, output_size, &out_used, p->pending_byte, want, 0);
       if (s != GCOMP_OK) {
+        *input_used_out = in_pos;
+        *output_used_inout = out_used;
         return s;
       }
-      state->total_output_bytes += (uint64_t)p->pending_count;
-      p->phase = RLE_DEC_CONTROL;
+      state->total_output_bytes += (uint64_t)want;
+      p->pending_count -= (uint32_t)want;
+      if (p->pending_count == 0) {
+        p->phase = RLE_DEC_CONTROL;
+      }
 
       gcomp_status_t lim = gcomp_limits_check_expansion_ratio(
           state->total_input_bytes, state->total_output_bytes, max_ratio);
       if (lim != GCOMP_OK) {
+        *input_used_out = in_pos;
+        *output_used_inout = out_used;
         return lim;
       }
+      continue;
     }
   }
 
