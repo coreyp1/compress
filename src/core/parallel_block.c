@@ -36,7 +36,7 @@ struct gcomp_parallel_block_ctx_s {
   uint32_t max_in_flight;
   bool is_inline;
 
-  gcomp_thread_pool_t * pool;
+  GCU_Pool * pool;
   gcomp_job_queue_t * queue;
 
   inline_node_t * inline_head;
@@ -49,10 +49,10 @@ struct gcomp_parallel_block_ctx_s {
 //
 
 static void parallel_block_job_complete(
-    void * job_ctx, gcomp_status_t status, void * user_data) {
+    void * job_ctx, int status, void * user_data) {
   gcomp_job_queue_t * queue = (gcomp_job_queue_t *)user_data;
   gcomp_block_job_t * base = (gcomp_block_job_t *)job_ctx;
-  gcomp_job_queue_complete(queue, base, status);
+  gcomp_job_queue_complete(queue, base, (gcomp_status_t)status);
 }
 
 //
@@ -98,15 +98,21 @@ gcomp_status_t gcomp_parallel_block_create(
   ctx->inline_tail = NULL;
   ctx->inline_count = 0;
 
-  gcomp_thread_pool_config_t pool_config = {
-      .num_threads = num_threads,
+  // num_threads is at least 2 here:  a request for one worker or none took
+  // the inline path above, so the pool is never asked for an inline one.
+  GCU_Pool_Config pool_config = {
+      .thread_count = num_threads,
+      .max_queued = 0,
+      .name_prefix = "gcomp-blk",
       .allocator = allocator,
   };
-  gcomp_status_t status = gcomp_thread_pool_create(&pool_config, &ctx->pool);
-  if (status != GCOMP_OK) {
+  ctx->pool = gcu_pool_create(&pool_config);
+  if (!ctx->pool) {
     gcomp_free(allocator, ctx);
-    return status;
+    return GCOMP_ERR_INTERNAL;
   }
+
+  gcomp_status_t status;
 
   gcomp_job_queue_config_t queue_config = {
       .capacity = ctx->max_in_flight,
@@ -114,7 +120,7 @@ gcomp_status_t gcomp_parallel_block_create(
   };
   status = gcomp_job_queue_create(&queue_config, &ctx->queue);
   if (status != GCOMP_OK) {
-    gcomp_thread_pool_destroy(ctx->pool);
+    gcu_pool_destroy(ctx->pool);
     gcomp_free(allocator, ctx);
     return status;
   }
@@ -128,9 +134,12 @@ void gcomp_parallel_block_destroy(gcomp_parallel_block_ctx_t * ctx) {
     return;
   }
   if (!ctx->is_inline) {
-    gcomp_thread_pool_wait(ctx->pool);
+    // Drain before the queue goes away:  a running job's completion callback
+    // writes to that queue.  gcu_pool_destroy() drains too, but waiting here
+    // keeps the ordering explicit rather than resting on it.
+    gcu_pool_wait(ctx->pool);
     gcomp_job_queue_destroy(ctx->queue);
-    gcomp_thread_pool_destroy(ctx->pool);
+    gcu_pool_destroy(ctx->pool);
   }
   /* Inline mode: free any remaining nodes (should be empty at destroy) */
   while (ctx->inline_head) {
@@ -179,10 +188,9 @@ static gcomp_status_t gcomp_parallel_block_submit_internal(
   if (status != GCOMP_OK) {
     return status;
   }
-  status = gcomp_thread_pool_submit(
-      ctx->pool, process_fn, job_ctx, parallel_block_job_complete, ctx->queue);
-  if (status != GCOMP_OK) {
-    gcomp_job_queue_complete(ctx->queue, base, status);
+  if (!gcu_pool_enqueue_cb(ctx->pool, process_fn, job_ctx,
+          parallel_block_job_complete, ctx->queue)) {
+    gcomp_job_queue_complete(ctx->queue, base, GCOMP_ERR_INTERNAL);
   }
   return GCOMP_OK;
 }
@@ -244,7 +252,13 @@ gcomp_status_t gcomp_parallel_block_wait(gcomp_parallel_block_ctx_t * ctx) {
   if (ctx->is_inline) {
     return GCOMP_OK;
   }
-  return gcomp_thread_pool_wait(ctx->pool);
+  // The pool keeps the first error until it is told to forget it, so that
+  // several waiters see the same answer.  This caller wants each wait to
+  // report only what happened since the last one, which is what the pool this
+  // replaced did as a side effect of being read.
+  int status = gcu_pool_wait(ctx->pool);
+  gcu_pool_clear_error(ctx->pool);
+  return (gcomp_status_t)status;
 }
 
 bool gcomp_parallel_block_is_inline(const gcomp_parallel_block_ctx_t * ctx) {

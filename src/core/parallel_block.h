@@ -25,7 +25,7 @@
 #include <ghoti.io/compress/allocator.h>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/job_queue.h>
-#include <ghoti.io/compress/thread_pool.h>
+#include <ghoti.io/cutil/pool.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -39,11 +39,18 @@ typedef struct gcomp_parallel_block_ctx_s gcomp_parallel_block_ctx_t;
 /**
  * @brief Process callback: run the method-specific work on one job.
  *
+ * Returns `int` rather than gcomp_status_t so that it is exactly cutil's
+ * GCU_Pool_Task and can be handed to the pool without a cast.  Casting a
+ * function pointer to a different signature and calling through it is
+ * undefined behaviour, and the call sites here used to do precisely that.
+ * The values are still gcomp_status_t values; GCOMP_OK is 0, which is what
+ * the pool treats as success.
+ *
  * @param job_ctx Opaque job pointer (struct with gcomp_block_job_t as first
  * member).
- * @return GCOMP_OK on success, error code on failure.
+ * @return GCOMP_OK on success, a gcomp_status_t error code on failure.
  */
-typedef gcomp_status_t (*gcomp_parallel_block_process_fn_t)(void * job_ctx);
+typedef int (*gcomp_parallel_block_process_fn_t)(void * job_ctx);
 
 /**
  * @brief Configuration for the generic parallel block context.

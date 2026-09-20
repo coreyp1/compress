@@ -295,7 +295,7 @@ static gcomp_status_t zstd_parallel_compress_blocks(
  *
  * Called by thread pool workers to compress a single input into a frame.
  */
-static gcomp_status_t zstd_parallel_process_job(void * ctx) {
+static int zstd_parallel_process_job(void * ctx) {
   zstd_parallel_job_t * job = (zstd_parallel_job_t *)ctx;
 
   // Get allocator from match finder (stored in the context that created job)
@@ -680,8 +680,8 @@ gcomp_status_t zstd_parallel_try_submit(
   // harmless -- nothing has looked at it in between and the caller tries
   // again with the same job.
   zstd_mf_reset(job->match_finder);
-  return gcomp_parallel_block_try_submit(ctx->block_ctx, job,
-      (gcomp_parallel_block_process_fn_t)zstd_parallel_process_job);
+  return gcomp_parallel_block_try_submit(
+      ctx->block_ctx, job, zstd_parallel_process_job);
 }
 
 gcomp_status_t zstd_parallel_get_result(

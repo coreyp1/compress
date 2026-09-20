@@ -153,7 +153,7 @@ static size_t lz4_parallel_job_bytes(const lz4_parallel_ctx_t * ctx) {
  * deliberate copy of lz4_encoder_update()'s block path rather than a tidier
  * equivalent.
  */
-static gcomp_status_t lz4_parallel_process_job(void * job_ctx) {
+static int lz4_parallel_process_job(void * job_ctx) {
   lz4_parallel_job_t * job = (lz4_parallel_job_t *)job_ctx;
   lz4_parallel_ctx_t * ctx = job->ctx;
 
@@ -430,8 +430,8 @@ gcomp_status_t lz4_parallel_submit(
   if (!ctx || !job) {
     return GCOMP_ERR_INVALID_ARG;
   }
-  return gcomp_parallel_block_submit(ctx->block_ctx, job,
-      (gcomp_parallel_block_process_fn_t)lz4_parallel_process_job);
+  return gcomp_parallel_block_submit(
+      ctx->block_ctx, job, lz4_parallel_process_job);
 }
 
 gcomp_status_t lz4_parallel_try_submit(
@@ -439,8 +439,8 @@ gcomp_status_t lz4_parallel_try_submit(
   if (!ctx || !job) {
     return GCOMP_ERR_INVALID_ARG;
   }
-  return gcomp_parallel_block_try_submit(ctx->block_ctx, job,
-      (gcomp_parallel_block_process_fn_t)lz4_parallel_process_job);
+  return gcomp_parallel_block_try_submit(
+      ctx->block_ctx, job, lz4_parallel_process_job);
 }
 
 gcomp_status_t lz4_parallel_get_result(

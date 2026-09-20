@@ -66,7 +66,6 @@
 #include <ghoti.io/compress/job_queue.h>
 #include <ghoti.io/compress/limits.h>
 #include <ghoti.io/compress/macros.h>
-#include <ghoti.io/compress/thread_pool.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
