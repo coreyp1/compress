@@ -56,6 +56,7 @@
 #include "deflate_internal.h"
 #include "huffman.h"
 #include <ghoti.io/compress/limits.h>
+#include <ghoti.io/compress/deflate.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -1301,7 +1302,7 @@ gcomp_status_t gcomp_deflate_decoder_init(gcomp_registry_t * registry,
   st->max_output_bytes =
       gcomp_limits_read_output_max(options, GCOMP_DEFAULT_MAX_OUTPUT_BYTES);
   st->max_expansion_ratio = gcomp_limits_read_expansion_ratio_max(
-      options, GCOMP_DEFAULT_MAX_EXPANSION_RATIO);
+      options, GCOMP_DEFLATE_MAX_EXPANSION_RATIO);
   st->total_output_bytes = 0;
   st->total_input_bytes = 0;
 

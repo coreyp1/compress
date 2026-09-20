@@ -34,6 +34,7 @@
 #include "../../core/strutil_internal.h"
 #include "lzw_internal.h"
 #include <ghoti.io/compress/limits.h>
+#include <ghoti.io/compress/lzw.h>
 #include <string.h>
 
 #define LZW_FORMAT_DEFAULT LZW_FORMAT_GIF
@@ -100,21 +101,13 @@ gcomp_status_t lzw_decoder_init(gcomp_registry_t * registry,
     state->max_code_bits = LZW_MAX_CODE_BITS_DEFAULT;
   }
 
-  if (options) {
-    u64 = 0;
-    if (gcomp_options_get_uint64(options, "limits.max_output_bytes", &u64) ==
-        GCOMP_OK) {
-      state->max_output_bytes = u64;
-    }
-    if (gcomp_options_get_uint64(options, "limits.max_memory_bytes", &u64) ==
-        GCOMP_OK) {
-      state->max_memory_bytes = u64;
-    }
-    if (gcomp_options_get_uint64(options, "limits.max_expansion_ratio", &u64) ==
-        GCOMP_OK) {
-      state->max_expansion_ratio = u64;
-    }
-  }
+  // Defaults, then whatever the caller asked for instead.
+  state->max_output_bytes = gcomp_limits_read_output_max(
+      options, GCOMP_DEFAULT_MAX_OUTPUT_BYTES);
+  state->max_memory_bytes = gcomp_limits_read_memory_max(
+      options, GCOMP_DEFAULT_MAX_MEMORY_BYTES);
+  state->max_expansion_ratio = gcomp_limits_read_expansion_ratio_max(
+      options, GCOMP_LZW_MAX_EXPANSION_RATIO);
 
   unsigned lit = (unsigned)state->lit_width;
   state->clear_code = lzw_profile_clear_code(state->profile_id, lit);
@@ -221,10 +214,19 @@ void lzw_decoder_destroy(gcomp_decoder_t * decoder) {
   decoder->method_state = NULL;
 }
 
-/** Copy pending bytes to output; check limits. Returns GCOMP_OK or
- * limit/corrupt. */
+/**
+ * Copy pending bytes to output; check limits. Returns GCOMP_OK or
+ * limit/corrupt.
+ *
+ * @param input_consumed Bytes of the stream consumed by the time this runs.
+ *        Not `state->total_input_bytes`: that is only brought up to date when
+ *        an update() returns, so inside the decode loop it lags by everything
+ *        the current call has read, and the ratio check would be comparing
+ *        this call's output against the previous calls' input.
+ */
 static gcomp_status_t flush_pending(lzw_decoder_state_t * state,
-    gcomp_decoder_t * decoder, gcomp_buffer_t * output) {
+    gcomp_decoder_t * decoder, gcomp_buffer_t * output,
+    uint64_t input_consumed) {
   if (state->pending_len == 0) {
     return GCOMP_OK;
   }
@@ -246,9 +248,9 @@ static gcomp_status_t flush_pending(lzw_decoder_state_t * state,
           decoder, GCOMP_ERR_LIMIT, "LZW decoder max output bytes exceeded");
     }
   }
-  if (state->max_expansion_ratio != 0 && state->total_input_bytes > 0) {
+  if (state->max_expansion_ratio != 0 && input_consumed > 0) {
     gcomp_status_t lim = gcomp_limits_check_expansion_ratio(
-        state->total_input_bytes, new_total, state->max_expansion_ratio);
+        input_consumed, new_total, state->max_expansion_ratio);
     if (lim != GCOMP_OK) {
       return gcomp_decoder_set_error(
           decoder, GCOMP_ERR_LIMIT, "LZW decoder expansion ratio exceeded");
@@ -284,7 +286,8 @@ gcomp_status_t lzw_decoder_update(gcomp_decoder_t * decoder,
 
   lzw_decoder_state_t * state = (lzw_decoder_state_t *)decoder->method_state;
 
-  gcomp_status_t s = flush_pending(state, decoder, output);
+  gcomp_status_t s =
+      flush_pending(state, decoder, output, state->total_input_bytes);
   if (s != GCOMP_OK) {
     return s;
   }
@@ -329,7 +332,8 @@ gcomp_status_t lzw_decoder_update(gcomp_decoder_t * decoder,
       input->used += state->reader.byte_pos;
       state->total_input_bytes += (uint64_t)state->reader.byte_pos;
       state->done = 1;
-      s = flush_pending(state, decoder, output);
+      s = flush_pending(state, decoder, output,
+          state->total_input_bytes + (uint64_t)state->reader.byte_pos);
       if (s != GCOMP_OK) {
         return s;
       }
@@ -365,10 +369,12 @@ gcomp_status_t lzw_decoder_update(gcomp_decoder_t * decoder,
             decoder, GCOMP_ERR_LIMIT, "LZW decoder max output bytes exceeded");
       }
     }
-    if (state->max_expansion_ratio != 0 && state->total_input_bytes > 0) {
+    if (state->max_expansion_ratio != 0) {
+      const uint64_t consumed =
+          state->total_input_bytes + (uint64_t)state->reader.byte_pos;
       uint64_t new_total = state->total_output_bytes + (uint64_t)dec_len;
       gcomp_status_t lim = gcomp_limits_check_expansion_ratio(
-          state->total_input_bytes, new_total, state->max_expansion_ratio);
+          consumed, new_total, state->max_expansion_ratio);
       if (lim != GCOMP_OK) {
         input->used += state->reader.byte_pos;
         state->total_input_bytes += (uint64_t)state->reader.byte_pos;
@@ -388,7 +394,8 @@ gcomp_status_t lzw_decoder_update(gcomp_decoder_t * decoder,
       }
     }
 
-    s = flush_pending(state, decoder, output);
+    s = flush_pending(state, decoder, output,
+        state->total_input_bytes + (uint64_t)state->reader.byte_pos);
     if (s != GCOMP_OK) {
       input->used += state->reader.byte_pos;
       state->total_input_bytes += (uint64_t)state->reader.byte_pos;
@@ -405,7 +412,8 @@ gcomp_status_t lzw_decoder_update(gcomp_decoder_t * decoder,
   state->total_input_bytes += (uint64_t)state->reader.byte_pos;
   /* Flush any pending bytes when we run out of input (stream may continue
    * later) */
-  s = flush_pending(state, decoder, output);
+  s = flush_pending(state, decoder, output,
+      state->total_input_bytes + (uint64_t)state->reader.byte_pos);
   if (s != GCOMP_OK) {
     return s;
   }
@@ -423,7 +431,8 @@ gcomp_status_t lzw_decoder_finish(
   }
 
   lzw_decoder_state_t * state = (lzw_decoder_state_t *)decoder->method_state;
-  gcomp_status_t s = flush_pending(state, decoder, output);
+  gcomp_status_t s =
+      flush_pending(state, decoder, output, state->total_input_bytes);
   if (s != GCOMP_OK) {
     return s;
   }

@@ -18,20 +18,21 @@ All limits default to sensible values and can be customized via options.
 |--------|------|---------|-------------|
 | `limits.max_output_bytes` | uint64 | 512 MiB | Maximum decompressed output size |
 | `limits.max_memory_bytes` | uint64 | 256 MiB | Maximum working memory (encoder and decoder where the method tracks allocations) |
-| `limits.max_expansion_ratio` | uint64 | 1000 | Maximum output/input byte ratio |
+| `limits.max_expansion_ratio` | uint64 | the format's own ceiling (see below) | Maximum output/input byte ratio |
 | `limits.max_window_bytes` | uint64 | method-specific | Maximum LZ77 window size |
 
 Set any limit to `0` for unlimited (not recommended for untrusted input).
 
 ## Expansion Ratio Protection
 
-The `limits.max_expansion_ratio` option specifically targets **decompression bombs** (also known as "zip bombs") - maliciously crafted archives designed to expand to massive sizes from tiny inputs.
+The `limits.max_expansion_ratio` option bounds how much output a decoder will
+produce per byte of input.
 
 ### How it works
 
 The decoder tracks:
-- `total_input_bytes`: Compressed bytes consumed
-- `total_output_bytes`: Decompressed bytes produced
+- `total_input_bytes`: Compressed bytes consumed **so far**
+- `total_output_bytes`: Decompressed bytes produced **so far**
 
 On each output operation, the decoder checks:
 
@@ -39,10 +40,51 @@ On each output operation, the decoder checks:
 output_bytes <= ratio_limit × input_bytes
 ```
 
-With the default limit of 1000:
-- 1 KB input → max 1 MB output
-- 1 MB input → max 1 GB output
-- 10 MB input → max 10 GB output
+Both figures are running totals, not whole-stream totals - a streaming decoder
+cannot know the whole stream. That matters: a file whose front compresses
+harder than its body reaches a far higher ratio part-way through than it ends
+at, so a limit chosen from whole-stream figures stops legitimate streams in the
+middle.
+
+### The default is the format's own ceiling
+
+Every format has a maximum expansion it can possibly encode, and they differ by
+a factor of five hundred:
+
+| Method | Default | Where the number comes from |
+|--------|---------|-----------------------------|
+| `rle` | 64 : 1 | TIFF 6.0 §9: a two-byte run token carries at most 128 bytes |
+| `lz4` | 255 : 1 | one extension byte per 255 further bytes of match |
+| `deflate`, `zlib`, `gzip` | 1032 : 1 | RFC 1951 §3.2.5: a 258-byte match in as little as two bits |
+| `lzw` | 2560 : 1 | TIFF 6.0 §13: a 3839-byte string in a twelve-bit code |
+| `zstd` | 32768 : 1 | RFC 8878 §3.1.1.2.2: a four-byte RLE\_Block carries 128 KB |
+
+Each is exposed as a macro - `GCOMP_DEFLATE_MAX_EXPANSION_RATIO` and so on - in
+that method's header.
+
+A limit set **below** a format's ceiling refuses streams that format may
+legitimately produce. Set **at or above** it, the check never fires. So at the
+default the check is not a policy guess but an impossibility test: it fires
+only on output the format could not have produced, which means corruption or a
+decoder bug.
+
+This replaced a single 1000:1 default shared by every method, which was below
+the ceiling for two formats and above it for two others. At that default this
+library refused its own output: 32 MiB of zeros, compressed by these encoders
+and handed back to these decoders, failed for five of the seven methods -
+including `deflate` at a whole-stream ratio of 993:1, *below* the 1000 limit it
+tripped, because the uniform prefix ran ahead of the average.
+
+### What actually bounds a decompression bomb
+
+`limits.max_output_bytes`. It is exact, it is format-independent, and it is the
+limit to set when the question is "how much output am I willing to hold". The
+ratio is the cheaper, earlier signal that a stream is heading somewhere
+impossible; it is not the bound.
+
+A caller who does want a ratio as policy - "nothing I accept should expand more
+than 20x" - sets one explicitly, and should expect to refuse some legitimate
+files.
 
 ### Example: Strict limits for untrusted input
 
@@ -134,14 +176,15 @@ Default values are defined in `<ghoti.io/compress/limits.h>`:
 ```c
 #define GCOMP_DEFAULT_MAX_OUTPUT_BYTES     (512ULL * 1024 * 1024)  // 512 MiB
 #define GCOMP_DEFAULT_MAX_MEMORY_BYTES     (256ULL * 1024 * 1024)  // 256 MiB
-#define GCOMP_DEFAULT_MAX_EXPANSION_RATIO  1000ULL                  // 1000x
+#define GCOMP_DEFAULT_MAX_EXPANSION_RATIO  1000ULL   // fallback only; no
+                                                     // built-in method uses it
 ```
 
 ## Security Recommendations
 
 1. **Always set limits for untrusted input** - Even with defaults, consider tighter limits for web endpoints or user uploads.
 
-2. **Use expansion ratio limits** - The default 1000x catches most decompression bombs while allowing legitimate high-compression data.
+2. **Set `limits.max_output_bytes` deliberately** - it is the real bound. The expansion ratio defaults to each format's own ceiling, so it will not refuse anything by itself; lower it only if a ratio cap is the policy you want, and expect false positives when you do.
 
 3. **Monitor for limit errors** - Log `GCOMP_ERR_LIMIT` errors to detect potential attacks.
 

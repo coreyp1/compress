@@ -89,6 +89,23 @@ extern "C" {
 #endif
 
 /**
+ * @brief The largest expansion RFC 8878 permits, as an output/input ratio.
+ *
+ * The cheapest output in the format is an RLE_Block (section 3.1.1.2.2): a
+ * three-byte Block_Header and a single byte, four bytes in all, standing for
+ * Block_Size repetitions of that byte.  Section 3.1.1.2.4 bounds Block_Size by
+ * Block_Maximum_Size, which is min(Window_Size, 128 KB), so four bytes carry
+ * at most 131072: 131072 / 4 = 32768.
+ *
+ * A Compressed_Block cannot beat that - its literals and sequences sections
+ * cost more than one byte between them - and a frame header is input that
+ * produces nothing, so it only lowers the ratio.
+ *
+ * Measured: 32 MiB of zeros compresses to 32482:1, just under it.
+ */
+#define GCOMP_ZSTD_MAX_EXPANSION_RATIO 32768ULL
+
+/**
  * @brief Register the Zstd method with a registry.
  *
  * This function registers the "zstd" compression method with the given

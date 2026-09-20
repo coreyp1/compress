@@ -28,6 +28,24 @@ extern "C" {
 #endif
 
 /**
+ * @brief The largest expansion TIFF 6.0 LZW permits, as an output/input ratio.
+ *
+ * Section 13 caps a code at twelve bits and the table at 4096 entries, of
+ * which 3838 are added by the decoder (258 through 4095).  Each added entry is
+ * one byte longer than the entry it extends, so the longest string the table
+ * can hold is 3839 bytes, and emitting it costs twelve bits:
+ * 3839 * 8 / 12 = 2559.3, rounded up.
+ *
+ * A stream that never sends Clear can repeat that code indefinitely, so the
+ * bound is sustained rather than momentary.  A smaller `lzw.max_code_bits`
+ * lowers it sharply - at nine bits it is 227:1 - so this is the bound across
+ * every setting, not the bound at the default.
+ *
+ * Measured: 32 MiB of zeros compresses to 1313:1.
+ */
+#define GCOMP_LZW_MAX_EXPANSION_RATIO 2560ULL
+
+/**
  * @brief Register the LZW method with a registry.
  *
  * @param registry The registry to register with (must not be NULL)

@@ -81,6 +81,20 @@ extern "C" {
 #endif
 
 /**
+ * @brief The largest expansion a gzip member can carry, output over input.
+ *
+ * The payload is deflate, so RFC 1951's 1032:1 bound applies unchanged (see
+ * ::GCOMP_DEFLATE_MAX_EXPANSION_RATIO for the derivation).  RFC 1952's framing
+ * - ten header bytes, an eight-byte trailer, and any FEXTRA/FNAME/FCOMMENT -
+ * produces no output, so it can only lower the ratio.  A multi-member stream
+ * pays that framing again per member, so it cannot beat a single member
+ * either.
+ *
+ * Measured: 32 MiB of zeros compresses to 1030:1 at level 9.
+ */
+#define GCOMP_GZIP_MAX_EXPANSION_RATIO 1032ULL
+
+/**
  * @brief Register the gzip method with a registry
  *
  * Call this to make the "gzip" method available for encoding and decoding.

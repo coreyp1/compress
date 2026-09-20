@@ -43,6 +43,7 @@
 #include "../../core/stream_internal.h"
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/limits.h>
+#include <ghoti.io/compress/zlib.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
 #include <ghoti.io/compress/stream.h>
@@ -99,7 +100,8 @@ extern "C" {
 
 #define ZLIB_DEFAULT_MAX_OUTPUT_BYTES (512ULL * 1024 * 1024)
 #define ZLIB_DEFAULT_MAX_MEMORY_BYTES (256ULL * 1024 * 1024)
-#define ZLIB_DEFAULT_MAX_EXPANSION_RATIO 1000ULL
+/// The format's own ceiling; see ::GCOMP_ZLIB_MAX_EXPANSION_RATIO.
+#define ZLIB_DEFAULT_MAX_EXPANSION_RATIO GCOMP_ZLIB_MAX_EXPANSION_RATIO
 
 //
 // Parsed header

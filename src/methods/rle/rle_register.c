@@ -77,14 +77,14 @@ static const gcomp_option_schema_t g_rle_option_schemas[] = {
         "limits.max_expansion_ratio", // key
         GCOMP_OPT_UINT64,             // type
         1,                            // has_default
-        {.ui64 = 0},                  // default_value
+        {.ui64 = GCOMP_RLE_MAX_EXPANSION_RATIO}, // default_value
         0,                            // has_min
         0,                            // has_max
         0,                            // min_int
         0,                            // max_int
         0,                            // min_uint
         0,                            // max_uint
-        "Decompression bomb protection (output/input ratio)",
+        "Maximum output/input ratio; default is this format's own ceiling",
     },
 };
 

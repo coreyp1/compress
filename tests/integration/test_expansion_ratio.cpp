@@ -4,6 +4,39 @@
  * Tests for decompression bomb protection (expansion ratio limits)
  * in the Ghoti.io Compress library.
  *
+ * ## What one number cannot do
+ *
+ * The formats' ceilings differ by a factor of five hundred:
+ *
+ * | method | ceiling | where it comes from |
+ * | --- | --- | --- |
+ * | rle | 64 : 1 | TIFF 6.0 section 9: a 2-byte run token carries 128 bytes |
+ * | lz4 | 255 : 1 | one extension byte per 255 bytes of match |
+ * | deflate, zlib, gzip | 1032 : 1 | RFC 1951 3.2.5: 258 bytes in two bits |
+ * | lzw | 2560 : 1 | TIFF 6.0 section 13: a 3839-byte string in twelve bits |
+ * | zstd | 32768 : 1 | RFC 8878 3.1.1.2.2: an RLE_Block is four bytes |
+ *
+ * A limit set below a format's ceiling refuses streams the format may
+ * legitimately produce; set at or above it, it never fires. For DEFLATE the
+ * whole range 1 to 1032 can only produce false positives, because no DEFLATE
+ * stream can exceed 1032:1 in the first place.
+ *
+ * So each method now defaults to its own ceiling. The check stops being a
+ * policy guess and becomes an impossibility test: it fires only on output the
+ * format could not have produced, which is corruption or a decoder bug.
+ * `limits.max_output_bytes` remains the bound on how much a decode may
+ * produce, and a caller who wants a policy cap sets a smaller ratio by hand.
+ *
+ * ## What these tests would have caught
+ *
+ * At the old default, 32 MiB of zeros handed to our own encoder and back to
+ * our own decoder failed for five of the seven methods - deflate at a
+ * whole-stream ratio of 993:1, which is *below* the 1000 limit it tripped,
+ * because a uniform prefix runs ahead of the average. That is the same shape
+ * as the real file that started this: a PNG whose transparent top rows push
+ * the running ratio to 1028:1 before the whole-stream figure settles at 458.
+ *
+ *
  * Copyright 2026 by Corey Pennycuff
  */
 
@@ -13,6 +46,13 @@
 #include <cstring>
 #include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/deflate.h>
+#include <ghoti.io/compress/gzip.h>
+#include <ghoti.io/compress/lz4.h>
+#include <ghoti.io/compress/lzw.h>
+#include <ghoti.io/compress/method.h>
+#include <ghoti.io/compress/rle.h>
+#include <ghoti.io/compress/zlib.h>
+#include <ghoti.io/compress/zstd.h>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/limits.h>
 #include <ghoti.io/compress/options.h>
@@ -345,10 +385,15 @@ TEST_F(ExpansionRatioTest, StoredBlocksRatioCheck) {
   EXPECT_EQ(decompressed.size(), input.size());
 }
 
-// Test documentation example: 1 KB compressed -> 1 MB decompressed at limit
+// Test an explicit 1000:1 limit against 1 MB of zeros.
 TEST_F(ExpansionRatioTest, DocumentationExampleAtLimit) {
-  // This test verifies the documentation claim:
-  // "Default: 1000 (1 KB compressed → max 1 MB decompressed)"
+  // This once verified a documented default of 1000:1.  There is no such
+  // default any more - each method defaults to its own format's ceiling, which
+  // for deflate is 1032:1 - so what is left here is the mechanism at an
+  // explicitly requested 1000, which is what a caller setting a policy cap
+  // gets.  GCOMP_DEFAULT_MAX_EXPANSION_RATIO is still 1000 and is still the
+  // fallback for a method with no known ceiling, so naming it below is not
+  // stale; it is simply no longer what deflate uses when nobody asks.
 
   // Create 1MB of zeros (compresses very well)
   std::vector<uint8_t> compressed = createCompressedData(1024 * 1024);
@@ -372,6 +417,258 @@ TEST_F(ExpansionRatioTest, DocumentationExampleAtLimit) {
         compressed, GCOMP_DEFAULT_MAX_EXPANSION_RATIO, decompressed);
     // Status depends on actual compression ratio achieved
     (void)status; // Just verify no crash
+  }
+}
+
+namespace {
+
+/// Every method, with the level key that makes it try hardest and its ceiling.
+struct MethodCase {
+  const char * name;
+  const char * level_key; ///< nullptr when the method has no level
+  int64_t level;
+  uint64_t ceiling;
+};
+
+const MethodCase k_methods[] = {
+    {"deflate", "deflate.level", 9, GCOMP_DEFLATE_MAX_EXPANSION_RATIO},
+    {"zlib", "zlib.level", 9, GCOMP_ZLIB_MAX_EXPANSION_RATIO},
+    {"gzip", "gzip.level", 9, GCOMP_GZIP_MAX_EXPANSION_RATIO},
+    {"zstd", "zstd.level", 19, GCOMP_ZSTD_MAX_EXPANSION_RATIO},
+    {"lz4", nullptr, 0, GCOMP_LZ4_MAX_EXPANSION_RATIO},
+    {"lzw", nullptr, 0, GCOMP_LZW_MAX_EXPANSION_RATIO},
+    {"rle", nullptr, 0, GCOMP_RLE_MAX_EXPANSION_RATIO},
+};
+
+/**
+ * @brief How much data to push through.
+ *
+ * Large enough that the running ratio has time to reach the ceiling - a few
+ * kilobytes never gets there - and small enough not to dominate the suite.
+ * Under Memcheck it is a twentieth of that: the ratio is a property of the
+ * stream, not of how long the stream is, so the shape survives the shrinking.
+ */
+size_t payload_size() {
+  const char * v = std::getenv("GCOMP_UNDER_VALGRIND");
+  return (v && v[0] == '1') ? (256u * 1024u) : (8u * 1024u * 1024u);
+}
+
+gcomp_options_t * options_for(const MethodCase & m) {
+  gcomp_options_t * o = nullptr;
+  EXPECT_EQ(gcomp_options_create(&o), GCOMP_OK);
+  if (m.level_key) {
+    EXPECT_EQ(gcomp_options_set_int64(o, m.level_key, m.level), GCOMP_OK);
+  }
+  return o;
+}
+
+/// Encode with the method's own best effort; returns the stream.
+std::vector<uint8_t> encode(
+    const MethodCase & m, const std::vector<uint8_t> & input) {
+  gcomp_options_t * o = options_for(m);
+  size_t bound = 0;
+  EXPECT_EQ(gcomp_encode_bound(nullptr, m.name, o, input.size(), &bound),
+      GCOMP_OK);
+  std::vector<uint8_t> out(bound ? bound : 1);
+  size_t written = 0;
+  EXPECT_EQ(gcomp_encode_buffer(nullptr, m.name, o, input.data(), input.size(),
+                out.data(), out.size(), &written),
+      GCOMP_OK)
+      << m.name;
+  gcomp_options_destroy(o);
+  out.resize(written);
+  return out;
+}
+
+/// Bytes whose four-byte prefixes are mostly distinct: nothing to match on.
+std::vector<uint8_t> incompressible(size_t len, uint32_t seed) {
+  std::vector<uint8_t> v(len);
+  uint32_t s = seed;
+  for (size_t i = 0; i < len; i++) {
+    s ^= s << 13;
+    s ^= s >> 17;
+    s ^= s << 5;
+    v[i] = (uint8_t)(s >> 24);
+  }
+  return v;
+}
+
+/**
+ * @brief The shape that started this: a uniform prefix, then real data.
+ *
+ * The PNG that first failed is a logo with transparent rows across the top.
+ * The prefix compresses at close to the format's ceiling while the tail does
+ * not, so the running ratio peaks early and the whole-stream ratio is far
+ * lower - a decoder that refuses on the running figure stops inside a file
+ * whose overall ratio was never close to the limit.
+ */
+std::vector<uint8_t> compressible_prefix(size_t len) {
+  std::vector<uint8_t> v(len, 0);
+  const size_t tail = len / 2;
+  std::vector<uint8_t> noise = incompressible(tail, 0x5eed1234u);
+  std::memcpy(v.data() + (len - tail), noise.data(), tail);
+  return v;
+}
+
+} // namespace
+
+/**
+ * @brief Our own encoder's output, through our own decoder, at our defaults.
+ *
+ * The simplest thing a compression library must do, and the one the old
+ * default broke: five of these seven failed with GCOMP_ERR_LIMIT.
+ */
+TEST(ExpansionRatio, EveryMethodDecodesItsOwnMostCompressibleOutput) {
+  const size_t n = payload_size();
+  const std::vector<uint8_t> input(n, 0);
+
+  for (const MethodCase & m : k_methods) {
+    const std::vector<uint8_t> enc = encode(m, input);
+    ASSERT_FALSE(enc.empty()) << m.name;
+
+    // A fresh options object: library defaults and nothing else.
+    gcomp_options_t * d = nullptr;
+    ASSERT_EQ(gcomp_options_create(&d), GCOMP_OK);
+    std::vector<uint8_t> back(n + 64);
+    size_t produced = 0;
+    const gcomp_status_t s = gcomp_decode_buffer(
+        nullptr, m.name, d, enc.data(), enc.size(), back.data(), back.size(),
+        &produced);
+    gcomp_options_destroy(d);
+
+    EXPECT_EQ(s, GCOMP_OK)
+        << m.name << " refused its own output: " << n << " bytes compressed to "
+        << enc.size() << " (" << ((double)n / (double)enc.size())
+        << ":1) against a default ceiling of " << m.ceiling;
+    EXPECT_EQ(produced, n) << m.name;
+    if (produced == n) {
+      EXPECT_EQ(std::memcmp(back.data(), input.data(), n), 0) << m.name;
+    }
+  }
+}
+
+/**
+ * @brief A stream whose front compresses harder than its body.
+ *
+ * The running-total check is what makes this different from the test above:
+ * the whole-stream ratio here is around two, and the prefix's is at the
+ * ceiling. A limit below the ceiling stops inside the file.
+ */
+TEST(ExpansionRatio, ACompressiblePrefixDoesNotStopTheStream) {
+  const size_t n = payload_size();
+  const std::vector<uint8_t> input = compressible_prefix(n);
+
+  for (const MethodCase & m : k_methods) {
+    const std::vector<uint8_t> enc = encode(m, input);
+    gcomp_options_t * d = nullptr;
+    ASSERT_EQ(gcomp_options_create(&d), GCOMP_OK);
+    std::vector<uint8_t> back(n + 64);
+    size_t produced = 0;
+    const gcomp_status_t s = gcomp_decode_buffer(
+        nullptr, m.name, d, enc.data(), enc.size(), back.data(), back.size(),
+        &produced);
+    gcomp_options_destroy(d);
+
+    EXPECT_EQ(s, GCOMP_OK)
+        << m.name << " stopped inside a stream whose whole-stream ratio is "
+        << ((double)n / (double)enc.size()) << ":1, well under its ceiling of "
+        << m.ceiling << "; it saw " << produced << " of " << n << " bytes";
+    EXPECT_EQ(produced, n) << m.name;
+    if (produced == n) {
+      EXPECT_EQ(std::memcmp(back.data(), input.data(), n), 0) << m.name;
+    }
+  }
+}
+
+/**
+ * @brief No encoder of ours beats the ceiling its format declares.
+ *
+ * If one did, the declared ceiling would be wrong and the default would refuse
+ * legitimate output again - so this is the test that keeps the numbers honest
+ * rather than merely consistent with themselves.
+ */
+TEST(ExpansionRatio, NoEncoderExceedsItsDeclaredCeiling) {
+  const size_t n = payload_size();
+  const std::vector<uint8_t> input(n, 0);
+
+  for (const MethodCase & m : k_methods) {
+    const std::vector<uint8_t> enc = encode(m, input);
+    ASSERT_FALSE(enc.empty()) << m.name;
+    const double achieved = (double)n / (double)enc.size();
+    EXPECT_LE(achieved, (double)m.ceiling)
+        << m.name << " reached " << achieved
+        << ":1 on uniform input, above the " << m.ceiling
+        << ":1 its format is supposed to bound it to";
+  }
+}
+
+/**
+ * @brief The schema reports the default the decoder actually uses.
+ *
+ * gcomp_method_get_option_schema() is how a caller discovers what a limit is
+ * without setting it. Four of the seven used to report either "no default" or
+ * zero while the decoder used something else entirely.
+ */
+TEST(ExpansionRatio, TheSchemaAgreesWithTheDecoder) {
+  gcomp_registry_t * reg = gcomp_registry_default();
+  ASSERT_NE(reg, nullptr);
+
+  for (const MethodCase & m : k_methods) {
+    const gcomp_method_t * method = gcomp_registry_find(reg, m.name);
+    ASSERT_NE(method, nullptr) << m.name;
+    const gcomp_option_schema_t * schema = nullptr;
+    ASSERT_EQ(gcomp_method_get_option_schema(
+                  method, "limits.max_expansion_ratio", &schema),
+        GCOMP_OK)
+        << m.name;
+    ASSERT_NE(schema, nullptr) << m.name;
+    EXPECT_TRUE(schema->has_default)
+        << m.name << " declares no default for limits.max_expansion_ratio, so "
+        << "introspection cannot tell a caller what it will get";
+    EXPECT_EQ(schema->default_value.ui64, m.ceiling) << m.name;
+  }
+}
+
+/**
+ * @brief Lowering the ratio still refuses, and zero still means unlimited.
+ *
+ * Raising the defaults is only safe if the mechanism they drive still works:
+ * a caller who wants a policy cap must still get one.
+ */
+TEST(ExpansionRatio, ACallersOwnLimitIsStillEnforced) {
+  const size_t n = payload_size();
+  const std::vector<uint8_t> input(n, 0);
+
+  for (const MethodCase & m : k_methods) {
+    const std::vector<uint8_t> enc = encode(m, input);
+
+    // Two to one, which every one of these streams beats by a wide margin.
+    gcomp_options_t * tight = nullptr;
+    ASSERT_EQ(gcomp_options_create(&tight), GCOMP_OK);
+    ASSERT_EQ(
+        gcomp_options_set_uint64(tight, "limits.max_expansion_ratio", 2),
+        GCOMP_OK);
+    std::vector<uint8_t> back(n + 64);
+    size_t produced = 0;
+    EXPECT_EQ(gcomp_decode_buffer(nullptr, m.name, tight, enc.data(),
+                  enc.size(), back.data(), back.size(), &produced),
+        GCOMP_ERR_LIMIT)
+        << m.name << " accepted a stream at " << ((double)n / (double)enc.size())
+        << ":1 under a 2:1 limit";
+    gcomp_options_destroy(tight);
+
+    // Zero is documented as unlimited, and has to keep meaning that.
+    gcomp_options_t * off = nullptr;
+    ASSERT_EQ(gcomp_options_create(&off), GCOMP_OK);
+    ASSERT_EQ(gcomp_options_set_uint64(off, "limits.max_expansion_ratio", 0),
+        GCOMP_OK);
+    produced = 0;
+    EXPECT_EQ(gcomp_decode_buffer(nullptr, m.name, off, enc.data(), enc.size(),
+                  back.data(), back.size(), &produced),
+        GCOMP_OK)
+        << m.name << " refused a stream with the ratio check turned off";
+    EXPECT_EQ(produced, n) << m.name;
+    gcomp_options_destroy(off);
   }
 }
 

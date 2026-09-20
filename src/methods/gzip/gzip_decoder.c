@@ -61,6 +61,7 @@
 #include "../../core/wrapper_options.h"
 #include <ghoti.io/compress/crc32.h>
 #include <ghoti.io/compress/limits.h>
+#include <ghoti.io/compress/gzip.h>
 #include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/stream.h>
 #include <stdint.h>
@@ -86,7 +87,7 @@ static gcomp_status_t read_decoder_options(
   state->max_output_bytes =
       gcomp_limits_read_output_max(options, GCOMP_DEFAULT_MAX_OUTPUT_BYTES);
   state->max_expansion_ratio = gcomp_limits_read_expansion_ratio_max(
-      options, GCOMP_DEFAULT_MAX_EXPANSION_RATIO);
+      options, GCOMP_GZIP_MAX_EXPANSION_RATIO);
 
   if (!options) {
     return GCOMP_OK;

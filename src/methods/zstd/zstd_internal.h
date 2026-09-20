@@ -41,6 +41,7 @@
 #include "../../core/stream_internal.h"
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/limits.h>
+#include <ghoti.io/compress/zstd.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
 #include <ghoti.io/compress/stream.h>
@@ -115,7 +116,8 @@ extern "C" {
 
 #define ZSTD_DEFAULT_MAX_OUTPUT_BYTES (512ULL * 1024 * 1024) ///< 512 MiB
 #define ZSTD_DEFAULT_MAX_MEMORY_BYTES (256ULL * 1024 * 1024) ///< 256 MiB
-#define ZSTD_DEFAULT_MAX_EXPANSION_RATIO 1000                ///< 1000x
+/// The format's own ceiling; see ::GCOMP_ZSTD_MAX_EXPANSION_RATIO.
+#define ZSTD_DEFAULT_MAX_EXPANSION_RATIO GCOMP_ZSTD_MAX_EXPANSION_RATIO
 #define ZSTD_DEFAULT_MAX_WINDOW_BYTES (1ULL << 27)           ///< 128 MiB
 
 // Parallel compression constants

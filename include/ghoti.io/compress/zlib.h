@@ -104,6 +104,19 @@ extern "C" {
 #endif
 
 /**
+ * @brief The largest expansion a zlib stream can carry, output over input.
+ *
+ * The payload is deflate, so RFC 1951's 1032:1 bound applies unchanged (see
+ * ::GCOMP_DEFLATE_MAX_EXPANSION_RATIO for the derivation).  RFC 1950's own
+ * framing - a two-byte header, a four-byte Adler-32, and four more when FDICT
+ * is set - is input that produces no output, so it can only lower the ratio,
+ * never raise it.
+ *
+ * Measured: 32 MiB of zeros compresses to 1030:1 at level 9.
+ */
+#define GCOMP_ZLIB_MAX_EXPANSION_RATIO 1032ULL
+
+/**
  * @brief Register the zlib method with a registry.
  *
  * Requires the "deflate" method to be registered in the same registry, which

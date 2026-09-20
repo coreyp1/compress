@@ -28,6 +28,19 @@ extern "C" {
 #endif
 
 /**
+ * @brief The largest expansion either RLE profile permits, output over input.
+ *
+ * PackBits (TIFF 6.0 section 9) writes a run as a one-byte control and one
+ * byte of data, standing for at most 128 repetitions: 128 / 2 = 64.  The
+ * Targa profile is byte-oriented here too, with the same 128-byte cap on a
+ * run, so it is bounded identically.
+ *
+ * Measured: 32 MiB of zeros compresses to exactly 64:1, which is the bound
+ * itself - a run-length encoder on uniform input reaches its own ceiling.
+ */
+#define GCOMP_RLE_MAX_EXPANSION_RATIO 64ULL
+
+/**
  * @brief Register the RLE method with a registry.
  *
  * @param registry The registry to register with (must not be NULL)

@@ -20,6 +20,7 @@
 #include "rle_internal.h"
 #include "rle_profile.h"
 #include <ghoti.io/compress/limits.h>
+#include <ghoti.io/compress/rle.h>
 #include <string.h>
 
 #define RLE_FORMAT_DEFAULT RLE_FORMAT_PACKBITS
@@ -55,21 +56,13 @@ gcomp_status_t rle_decoder_init(gcomp_registry_t * registry,
     gcomp_copy_cstr(state->format, sizeof(state->format), RLE_FORMAT_DEFAULT);
   }
 
-  if (options) {
-    uint64_t u64 = 0;
-    if (gcomp_options_get_uint64(options, "limits.max_output_bytes", &u64) ==
-        GCOMP_OK) {
-      state->max_output_bytes = u64;
-    }
-    if (gcomp_options_get_uint64(options, "limits.max_memory_bytes", &u64) ==
-        GCOMP_OK) {
-      state->max_memory_bytes = u64;
-    }
-    if (gcomp_options_get_uint64(options, "limits.max_expansion_ratio", &u64) ==
-        GCOMP_OK) {
-      state->max_expansion_ratio = u64;
-    }
-  }
+  // Defaults, then whatever the caller asked for instead.
+  state->max_output_bytes = gcomp_limits_read_output_max(
+      options, GCOMP_DEFAULT_MAX_OUTPUT_BYTES);
+  state->max_memory_bytes = gcomp_limits_read_memory_max(
+      options, GCOMP_DEFAULT_MAX_MEMORY_BYTES);
+  state->max_expansion_ratio = gcomp_limits_read_expansion_ratio_max(
+      options, GCOMP_RLE_MAX_EXPANSION_RATIO);
 
   decoder->method_state = state;
   return GCOMP_OK;

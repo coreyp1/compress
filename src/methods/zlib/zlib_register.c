@@ -81,7 +81,7 @@ static const gcomp_option_schema_t g_zlib_option_schemas[] = {
         0,                                           // max_int
         0,                                           // min_uint
         0,                                           // max_uint
-        "Maximum output/input ratio (decompression bomb protection)", // help
+        "Maximum output/input ratio; default is this format's own ceiling", // help
     },
 };
 

@@ -102,6 +102,25 @@ extern "C" {
 #endif
 
 /**
+ * @brief The largest expansion RFC 1951 permits, as an output/input ratio.
+ *
+ * RFC 1951 section 3.2.5 bounds a match at 258 bytes, and a dynamic-Huffman
+ * block (section 3.2.7) may give the length code and the distance code one bit
+ * each, so two bits of input can carry 258 bytes of output:
+ * 258 * 8 / 2 = 1032.  No stream this decoder should accept can do better, so
+ * a `limits.max_expansion_ratio` at this value cannot refuse a legitimate
+ * stream - it fires only on output the format could not have produced.
+ *
+ * Measured: 32 MiB of zeros compresses to 993:1 at level 9, just under it.
+ *
+ * A caller who wants a policy cap rather than an impossibility check sets a
+ * smaller number; 0 turns the check off entirely.  Either way
+ * `limits.max_output_bytes` remains the hard bound on what a decode may
+ * produce.
+ */
+#define GCOMP_DEFLATE_MAX_EXPANSION_RATIO 1032ULL
+
+/**
  * @brief Register the deflate method with a registry.
  *
  * Call this to make the "deflate" method available for encoding and decoding.

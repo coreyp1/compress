@@ -41,13 +41,33 @@ typedef struct {
 #define GCOMP_DEFAULT_MAX_MEMORY_BYTES (256ULL * 1024 * 1024)
 
 /**
- * @brief Default maximum expansion ratio (1000x)
+ * @brief Fallback maximum expansion ratio for a method with no known ceiling.
  *
- * This means 1 KB of compressed data can expand to at most 1 MB of output.
- * This protects against "decompression bombs" - maliciously crafted inputs
- * that decompress to massive outputs (e.g., 1 MB → 1 TB).
+ * **None of the built-in methods use this.** Each one defaults to its own
+ * format's proven ceiling instead - ::GCOMP_DEFLATE_MAX_EXPANSION_RATIO,
+ * ::GCOMP_ZSTD_MAX_EXPANSION_RATIO and so on - so that the check fires only on
+ * output the format could not have produced. This value is what is left for a
+ * third-party method whose ceiling nobody has worked out.
  *
- * Set to 0 for unlimited (not recommended for untrusted input).
+ * ## Why a single number was wrong
+ *
+ * It used to be the default everywhere, and the formats' ceilings differ by a
+ * factor of five hundred: 64:1 for RLE, 255:1 for LZ4, 1032:1 for DEFLATE,
+ * 2560:1 for TIFF LZW, 32768:1 for Zstandard. One number cannot serve all of
+ * them. Below a format's ceiling it refuses legitimate streams - 32 MiB of
+ * zeros round-tripped through five of the seven methods was refused by this
+ * library's own decoder at this library's own default - and at or above it the
+ * check never fires at all. For DEFLATE in particular every value in its
+ * entire useful range, 1 to 1032, can only produce false positives.
+ *
+ * ## What actually bounds a decompression bomb
+ *
+ * ::GCOMP_DEFAULT_MAX_OUTPUT_BYTES. It is exact, it is format-independent, and
+ * it is the limit a caller should set when the question is "how much output am
+ * I willing to hold". The ratio is the cheaper, earlier check that a stream is
+ * heading somewhere impossible; it is not the bound.
+ *
+ * Set to 0 for unlimited.
  */
 #define GCOMP_DEFAULT_MAX_EXPANSION_RATIO 1000ULL
 

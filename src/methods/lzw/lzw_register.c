@@ -131,14 +131,14 @@ static const gcomp_option_schema_t g_lzw_option_schemas[] = {
         "limits.max_expansion_ratio",
         GCOMP_OPT_UINT64,
         1,
-        {.ui64 = 0},
+        {.ui64 = GCOMP_LZW_MAX_EXPANSION_RATIO},
         0,
         0,
         0,
         0,
         0,
         0,
-        "Decompression bomb protection (output/input ratio)",
+        "Maximum output/input ratio; default is this format's own ceiling",
     },
 };
 

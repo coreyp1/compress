@@ -146,7 +146,8 @@ extern "C" {
 // Limit defaults
 #define LZ4_DEFAULT_MAX_OUTPUT_BYTES (512ULL * 1024 * 1024) ///< 512 MiB
 #define LZ4_DEFAULT_MAX_MEMORY_BYTES (256ULL * 1024 * 1024) ///< 256 MiB
-#define LZ4_DEFAULT_MAX_EXPANSION_RATIO 1000                ///< 1000x
+/// The format's own ceiling; see ::GCOMP_LZ4_MAX_EXPANSION_RATIO.
+#define LZ4_DEFAULT_MAX_EXPANSION_RATIO GCOMP_LZ4_MAX_EXPANSION_RATIO
 
 //
 

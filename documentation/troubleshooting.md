@@ -73,11 +73,20 @@ if (s != GCOMP_OK) {
 
 2. **Expansion ratio exceeded**
    - Error: `"expansion ratio exceeds limit"`
-   - Cause: Possible decompression bomb or highly compressed data
-   - Solution: For legitimate data, increase `limits.max_expansion_ratio`
+   - Cause: The stream expanded further than the limit allows. At the default
+     this cannot happen for a well-formed stream - the default is the format's
+     own ceiling (see [Limits](api/limits.md)), so exceeding it means the
+     output could not have come from a valid stream of that format. Corruption
+     is the usual explanation.
+   - If you lowered `limits.max_expansion_ratio` yourself, this is the limit
+     doing what you asked, and legitimate files will trip it: a PNG with a
+     large uniform region reaches 1028:1 part-way through a stream whose
+     whole-file ratio is 458:1, because the check compares running totals.
+   - Solution: leave the ratio at its default and bound the decode with
+     `limits.max_output_bytes`, which is exact.
 
    ```c
-   gcomp_options_set_uint64(opts, "limits.max_expansion_ratio", 10000);
+   gcomp_options_set_uint64(opts, "limits.max_output_bytes", 64 * 1024 * 1024);
    ```
 
 3. **Header field too large** (gzip)
