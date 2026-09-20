@@ -203,6 +203,30 @@ A run is slower than a release run by roughly an order of magnitude, and
 `halt_on_error=1` stops at the first race rather than repeating it from every
 test that follows.
 
+#### Do not preload the TSan runtime
+
+The ASan target runs its tests with `LD_PRELOAD` naming `libasan.so`, because
+the ASan runtime has to initialise before anything it intercepts and an
+`LD_PRELOAD` inherited from the environment would otherwise come first. The
+TSan target deliberately does the opposite: it *empties* `LD_PRELOAD`.
+
+Linking with `-fsanitize=thread` already puts `libtsan.so.2` first in the
+executable's own `NEEDED` list, so a preload buys nothing. It also breaks the
+suite. With `libtsan` preloaded, the shell that `system()` spawns inherits the
+preload and dies, and `system()` returns 11 whatever it was asked to run - so
+every oracle in this project reports its reference as missing. `python3` backs
+the zlib, gzip and deflate oracles; the `zstd` CLI backs the Zstandard and
+seekable ones. The first full TSan run failed 135 tests for this reason and not
+one of them was a race.
+
+ASan does not have this problem: `system()` works normally with `libasan`
+preloaded, and the ASan oracle suites do run their comparisons.
+
+The thing that made this visible is worth keeping in mind when writing an
+oracle test. These suites treat an absent reference as a **failure**, not a
+skip. Had they skipped, the run would have been green while nothing was ever
+compared against a reference implementation.
+
 ### Understanding Sanitizer Output
 
 **ASan buffer overflow example:**

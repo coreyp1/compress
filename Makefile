@@ -1634,8 +1634,27 @@ TSAN_CXXFLAGS := $(CXXFLAGS) $(TSAN_FLAGS)
 TSAN_LDFLAGS := $(LDFLAGS) $(TSAN_FLAGS)
 TSAN_COMPRESSLIBRARY := -L $(TSAN_APP_DIR) -l$(SUITE)-$(PROJECT)$(BRANCH)-tsan
 
-# For the same reason the ASan build names its runtime: see the comment there.
-TSAN_RUNTIME := $(shell $(CC) -print-file-name=libtsan.so)
+# Unlike the ASan build, this one does *not* preload its runtime, and must not.
+#
+# -fsanitize=thread at link time puts libtsan.so.2 first in the executable's
+# own NEEDED list, so the runtime already initialises before anything it has to
+# intercept; the preload the ASan block needs would be redundant here.  It is
+# also actively harmful.  With libtsan preloaded, every system() call in the
+# test suite fails - the shell it spawns inherits the preload and dies, and
+# system() returns 11 whatever it was asked to run.
+#
+# That is not a small blast radius.  Every oracle in this project shells out:
+# python3 for zlib, gzip and deflate, the zstd CLI for Zstandard and for the
+# seekable format.  A preloaded run reports all of them as "reference not
+# installed".  The first full run of this target failed 135 tests for that
+# reason and not one of them was a race.
+#
+# What caught it is worth keeping: those suites treat an absent oracle as a
+# failure rather than a skip.  Had they skipped, this would have been a green
+# ThreadSanitizer run in which nothing was ever compared against a reference.
+#
+# LD_PRELOAD is emptied rather than left alone so that a preload inherited from
+# the environment cannot reintroduce the problem.
 
 # TSan requires position-independent code and refuses to start without it.
 ifeq ($(UNAME_S), Linux)
@@ -1689,7 +1708,7 @@ $(foreach pair,$(TEST_PAIRS),$(eval $(call tsan-test-executable-rule,$(word 1,$(
 # every subsequent test, and history_size buys a deeper record of the other
 # thread's accesses - the shallow default frequently reports a race with no
 # stack for one side, which is not enough to act on.
-TSAN_RUN_ENV := LD_LIBRARY_PATH="$(TSAN_APP_DIR)" LD_PRELOAD="$(TSAN_RUNTIME)" \
+TSAN_RUN_ENV := LD_LIBRARY_PATH="$(TSAN_APP_DIR)" LD_PRELOAD= \
 	TSAN_OPTIONS="halt_on_error=1:history_size=7:second_deadlock_stack=1"
 
 test-tsan: ## Run all tests with ThreadSanitizer (Linux only)
