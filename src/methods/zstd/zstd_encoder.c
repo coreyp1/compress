@@ -691,7 +691,22 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
     state->mf_window_max = (size_t)content_size;
   }
 
+  // RFC 8878 section 3.1.1.2: Block_Maximum_Size is "the smaller of
+  // Window_Size and 128 KB".  The block buffer is what decides how much this
+  // encoder puts in one block, so the window the frame header declares caps it
+  // as well as the format's own ceiling.
+  //
+  // This used to be ZSTD_BLOCK_SIZE_MAX unconditionally, so any frame asking
+  // for a window below 128 KB -- window_log under 17 -- described itself as
+  // holding less than the blocks it then wrote.  Our own decoder reads such a
+  // frame, because it sizes its output buffer from the format ceiling rather
+  // than from the frame; the reference decoder applies the rule and refuses
+  // the frame outright.  Nothing caught it because nothing had ever handed a
+  // small-window frame of ours to another implementation.
   size_t block_buffer_size = ZSTD_BLOCK_SIZE_MAX;
+  if (state->header.window_size < block_buffer_size) {
+    block_buffer_size = (size_t)state->header.window_size;
+  }
   // May be larger than the input for incompressible data.
   size_t compressed_buffer_size =
       block_buffer_size + ZSTD_BLOCK_HEADER_SIZE + 256;
