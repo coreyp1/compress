@@ -51,8 +51,10 @@
 #include <ghoti.io/compress/limits.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
+#include <ghoti.io/compress/stream.h>
 #include <ghoti.io/compress/zstd.h>
 #include <gtest/gtest.h>
+#include <functional>
 #include <random>
 #include <sstream>
 #include <string>
@@ -426,6 +428,241 @@ protected:
   }
 
 
+
+  // Options-flexible variants.
+  //
+  // The helpers above fix the options they set.  The tests added for
+  // concatenation, window_log, threads and streaming each need a different
+  // encoder or decoder configuration, so they pass a setter instead.
+  using OptSetter = std::function<bool(gcomp_options_t *)>;
+
+  // Why the last streaming helper returned nothing.  Without this an internal
+  // bail-out and a genuine decode failure are the same empty vector.
+  std::string stream_why_;
+
+  std::vector<uint8_t> gcompCompressOpts(
+      const std::vector<uint8_t> & data, const OptSetter & set = nullptr) {
+    gcomp_options_t * opts = nullptr;
+    if (gcomp_options_create(&opts) != GCOMP_OK) {
+      return {};
+    }
+    if (set && !set(opts)) {
+      gcomp_options_destroy(opts);
+      return {};
+    }
+    size_t cap = (data.size() * 12 / 10) + 4096;
+    std::vector<uint8_t> compressed(std::max(cap, size_t(4096)));
+    size_t used = 0;
+    gcomp_status_t status = gcomp_encode_buffer(registry_, "zstd", opts,
+        data.data(), data.size(), compressed.data(), compressed.size(), &used);
+    gcomp_options_destroy(opts);
+    if (status != GCOMP_OK) {
+      return {};
+    }
+    compressed.resize(used);
+    return compressed;
+  }
+
+  // Decoder limits are deliberately generous here: these tests are about
+  // format agreement with the reference tool, not about our limit policy,
+  // which has its own tests in test_zstd_limits.cpp.
+  std::vector<uint8_t> gcompDecompressOpts(const std::vector<uint8_t> & data,
+      size_t expected_size, const OptSetter & set = nullptr) {
+    if (data.empty()) {
+      return {};
+    }
+    gcomp_options_t * opts = nullptr;
+    if (gcomp_options_create(&opts) != GCOMP_OK) {
+      return {};
+    }
+    bool ok =
+        gcomp_options_set_uint64(opts, "limits.max_expansion_ratio", 0) ==
+            GCOMP_OK &&
+        gcomp_options_set_uint64(opts, "limits.max_window_bytes",
+            (uint64_t)512 * 1024 * 1024) == GCOMP_OK;
+    if (ok && set) {
+      ok = set(opts);
+    }
+    if (!ok) {
+      gcomp_options_destroy(opts);
+      return {};
+    }
+    size_t cap = expected_size > 0 ? expected_size + 4096
+                                   : data.size() * 100 + 4096;
+    std::vector<uint8_t> out(cap);
+    size_t used = 0;
+    gcomp_status_t status = gcomp_decode_buffer(registry_, "zstd", opts,
+        data.data(), data.size(), out.data(), out.size(), &used);
+    gcomp_options_destroy(opts);
+    if (status != GCOMP_OK) {
+      return {};
+    }
+    out.resize(used);
+    return out;
+  }
+
+  // Streaming encode: input handed over in in_chunk-sized pieces and output
+  // collected through an out_chunk-sized window.  Either may be smaller than
+  // any internal block, which is the point -- the encoder has to carry its
+  // state across a call boundary that falls wherever the caller put it.
+  std::vector<uint8_t> gcompCompressStreaming(const std::vector<uint8_t> & data,
+      size_t in_chunk, size_t out_chunk, const OptSetter & set = nullptr) {
+    stream_why_.clear();
+    gcomp_options_t * opts = nullptr;
+    if (gcomp_options_create(&opts) != GCOMP_OK) {
+      return {};
+    }
+    if (set && !set(opts)) {
+      gcomp_options_destroy(opts);
+      return {};
+    }
+    gcomp_encoder_t * enc = nullptr;
+    gcomp_status_t status =
+        gcomp_encoder_create(registry_, "zstd", opts, &enc);
+    gcomp_options_destroy(opts);
+    if (status != GCOMP_OK) {
+      return {};
+    }
+
+    std::vector<uint8_t> result;
+    std::vector<uint8_t> obuf(out_chunk);
+    size_t offset = 0;
+    while (offset < data.size()) {
+      size_t n = std::min(in_chunk, data.size() - offset);
+      gcomp_buffer_t in = {const_cast<uint8_t *>(data.data() + offset), n, 0};
+      while (in.used < in.size) {
+        gcomp_buffer_t ob = {obuf.data(), obuf.size(), 0};
+        size_t before = in.used;
+        gcomp_status_t ust = gcomp_encoder_update(enc, &in, &ob);
+        if (ust != GCOMP_OK) {
+          stream_why_ = std::string("encoder_update -> ") +
+              gcomp_status_to_string(ust);
+          gcomp_encoder_destroy(enc);
+          return {};
+        }
+        result.insert(result.end(), obuf.data(), obuf.data() + ob.used);
+        if (in.used == before && ob.used == 0) {
+          stream_why_ = "encoder made no progress";
+          gcomp_encoder_destroy(enc);
+          return {};
+        }
+      }
+      offset += in.used;
+    }
+
+    for (;;) {
+      gcomp_buffer_t ob = {obuf.data(), obuf.size(), 0};
+      gcomp_status_t st = gcomp_encoder_finish(enc, &ob);
+      result.insert(result.end(), obuf.data(), obuf.data() + ob.used);
+      if (st == GCOMP_OK) {
+        break;
+      }
+      if (st != GCOMP_ERR_LIMIT || ob.used == 0) {
+        stream_why_ = std::string("encoder_finish -> ") +
+            gcomp_status_to_string(st);
+        gcomp_encoder_destroy(enc);
+        return {};
+      }
+    }
+    gcomp_encoder_destroy(enc);
+    return result;
+  }
+
+  std::vector<uint8_t> gcompDecompressStreaming(
+      const std::vector<uint8_t> & data, size_t expected_size, size_t in_chunk,
+      size_t out_chunk, const OptSetter & set = nullptr) {
+    stream_why_.clear();
+    gcomp_options_t * opts = nullptr;
+    if (gcomp_options_create(&opts) != GCOMP_OK) {
+      return {};
+    }
+    bool ok =
+        gcomp_options_set_uint64(opts, "limits.max_expansion_ratio", 0) ==
+            GCOMP_OK &&
+        gcomp_options_set_uint64(opts, "limits.max_window_bytes",
+            (uint64_t)512 * 1024 * 1024) == GCOMP_OK;
+    if (ok && set) {
+      ok = set(opts);
+    }
+    if (!ok) {
+      gcomp_options_destroy(opts);
+      return {};
+    }
+    gcomp_decoder_t * dec = nullptr;
+    gcomp_status_t status =
+        gcomp_decoder_create(registry_, "zstd", opts, &dec);
+    gcomp_options_destroy(opts);
+    if (status != GCOMP_OK) {
+      return {};
+    }
+
+    std::vector<uint8_t> result;
+    std::vector<uint8_t> obuf(out_chunk);
+    size_t offset = 0;
+    while (offset < data.size()) {
+      size_t n = std::min(in_chunk, data.size() - offset);
+      gcomp_buffer_t in = {const_cast<uint8_t *>(data.data() + offset), n, 0};
+      while (in.used < in.size) {
+        gcomp_buffer_t ob = {obuf.data(), obuf.size(), 0};
+        size_t before = in.used;
+        gcomp_status_t ust = gcomp_decoder_update(dec, &in, &ob);
+        if (ust != GCOMP_OK) {
+          stream_why_ = std::string("decoder_update -> ") +
+              gcomp_status_to_string(ust);
+          gcomp_decoder_destroy(dec);
+          return {};
+        }
+        result.insert(result.end(), obuf.data(), obuf.data() + ob.used);
+        if (in.used == before && ob.used == 0) {
+          stream_why_ = "decoder made no progress";
+          gcomp_decoder_destroy(dec);
+          return {};
+        }
+      }
+      offset += in.used;
+    }
+
+    for (;;) {
+      gcomp_buffer_t ob = {obuf.data(), obuf.size(), 0};
+      gcomp_status_t st = gcomp_decoder_finish(dec, &ob);
+      result.insert(result.end(), obuf.data(), obuf.data() + ob.used);
+      if (st == GCOMP_OK) {
+        break;
+      }
+      if (st != GCOMP_ERR_LIMIT || ob.used == 0) {
+        stream_why_ = std::string("decoder_finish -> ") +
+            gcomp_status_to_string(st);
+        gcomp_decoder_destroy(dec);
+        return {};
+      }
+    }
+    gcomp_decoder_destroy(dec);
+    (void)expected_size;
+    return result;
+  }
+
+  // A skippable frame (RFC 8878 section 3.1.2): magic 0x184D2A5?, a four byte
+  // little-endian length, then that many bytes a decoder must ignore.
+  static std::vector<uint8_t> makeSkippableFrame(size_t payload) {
+    std::vector<uint8_t> f = {0x50, 0x2a, 0x4d, 0x18};
+    f.push_back((uint8_t)(payload & 0xFF));
+    f.push_back((uint8_t)((payload >> 8) & 0xFF));
+    f.push_back((uint8_t)((payload >> 16) & 0xFF));
+    f.push_back((uint8_t)((payload >> 24) & 0xFF));
+    for (size_t i = 0; i < payload; i++) {
+      f.push_back((uint8_t)(i * 31 + 7));
+    }
+    return f;
+  }
+
+  static std::vector<uint8_t> concatFrames(
+      const std::vector<std::vector<uint8_t>> & parts) {
+    std::vector<uint8_t> out;
+    for (const auto & p : parts) {
+      out.insert(out.end(), p.begin(), p.end());
+    }
+    return out;
+  }
 
   // Compress with our library
   std::vector<uint8_t> gcompCompress(
@@ -1020,6 +1257,369 @@ TEST_F(ZstdOracleTest, ZstdCli_OurDecoder_EveryShortLength) {
     if (n) {
       ASSERT_EQ(memcmp(out.data(), original.data(), n), 0) << "n=" << n;
     }
+  }
+}
+
+//
+// Gap 1: concatenated frames
+//
+// RFC 8878 section 3: a zstd file is a SEQUENCE of frames, and a decoder is
+// expected to run through all of them.  The oracle tests above only ever
+// handed the decoder one.  The zstd CLI concatenates by simple byte
+// concatenation, so the reference behaviour is easy to state and easy to
+// check in both directions.
+//
+
+TEST_F(ZstdOracleTest, ZstdCli_OurDecoder_ConcatenatedFrames) {
+  if (!has_zstd_cli_) {
+    GTEST_SKIP() << "zstd CLI not available";
+  }
+
+  std::vector<std::vector<uint8_t>> originals = {
+      generateProseLikeData(1000, 11u),
+      generateProseLikeData(64 * 1024, 12u),
+      generateProseLikeData(1, 13u),
+      generateProseLikeData(9000, 14u),
+  };
+
+  std::vector<std::vector<uint8_t>> frames;
+  std::vector<uint8_t> expected;
+  for (const auto & o : originals) {
+    std::vector<uint8_t> f = zstdCliCompressWith(o, "-3");
+    ASSERT_FALSE(f.empty());
+    frames.push_back(f);
+    expected.insert(expected.end(), o.begin(), o.end());
+  }
+
+  std::vector<uint8_t> joined = concatFrames(frames);
+  std::vector<uint8_t> out =
+      gcompDecompressOpts(joined, expected.size(), [](gcomp_options_t * o) {
+        return gcomp_options_set_bool(o, "zstd.concat", 1) == GCOMP_OK;
+      });
+
+  ASSERT_EQ(out.size(), expected.size())
+      << "four reference frames concatenated";
+  EXPECT_EQ(memcmp(out.data(), expected.data(), expected.size()), 0);
+}
+
+TEST_F(ZstdOracleTest, OurEncoder_ZstdCli_ConcatenatedFrames) {
+  if (!has_zstd_cli_) {
+    GTEST_SKIP() << "zstd CLI not available";
+  }
+
+  std::vector<std::vector<uint8_t>> originals = {
+      generateProseLikeData(777, 21u),
+      generateProseLikeData(32 * 1024, 22u),
+      generateProseLikeData(5, 23u),
+  };
+
+  std::vector<std::vector<uint8_t>> frames;
+  std::vector<uint8_t> expected;
+  for (const auto & o : originals) {
+    std::vector<uint8_t> f = gcompCompress(o);
+    ASSERT_FALSE(f.empty());
+    frames.push_back(f);
+    expected.insert(expected.end(), o.begin(), o.end());
+  }
+
+  std::vector<uint8_t> out = zstdCliDecompress(concatFrames(frames));
+  ASSERT_EQ(out.size(), expected.size())
+      << "the zstd CLI could not read our frames concatenated";
+  EXPECT_EQ(memcmp(out.data(), expected.data(), expected.size()), 0);
+}
+
+TEST_F(ZstdOracleTest, ZstdCli_OurDecoder_MixedAndSkippableFrames) {
+  if (!has_zstd_cli_) {
+    GTEST_SKIP() << "zstd CLI not available";
+  }
+
+  std::vector<uint8_t> a = generateProseLikeData(4096, 31u);
+  std::vector<uint8_t> b = generateProseLikeData(20000, 32u);
+
+  std::vector<uint8_t> ref_a = zstdCliCompressWith(a, "-5");
+  std::vector<uint8_t> our_b = gcompCompress(b);
+  ASSERT_FALSE(ref_a.empty());
+  ASSERT_FALSE(our_b.empty());
+
+  // A skippable frame before, between and after the real ones.  A decoder
+  // that mistakes one for a real frame, or that stops at it, fails here.
+  std::vector<uint8_t> joined = concatFrames({makeSkippableFrame(0),
+      ref_a, makeSkippableFrame(37), our_b, makeSkippableFrame(1024)});
+
+  std::vector<uint8_t> expected = a;
+  expected.insert(expected.end(), b.begin(), b.end());
+
+  std::vector<uint8_t> out =
+      gcompDecompressOpts(joined, expected.size(), [](gcomp_options_t * o) {
+        return gcomp_options_set_bool(o, "zstd.concat", 1) == GCOMP_OK;
+      });
+  ASSERT_EQ(out.size(), expected.size())
+      << "reference frame + our frame, with skippable frames interleaved";
+  EXPECT_EQ(memcmp(out.data(), expected.data(), expected.size()), 0);
+
+  // The reference tool must read the same byte sequence the same way.
+  std::vector<uint8_t> ref_out = zstdCliDecompress(joined);
+  ASSERT_EQ(ref_out.size(), expected.size())
+      << "the zstd CLI disagrees about this sequence";
+  EXPECT_EQ(memcmp(ref_out.data(), expected.data(), expected.size()), 0);
+}
+
+//
+// Gap 2: window_log
+//
+// RFC 8878 section 3.1.1.1.2.  The window size decides how far back a match
+// may reach, so it is the one frame header field that changes what the
+// decoder must keep.  A decoder that sizes its window from something other
+// than the header is correct only while the two agree, and nothing above
+// ever made them disagree: every earlier test used whatever window the level
+// picked.
+//
+
+TEST_F(ZstdOracleTest, OurEncoder_ZstdCli_EveryWindowLog) {
+  if (!has_zstd_cli_) {
+    GTEST_SKIP() << "zstd CLI not available";
+  }
+
+  // 256 KB of input against a 1 KB window forces matches to be dropped and
+  // rediscovered constantly; against a 16 MB window the whole input is
+  // reachable.  Both must round-trip through the reference tool.
+  std::vector<uint8_t> original = generateProseLikeData(256 * 1024, 41u);
+
+  for (uint64_t wlog = 10; wlog <= 24; wlog++) {
+    std::vector<uint8_t> compressed =
+        gcompCompressOpts(original, [wlog](gcomp_options_t * o) {
+          return gcomp_options_set_uint64(o, "zstd.window_log", wlog) ==
+              GCOMP_OK;
+        });
+    ASSERT_FALSE(compressed.empty()) << "window_log=" << wlog;
+
+    std::vector<uint8_t> out = zstdCliDecompress(compressed);
+    ASSERT_EQ(out.size(), original.size())
+        << "window_log=" << wlog << ": the zstd CLI could not read our frame";
+    EXPECT_EQ(memcmp(out.data(), original.data(), original.size()), 0)
+        << "window_log=" << wlog;
+  }
+}
+
+TEST_F(ZstdOracleTest, ZstdCli_OurDecoder_EveryWindowLog) {
+  if (!has_zstd_cli_) {
+    GTEST_SKIP() << "zstd CLI not available";
+  }
+
+  std::vector<uint8_t> original = generateProseLikeData(256 * 1024, 42u);
+
+  for (int wlog = 10; wlog <= 24; wlog++) {
+    std::stringstream flags;
+    flags << "-3 --zstd=wlog=" << wlog;
+    std::vector<uint8_t> compressed =
+        zstdCliCompressWith(original, flags.str());
+    ASSERT_FALSE(compressed.empty()) << "wlog=" << wlog;
+
+    std::vector<uint8_t> out = gcompDecompressOpts(compressed, original.size());
+    ASSERT_EQ(out.size(), original.size()) << "wlog=" << wlog;
+    EXPECT_EQ(memcmp(out.data(), original.data(), original.size()), 0)
+        << "wlog=" << wlog;
+  }
+}
+
+//
+// Gap 3: threads and job_size
+//
+// The parallel encoder is a second code path to the same format: it splits
+// the input into jobs and compresses them independently.  Nothing above ran
+// it, so every oracle result so far described the single-threaded encoder
+// only.  The output has to be readable by the reference tool and has to carry
+// the same bytes, whatever the split.
+//
+
+TEST_F(ZstdOracleTest, OurEncoder_ZstdCli_ParallelMatchesSingleThreaded) {
+  if (!has_zstd_cli_) {
+    GTEST_SKIP() << "zstd CLI not available";
+  }
+
+  // Comfortably more than the 64 KB minimum job size, so the work really is
+  // split rather than quietly falling back to one job.
+  std::vector<uint8_t> original = generateProseLikeData(768 * 1024, 51u);
+
+  std::vector<uint8_t> single = gcompCompress(original);
+  ASSERT_FALSE(single.empty());
+
+  struct Case {
+    uint64_t threads;
+    uint64_t job_size;
+  };
+  const std::vector<Case> cases = {
+      {2, 0},              // auto job size
+      {4, 0},
+      {2, 64 * 1024},      // the minimum
+      {4, 128 * 1024},
+      {8, 256 * 1024},
+  };
+
+  for (const auto & c : cases) {
+    std::vector<uint8_t> compressed =
+        gcompCompressOpts(original, [&c](gcomp_options_t * o) {
+          return gcomp_options_set_uint64(o, "threads.count", c.threads) ==
+              GCOMP_OK &&
+              gcomp_options_set_uint64(o, "zstd.job_size", c.job_size) ==
+              GCOMP_OK;
+        });
+    ASSERT_FALSE(compressed.empty())
+        << "threads=" << c.threads << " job_size=" << c.job_size;
+
+    std::vector<uint8_t> out = zstdCliDecompress(compressed);
+    ASSERT_EQ(out.size(), original.size())
+        << "threads=" << c.threads << " job_size=" << c.job_size
+        << ": the zstd CLI could not read our frame";
+    EXPECT_EQ(memcmp(out.data(), original.data(), original.size()), 0)
+        << "threads=" << c.threads << " job_size=" << c.job_size;
+
+    // And our own decoder must agree with the reference about it.
+    //
+    // zstd.concat is required here and that is by design, not an oversight:
+    // the parallel encoder emits one frame per job, and this library's decoder
+    // stops after the first frame unless told otherwise (documented in
+    // documentation/modules/zstd.md, and asserted by
+    // ZstdConcatTest.TwoFramesConcatDisabled).
+    std::vector<uint8_t> ours = gcompDecompressOpts(
+        compressed, original.size(), [](gcomp_options_t * o) {
+          return gcomp_options_set_bool(o, "zstd.concat", 1) == GCOMP_OK;
+        });
+    ASSERT_EQ(ours.size(), original.size())
+        << "threads=" << c.threads << " job_size=" << c.job_size;
+    EXPECT_EQ(memcmp(ours.data(), original.data(), original.size()), 0)
+        << "threads=" << c.threads << " job_size=" << c.job_size;
+  }
+}
+
+TEST_F(ZstdOracleTest, ZstdCli_OurDecoder_ReferenceMultiThreadedOutput) {
+  if (!has_zstd_cli_) {
+    GTEST_SKIP() << "zstd CLI not available";
+  }
+
+  std::vector<uint8_t> original = generateProseLikeData(768 * 1024, 52u);
+
+  for (const char * flags : {"-3 -T4", "-3 -T2 --zstd=chainLog=15", "-5 -T0"}) {
+    std::vector<uint8_t> compressed = zstdCliCompressWith(original, flags);
+    ASSERT_FALSE(compressed.empty()) << flags;
+
+    std::vector<uint8_t> out = gcompDecompressOpts(compressed, original.size());
+    ASSERT_EQ(out.size(), original.size()) << flags;
+    EXPECT_EQ(memcmp(out.data(), original.data(), original.size()), 0)
+        << flags;
+  }
+}
+
+//
+// Gap 4: streaming across awkward chunk boundaries
+//
+// The buffer API hands the whole input over at once, which is the one case
+// where no piece of decoder state has to survive a call boundary.  Every
+// oracle test above used it.  A caller reading from a socket does not have
+// that luxury, and a state machine that is wrong about where it stopped is
+// wrong only when the boundary lands inside a structure -- a frame header, a
+// block header, a Huffman table, a bitstream.
+//
+// The chunk sizes below are chosen to be coprime with every block and header
+// size in the format, so the boundaries walk through those structures rather
+// than landing in the same relative place each time.
+//
+
+TEST_F(ZstdOracleTest, OurEncoder_ZstdCli_StreamingChunkBoundaries) {
+  if (!has_zstd_cli_) {
+    GTEST_SKIP() << "zstd CLI not available";
+  }
+
+  std::vector<uint8_t> original = generateProseLikeData(140 * 1024, 61u);
+
+  struct Case {
+    size_t in_chunk;
+    size_t out_chunk;
+  };
+  const std::vector<Case> cases = {
+      {1, 1},          // one byte in, one byte out
+      {1, 64 * 1024},
+      {7, 13},
+      {13, 7},
+      {1023, 17},
+      {4099, 4099},
+      {65537, 251},
+      {140 * 1024, 1}, // all input at once, output one byte at a time
+  };
+
+  for (const auto & c : cases) {
+    std::vector<uint8_t> compressed =
+        gcompCompressStreaming(original, c.in_chunk, c.out_chunk);
+    ASSERT_FALSE(compressed.empty())
+        << "in_chunk=" << c.in_chunk << " out_chunk=" << c.out_chunk;
+
+    std::vector<uint8_t> out = zstdCliDecompress(compressed);
+    ASSERT_EQ(out.size(), original.size())
+        << "in_chunk=" << c.in_chunk << " out_chunk=" << c.out_chunk
+        << ": the zstd CLI could not read what streaming produced";
+    EXPECT_EQ(memcmp(out.data(), original.data(), original.size()), 0)
+        << "in_chunk=" << c.in_chunk << " out_chunk=" << c.out_chunk;
+  }
+}
+
+TEST_F(ZstdOracleTest, ZstdCli_OurDecoder_StreamingChunkBoundaries) {
+  if (!has_zstd_cli_) {
+    GTEST_SKIP() << "zstd CLI not available";
+  }
+
+  std::vector<uint8_t> original = generateProseLikeData(140 * 1024, 62u);
+
+  // Checksummed and not: the frame trailer is the structure most likely to
+  // straddle a boundary, being the last four bytes of the stream.
+  for (const char * flags : {"-3", "-3 --check", "-9 --check", "-1"}) {
+    std::vector<uint8_t> compressed = zstdCliCompressWith(original, flags);
+    ASSERT_FALSE(compressed.empty()) << flags;
+
+    const std::vector<std::pair<size_t, size_t>> cases = {
+        {1, 1}, {1, 64 * 1024}, {7, 13}, {13, 7}, {1023, 17}, {4099, 4099},
+        {compressed.size(), 1}};
+
+    for (const auto & c : cases) {
+      std::vector<uint8_t> out = gcompDecompressStreaming(
+          compressed, original.size(), c.first, c.second);
+      ASSERT_EQ(out.size(), original.size())
+          << flags << " in_chunk=" << c.first << " out_chunk=" << c.second
+          << " why=" << stream_why_;
+      EXPECT_EQ(memcmp(out.data(), original.data(), original.size()), 0)
+          << flags << " in_chunk=" << c.first << " out_chunk=" << c.second;
+    }
+  }
+}
+
+TEST_F(ZstdOracleTest, ZstdCli_OurDecoder_StreamingConcatenatedFrames) {
+  if (!has_zstd_cli_) {
+    GTEST_SKIP() << "zstd CLI not available";
+  }
+
+  // The two gaps together: a frame boundary is the one place a decoder has to
+  // tear down and rebuild its state, and doing that halfway through a caller's
+  // buffer is where the two failure modes meet.
+  std::vector<uint8_t> a = generateProseLikeData(9000, 71u);
+  std::vector<uint8_t> b = generateProseLikeData(33000, 72u);
+  std::vector<uint8_t> fa = zstdCliCompressWith(a, "-3 --check");
+  std::vector<uint8_t> fb = zstdCliCompressWith(b, "-7");
+  ASSERT_FALSE(fa.empty());
+  ASSERT_FALSE(fb.empty());
+
+  std::vector<uint8_t> joined =
+      concatFrames({fa, makeSkippableFrame(11), fb});
+  std::vector<uint8_t> expected = a;
+  expected.insert(expected.end(), b.begin(), b.end());
+
+  for (size_t in_chunk : {(size_t)1, (size_t)3, (size_t)97, (size_t)4096}) {
+    std::vector<uint8_t> out = gcompDecompressStreaming(joined,
+        expected.size(), in_chunk, 1024, [](gcomp_options_t * o) {
+          return gcomp_options_set_bool(o, "zstd.concat", 1) == GCOMP_OK;
+        });
+    ASSERT_EQ(out.size(), expected.size())
+        << "in_chunk=" << in_chunk << " why=" << stream_why_;
+    EXPECT_EQ(memcmp(out.data(), expected.data(), expected.size()), 0)
+        << "in_chunk=" << in_chunk;
   }
 }
 
