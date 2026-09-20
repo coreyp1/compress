@@ -34,6 +34,7 @@
 
 #include <ghoti.io/compress/macros.h>
 #include "zstd_internal.h"
+#include <string.h>
 
 //
 // Frame Header
@@ -221,4 +222,151 @@ void zstd_write_block_header(
   buf[0] = (uint8_t)(header);
   buf[1] = (uint8_t)(header >> 8);
   buf[2] = (uint8_t)(header >> 16);
+}
+
+//
+// Frame Header: parsing
+//
+// One parser, used by the decoder and by gcomp_peek().  Two would be two
+// readings of RFC 8878 section 3.1.1.1, and the one a caller was shown would
+// not have to agree with the one that decoded the bytes.  The LZ4 decoder
+// already states that rule where it parses its own frame descriptor; this is
+// the same rule applied to Zstandard.
+//
+// What lives here is only what the bytes say.  What to *do* about it - whether
+// a declared window is larger than this decoder will hold, whether a named
+// dictionary is present - is policy, and stays with the decoder that has the
+// limits and the dictionary to check against.
+//
+
+size_t zstd_dict_id_size(uint8_t flag) {
+  static const size_t sizes[] = {0, 1, 2, 4};
+  return sizes[flag & 0x03];
+}
+
+size_t zstd_fcs_size(uint8_t flag, bool single_segment) {
+  if (single_segment && flag == 0) {
+    // RFC 8878 section 3.1.1.1.4: with Single_Segment_Flag set, a
+    // Frame_Content_Size_Flag of 0 still means one byte of content size.
+    return 1;
+  }
+  static const size_t sizes[] = {0, 2, 4, 8};
+  return sizes[flag & 0x03];
+}
+
+size_t zstd_frame_header_length(uint8_t fhd) {
+  bool single_segment = (fhd & ZSTD_FHD_SINGLE_SEGMENT_FLAG) != 0;
+  uint8_t dict_id_flag = fhd & ZSTD_FHD_DICT_ID_FLAG_MASK;
+  uint8_t fcs_flag = (fhd & ZSTD_FHD_FCS_FLAG_MASK) >> ZSTD_FHD_FCS_FLAG_SHIFT;
+
+  // Magic_Number (4) and Frame_Header_Descriptor (1), then the optional
+  // fields.  Each term is bounded by a constant - the largest total is
+  // 4 + 1 + 1 + 4 + 8 = 18 - so this cannot overflow and needs no checked
+  // arithmetic to say so.
+  size_t len = 5u;
+  if (!single_segment) {
+    len += 1u; // Window_Descriptor
+  }
+  len += zstd_dict_id_size(dict_id_flag);
+  len += zstd_fcs_size(fcs_flag, single_segment);
+  return len;
+}
+
+gcomp_status_t zstd_frame_header_parse(const uint8_t * buf, size_t buf_size,
+    zstd_frame_header_t * header_out, uint64_t * window_size_out,
+    size_t * needed_out) {
+  if (!buf || !header_out || !window_size_out || !needed_out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  *window_size_out = 0;
+  *needed_out = ZSTD_FRAME_HEADER_MIN_SIZE;
+  if (buf_size < ZSTD_FRAME_HEADER_MIN_SIZE) {
+    return GCOMP_ERR_LIMIT;
+  }
+
+  uint32_t magic = gcomp_read_le32(buf);
+  if (magic != ZSTD_MAGIC) {
+    return GCOMP_ERR_CORRUPT;
+  }
+
+  uint8_t fhd = buf[4];
+  // RFC 8878 section 3.1.1.1.1: bit 3 is reserved and "must be zero".
+  if (fhd & ZSTD_FHD_RESERVED_BIT) {
+    return GCOMP_ERR_CORRUPT;
+  }
+
+  size_t header_len = zstd_frame_header_length(fhd);
+  *needed_out = header_len;
+  if (buf_size < header_len) {
+    return GCOMP_ERR_LIMIT;
+  }
+
+  zstd_frame_header_t h;
+  memset(&h, 0, sizeof(h));
+  h.descriptor = fhd;
+  h.dict_id_flag = fhd & ZSTD_FHD_DICT_ID_FLAG_MASK;
+  h.content_checksum = (fhd & ZSTD_FHD_CHECKSUM_FLAG) != 0;
+  h.single_segment = (fhd & ZSTD_FHD_SINGLE_SEGMENT_FLAG) != 0;
+  h.fcs_flag = (fhd & ZSTD_FHD_FCS_FLAG_MASK) >> ZSTD_FHD_FCS_FLAG_SHIFT;
+
+  size_t pos = 5;
+  uint64_t window_size = 0;
+
+  if (!h.single_segment) {
+    // RFC 8878 section 3.1.1.1.2:
+    //   Window_Log = 10 + Exponent
+    //   Window_Base = 1 << Window_Log
+    //   Window_Size = Window_Base + (Window_Base / 8) * Mantissa
+    //
+    // The exponent is five bits, so a frame may legally declare a window log
+    // of up to 41.  Computed in 64 bits because a 32-bit shift by that much is
+    // undefined - which it once was here, and a nine-byte frame header reached
+    // it.  Whether the result is acceptable is the caller's decision, not this
+    // function's: an enormous window is a well-formed frame asking for more
+    // history than a particular decoder will hold.
+    uint8_t wd = buf[pos++];
+    unsigned exponent = (wd >> 3) & 0x1Fu;
+    unsigned mantissa = wd & 0x07u;
+    unsigned window_log = exponent + 10u;
+    uint64_t base = (uint64_t)1u << window_log;
+    window_size = base + (base / 8u) * mantissa;
+    h.window_log = (uint8_t)window_log;
+    h.window_size =
+        (window_size > UINT32_MAX) ? UINT32_MAX : (uint32_t)window_size;
+  }
+
+  size_t dict_id_len = zstd_dict_id_size(h.dict_id_flag);
+  switch (dict_id_len) {
+  case 1: h.dict_id = buf[pos]; break;
+  case 2: h.dict_id = gcomp_read_le16(buf + pos); break;
+  case 4: h.dict_id = gcomp_read_le32(buf + pos); break;
+  default: break;
+  }
+  pos += dict_id_len;
+
+  size_t fcs_len = zstd_fcs_size(h.fcs_flag, h.single_segment);
+  h.content_size_present = (fcs_len > 0);
+  switch (fcs_len) {
+  case 1: h.content_size = buf[pos]; break;
+  // RFC 8878 section 3.1.1.1.4: the two-byte form carries the value minus 256.
+  case 2: h.content_size = (uint64_t)gcomp_read_le16(buf + pos) + 256u; break;
+  case 4: h.content_size = gcomp_read_le32(buf + pos); break;
+  case 8: h.content_size = gcomp_read_le64(buf + pos); break;
+  default: break;
+  }
+  pos += fcs_len;
+
+  if (h.single_segment) {
+    // Section 3.1.1.1.2: with no Window_Descriptor, "Window_Size is
+    // Frame_Content_Size" - the whole content is one segment.
+    window_size = h.content_size;
+    h.window_size =
+        (window_size > UINT32_MAX) ? UINT32_MAX : (uint32_t)window_size;
+  }
+
+  *header_out = h;
+  *window_size_out = window_size;
+  *needed_out = pos;
+  return GCOMP_OK;
 }

@@ -64,6 +64,7 @@ extern "C" {
 #define ZSTD_HEADER_MIN_SIZE 2               ///< FHD(1) + min window/size
 #define ZSTD_HEADER_MAX_SIZE 14      ///< FHD(1) + window(1) + dict(4) + fcs(8)
 #define ZSTD_BLOCK_HEADER_SIZE 3     ///< Block header size
+#define ZSTD_FRAME_HEADER_MIN_SIZE 5 ///< Magic_Number and the descriptor
 #define ZSTD_CONTENT_CHECKSUM_SIZE 4 ///< Content checksum (xxHash64 low 32)
 
 // Frame Header Descriptor bits
@@ -657,6 +658,53 @@ gcomp_status_t zstd_decoder_reset(gcomp_decoder_t * decoder);
  * @param header_len_out Output: actual header length written
  * @return GCOMP_OK on success
  */
+/**
+ * @brief Size of the Dictionary_ID field a descriptor's flag selects.
+ *
+ * RFC 8878 section 3.1.1.1.3.
+ */
+size_t zstd_dict_id_size(uint8_t flag);
+
+/**
+ * @brief Size of the Frame_Content_Size field a descriptor selects.
+ *
+ * RFC 8878 section 3.1.1.1.4.  Single_Segment_Flag changes the meaning of a
+ * flag of zero from "absent" to "one byte", which is why it is a parameter.
+ */
+size_t zstd_fcs_size(uint8_t flag, bool single_segment);
+
+/**
+ * @brief Total bytes of Magic_Number and Frame_Header for this descriptor.
+ *
+ * Between 5 and 18.  Lets a streaming reader know how much to accumulate after
+ * it has seen the descriptor byte, without a second reading of which optional
+ * fields are present.
+ */
+size_t zstd_frame_header_length(uint8_t fhd);
+
+/**
+ * @brief Read a frame header, and only read it.
+ *
+ * Shared by the decoder and by gcomp_peek(), so that what a caller is shown
+ * and what the decoder acts on cannot disagree.  Nothing here is policy: an
+ * enormous declared window is reported faithfully and left for the caller to
+ * accept or refuse, and a named dictionary is reported without any view on
+ * whether one is available.
+ *
+ * @param buf Start of the frame
+ * @param buf_size How much of it is available
+ * @param header_out Receives the parsed fields
+ * @param window_size_out Receives Window_Size in full, which may exceed what a
+ *        uint32_t holds and what @ref zstd_frame_header_t can carry
+ * @param needed_out Receives the header length on success, or how many bytes
+ *        are needed when there are not enough yet
+ * @return ::GCOMP_OK; ::GCOMP_ERR_LIMIT when more input is needed;
+ *         ::GCOMP_ERR_CORRUPT for a bad magic number or a set reserved bit
+ */
+gcomp_status_t zstd_frame_header_parse(const uint8_t * buf, size_t buf_size,
+    zstd_frame_header_t * header_out, uint64_t * window_size_out,
+    size_t * needed_out);
+
 gcomp_status_t zstd_write_frame_header(const zstd_frame_header_t * header,
     uint8_t * buf, size_t buf_size, size_t * header_len_out);
 

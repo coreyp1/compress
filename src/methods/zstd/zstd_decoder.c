@@ -296,170 +296,71 @@ void zstd_decoder_destroy(gcomp_decoder_t * decoder) {
 /**
  * @brief Get the size of the dictionary ID field based on flag.
  */
-static size_t zstd_dict_id_size(uint8_t flag) {
-  static const size_t sizes[] = {0, 1, 2, 4};
-  return sizes[flag & 0x03];
-}
-
 /**
- * @brief Get the size of the frame content size field based on flag.
- */
-static size_t zstd_fcs_size(uint8_t flag, bool single_segment) {
-  if (single_segment && flag == 0) {
-    return 1; // Single segment with fcs_flag=0 means 1 byte
-  }
-  static const size_t sizes[] = {0, 2, 4, 8};
-  return sizes[flag];
-}
-
-/**
- * @brief Parse frame header from accumulated buffer.
+ * @brief Read the accumulated frame header, and decide what to do about it.
+ *
+ * The reading is zstd_frame_header_parse()'s, which gcomp_peek() also uses, so
+ * a caller cannot be shown one interpretation of a header while the decode
+ * acts on another.  What stays here is the part that is this decoder's own:
+ * whether it will hold a window that large, whether it has the dictionary the
+ * frame names, and the buffers that follow from both.
  */
 static gcomp_status_t zstd_parse_frame_header(
     zstd_decoder_state_t * state, gcomp_decoder_t * decoder) {
-  const uint8_t * buf = state->header_accum;
-  size_t pos = 0;
-
-  // Verify magic number
-  uint32_t magic = gcomp_read_le32(buf);
-  if (magic != ZSTD_MAGIC) {
-    gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
-        "invalid zstd magic: expected 0x%08X, got 0x%08X", ZSTD_MAGIC, magic);
+  zstd_frame_header_t header;
+  uint64_t window_size = 0;
+  size_t header_len = 0;
+  gcomp_status_t s = zstd_frame_header_parse(state->header_accum,
+      state->header_accum_pos, &header, &window_size, &header_len);
+  if (s == GCOMP_ERR_CORRUPT) {
+    uint32_t magic = gcomp_read_le32(state->header_accum);
+    if (magic != ZSTD_MAGIC) {
+      gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+          "invalid zstd magic: expected 0x%08X, got 0x%08X", ZSTD_MAGIC,
+          magic);
+    }
+    else {
+      gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+          "reserved bit set in frame header descriptor");
+    }
     return GCOMP_ERR_CORRUPT;
   }
-  pos += 4;
-
-  // Parse frame header descriptor
-  uint8_t fhd = buf[pos++];
-  state->header.descriptor = fhd;
-
-  // Check reserved/unused bits
-  if (fhd & ZSTD_FHD_RESERVED_BIT) {
-    gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
-        "reserved bit set in frame header descriptor");
-    return GCOMP_ERR_CORRUPT;
+  if (s != GCOMP_OK) {
+    return gcomp_decoder_set_error(decoder, s,
+        "zstd frame header needs %zu bytes, have %zu", header_len,
+        state->header_accum_pos);
   }
+  state->header = header;
 
-  // Extract flags
-  state->header.dict_id_flag = fhd & ZSTD_FHD_DICT_ID_FLAG_MASK;
-  state->header.content_checksum = (fhd & ZSTD_FHD_CHECKSUM_FLAG) != 0;
-  state->header.single_segment = (fhd & ZSTD_FHD_SINGLE_SEGMENT_FLAG) != 0;
-  state->header.fcs_flag =
-      (fhd & ZSTD_FHD_FCS_FLAG_MASK) >> ZSTD_FHD_FCS_FLAG_SHIFT;
-
-  // Parse window descriptor (if not single segment)
-  if (!state->header.single_segment) {
-    uint8_t wd = buf[pos++];
-    uint8_t exponent = (wd >> 3) & 0x1F;
-    uint8_t mantissa = wd & 0x07;
-
-    // RFC 8878 section 3.1.1.1.2: Window_Log is 10 + Exponent, and the
-    // exponent is five bits, so a frame may legally declare a window log of
-    // up to 41. Shifting a 32-bit type by that much is undefined, and the
-    // result does not fit window_size either: the old
-    //
-    //     uint32_t base = 1U << (exponent + 10);
-    //
-    // was undefined behaviour for any exponent above 21, and for the ones
-    // just past that it wrapped to a small number that sailed through the
-    // limit check below. A nine-byte frame header reached it.
-    //
-    // Computed in 64 bits and refused here. A window this size is not a
-    // corrupt frame - it is a well-formed one asking for more history than
-    // this decoder will hold - so it is GCOMP_ERR_LIMIT, the same answer the
-    // check further down gives.
-    unsigned window_log = (unsigned)exponent + 10u;
-    uint64_t base = (uint64_t)1u << window_log;
-    uint64_t window_size = base + (base / 8u) * mantissa;
-
-    if (window_size > state->max_window_bytes || window_size > UINT32_MAX) {
-      gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
-          "window size %llu exceeds limit %llu",
-          (unsigned long long)window_size,
-          (unsigned long long)state->max_window_bytes);
-      return GCOMP_ERR_LIMIT;
-    }
-
-    state->header.window_log = (uint8_t)window_log;
-    state->header.window_size = (uint32_t)window_size;
-  }
-
-  // Parse dictionary ID (if present)
-  size_t dict_id_len = zstd_dict_id_size(state->header.dict_id_flag);
-  if (dict_id_len > 0) {
-    switch (dict_id_len) {
-    case 1:
-      state->header.dict_id = buf[pos];
-      break;
-    case 2:
-      state->header.dict_id = gcomp_read_le16(buf + pos);
-      break;
-    case 4:
-      state->header.dict_id = gcomp_read_le32(buf + pos);
-      break;
-    default:
-      break;
-    }
-    pos += dict_id_len;
-
-    if (state->header.dict_id != 0) {
-      if (!state->dict_bytes) {
-        gcomp_decoder_set_error(decoder, GCOMP_ERR_UNSUPPORTED,
-            "zstd stream requires dictionary ID %u but no dictionary provided",
-            state->header.dict_id);
-        return GCOMP_ERR_UNSUPPORTED;
-      }
-      /* Require dict_id match for formatted dictionaries. Raw dictionaries
-       * (dict_id 0) are accepted for any frame dict_id so external encoders
-       * that write a content-derived ID for raw dicts still decode. */
-      if (state->dict_parsed.dict_id != 0 &&
-          state->dict_parsed.dict_id != state->header.dict_id) {
-        gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
-            "dictionary ID mismatch: frame has %u, dictionary has %u",
-            state->header.dict_id, state->dict_parsed.dict_id);
-        return GCOMP_ERR_CORRUPT;
-      }
-    }
-  }
-
-  // Parse frame content size (if present)
-  size_t fcs_len =
-      zstd_fcs_size(state->header.fcs_flag, state->header.single_segment);
-  state->header.content_size_present = (fcs_len > 0);
-  if (fcs_len > 0) {
-    switch (fcs_len) {
-    case 1:
-      state->header.content_size = buf[pos];
-      break;
-    case 2:
-      state->header.content_size = gcomp_read_le16(buf + pos) + 256;
-      break;
-    case 4:
-      state->header.content_size = gcomp_read_le32(buf + pos);
-      break;
-    case 8:
-      state->header.content_size = gcomp_read_le64(buf + pos);
-      break;
-    default:
-      break;
-    }
-    pos += fcs_len;
-
-    // For single segment, window size equals content size
-    if (state->header.single_segment) {
-      state->header.window_size = (uint32_t)state->header.content_size;
-      if (state->header.content_size > UINT32_MAX) {
-        state->header.window_size = UINT32_MAX;
-      }
-    }
-  }
-
-  // Validate window size against limits
-  if (state->header.window_size > state->max_window_bytes) {
+  // RFC 8878 section 3.1.1.1.2 lets a frame declare a window log of up to 41.
+  // Such a frame is not corrupt - it is well formed and asking for more
+  // history than this decoder will hold - so it is GCOMP_ERR_LIMIT.  The
+  // comparison is in 64 bits because the declared size need not fit in 32.
+  if (window_size > state->max_window_bytes || window_size > UINT32_MAX) {
     gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
-        "window size %u exceeds limit %llu", state->header.window_size,
+        "window size %llu exceeds limit %llu",
+        (unsigned long long)window_size,
         (unsigned long long)state->max_window_bytes);
     return GCOMP_ERR_LIMIT;
+  }
+
+  if (state->header.dict_id != 0) {
+    if (!state->dict_bytes) {
+      gcomp_decoder_set_error(decoder, GCOMP_ERR_UNSUPPORTED,
+          "zstd stream requires dictionary ID %u but no dictionary provided",
+          state->header.dict_id);
+      return GCOMP_ERR_UNSUPPORTED;
+    }
+    /* Require dict_id match for formatted dictionaries. Raw dictionaries
+     * (dict_id 0) are accepted for any frame dict_id so external encoders
+     * that write a content-derived ID for raw dicts still decode. */
+    if (state->dict_parsed.dict_id != 0 &&
+        state->dict_parsed.dict_id != state->header.dict_id) {
+      gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+          "dictionary ID mismatch: frame has %u, dictionary has %u",
+          state->header.dict_id, state->dict_parsed.dict_id);
+      return GCOMP_ERR_CORRUPT;
+    }
   }
 
   // Initialize content hash if checksum enabled
@@ -760,34 +661,12 @@ static gcomp_status_t zstd_decoder_step(gcomp_decoder_t * decoder,
       return GCOMP_OK;
     }
 
-    // Calculate expected header length
-    uint8_t fhd = state->header_accum[4];
-    bool single_segment = (fhd & ZSTD_FHD_SINGLE_SEGMENT_FLAG) != 0;
-    uint8_t dict_id_flag = fhd & ZSTD_FHD_DICT_ID_FLAG_MASK;
-    uint8_t fcs_flag =
-        (fhd & ZSTD_FHD_FCS_FLAG_MASK) >> ZSTD_FHD_FCS_FLAG_SHIFT;
-
-    // Safe math for header length from untrusted descriptor
-    size_t expected_len = 5; // magic + FHD
-    if (!single_segment) {
-      if (!gcu_safe_add_size(expected_len, 1, &expected_len)) {
-        state->stage = ZSTD_DEC_STAGE_ERROR;
-        gcomp_decoder_set_error(
-            decoder, GCOMP_ERR_CORRUPT, "header length overflow");
-        return GCOMP_ERR_CORRUPT;
-      }
-    }
-    if (!gcu_safe_add_size(
-            expected_len, zstd_dict_id_size(dict_id_flag), &expected_len) ||
-        !gcu_safe_add_size(expected_len,
-            zstd_fcs_size(fcs_flag, single_segment), &expected_len)) {
-      state->stage = ZSTD_DEC_STAGE_ERROR;
-      gcomp_decoder_set_error(
-          decoder, GCOMP_ERR_CORRUPT, "header length overflow");
-      return GCOMP_ERR_CORRUPT;
-    }
-
-    state->header_expected_len = expected_len;
+    // How much of the header to accumulate, from the same function the
+    // parser uses to walk it.  Every term is bounded by a constant and the
+    // largest total is eighteen bytes, so there is nothing here that can
+    // overflow - which is why this no longer carries the checked arithmetic it
+    // used to.
+    state->header_expected_len = zstd_frame_header_length(state->header_accum[4]);
 
     // Read remaining header bytes
     while (state->header_accum_pos < state->header_expected_len &&
