@@ -250,6 +250,21 @@ gcomp_status_t zstd_block_compress(zstd_encoder_state_t * state,
     if (state->mf_window && input_len <= state->mf_window_capacity) {
       // Stream path: the block is appended to the history already in the
       // window, and the match finder's tables already describe that history.
+      // Defensive, and `make coverage` will keep saying so: nothing in the
+      // suite reaches it, and an instrumented run of all 99 suites fired it
+      // zero times.
+      //
+      // The reason is an invariant rather than an accident.
+      // mf_window_capacity is mf_window_max + block_buffer_size; the slide at
+      // the end of a block below leaves mf_window_len at most mf_window_max;
+      // and a block the encoder produces is at most block_buffer_size. The
+      // three together make the sum here no larger than the capacity.
+      //
+      // It stays because the invariant is not local. A parallel job supplies
+      // its own mf_window_capacity (zstd_parallel.c), and the dictionary
+      // paths set mf_window_len directly, so the guarantee is spread across
+      // three files and would be cheap to break silently. Two lines of unhit
+      // coverage are a smaller price than a window overrun.
       if (state->mf_window_len + input_len > state->mf_window_capacity) {
         size_t shift =
             state->mf_window_len + input_len - state->mf_window_capacity;

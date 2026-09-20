@@ -80,13 +80,20 @@ static const gcomp_option_schema_t g_lzw_option_schemas[] = {
         GCOMP_OPT_UINT64,    // type
         1,                   // has_default
         {.ui64 = 12},        // default_value
-        0,                   // has_min
-        0,                   // has_max
-        0,                   // min_int
-        0,                   // max_int
-        0,                   // min_uint
-        0,                   // max_uint
-        "Maximum code width in bits (e.g. 12 for 4096 entries)",
+        // The range the decoder and lzw_core_encoder_init() already enforce,
+        // declared so that gcomp_options_validate() - which the create calls
+        // run over a caller's options - can refuse it by name, and so that
+        // introspection can report it.  Undeclared, a 13 reached the method
+        // and failed there against a limit the schema had never mentioned.
+        // TIFF 6.0 section 13 caps a code at twelve bits; below nine there is
+        // no room for 256 literals plus Clear and End_of_Information.
+        1,                      // has_min
+        1,                      // has_max
+        0,                      // min_int
+        0,                      // max_int
+        9,                      // min_uint
+        LZW_CORE_MAX_CODE_BITS, // max_uint
+        "Maximum code width in bits, 9 to 12 (12 gives 4096 entries)",
     },
     {
         "lzw.encoder_lookup",                // key
