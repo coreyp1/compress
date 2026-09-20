@@ -512,10 +512,24 @@ AFL_LIBOBJECTS := $(patsubst src/%.c,$(AFL_OBJ_DIR)/%.o,$(SOURCES))
 AFL_STATIC_TARGET := $(BASE_NAME_PREFIX)-afl.a
 
 # Pattern rule for AFL-instrumented object files
+#
+# -MMD, and the -include below, are not optional here even though the rule
+# worked without them for a long time.  Without a depfile these objects are
+# rebuilt only when their own .c changes, so a change to a header left the AFL
+# library built from a mix of old and new declarations - and a fuzzing campaign
+# against a mixed build reports crashes that are artefacts of the build rather
+# than defects in the code.  It happened: adding two fields to
+# zstd_match_finder_t made `make fuzz-replay` fail four inputs with a
+# misaligned-pointer report from UBSan, in a build where one translation unit
+# still had the old struct layout.  The regular and ASan builds already do
+# this; this rule was the one that did not.
 $(AFL_OBJ_DIR)/%.o: src/%.c
 	@printf "\n### Compiling (AFL instrumented): $< ###\n"
 	@mkdir -p $(@D)
-	$(AFL_CC) $(AFL_CFLAGS) -c $< -o $@
+	$(AFL_CC) $(AFL_CFLAGS) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
+
+AFL_DEPFILES := $(AFL_LIBOBJECTS:.o=.d)
+-include $(AFL_DEPFILES)
 
 # AFL-instrumented static library
 $(APP_DIR)/$(AFL_STATIC_TARGET): $(AFL_LIBOBJECTS)
@@ -556,8 +570,13 @@ $(APP_DIR)/fuzz/%$(EXE_EXTENSION): fuzz/%.c $(APP_DIR)/$(AFL_STATIC_TARGET)
 	@printf "\n### Compiling Fuzz Harness: $* ###\n"
 	@mkdir -p $(@D)
 	$(AFL_CC) $(AFL_CFLAGS) $(AFL_LDFLAGS) -o $@ $< \
+		-MMD -MP -MF $(@:$(EXE_EXTENSION)=.d) \
 		-Wl,--whole-archive $(APP_DIR)/$(AFL_STATIC_TARGET) -Wl,--no-whole-archive \
 		$(CUTIL_LIBS) -lm -lpthread
+
+# Same reason as the objects above: a harness includes the public headers.
+FUZZ_DEPFILES := $(patsubst fuzz/%.c,$(APP_DIR)/fuzz/%.d,$(FUZZ_SOURCES))
+-include $(FUZZ_DEPFILES)
 
 ####################################################################
 # Commands
