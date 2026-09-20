@@ -415,6 +415,104 @@ TEST_F(JobQueueTest, ConcurrentSubmitAndComplete) {
   gcomp_job_queue_destroy(queue);
 }
 
+//
+// Multiple-waiter tests.
+//
+// Both conditions used to be recorded as a single bool and signalled exactly
+// once, so a second thread blocked on either of them was never woken.  These
+// fail as a hang rather than an assertion if that returns, so each one checks
+// a deadline first to say what went wrong before the join blocks.
+//
+
+TEST_F(JobQueueTest, TwoBlockedConsumersBothGetAResult) {
+  gcomp_job_queue_config_t config = {.capacity = 0, .allocator = nullptr};
+  gcomp_job_queue_t * queue = nullptr;
+  ASSERT_EQ(gcomp_job_queue_create(&config, &queue), GCOMP_OK);
+
+  std::vector<gcomp_block_job_t> jobs(2);
+  ASSERT_EQ(gcomp_job_queue_submit(queue, &jobs[0]), GCOMP_OK);
+  ASSERT_EQ(gcomp_job_queue_submit(queue, &jobs[1]), GCOMP_OK);
+
+  // Both consumers block: nothing has completed yet.
+  std::atomic<int> returned{0};
+  auto consumer = [&] {
+    gcomp_block_job_t * result = nullptr;
+    if (gcomp_job_queue_get_next_result(queue, &result) == GCOMP_OK) {
+      returned.fetch_add(1);
+    }
+  };
+  std::thread a(consumer);
+  std::thread b(consumer);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  gcomp_job_queue_complete(queue, &jobs[0], GCOMP_OK);
+  gcomp_job_queue_complete(queue, &jobs[1], GCOMP_OK);
+
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (returned.load() < 2 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_EQ(returned.load(), 2)
+      << "a consumer was never woken; only one signal was sent";
+
+  a.join();
+  b.join();
+  gcomp_job_queue_destroy(queue);
+}
+
+TEST_F(JobQueueTest, TwoBlockedProducersBothProceed) {
+  // Capacity one, so a second and third submit must wait for space.
+  gcomp_job_queue_config_t config = {.capacity = 1, .allocator = nullptr};
+  gcomp_job_queue_t * queue = nullptr;
+  ASSERT_EQ(gcomp_job_queue_create(&config, &queue), GCOMP_OK);
+
+  std::vector<gcomp_block_job_t> jobs(3);
+  ASSERT_EQ(gcomp_job_queue_submit(queue, &jobs[0]), GCOMP_OK);
+
+  std::atomic<int> submitted{0};
+  std::thread b([&] {
+    if (gcomp_job_queue_submit(queue, &jobs[1]) == GCOMP_OK) {
+      submitted.fetch_add(1);
+    }
+  });
+  std::thread c([&] {
+    if (gcomp_job_queue_submit(queue, &jobs[2]) == GCOMP_OK) {
+      submitted.fetch_add(1);
+    }
+  });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_EQ(submitted.load(), 0) << "the capacity bound was not honoured";
+
+  // Free the slots one at a time.  Each release has to wake a producer, and
+  // the flag the old code cleared after the first one meant the second was
+  // never signalled again.
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  int drained = 0;
+  while (drained < 3 && std::chrono::steady_clock::now() < deadline) {
+    gcomp_block_job_t * result = nullptr;
+    if (gcomp_job_queue_result_ready(queue)) {
+      if (gcomp_job_queue_get_next_result(queue, &result) == GCOMP_OK) {
+        drained++;
+      }
+      continue;
+    }
+    // Complete whatever is in the queue so that a result becomes available.
+    for (auto & job : jobs) {
+      gcomp_job_queue_complete(queue, &job, GCOMP_OK);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+
+  EXPECT_EQ(submitted.load(), 2)
+      << "a producer was never woken; only one signal was sent";
+
+  b.join();
+  c.join();
+  gcomp_job_queue_destroy(queue);
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

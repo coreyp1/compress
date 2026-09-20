@@ -73,8 +73,13 @@ struct gcomp_job_queue_s {
   GCU_MUTEX_T mutex;             ///< Protects all state
   GCU_Semaphore space_available; ///< Signaled when slot becomes free
   GCU_Semaphore result_ready;    ///< Signaled when next result ready
-  bool waiting_for_space;        ///< True if submit is waiting for space
-  bool waiting_for_result;       ///< True if get_next is waiting
+  // Counts, not flags.  A single bool could record only that *somebody* was
+  // waiting, and each condition was then signalled exactly once, so with two
+  // threads blocked one of them was never woken.  Worse, the flag was cleared
+  // unconditionally by whichever thread got through, after which nothing
+  // would signal for the thread still blocked behind it.
+  uint32_t space_waiters;        ///< Threads blocked in submit()
+  uint32_t result_waiters;       ///< Threads blocked in get_next_result()
 };
 
 //
@@ -101,6 +106,29 @@ static gcomp_job_slot_t * gcomp_job_queue_find_slot(
  *
  * Must be called with mutex held.
  */
+/**
+ * @brief Wake every thread blocked on one of the queue's conditions.
+ *
+ * Posting once per registered waiter rather than once is the whole of the
+ * fix: a single post wakes one thread and leaves the rest blocked forever.
+ *
+ * Waking more threads than can actually proceed is safe, because every
+ * waiter re-tests its condition under the mutex after waking and simply
+ * waits again if it cannot continue.
+ *
+ * Must be called with the mutex held, so that the count cannot change
+ * between reading it and posting.
+ *
+ * @param semaphore The condition to signal.
+ * @param waiters How many threads are registered as waiting on it.
+ */
+static void gcomp_job_queue_wake_all(
+    GCU_Semaphore * semaphore, uint32_t waiters) {
+  for (uint32_t i = 0; i < waiters; i++) {
+    gcu_semaphore_signal(semaphore);
+  }
+}
+
 static bool gcomp_job_queue_next_ready_locked(gcomp_job_queue_t * queue) {
   gcomp_job_slot_t * slot =
       gcomp_job_queue_find_slot(queue, queue->next_result_seq);
@@ -161,8 +189,8 @@ gcomp_status_t gcomp_job_queue_create(
   queue->slots_head = NULL;
   queue->slots_tail = NULL;
   queue->active_count = 0;
-  queue->waiting_for_space = false;
-  queue->waiting_for_result = false;
+  queue->space_waiters = 0;
+  queue->result_waiters = 0;
 
   // Initialize synchronization
   if (GCU_MUTEX_CREATE(queue->mutex) != 0) {
@@ -231,12 +259,12 @@ static gcomp_status_t gcomp_job_queue_submit_internal(
       GCU_MUTEX_UNLOCK(queue->mutex);
       return GCOMP_ERR_LIMIT;
     }
-    queue->waiting_for_space = true;
+    queue->space_waiters++;
     GCU_MUTEX_UNLOCK(queue->mutex);
     gcu_semaphore_wait(&queue->space_available);
     GCU_MUTEX_LOCK(queue->mutex);
+    queue->space_waiters--;
   }
-  queue->waiting_for_space = false;
 
   // Allocate a new slot
   gcomp_job_slot_t * slot =
@@ -295,10 +323,11 @@ void gcomp_job_queue_complete(
     job->status = (status == GCOMP_OK) ? GCOMP_JOB_COMPLETE : GCOMP_JOB_ERROR;
     job->result = status;
 
-    // If someone is waiting for a result and this is the next one, signal
-    if (queue->waiting_for_result &&
-        job->sequence_num == queue->next_result_seq) {
-      gcu_semaphore_signal(&queue->result_ready);
+    // If this is the result the consumers are waiting for, wake all of them.
+    // Only one can take it; the rest re-test, find the sequence has moved on,
+    // and wait again for theirs.
+    if (job->sequence_num == queue->next_result_seq) {
+      gcomp_job_queue_wake_all(&queue->result_ready, queue->result_waiters);
     }
   }
 
@@ -323,12 +352,12 @@ gcomp_status_t gcomp_job_queue_get_next_result(
       return GCOMP_ERR_INVALID_ARG; // No jobs pending
     }
 
-    queue->waiting_for_result = true;
+    queue->result_waiters++;
     GCU_MUTEX_UNLOCK(queue->mutex);
     gcu_semaphore_wait(&queue->result_ready);
     GCU_MUTEX_LOCK(queue->mutex);
+    queue->result_waiters--;
   }
-  queue->waiting_for_result = false;
 
   // Find and remove the slot
   // The next result should be at the head of the list (since we submit in
@@ -345,10 +374,9 @@ gcomp_status_t gcomp_job_queue_get_next_result(
     }
     queue->active_count--;
 
-    // Signal if someone is waiting for space
-    if (queue->waiting_for_space) {
-      gcu_semaphore_signal(&queue->space_available);
-    }
+    // A slot has freed.  Wake every blocked producer: only one can take the
+    // slot, and the others go back to waiting.
+    gcomp_job_queue_wake_all(&queue->space_available, queue->space_waiters);
 
     gcomp_free(queue->allocator, slot);
   }
