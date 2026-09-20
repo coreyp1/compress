@@ -100,7 +100,7 @@ Compressed blocks contain two sections:
 | `zstd.dictionary` | bytes | (none) | Optional dictionary (raw content or formatted per RFC 8878 §5) |
 | `zstd.dictionary_id` | uint64 | (none) | Dictionary ID to write (encoder) or validate (decoder); used when dictionary provided. The format carries at most 32 bits |
 | `zstd.content_size` | uint64 | (none) | Content size to write in header (optional) |
-| `zstd.concat` | bool | false | Decoder: support concatenated frames |
+| `zstd.concat` | bool | true | Decoder: decode every frame in the input (RFC 8878 §3.1). Set false to stop after the first frame |
 | `zstd.job_size` | uint64 | 0 (auto) | Encoder: job size for parallel compression (64KB–16MB, 0=auto) |
 
 ### Threading options (encoder only)
@@ -356,13 +356,13 @@ Larger job sizes provide better compression (more context for the match finder) 
 Parallel compression produces **concatenated Zstd frames**. Each frame is complete and valid:
 
 - Standard tools (`zstd`, `unzstd`) can decompress the output directly
-- When decoding with this library, enable `zstd.concat=true` to decode all frames
+- Decoding all frames is the default; `zstd.concat=false` stops after the first
 
 ```c
 // Decoding parallel-compressed output
 gcomp_options_t *dec_opts = NULL;
 gcomp_options_create(&dec_opts);
-gcomp_options_set_bool(dec_opts, "zstd.concat", true);  // Required for multi-frame
+// Multi-frame input decodes fully by default; no option needed.
 
 gcomp_decoder_t *dec = NULL;
 gcomp_decoder_create(registry, "zstd", dec_opts, &dec);
@@ -403,7 +403,8 @@ A zstd frame is a run of blocks, so a flushed block is an ordinary one and
 ### Why a full flush ends the frame
 
 `GCOMP_FLUSH_FULL` is different: **it ends the current frame and starts
-another**, and reading the result needs `zstd.concat` on the decoder.
+another**. The decoder reads every frame in its input by default, so the
+result reads back with no option set.
 
 The repeat offsets are frame-level state that the decoder tracks in step with
 the encoder (RFC 8878 §3.1.1.3.2.1.1). An encoder that quietly reset them
@@ -431,15 +432,12 @@ nothing the caller handed over is left in flight.
 
 ## Concatenated frames
 
-Multiple Zstd frames can be concatenated into a single stream. By default, the decoder stops after the first frame. Enable `zstd.concat` to decode all frames:
+Multiple Zstd frames can be concatenated into a single stream. RFC 8878 §3.1: "The decompressed content of multiple concatenated frames is the concatenation of each frame's decompressed content." The decoder does this by default. Set `zstd.concat=false` to stop after the first frame instead:
 
 ```c
-gcomp_options_t *opts = NULL;
-gcomp_options_create(&opts);
-gcomp_options_set_bool(opts, "zstd.concat", 1);
-
+// Every frame in the input is decoded by default -- no option required.
 gcomp_decoder_t *dec = NULL;
-gcomp_decoder_create(registry, "zstd", opts, &dec);
+gcomp_decoder_create(registry, "zstd", NULL, &dec);
 
 // Now the decoder will process all concatenated frames,
 // writing their decompressed output contiguously.
@@ -523,8 +521,9 @@ gcomp_decoder_t *dec = NULL;
 gcomp_options_t *opts = NULL;
 gcomp_options_create(&opts);
 
-// Enable concatenated frame support if needed
-gcomp_options_set_bool(opts, "zstd.concat", 1);
+// Concatenated frames decode by default; set this only to stop after the
+// first frame.
+// gcomp_options_set_bool(opts, "zstd.concat", 0);
 
 gcomp_decoder_create(registry, "zstd", opts, &dec);
 

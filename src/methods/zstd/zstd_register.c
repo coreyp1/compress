@@ -113,14 +113,15 @@ static const gcomp_option_schema_t g_zstd_option_schemas[] = {
         "zstd.concat",                               // key
         GCOMP_OPT_BOOL,                              // type
         1,                                           // has_default
-        {.b = false},                                // default_value
+        {.b = true},                                 // default_value
         0,                                           // has_min
         0,                                           // has_max
         0,                                           // min_int
         0,                                           // max_int
         0,                                           // min_uint
         0,                                           // max_uint
-        "Decoder: support concatenated zstd frames", // help
+        "Decoder: decode every frame in the input (RFC 8878 section 3.1); "
+        "set false to stop after the first",                              // help
     },
     // zstd.dictionary - Dictionary data (RFC 8878 §5; raw or formatted)
     {

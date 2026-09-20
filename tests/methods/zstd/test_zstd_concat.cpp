@@ -177,7 +177,18 @@ TEST_F(ZstdConcatTest, TwoFramesConcatEnabled) {
   gcomp_options_destroy(opts);
 }
 
-TEST_F(ZstdConcatTest, TwoFramesConcatDisabled) {
+// RFC 8878 section 3.1: "The decompressed content of multiple concatenated
+// frames is the concatenation of each frame's decompressed content."  Decoding
+// every frame is therefore what a decoder given this input must do, and it is
+// what the default does.
+//
+// This test used to pass no options and expect the first frame's content back
+// with GCOMP_OK -- the default was to stop after one frame, so a caller
+// decoding a two frame file silently got half of it and no indication.  It now
+// asks for that behaviour explicitly, because it is a deliberate opt-out for a
+// caller that wants one frame and will handle what follows itself, not
+// something anyone should get by not choosing.
+TEST_F(ZstdConcatTest, TwoFramesConcatDisabledExplicitly) {
   const char data1[] = "First frame";
   const char data2[] = "Second frame";
 
@@ -191,14 +202,45 @@ TEST_F(ZstdConcatTest, TwoFramesConcatDisabled) {
   concat.insert(concat.end(), frame1.begin(), frame1.end());
   concat.insert(concat.end(), frame2.begin(), frame2.end());
 
-  // Decompress with concat disabled (default)
+  // Decompress with concat explicitly disabled
+  gcomp_options_t * opts = nullptr;
+  ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+  ASSERT_EQ(gcomp_options_set_bool(opts, "zstd.concat", false), GCOMP_OK);
+
   gcomp_status_t status;
-  auto result = decompress(concat.data(), concat.size(), nullptr, &status);
+  auto result = decompress(concat.data(), concat.size(), opts, &status);
+  gcomp_options_destroy(opts);
 
   // Should succeed but only decode first frame
   EXPECT_EQ(status, GCOMP_OK);
   ASSERT_EQ(result.size(), strlen(data1));
   EXPECT_EQ(memcmp(result.data(), data1, strlen(data1)), 0);
+}
+
+// The default must decode both frames: RFC 8878 section 3.1 says the
+// decompressed content of concatenated frames is the concatenation of their
+// contents, so a caller who chooses nothing gets all of it.
+TEST_F(ZstdConcatTest, TwoFramesDecodeFullyByDefault) {
+  const char data1[] = "First frame";
+  const char data2[] = "Second frame";
+
+  auto frame1 = compress(data1, strlen(data1));
+  auto frame2 = compress(data2, strlen(data2));
+  ASSERT_GT(frame1.size(), 0u);
+  ASSERT_GT(frame2.size(), 0u);
+
+  std::vector<uint8_t> concat;
+  concat.insert(concat.end(), frame1.begin(), frame1.end());
+  concat.insert(concat.end(), frame2.begin(), frame2.end());
+
+  std::string expected = std::string(data1) + std::string(data2);
+
+  gcomp_status_t status;
+  auto result = decompress(concat.data(), concat.size(), nullptr, &status);
+
+  EXPECT_EQ(status, GCOMP_OK);
+  ASSERT_EQ(result.size(), expected.size());
+  EXPECT_EQ(memcmp(result.data(), expected.data(), expected.size()), 0);
 }
 
 //
