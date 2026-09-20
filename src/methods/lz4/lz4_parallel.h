@@ -63,13 +63,13 @@
 
 #include <ghoti.io/compress/allocator.h>
 #include <ghoti.io/compress/errors.h>
-#include <ghoti.io/compress/job_queue.h>
 #include <ghoti.io/compress/limits.h>
 #include <ghoti.io/compress/macros.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
+#include "../../core/block_job.h"
 #include "../../core/stepdown.h"
 
 #ifdef __cplusplus

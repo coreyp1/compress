@@ -4,13 +4,20 @@
  * Generic parallel block job helper for method-specific parallel compression.
  *
  * This module encapsulates the common pattern used by LZ4 and Zstd parallel
- * encoders: inline vs threaded mode, job queue for ordering, thread pool for
- * execution. Method-specific code provides the process callback and job
- * allocation; this helper handles create/destroy, submit, and get_result
- * ordering.
+ * encoders: inline vs threaded mode, cutil's GCU_Sequencer for ordering,
+ * cutil's GCU_Pool for execution. Method-specific code provides the process
+ * callback and job allocation; this helper handles create/destroy, submit,
+ * and get_result ordering.
  *
- * Job struct contract: the method job must have gcomp_block_job_t as its first
- * member so that (gcomp_block_job_t *)job is valid for the queue.
+ * The two cutil pieces do not overlap: the pool decides when a block is
+ * compressed, the sequencer decides what order the finished blocks are
+ * handed back in. Blocks finish out of order and must be written in file
+ * order, which is the whole reason the sequencer is here.
+ *
+ * Job struct contract: the method job must have gcomp_block_job_t as its
+ * first member, so that (gcomp_block_job_t *)job is valid. The sequencer
+ * ticket is stored in that base's sequence_num, which is how the pool's
+ * completion callback names the job it just finished.
  *
  * Internal only — not part of the public API.
  *
@@ -24,8 +31,10 @@
 
 #include <ghoti.io/compress/allocator.h>
 #include <ghoti.io/compress/errors.h>
-#include <ghoti.io/compress/job_queue.h>
 #include <ghoti.io/cutil/pool.h>
+#include <ghoti.io/cutil/sequencer.h>
+
+#include "block_job.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>

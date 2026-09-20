@@ -286,14 +286,12 @@ tests/
 │   ├── test_callback_api.cpp     # Callback streaming API tests
 │   ├── test_crc32.cpp            # CRC32 utility tests
 │   ├── test_errors.cpp           # Error handling tests
-│   ├── test_job_queue.cpp        # Job queue tests
 │   ├── test_limits.cpp           # Safety limits tests
 │   ├── test_options.cpp          # Options API tests
 │   ├── test_registry.cpp         # Registry tests
 │   ├── test_schema.cpp           # Option schema introspection tests
 │   ├── test_state_machine.cpp    # State machine robustness tests
 │   ├── test_stream.cpp           # Stream infrastructure tests
-│   ├── test_thread_pool.cpp      # Thread pool tests
 │   └── test_xxhash32.cpp         # xxHash32 utility tests
 ├── integration/                  # Integration tests
 │   ├── test_autoreg.cpp          # Auto-registration tests

@@ -17,9 +17,11 @@ The `compress` library provides:
 
 ## Dependencies
 
-- `cutil` - Ghoti.io core utilities, for the thread/mutex/semaphore
-  abstractions used by the thread pool and job queue
-  (`src/core/thread_pool.c`, `src/core/job_queue.c`)
+- `cutil` - Ghoti.io core utilities.  Parallel compression is built on its
+  `GCU_Pool` (worker threads) and `GCU_Sequencer` (reorder buffer), used
+  together in `src/core/parallel_block.c`: the pool decides when a block is
+  compressed, the sequencer decides what order the finished blocks are
+  written in.  This library had its own copy of both and no longer does.
 
 No third-party dependencies: every compression method is implemented from
 scratch against libc.

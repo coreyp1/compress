@@ -108,7 +108,8 @@ Public headers and main entry points (all under `include/ghoti.io/compress/`):
 | `namespace.h` | Renames every symbol to its `ghotiio_compress_<branch>_` form |
 | `libver.h` | Version macros, generated at build time into `libver_gen.h` |
 
-Optional / build-time: `job_queue.h`, `thread_pool.h` (for parallel encode when used).
+Parallel encoding needs no header of its own here:  it is built on cutil's
+`GCU_Pool` and `GCU_Sequencer`, driven by the private `src/core/parallel_block.c`.
 
 Every header listed here is installed, `namespace.h` and `libver.h` included -
 `make install` copies the whole of `include/ghoti.io/` plus the generated
@@ -498,8 +499,6 @@ compress/
 │   ├── errors.h                  # Status codes
 │   ├── allocator.h               # Memory allocation
 │   ├── limits.h                  # Safety limits
-│   ├── thread_pool.h             # Worker pool for parallel encoding
-│   ├── job_queue.h               # Bounded queue the pool feeds from
 │   ├── deflate.h                 # Deflate-specific API
 │   ├── gzip.h                    # Gzip-specific API
 │   ├── lz4.h                     # LZ4-specific API
@@ -525,10 +524,9 @@ compress/
 │   │   ├── limits.c              # Limit checking
 │   │   ├── errors.c              # Error utilities
 │   │   ├── buffer.c              # Buffer convenience functions
-│   │   ├── thread_pool.c         # Worker threads over cutil primitives
-│   │   ├── job_queue.c           # Bounded job queue (see the warning in
-│   │   │                         #   job_queue.h about blocking submits)
-│   │   ├── parallel_block.c      # Shared block-parallel driver (LZ4, zstd)
+│   │   ├── block_job.h           # The job struct the parallel encoders embed
+│   │   ├── parallel_block.c      # Shared block-parallel driver (LZ4, zstd),
+│   │   │                         #   over cutil's GCU_Pool and GCU_Sequencer
 │   │   ├── huffman_lengths.c     # Length-limited code lengths by
 │   │   │                         #   boundary package-merge (deflate, zstd)
 │   │   ├── wrapper_options.c     # Option cloning for wrappers (gzip, zlib)
@@ -612,8 +610,8 @@ compress/
 
 LZ4 and Zstd parallel encoders share a generic **parallel block** helper in `src/core/parallel_block.c` (internal API in `parallel_block.h`). The helper encapsulates:
 
-- **Inline vs threaded mode:** When `num_threads <= 1`, jobs run in the caller thread; otherwise a thread pool and job queue are used.
-- **Ordered results:** Jobs may complete out of order; the helper returns results in submission order via the existing `gcomp_job_queue_t` and an inline FIFO.
+- **Inline vs threaded mode:** When `num_threads <= 1`, jobs run in the caller thread; otherwise cutil's `GCU_Pool` runs them and cutil's `GCU_Sequencer` orders them.
+- **Ordered results:** Jobs may complete out of order; the helper returns results in submission order via `GCU_Sequencer` (threaded) or an inline FIFO.
 - **Submit / get_result:** Methods submit an opaque job (whose first member is `gcomp_block_job_t`) and a process callback; they retrieve the next completed job in order.
 
 Method-specific logic (per-job allocation, block or frame compression, checksums) remains in `lz4_parallel.c` and `zstd_parallel.c`; the helper only manages context lifecycle, threading, and ordering.

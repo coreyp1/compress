@@ -37,7 +37,7 @@ struct gcomp_parallel_block_ctx_s {
   bool is_inline;
 
   GCU_Pool * pool;
-  gcomp_job_queue_t * queue;
+  GCU_Sequencer * sequencer;
 
   inline_node_t * inline_head;
   inline_node_t * inline_tail;
@@ -48,11 +48,36 @@ struct gcomp_parallel_block_ctx_s {
 // Completion callback for threaded mode
 //
 
+/**
+ * @brief Translate a sequencer outcome into this library's status codes.
+ *
+ * GCU_SEQUENCER_EMPTY is a distinct outcome rather than an error, but the
+ * inline path reports "nothing to collect" as GCOMP_ERR_INVALID_ARG and the
+ * two modes must not diverge, so it is folded in here.
+ */
+static gcomp_status_t parallel_block_status(GCU_Sequencer_Result result) {
+  switch (result) {
+    case GCU_SEQUENCER_OK:
+      return GCOMP_OK;
+    case GCU_SEQUENCER_FULL:
+      return GCOMP_ERR_LIMIT;
+    default:
+      return GCOMP_ERR_INVALID_ARG;
+  }
+}
+
 static void parallel_block_job_complete(
     void * job_ctx, int status, void * user_data) {
-  gcomp_job_queue_t * queue = (gcomp_job_queue_t *)user_data;
+  GCU_Sequencer * sequencer = (GCU_Sequencer *)user_data;
   gcomp_block_job_t * base = (gcomp_block_job_t *)job_ctx;
-  gcomp_job_queue_complete(queue, base, (gcomp_status_t)status);
+
+  // The job structure is the caller's, so recording the outcome in it is
+  // this module's job and not the sequencer's; the sequencer carries the
+  // same status separately, for callers whose payload has nowhere to put it.
+  base->status = (status == GCOMP_OK) ? GCOMP_JOB_COMPLETE : GCOMP_JOB_ERROR;
+  base->result = (gcomp_status_t)status;
+
+  gcu_sequencer_complete(sequencer, base->sequence_num, status);
 }
 
 //
@@ -85,7 +110,7 @@ gcomp_status_t gcomp_parallel_block_create(
   if (num_threads <= 1) {
     ctx->is_inline = true;
     ctx->pool = NULL;
-    ctx->queue = NULL;
+    ctx->sequencer = NULL;
     ctx->inline_head = NULL;
     ctx->inline_tail = NULL;
     ctx->inline_count = 0;
@@ -112,17 +137,18 @@ gcomp_status_t gcomp_parallel_block_create(
     return GCOMP_ERR_INTERNAL;
   }
 
-  gcomp_status_t status;
-
-  gcomp_job_queue_config_t queue_config = {
+  // The tracked allocator, not the default:  gcomp_allocator_t *is* cutil's
+  // GCU_Allocator, and the ring has to be counted against this library's
+  // memory limit exactly as the queue it replaces was.
+  GCU_Sequencer_Config sequencer_config = {
       .capacity = ctx->max_in_flight,
       .allocator = allocator,
   };
-  status = gcomp_job_queue_create(&queue_config, &ctx->queue);
-  if (status != GCOMP_OK) {
+  ctx->sequencer = gcu_sequencer_create(&sequencer_config);
+  if (!ctx->sequencer) {
     gcu_pool_destroy(ctx->pool);
     gcomp_free(allocator, ctx);
-    return status;
+    return GCOMP_ERR_MEMORY;
   }
 
   *ctx_out = ctx;
@@ -138,7 +164,7 @@ void gcomp_parallel_block_destroy(gcomp_parallel_block_ctx_t * ctx) {
     // writes to that queue.  gcu_pool_destroy() drains too, but waiting here
     // keeps the ordering explicit rather than resting on it.
     gcu_pool_wait(ctx->pool);
-    gcomp_job_queue_destroy(ctx->queue);
+    gcu_sequencer_destroy(ctx->sequencer);
     gcu_pool_destroy(ctx->pool);
   }
   /* Inline mode: free any remaining nodes (should be empty at destroy) */
@@ -182,15 +208,24 @@ static gcomp_status_t gcomp_parallel_block_submit_internal(
     return GCOMP_OK;
   }
 
-  gcomp_status_t status = blocking
-      ? gcomp_job_queue_submit(ctx->queue, base)
-      : gcomp_job_queue_try_submit(ctx->queue, base);
-  if (status != GCOMP_OK) {
-    return status;
+  uint64_t ticket = 0;
+  GCU_Sequencer_Result submitted = blocking
+      ? gcu_sequencer_submit_wait(ctx->sequencer, base, &ticket)
+      : gcu_sequencer_submit(ctx->sequencer, base, &ticket);
+  if (submitted != GCU_SEQUENCER_OK) {
+    return parallel_block_status(submitted);
   }
+
+  // Recorded before the pool is told about the job, because the completion
+  // callback reads it back to name the ticket and a worker may run the job
+  // the instant it is enqueued.
+  base->sequence_num = ticket;
+  base->status = GCOMP_JOB_PENDING;
+  base->result = GCOMP_OK;
+
   if (!gcu_pool_enqueue_cb(ctx->pool, process_fn, job_ctx,
-          parallel_block_job_complete, ctx->queue)) {
-    gcomp_job_queue_complete(ctx->queue, base, GCOMP_ERR_INTERNAL);
+          parallel_block_job_complete, ctx->sequencer)) {
+    parallel_block_job_complete(job_ctx, GCOMP_ERR_INTERNAL, ctx->sequencer);
   }
   return GCOMP_OK;
 }
@@ -228,10 +263,13 @@ gcomp_status_t gcomp_parallel_block_get_result(
     return (*base_out)->result;
   }
 
-  gcomp_status_t status = gcomp_job_queue_get_next_result(ctx->queue, base_out);
-  if (status != GCOMP_OK) {
-    return status;
+  void * payload = NULL;
+  GCU_Sequencer_Result collected =
+      gcu_sequencer_next(ctx->sequencer, &payload, NULL);
+  if (collected != GCU_SEQUENCER_OK) {
+    return parallel_block_status(collected);
   }
+  *base_out = (gcomp_block_job_t *)payload;
   return (*base_out)->result;
 }
 
@@ -242,7 +280,7 @@ bool gcomp_parallel_block_result_ready(const gcomp_parallel_block_ctx_t * ctx) {
   if (ctx->is_inline) {
     return ctx->inline_head != NULL;
   }
-  return gcomp_job_queue_result_ready(ctx->queue);
+  return gcu_sequencer_is_ready(ctx->sequencer);
 }
 
 gcomp_status_t gcomp_parallel_block_wait(gcomp_parallel_block_ctx_t * ctx) {
@@ -273,7 +311,7 @@ uint32_t gcomp_parallel_block_pending_count(
   if (ctx->is_inline) {
     return ctx->inline_count;
   }
-  return gcomp_job_queue_pending_count(ctx->queue);
+  return (uint32_t)gcu_sequencer_count_outstanding(ctx->sequencer);
 }
 
 gcomp_status_t gcomp_parallel_block_reset(gcomp_parallel_block_ctx_t * ctx) {
@@ -288,5 +326,8 @@ gcomp_status_t gcomp_parallel_block_reset(gcomp_parallel_block_ctx_t * ctx) {
     ctx->inline_tail = NULL;
     return GCOMP_OK;
   }
-  return gcomp_job_queue_reset(ctx->queue);
+  if (gcu_sequencer_count_outstanding(ctx->sequencer) > 0) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  return parallel_block_status(gcu_sequencer_reset(ctx->sequencer));
 }

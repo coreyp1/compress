@@ -272,43 +272,62 @@ Do not leave orphaned threads running after returning an error.
 
 The compress library provides core threading infrastructure that methods can use:
 
-### Thread Pool (`core/thread_pool.h`)
+### Thread Pool (`GCU_Pool`, from cutil)
 
-A reusable thread pool for parallel job processing:
-
-```c
-#include "core/thread_pool.h"
-
-gcomp_thread_pool_t *pool = NULL;
-gcomp_thread_pool_create(4, allocator, &pool);  // 4 workers
-
-// Submit work
-gcomp_thread_pool_submit(pool, work_func, work_ctx, complete_cb, user_data);
-
-// Cleanup
-gcomp_thread_pool_destroy(pool);
-```
-
-### Job Queue (`core/job_queue.h`)
-
-An ordered job queue for collecting results in submission order:
+Parallel work runs on cutil's thread pool.  This library had its own, in
+`src/core/thread_pool.c`, and it was removed:  its `destroy` was documented
+as draining but tested its shutdown flag before the queue, so an
+unpredictable number of queued blocks were silently discarded.
 
 ```c
-#include "core/job_queue.h"
+#include <ghoti.io/cutil/pool.h>
 
-gcomp_job_queue_t *queue = NULL;
-gcomp_job_queue_create(max_in_flight, allocator, &queue);
+GCU_Pool_Config config = {
+    .thread_count = 4,
+    .max_queued = 0,
+    .name_prefix = "gcomp-blk",
+    .allocator = allocator,
+};
+GCU_Pool * pool = gcu_pool_create(&config);
 
-// Submit jobs (assigns sequence numbers)
-gcomp_job_queue_submit(queue, &job->base);
+gcu_pool_enqueue_cb(pool, process_fn, job_ctx, on_complete, user_data);
 
-// Mark job complete
-gcomp_job_queue_complete(queue, &job->base, status);
-
-// Get next completed job in order (blocks if not ready)
-gcomp_block_job_t *completed = NULL;
-gcomp_job_queue_get_next(queue, &completed);
+gcu_pool_destroy(pool);  // drains:  runs what is queued, then stops
 ```
+
+### Sequencer (`GCU_Sequencer`, from cutil)
+
+Blocks are compressed in parallel and finish in whatever order they finish,
+but must be written in file order.  That reordering is cutil's sequencer.
+This library had its own, as `gcomp_job_queue_t`, and it was replaced:  the
+mechanism is entirely generic, and keeping a private copy meant fixing the
+same concurrency defects twice.
+
+```c
+#include <ghoti.io/cutil/sequencer.h>
+
+GCU_Sequencer_Config config = {
+    .capacity = max_in_flight,
+    .allocator = allocator,
+};
+GCU_Sequencer * sequencer = gcu_sequencer_create(&config);
+
+// Submit; the ticket is what names this item from now on.
+uint64_t ticket = 0;
+gcu_sequencer_submit(sequencer, &job->base, &ticket);
+job->base.sequence_num = ticket;
+
+// Whichever worker finishes it says so, by ticket.
+gcu_sequencer_complete(sequencer, job->base.sequence_num, status);
+
+// Collect in submission order, blocking while the oldest is unfinished.
+void * payload = NULL;
+gcu_sequencer_next(sequencer, &payload, NULL);
+```
+
+Both are wired together in `src/core/parallel_block.c`, which is what the
+LZ4 and Zstd parallel encoders actually use; neither calls the pool or the
+sequencer directly.
 
 ## Method-Specific Options
 
@@ -323,7 +342,7 @@ Methods may define additional threading-related options beyond `threads.count`:
 
 ### Zstd Parallel Compression
 
-The Zstd encoder implements parallel compression using the core thread pool and job queue:
+The Zstd encoder implements parallel compression through `parallel_block.c`, and so through cutil's pool and sequencer:
 
 - **Location**: `src/methods/zstd/zstd_parallel.c`
 - **Options**: `threads.count`, `zstd.job_size`
