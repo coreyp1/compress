@@ -399,6 +399,13 @@ static gcomp_status_t zstd_encoder_update_parallel(gcomp_encoder_t * encoder,
       uint8_t * job_input = (uint8_t *)state->parallel_job->base.input;
       memcpy(job_input + state->parallel_job->base.input_size,
           in_ptr + input->used, to_copy);
+      // The checksum covers the frame's whole content, so it is taken here,
+      // where the bytes are still in order, rather than inside a job that
+      // only ever sees its own slice.
+      if (state->checksum_enabled) {
+        gcomp_xxhash64_update(
+            &state->content_hash, in_ptr + input->used, to_copy);
+      }
       state->parallel_job->base.input_size += to_copy;
       input->used += to_copy;
       state->total_input_bytes += to_copy;
@@ -515,6 +522,37 @@ static gcomp_status_t zstd_encoder_finish_parallel(gcomp_encoder_t * encoder,
     // Shouldn't happen after wait, but be defensive: the stream is not
     // complete, so do not report GCOMP_OK.
     return GCOMP_ERR_LIMIT;
+  }
+
+  // Every job's blocks are out, and all of them have Last_Block clear because
+  // no job knows it is the last.  The frame is ended here instead, by an empty
+  // Raw block carrying the flag -- three bytes, and the same terminator the
+  // reference encoder writes for empty input.  The checksum over the whole
+  // content follows it, taken from the hash this encoder kept as it handed the
+  // input to the jobs in order.
+  if (!state->parallel_epilogue_staged) {
+    size_t need = ZSTD_BLOCK_HEADER_SIZE + (state->checksum_enabled ? 4u : 0u);
+    if (need > state->parallel_output_buf_cap) {
+      gcomp_encoder_set_error(encoder, GCOMP_ERR_INTERNAL,
+          "parallel output buffer too small for the frame terminator");
+      return GCOMP_ERR_INTERNAL;
+    }
+    zstd_write_block_header(
+        state->parallel_output_buf, true, ZSTD_BLOCK_TYPE_RAW, 0);
+    size_t epi = ZSTD_BLOCK_HEADER_SIZE;
+    if (state->checksum_enabled) {
+      uint64_t hash = gcomp_xxhash64_finalize(&state->content_hash);
+      gcomp_write_le32(
+          state->parallel_output_buf + epi, (uint32_t)(hash & 0xFFFFFFFF));
+      epi += 4;
+    }
+    state->parallel_output_buf_pos = 0;
+    state->parallel_output_buf_len = epi;
+    state->parallel_epilogue_staged = true;
+  }
+
+  if (!zstd_encoder_drain_parallel_output(state, output)) {
+    return GCOMP_ERR_LIMIT; // terminator did not fit; call finish again.
   }
 
   // All done
@@ -914,7 +952,19 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
     gcomp_memory_track_alloc(
         &state->mem_tracker, state->parallel_output_buf_cap);
 
-    // Set initial stage - parallel mode doesn't use HEADER stage
+    // Parallel jobs emit blocks only, so the frame header is this encoder's
+    // to write, exactly as in single-threaded mode.  Staging it as the first
+    // thing in the parallel output buffer puts it ahead of every job's blocks
+    // without giving the drain path a special case.
+    status = zstd_write_frame_header(&state->header, state->parallel_output_buf,
+        state->parallel_output_buf_cap, &state->header_len);
+    if (status != GCOMP_OK) {
+      gcomp_encoder_set_error(encoder, status, "frame header write failed");
+      goto cleanup;
+    }
+    state->parallel_output_buf_pos = 0;
+    state->parallel_output_buf_len = state->header_len;
+
     state->stage = ZSTD_ENC_STAGE_BLOCKS;
   }
   else {
@@ -1673,9 +1723,19 @@ gcomp_status_t zstd_encoder_reset(gcomp_encoder_t * encoder) {
       return status;
     }
 
-    // Reset parallel output buffer
+    // A reset starts a new frame, so the header goes back at the front of the
+    // output buffer exactly as it did at create time, and the terminator this
+    // encoder appends after the last job is owed again.  Leaving either out
+    // produced a second stream with no frame header and no final block --
+    // headerless bytes that decoded to nothing.
+    state->parallel_epilogue_staged = false;
+    status = zstd_write_frame_header(&state->header, state->parallel_output_buf,
+        state->parallel_output_buf_cap, &state->header_len);
+    if (status != GCOMP_OK) {
+      return status;
+    }
     state->parallel_output_buf_pos = 0;
-    state->parallel_output_buf_len = 0;
+    state->parallel_output_buf_len = state->header_len;
 
     // Set stage to BLOCKS (parallel mode doesn't use HEADER stage)
     state->stage = ZSTD_ENC_STAGE_BLOCKS;

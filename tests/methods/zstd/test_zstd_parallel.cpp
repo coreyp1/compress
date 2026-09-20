@@ -59,6 +59,30 @@ protected:
   }
 
   // Helper to decode data using the standard decoder
+  // A job's output is a run of BLOCKS, not a frame.
+  //
+  // Each job used to emit a complete frame of its own, so a test could hand
+  // job->base.output straight to the decoder.  Jobs are now pieces of one
+  // shared frame: they carry no magic, no frame header and no terminator,
+  // because only the encoder knows where the content ends.  To decode one on
+  // its own a test has to supply the frame around it, which is what this does
+  // -- a header declaring the job's window and no content size, the job's
+  // blocks, then the empty Last_Block the encoder would have appended.
+  std::vector<uint8_t> decodeJobBlocks(
+      const void * blocks, size_t len, uint8_t window_log) {
+    std::vector<uint8_t> frame;
+    frame.insert(frame.end(), {0x28, 0xb5, 0x2f, 0xfd});
+    // Frame_Header_Descriptor: no content size, not single segment, no
+    // dictionary, no checksum -- so a Window_Descriptor byte follows.
+    frame.push_back(0x00);
+    frame.push_back((uint8_t)((window_log - 10u) << 3));
+    const uint8_t * b = (const uint8_t *)blocks;
+    frame.insert(frame.end(), b, b + len);
+    // Last_Block set, Raw, size zero.
+    frame.insert(frame.end(), {0x01, 0x00, 0x00});
+    return decode(frame.data(), frame.size());
+  }
+
   std::vector<uint8_t> decode(
       const void * data, size_t len, bool concat = true) {
     gcomp_decoder_t * dec = nullptr;
@@ -283,7 +307,8 @@ TEST_F(ZstdParallelTest, InlineSubmitGetResult) {
   EXPECT_EQ(zstd_parallel_pending_count(ctx), 0u);
 
   // Verify the output is decodable
-  auto decoded = decode(result->base.output, result->base.output_size);
+  auto decoded = decodeJobBlocks(result->base.output, result->base.output_size,
+        result->window_log);
   ASSERT_EQ(decoded.size(), strlen(test_data));
   EXPECT_EQ(memcmp(decoded.data(), test_data, decoded.size()), 0);
 
@@ -328,7 +353,8 @@ TEST_F(ZstdParallelTest, InlineMultipleJobs) {
     ASSERT_EQ(zstd_parallel_get_result(ctx, &result), GCOMP_OK);
     EXPECT_EQ(result, jobs[i]);
 
-    auto decoded = decode(result->base.output, result->base.output_size);
+    auto decoded = decodeJobBlocks(result->base.output, result->base.output_size,
+        result->window_log);
     ASSERT_EQ(decoded.size(), strlen(test_strings[i]));
     EXPECT_EQ(memcmp(decoded.data(), test_strings[i], decoded.size()), 0);
   }
@@ -368,9 +394,15 @@ TEST_F(ZstdParallelTest, InlineWithChecksum) {
 
   zstd_parallel_job_t * result = nullptr;
   ASSERT_EQ(zstd_parallel_get_result(ctx, &result), GCOMP_OK);
-  EXPECT_GT(result->content_checksum, 0u);
+  // The checksum is no longer a job's business: it covers the whole frame's
+  // content, which no single job sees.  The encoder takes it over the input
+  // as it hands it to the jobs, and writes it after the last block; see
+  // ZstdParallelEncoderTest and the zstd CLI oracle tests for that.  What
+  // this test still checks is that asking for a checksum does not change
+  // what a job produces.
 
-  auto decoded = decode(result->base.output, result->base.output_size);
+  auto decoded = decodeJobBlocks(result->base.output, result->base.output_size,
+        result->window_log);
   ASSERT_EQ(decoded.size(), strlen(test_data));
   EXPECT_EQ(memcmp(decoded.data(), test_data, decoded.size()), 0);
 
@@ -413,7 +445,8 @@ TEST_F(ZstdParallelTest, ThreadedSubmitGetResult) {
   EXPECT_EQ(result, job);
   EXPECT_GT(result->base.output_size, 0u);
 
-  auto decoded = decode(result->base.output, result->base.output_size);
+  auto decoded = decodeJobBlocks(result->base.output, result->base.output_size,
+        result->window_log);
   ASSERT_EQ(decoded.size(), strlen(test_data));
   EXPECT_EQ(memcmp(decoded.data(), test_data, decoded.size()), 0);
 
@@ -463,7 +496,8 @@ TEST_F(ZstdParallelTest, ThreadedMultipleJobsOrderPreserved) {
     ASSERT_EQ(zstd_parallel_get_result(ctx, &result), GCOMP_OK);
     EXPECT_EQ(result, jobs[i]) << "Results should be in submission order";
 
-    auto decoded = decode(result->base.output, result->base.output_size);
+    auto decoded = decodeJobBlocks(result->base.output, result->base.output_size,
+        result->window_log);
     ASSERT_EQ(decoded.size(), inputs[i].size());
     EXPECT_EQ(memcmp(decoded.data(), inputs[i].data(), decoded.size()), 0);
   }
@@ -497,6 +531,7 @@ TEST_F(ZstdParallelTest, ConcatenatedFramesDecodable) {
   // Create multiple jobs
   std::vector<std::vector<uint8_t>> inputs;
   std::vector<uint8_t> concatenated_output;
+  uint8_t last_window_log = 0;
 
   for (int i = 0; i < 3; i++) {
     zstd_parallel_job_t * job = nullptr;
@@ -512,6 +547,7 @@ TEST_F(ZstdParallelTest, ConcatenatedFramesDecodable) {
 
     zstd_parallel_job_t * result = nullptr;
     ASSERT_EQ(zstd_parallel_get_result(ctx, &result), GCOMP_OK);
+    last_window_log = result->window_log;
 
     // Concatenate output
     concatenated_output.insert(concatenated_output.end(), result->base.output,
@@ -521,9 +557,11 @@ TEST_F(ZstdParallelTest, ConcatenatedFramesDecodable) {
   }
 
 
-  // Decode concatenated frames
-  auto decoded =
-      decode(concatenated_output.data(), concatenated_output.size(), true);
+  // The jobs' outputs concatenate into ONE run of blocks, which is the point:
+  // they are pieces of a single frame, so the whole run decodes under one
+  // frame header rather than as a frame each.
+  auto decoded = decodeJobBlocks(concatenated_output.data(),
+      concatenated_output.size(), last_window_log);
 
   // Expected: all inputs concatenated
   size_t expected_size = 0;
@@ -692,9 +730,13 @@ TEST_F(ZstdParallelTest, EmptyInput) {
 
   zstd_parallel_job_t * result = nullptr;
   ASSERT_EQ(zstd_parallel_get_result(ctx, &result), GCOMP_OK);
-  EXPECT_GT(result->base.output_size, 0u); // Should produce a valid frame
+  // No input, so no blocks.  A job no longer emits a frame of its own, and
+  // there is nothing else for it to say: the encoder's terminating block is
+  // what makes the empty frame.
+  EXPECT_EQ(result->base.output_size, 0u);
 
-  auto decoded = decode(result->base.output, result->base.output_size);
+  auto decoded = decodeJobBlocks(result->base.output, result->base.output_size,
+        result->window_log);
   EXPECT_EQ(decoded.size(), 0u);
 
   zstd_parallel_free_job(ctx, job);
@@ -730,7 +772,8 @@ TEST_F(ZstdParallelTest, RLECompressibleInput) {
   ASSERT_EQ(zstd_parallel_get_result(ctx, &result), GCOMP_OK);
   EXPECT_LT(result->base.output_size, 100u); // Should compress very well
 
-  auto decoded = decode(result->base.output, result->base.output_size);
+  auto decoded = decodeJobBlocks(result->base.output, result->base.output_size,
+        result->window_log);
   ASSERT_EQ(decoded.size(), 10000u);
   for (size_t i = 0; i < decoded.size(); i++) {
     EXPECT_EQ(decoded[i], 'X');
@@ -771,7 +814,8 @@ TEST_F(ZstdParallelTest, LargeInputMultipleBlocks) {
   ASSERT_EQ(zstd_parallel_get_result(ctx, &result), GCOMP_OK);
   EXPECT_GT(result->base.output_size, 0u);
 
-  auto decoded = decode(result->base.output, result->base.output_size);
+  auto decoded = decodeJobBlocks(result->base.output, result->base.output_size,
+        result->window_log);
   ASSERT_EQ(decoded.size(), data.size());
   EXPECT_EQ(memcmp(decoded.data(), data.data(), data.size()), 0);
 

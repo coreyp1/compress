@@ -65,7 +65,6 @@ struct zstd_parallel_job_s {
   size_t seq_buffer_capacity;      ///< Sequence buffer capacity
   uint8_t * literals_buffer;       ///< Literals buffer for encoding
   size_t literals_buffer_capacity; ///< Literals buffer capacity
-  uint32_t content_checksum; ///< Content checksum (low 32 bits of xxHash64)
   bool checksum_enabled;     ///< Whether checksum was requested
   int compression_level;     ///< Compression level for this job
   uint8_t window_log;        ///< Window log for this job

@@ -430,6 +430,7 @@ typedef struct {
   // Finish state
   bool finish_called;
   bool blocks_finished;
+  bool parallel_epilogue_staged; ///< Frame terminator + checksum written
 
   // ─────────────────────────────────────────────────────────────────────
   // Parallel Compression State (when threads.count > 1)

@@ -126,53 +126,52 @@ struct zstd_parallel_ctx_s {
 //
 
 /**
- * @brief Compress input data into a complete zstd frame.
+ * @brief Compress one job's input into a run of zstd blocks.
+ *
+ * A job is a piece of ONE frame, not a frame of its own.  It emits blocks and
+ * nothing else: the frame header, the block that ends the frame, and the
+ * checksum over the whole content all belong to the encoder, which is the only
+ * party that sees the jobs in order and knows where the content stops.
+ *
+ * This used to write a complete frame per job, so compressing with
+ * threads.count > 1 produced a multi-frame stream.  That is legal -- RFC 8878
+ * section 3.1 defines the content of concatenated frames as the concatenation
+ * of their contents -- but it costs ratio: a frame boundary throws away the
+ * repeat offsets and forces a fresh header, and it made our output differ in
+ * shape from every other zstd encoder for no benefit.
+ *
+ * Every block here is written with Last_Block clear.  The encoder appends an
+ * empty raw block with the flag set once the input really has ended, which is
+ * also how it terminates a frame whose content size it never knew.
+ *
+ * Jobs stay independent: a job's matches never reach behind its own first
+ * byte, so any declared window at least one job wide is honest, and the
+ * decoder needs no knowledge of the split.
  *
  * @param job The job containing input data and configuration.
  * @param allocator Allocator for temporary buffers.
  * @return GCOMP_OK on success, error code on failure.
  */
-static gcomp_status_t zstd_parallel_compress_frame(
+static gcomp_status_t zstd_parallel_compress_blocks(
     zstd_parallel_job_t * job, const gcomp_allocator_t * allocator) {
   const uint8_t * input = job->base.input;
   size_t input_len = job->base.input_size;
   uint8_t * output = job->base.output;
   size_t output_cap = job->base.output_capacity;
 
-  // Initialize content hash if checksum enabled
-  gcomp_xxhash64_state_t content_hash;
-  if (job->checksum_enabled) {
-    gcomp_xxhash64_reset(&content_hash, 0);
-    gcomp_xxhash64_update(&content_hash, input, input_len);
-  }
+  gcomp_status_t status = GCOMP_OK;
+  size_t pos = 0;
 
-  // Build frame header
-  zstd_frame_header_t header = {
-      .window_log = job->window_log,
-      .window_size = zstd_window_log_to_size(job->window_log),
-      .content_checksum = job->checksum_enabled,
-      .content_size_present = true,
-      .content_size = input_len,
-      .single_segment = (input_len <= zstd_window_log_to_size(job->window_log)),
-      .dict_id = 0,
-      .dict_id_flag = 0,
-  };
-
-  // Write magic number
-  if (output_cap < 4) {
-    return GCOMP_ERR_LIMIT;
+  // RFC 8878 section 3.1.1.2.4: Block_Maximum_Size is the smaller of
+  // Window_Size and 128 KB, and the window the frame header declares is the
+  // one every block in it has to fit.
+  size_t block_max = ZSTD_BLOCK_SIZE_MAX;
+  {
+    uint64_t window_size = zstd_window_log_to_size(job->window_log);
+    if (window_size < (uint64_t)block_max) {
+      block_max = (size_t)window_size;
+    }
   }
-  gcomp_write_le32(output, ZSTD_MAGIC);
-  size_t pos = 4;
-
-  // Write frame header (without magic - zstd_write_frame_header includes it)
-  size_t header_len;
-  gcomp_status_t status =
-      zstd_write_frame_header(&header, output, output_cap, &header_len);
-  if (status != GCOMP_OK) {
-    return status;
-  }
-  pos = header_len; // zstd_write_frame_header includes magic
 
   // Create a temporary encoder state for block compression
   // We need match finder and sequence buffers from the job
@@ -183,9 +182,32 @@ static gcomp_status_t zstd_parallel_compress_frame(
       .seq_buffer_capacity = job->seq_buffer_capacity / sizeof(zstd_sequence_t),
       .literals_buffer = job->literals_buffer,
       .literals_buffer_capacity = job->literals_buffer_capacity,
-      .rep_offset_1 = ZSTD_REP_OFFSET_1_INIT,
-      .rep_offset_2 = ZSTD_REP_OFFSET_2_INIT,
-      .rep_offset_3 = ZSTD_REP_OFFSET_3_INIT,
+      // Deliberately zero, not the frame-start values.
+      //
+      // RFC 8878 section 3.1.1.3.2.1.1 starts a FRAME's offset history at
+      // 1, 4, 8 and carries it from one block to the next.  Jobs are blocks
+      // of one shared frame now, so the decoder reaching this job's first
+      // block holds whatever the previous job left -- which this job cannot
+      // know, because they are compressed at the same time.  Starting from
+      // 1, 4, 8 here made the encoder name distances the decoder had never
+      // seen, and the stream decoded to the wrong bytes while remaining
+      // perfectly well-formed.
+      //
+      // Zero is not a distance, so both parses decline every repeat code
+      // while the history holds one (they already skip a zero candidate) and
+      // zstd_opt_encode_offset falls through to writing the distance in
+      // full.  The history then fills with distances this job has itself
+      // emitted, and those the decoder does have, in the same places: after
+      // an explicit distance X ours is {X,0,0} and the decoder's is {X,...},
+      // and every later rotation moves both the same way.  So a non-zero
+      // entry here always equals the decoder's entry at that index, and a
+      // zero one is never chosen -- which is the whole invariant.
+      //
+      // The cost is a handful of full distances at the start of each job,
+      // before the history has filled.
+      .rep_offset_1 = 0u,
+      .rep_offset_2 = 0u,
+      .rep_offset_3 = 0u,
   };
 
   // Compress input as a single block (or multiple blocks if large)
@@ -193,9 +215,10 @@ static gcomp_status_t zstd_parallel_compress_frame(
   const uint8_t * inp = input;
 
   while (remaining > 0) {
-    size_t block_input_len =
-        (remaining > ZSTD_BLOCK_SIZE_MAX) ? ZSTD_BLOCK_SIZE_MAX : remaining;
-    bool is_last = (remaining - block_input_len == 0);
+    size_t block_input_len = (remaining > block_max) ? block_max : remaining;
+    // Never the last block of the frame: only the encoder knows where the
+    // content ends, and it marks that with a block of its own.
+    const bool is_last = false;
 
     // The finder's positions go, because it is given each block on its own
     // with positions counted from that block's first byte and carrying them
@@ -238,17 +261,9 @@ static gcomp_status_t zstd_parallel_compress_frame(
     remaining -= block_input_len;
   }
 
-  // Write content checksum if enabled
-  if (job->checksum_enabled) {
-    if (pos + 4 > output_cap) {
-      return GCOMP_ERR_LIMIT;
-    }
-    uint64_t hash = gcomp_xxhash64_finalize(&content_hash);
-    gcomp_write_le32(output + pos, (uint32_t)(hash & 0xFFFFFFFF));
-    job->content_checksum = (uint32_t)(hash & 0xFFFFFFFF);
-    pos += 4;
-  }
-
+  // No checksum here: it covers the frame's whole content, which no single
+  // job has.  The encoder hashes the input as it hands it over and writes the
+  // result once, after the last block.
   job->base.output_size = pos;
   return GCOMP_OK;
 }
@@ -269,7 +284,7 @@ static gcomp_status_t zstd_parallel_process_job(void * ctx) {
   // For now, use default allocator in worker threads
   const gcomp_allocator_t * allocator = gcomp_allocator_default();
 
-  return zstd_parallel_compress_frame(job, allocator);
+  return zstd_parallel_compress_blocks(job, allocator);
 }
 
 //
@@ -510,7 +525,6 @@ gcomp_status_t zstd_parallel_alloc_job(
   job->checksum_enabled = ctx->checksum_enabled;
   job->compression_level = ctx->compression_level;
   job->window_log = ctx->window_log;
-  job->content_checksum = 0;
   job->next_inline = NULL;
 
   *job_out = job;
