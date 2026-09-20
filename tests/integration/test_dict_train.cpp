@@ -80,6 +80,23 @@ size_t compressed_total(const std::vector<std::string> & recs,
   return total;
 }
 
+/**
+ * @brief How many samples to use.
+ *
+ * Training scans every segment position in the corpus once per dictionary
+ * segment chosen, which is cheap normally and expensive under Memcheck: this
+ * file took 243 seconds there, second only to the match finder's. The shape
+ * being tested is "a dictionary learned from these helps on those", and that
+ * holds at a tenth of the samples - so under Memcheck it runs a tenth of them
+ * and still exercises every path.
+ *
+ * GCOMP_UNDER_VALGRIND is set by the Makefile's valgrind targets.
+ */
+size_t scale(size_t n) {
+  const char * v = std::getenv("GCOMP_UNDER_VALGRIND");
+  return (v && v[0] == '1') ? ((n / 10u) ? (n / 10u) : 1u) : n;
+}
+
 struct Split {
   std::vector<std::string> train;
   std::vector<std::string> held;
@@ -125,9 +142,9 @@ std::vector<uint8_t> train(const std::vector<std::string> & samples,
  * three, not a few percent.
  */
 TEST(DictTrain, HelpsOnSamplesItNeverSaw) {
-  const Split split = make_split(3000, 1000);
+  const Split split = make_split(scale(3000), scale(1000));
   const std::vector<uint8_t> dict = train(split.train, 16384, nullptr);
-  ASSERT_GT(dict.size(), 4096u) << "the trainer produced almost nothing";
+  ASSERT_GT(dict.size(), scale(4096)) << "the trainer produced almost nothing";
 
   for (int64_t level : {1, 3, 9, 19}) {
     const size_t without = compressed_total(split.held, nullptr, level);
@@ -151,7 +168,7 @@ TEST(DictTrain, HelpsOnSamplesItNeverSaw) {
 TEST(DictTrain, WorksOnSamplesShorterThanTheDefaultSegment) {
   std::vector<std::string> samples;
   uint32_t seed = 999u;
-  for (int i = 0; i < 2000; i++) {
+  for (size_t i = 0; i < scale(2000); i++) {
     // Around 60 bytes: far below the 256-byte default segment.
     const std::string r = record(seed);
     samples.push_back(r.substr(0, 60));
@@ -161,7 +178,7 @@ TEST(DictTrain, WorksOnSamplesShorterThanTheDefaultSegment) {
       << "samples shorter than the default segment produced no dictionary";
 
   std::vector<std::string> held;
-  for (int i = 0; i < 300; i++) {
+  for (size_t i = 0; i < scale(300); i++) {
     held.push_back(record(seed).substr(0, 60));
   }
   const size_t without = compressed_total(held, nullptr, 3);
@@ -173,7 +190,7 @@ TEST(DictTrain, WorksOnSamplesShorterThanTheDefaultSegment) {
 
 /// The knobs move the result, and bad arguments are refused.
 TEST(DictTrain, RefusesWhatItCannotTrainOn) {
-  const Split split = make_split(200, 0);
+  const Split split = make_split(scale(200), 0);
   std::vector<const void *> ptrs;
   std::vector<size_t> sizes;
   for (const std::string & r : split.train) {
@@ -209,9 +226,9 @@ TEST(DictTrain, RefusesWhatItCannotTrainOn) {
  * history as raw bytes just as Zstandard does with a content-only dictionary.
  */
 TEST(DictTrain, TheSameDictionaryHelpsDeflateAndLz4) {
-  const Split split = make_split(3000, 500);
+  const Split split = make_split(scale(3000), scale(500));
   const std::vector<uint8_t> dict = train(split.train, 16384, nullptr);
-  ASSERT_GT(dict.size(), 4096u);
+  ASSERT_GT(dict.size(), scale(4096));
 
   for (const char * method : {"zlib", "lz4"}) {
     size_t with = 0, without = 0;
