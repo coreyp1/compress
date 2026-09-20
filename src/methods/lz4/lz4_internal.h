@@ -642,6 +642,16 @@ gcomp_status_t lz4_block_compress_linked(const uint8_t * window,
  * @param history_len History length
  * @return GCOMP_OK on success, error code on failure
  */
+/**
+ * @brief Decode a whole LZ4 stream with several threads, or decline.
+ *
+ * The ::gcomp_method_s::decode_parallel hook. See lz4_decode_parallel.c for
+ * which streams it declines and why declining is the common answer.
+ */
+gcomp_status_t lz4_decode_parallel(gcomp_registry_t * registry,
+    gcomp_options_t * options, const void * input, size_t input_size,
+    void * output, size_t output_capacity, size_t * output_size_out);
+
 gcomp_status_t lz4_block_decompress(const uint8_t * input, size_t input_len,
     uint8_t * output, size_t output_cap, size_t * output_len_out,
     const uint8_t * history, size_t history_len);

@@ -11,6 +11,7 @@
 #include <ghoti.io/compress/macros.h>
 #include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/errors.h>
+#include <ghoti.io/compress/method.h>
 #include <ghoti.io/compress/registry.h>
 #include <ghoti.io/compress/stream.h>
 #include <string.h>
@@ -171,6 +172,39 @@ gcomp_status_t gcomp_decode_buffer(gcomp_registry_t * registry,
     registry = gcomp_registry_default();
     if (!registry) {
       return GCOMP_ERR_INTERNAL;
+    }
+  }
+
+  // Decoding with threads, when the method offers it and the stream allows it.
+  //
+  // Asked first because the whole input is in hand here, which is what makes
+  // splitting possible: the streaming decoder sees the stream a piece at a
+  // time and cannot know where the next unit ends until it arrives.
+  //
+  // GCOMP_ERR_UNSUPPORTED from the hook means "not this stream" and is the
+  // usual answer - a single-block frame, a Zstandard frame whose blocks share
+  // a window, an LZ4 frame with linked blocks. The ordinary path below is
+  // always correct, so declining costs speed and nothing else.
+  {
+    uint64_t threads = 1;
+    if (options &&
+        gcomp_options_get_uint64(options, "threads.count", &threads) !=
+            GCOMP_OK) {
+      threads = 1;
+    }
+    if (threads > 1) {
+      const gcomp_method_t * method = gcomp_registry_find(registry, method_name);
+      if (method && method->size >= sizeof(gcomp_method_t) &&
+          method->decode_parallel) {
+        const gcomp_status_t p = method->decode_parallel(registry, options,
+            input_data, input_size, output_data, output_capacity,
+            output_size_out);
+        if (p != GCOMP_ERR_UNSUPPORTED) {
+          return p;
+        }
+        // Declined: fall through and decode it the ordinary way.
+        *output_size_out = 0;
+      }
     }
   }
 

@@ -109,7 +109,7 @@ alone; `threads.count` is ignored in that mode.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `threads.count` | uint64 | 1 | Number of worker threads (0 or 1 = single-threaded) |
+| `threads.count` | uint64 | 1 | Number of worker threads (0 or 1 = single-threaded). Applies to decoding as well as encoding: with `gcomp_decode_buffer()` and a frame whose blocks are independent, every block is a job. A frame with linked blocks, one block, or a dictionary is decoded single-threaded — see [Threading](../threading.md). |
 
 See [Parallel compression](#parallel-compression) below.
 

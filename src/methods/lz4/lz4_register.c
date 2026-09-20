@@ -521,6 +521,7 @@ static const gcomp_method_t g_lz4_method = {
     .get_schema = lz4_get_schema,
     .encode_bound = lz4_encode_bound,
     .peek = lz4_peek,
+    .decode_parallel = lz4_decode_parallel,
 };
 
 //

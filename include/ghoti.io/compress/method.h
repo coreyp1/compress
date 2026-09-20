@@ -270,17 +270,64 @@ struct gcomp_method_s {
    */
   gcomp_status_t (*peek)(gcomp_options_t * options, const void * input,
       size_t input_size, gcomp_stream_info_t * info_out, size_t * needed_out);
+
+  /**
+   * @brief Decode a whole buffer using several threads, or decline to.
+   *
+   * Added in method ABI version 3. Optional: a method that leaves it @c NULL
+   * simply never decodes in parallel, and gcomp_decode_buffer() uses the
+   * ordinary path.
+   *
+   * ## Declining is normal, and is not an error
+   *
+   * Returning ::GCOMP_ERR_UNSUPPORTED means "not this stream", and the caller
+   * then decodes it single-threaded. That is the answer for most streams:
+   * whether a stream can be split at all is a property of how it was written,
+   * not of the format. Blocks inside a Zstandard frame share a window (RFC 8878
+   * section 3.1.1.1.2) and cannot be split; an LZ4 frame that clears B.Indep
+   * links its blocks to the ones before them; a stream with one block has
+   * nothing to divide. A method must decline all of those rather than produce
+   * a plausible wrong answer.
+   *
+   * It must also decline anything it is not certain of. The single-threaded
+   * path is always correct, so the cost of declining is speed, and the cost of
+   * guessing is a wrong decode.
+   *
+   * ## What it must not change
+   *
+   * The bytes. Decoding with threads must produce exactly what decoding
+   * without them produces, including every limit and checksum the ordinary
+   * path enforces - otherwise `threads.count` becomes a correctness setting
+   * rather than a speed one, which is the sort of option nobody can use
+   * safely.
+   *
+   * @param registry Registry the method was found in
+   * @param options Configuration options (may be NULL for defaults)
+   * @param input Whole compressed stream
+   * @param input_size How many bytes of it
+   * @param output Where the decoded bytes go
+   * @param output_capacity How much room there is
+   * @param output_size_out Receives how much was written
+   * @return ::GCOMP_OK; ::GCOMP_ERR_UNSUPPORTED to decline, leaving
+   *         @p output untouched; any other error as the ordinary path would
+   *         report it
+   */
+  gcomp_status_t (*decode_parallel)(gcomp_registry_t * registry,
+      gcomp_options_t * options, const void * input, size_t input_size,
+      void * output, size_t output_capacity, size_t * output_size_out);
 };
 
 /**
  * @brief Method ABI version this build of the library defines.
  *
  * Version 1 ends at @ref gcomp_method_s::get_schema.  Version 2 adds
- * @ref gcomp_method_s::encode_bound.  A descriptor is registered by pointer
- * and read through @ref gcomp_method_s::size, so a version-1 method still
- * registers and works; only the hooks it does not define are unavailable.
+ * @ref gcomp_method_s::encode_bound and @ref gcomp_method_s::peek.  Version 3
+ * adds @ref gcomp_method_s::decode_parallel.  A descriptor is registered by
+ * pointer and read through @ref gcomp_method_s::size, so a version-1 method
+ * still registers and works; only the hooks it does not define are
+ * unavailable.
  */
-#define GCOMP_METHOD_ABI_VERSION 2u
+#define GCOMP_METHOD_ABI_VERSION 3u
 
 /**
  * @brief List all option keys supported by a method.

@@ -126,6 +126,48 @@ if (thread_count < 1) {
 
 Methods should document whether they support the `threads.count` option in their schema.
 
+## `threads.count` on decode
+
+The same option, and it means the same thing — use this many threads — but what
+it can do is decided by the stream rather than by the caller.
+
+**A unit can be decoded on its own only if it references nothing before it.**
+That is a property of how the stream was written:
+
+| Method | Can decode in parallel? |
+|--------|-------------------------|
+| `lz4` | Yes, when the frame sets `B.Indep` (this library's default). Every block is a job, so a single frame parallelises. |
+| `zstd` | Only across frames. Blocks inside one frame share a window (RFC 8878 §3.1.1.1.2) and cannot be split, and our encoder emits one frame. |
+| `deflate`, `gzip`, `zlib`, `lzw`, `rle` | No. Each is one stream of back-references from beginning to end. |
+
+A method opts in through `gcomp_method_s::decode_parallel` (method ABI 3), which
+`gcomp_decode_buffer()` offers the whole input. It is offered only there, not to
+the streaming decoder: splitting needs to see where the next unit ends, and a
+streaming decoder is given the stream a piece at a time.
+
+### Declining is the normal answer
+
+The hook returns `GCOMP_ERR_UNSUPPORTED` to say "not this stream", and the
+caller then decodes it the ordinary way. LZ4 declines a frame with linked
+blocks, a frame with one block, a frame compressed against a dictionary, and
+anything it could not walk. A method must decline anything it is not certain
+of: the single-threaded path is always correct, so declining costs speed and
+guessing costs a wrong decode.
+
+### What a parallel decoder must not change
+
+The bytes, and every check the ordinary path makes — block checksums, content
+checksums, declared content sizes, `limits.max_output_bytes`. A path that is
+faster because it checks less is invisible on valid input, which is why
+`tests/methods/lz4/test_lz4_parallel_decode.cpp` corrupts each of them
+deliberately and requires the same answer at 1, 2, 3, 4 and 12 threads.
+
+Ordering is the other half. Blocks finish out of order and must be written in
+order; getting that wrong on a stream of similar blocks gives output of exactly
+the right length that is subtly scrambled, which no length check would catch.
+The sequencer in `src/core/parallel_block.h` is what hands results back in
+submission order, and it is the same one the encoders use.
+
 ## Implementation Pattern
 
 Here's a typical pattern for methods implementing parallel compression:
