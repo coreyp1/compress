@@ -105,6 +105,13 @@ extern "C" {
 #define ZSTD_LEVEL_DEFAULT 3 ///< Default compression level
 
 // Default limits
+/**
+ * Decode every frame in the input, per RFC 8878 section 3.1: "The decompressed
+ * content of multiple concatenated frames is the concatenation of each frame's
+ * decompressed content."  Set zstd.concat false to stop after the first frame.
+ */
+#define ZSTD_DEFAULT_CONCAT 1
+
 #define ZSTD_DEFAULT_MAX_OUTPUT_BYTES (512ULL * 1024 * 1024) ///< 512 MiB
 #define ZSTD_DEFAULT_MAX_MEMORY_BYTES (256ULL * 1024 * 1024) ///< 256 MiB
 #define ZSTD_DEFAULT_MAX_EXPANSION_RATIO 1000                ///< 1000x
@@ -142,6 +149,7 @@ typedef enum {
   ZSTD_DEC_STAGE_BLOCK_HEADER,     ///< Reading 3-byte block header
   ZSTD_DEC_STAGE_BLOCK_DATA,       ///< Decompressing block content
   ZSTD_DEC_STAGE_CONTENT_CHECKSUM, ///< Reading content checksum (4 bytes)
+  ZSTD_DEC_STAGE_SKIPPABLE,        ///< Discarding a skippable frame's payload
   ZSTD_DEC_STAGE_DONE,             ///< Frame complete
   ZSTD_DEC_STAGE_ERROR,            ///< Unrecoverable error
 } zstd_decoder_stage_t;
@@ -470,6 +478,9 @@ typedef struct {
   // Header parsing state
   uint8_t header_accum[ZSTD_HEADER_MAX_SIZE + 4]; ///< Magic + header
   size_t header_accum_pos;
+  uint32_t skippable_remaining; ///< Bytes of a skippable frame still to discard
+  unsigned frames_completed;    ///< Frames finished, skippable ones included
+  int saw_data_frame;           ///< A non-skippable frame has completed
   size_t header_expected_len; ///< Expected total header length
 
   // Running content checksum (if enabled)
