@@ -69,6 +69,7 @@ static const gcomp_option_schema_t g_lz4_option_schemas[] = {
         LZ4_BLOCK_SIZE_64KB,              // min_uint
         LZ4_BLOCK_SIZE_4MB,               // max_uint
         "Block size in bytes (65536, 262144, 1048576, or 4194304)", // help
+        NULL, // allowed
     },
     // lz4.block_checksum - Enable per-block checksum
     {
@@ -83,6 +84,7 @@ static const gcomp_option_schema_t g_lz4_option_schemas[] = {
         0,                                    // min_uint
         0,                                    // max_uint
         "Enable per-block xxHash32 checksum", // help
+        NULL, // allowed
     },
     // lz4.content_checksum - Enable content checksum in trailer
     {
@@ -97,6 +99,7 @@ static const gcomp_option_schema_t g_lz4_option_schemas[] = {
         0,                                                   // min_uint
         0,                                                   // max_uint
         "Enable content xxHash32 checksum in frame trailer", // help
+        NULL, // allowed
     },
     // lz4.independent_blocks - Use independent blocks
     {
@@ -111,6 +114,7 @@ static const gcomp_option_schema_t g_lz4_option_schemas[] = {
         0,                                                     // min_uint
         0,                                                     // max_uint
         "Use independent blocks (better for parallel decode)", // help
+        NULL, // allowed
     },
     // lz4.concat - Decoder: support concatenated frames
     {
@@ -125,6 +129,7 @@ static const gcomp_option_schema_t g_lz4_option_schemas[] = {
         0,                                          // min_uint
         0,                                          // max_uint
         "Decoder: support concatenated LZ4 frames", // help
+        NULL, // allowed
     },
     // lz4.dictionary - Dictionary content for the encoder and decoder
     {
@@ -139,6 +144,7 @@ static const gcomp_option_schema_t g_lz4_option_schemas[] = {
         0,                 // min_uint
         0,                 // max_uint
         "Dictionary content; only the last 64 KB is used", // help
+        NULL, // allowed
     },
     // lz4.dictionary_id - Dictionary ID (optional, parsing only in v1)
     {
@@ -153,6 +159,7 @@ static const gcomp_option_schema_t g_lz4_option_schemas[] = {
         0,                                          // min_uint
         0xFFFFFFFFU,                                // max_uint
         "Dictionary ID (written to header if set)", // help
+        NULL, // allowed
     },
     // lz4.content_size - Content size (optional)
     {
@@ -167,6 +174,7 @@ static const gcomp_option_schema_t g_lz4_option_schemas[] = {
         0,                                         // min_uint
         0,                                         // max_uint
         "Content size (written to header if set)", // help
+        NULL, // allowed
     },
     // limits.max_output_bytes - Maximum decompressed output
     {
@@ -181,6 +189,7 @@ static const gcomp_option_schema_t g_lz4_option_schemas[] = {
         0,                                      // min_uint (0 means unlimited)
         0,                                      // max_uint
         "Maximum decompressed output bytes",    // help
+        NULL, // allowed
     },
     // limits.max_block_bytes - Maximum block size during decode
     {
@@ -195,6 +204,7 @@ static const gcomp_option_schema_t g_lz4_option_schemas[] = {
         0,                                  // min_uint
         0,                                  // max_uint
         "Maximum block size during decode", // help
+        NULL, // allowed
     },
     // limits.max_memory_bytes - Maximum memory usage
     {
@@ -209,6 +219,7 @@ static const gcomp_option_schema_t g_lz4_option_schemas[] = {
         0,                                             // min_uint
         0,                                             // max_uint
         "Maximum memory usage (buffers, hash tables)", // help
+        NULL, // allowed
     },
     // limits.max_expansion_ratio - Decompression bomb protection
     {
@@ -223,6 +234,7 @@ static const gcomp_option_schema_t g_lz4_option_schemas[] = {
         0,                                         // min_uint
         0,                                         // max_uint
         "Maximum output/input ratio; default is this format's own ceiling", // help
+        NULL, // allowed
     },
     // threads.count - Number of worker threads for parallel compression
     {
@@ -237,6 +249,7 @@ static const gcomp_option_schema_t g_lz4_option_schemas[] = {
         0,                                                     // min_uint
         0,                                                     // max_uint
         "Number of worker threads (0 or 1 = single-threaded)", // help
+        NULL, // allowed
     },
 };
 

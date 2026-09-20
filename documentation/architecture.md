@@ -440,6 +440,22 @@ static const gcomp_option_schema_t g_mymethod_options[] = {
         .max_int = 9,
         .help = "Compression level (1=fast, 9=best)"
     },
+    {
+        .key = "mymethod.mode",
+        .type = GCOMP_OPT_STRING,
+        .has_default = 1,
+        .default_value.str = "fast",
+        .help = "Mode: fast or small",
+        // A string option that takes a fixed set must say so. Validation
+        // then refuses anything else where the caller set it, naming the
+        // key, instead of leaving the method to fail later with a message
+        // about something further downstream - and a caller can discover
+        // the set instead of parsing `help`.
+        //
+        // Leave it NULL only when the option really is free-form, the way
+        // `gzip.name` is.
+        .allowed = (const char * const[]){"fast", "small", NULL}
+    },
     // ... more options ...
 };
 

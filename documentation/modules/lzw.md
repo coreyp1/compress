@@ -38,10 +38,10 @@ See [Auto-Registration](../auto-registration.md) for details.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `lzw.format` | string | `"gif"` | Profile: `"gif"` (LSB) or `"tiff"` (MSB) |
+| `lzw.format` | string | `"gif"` | Profile: `"gif"` (LSB) or `"tiff"` (MSB). Declared in the schema, so any other value is refused when the encoder or decoder is created. |
 | `lzw.lit_width` | uint64 | (format default) | Literal width in bits. If unset: 8 for `"gif"`, 9 for `"tiff"` |
 | `lzw.max_code_bits` | uint64 | 12 | Maximum code width in bits, 9 to 12 (12 → 4096 entries). Declared in the schema, so it is refused at create rather than from inside the method. |
-| `lzw.encoder_lookup` | string | `"hash"` | Encoder dictionary lookup: `"linear"` (O(n) scan) or `"hash"` (O(1), faster). Decoder is unchanged. |
+| `lzw.encoder_lookup` | string | `"hash"` | Encoder dictionary lookup: `"linear"` (O(n) scan) or `"hash"` (O(1), faster). Decoder is unchanged. Declared in the schema, so any other value is refused when the encoder or decoder is created. |
 
 ### Core limit options
 

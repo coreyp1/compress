@@ -32,6 +32,7 @@ static const gcomp_option_schema_t kDummyOptionSchemas[] = {
         0,                                       /* min_uint (unused) */
         0,                                       /* max_uint (unused) */
         "Integer option with default and range", /* help */
+        nullptr, /* allowed */
     },
     {
         "dummy.uint",                          /* key */
@@ -45,6 +46,7 @@ static const gcomp_option_schema_t kDummyOptionSchemas[] = {
         0,                                     /* min_uint */
         100,                                   /* max_uint */
         "Unsigned option with max constraint", /* help */
+        nullptr, /* allowed */
     },
     {
         "dummy.flag",          /* key */
@@ -58,6 +60,7 @@ static const gcomp_option_schema_t kDummyOptionSchemas[] = {
         0,                     /* min_uint (unused) */
         0,                     /* max_uint (unused) */
         "Boolean flag option", /* help */
+        nullptr, /* allowed */
     },
 };
 

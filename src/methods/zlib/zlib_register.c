@@ -40,6 +40,7 @@ static const gcomp_option_schema_t g_zlib_option_schemas[] = {
         0,                  // min_uint
         0,                  // max_uint
         "Preset dictionary (not yet supported; rejected rather than ignored)",
+        NULL, // allowed
     },
     // limits.max_output_bytes
     {
@@ -54,6 +55,7 @@ static const gcomp_option_schema_t g_zlib_option_schemas[] = {
         0,                                      // min_uint
         0,                                      // max_uint
         "Maximum decompressed output bytes",    // help
+        NULL, // allowed
     },
     // limits.max_memory_bytes
     {
@@ -68,6 +70,7 @@ static const gcomp_option_schema_t g_zlib_option_schemas[] = {
         0,                                       // min_uint
         0,                                       // max_uint
         "Maximum working memory",                // help
+        NULL, // allowed
     },
     // limits.max_expansion_ratio
     {
@@ -82,6 +85,7 @@ static const gcomp_option_schema_t g_zlib_option_schemas[] = {
         0,                                           // min_uint
         0,                                           // max_uint
         "Maximum output/input ratio; default is this format's own ceiling", // help
+        NULL, // allowed
     },
 };
 

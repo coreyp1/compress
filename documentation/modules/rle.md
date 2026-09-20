@@ -33,7 +33,7 @@ See [Auto-Registration](../auto-registration.md) for details.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `rle.format` | string | `"packbits"` | Token grammar: `"packbits"` (TIFF/Apple) or `"tga"` (Truevision Targa) |
+| `rle.format` | string | `"packbits"` | Token grammar: `"packbits"` (TIFF/Apple) or `"tga"` (Truevision Targa). Declared in the schema, so any other value is refused when the encoder or decoder is created. |
 
 ### Core limit options
 

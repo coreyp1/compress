@@ -7,6 +7,7 @@
  */
 
 #include "test_helpers.h"
+#include "failing_allocator.h"
 #include <cstdlib>
 #include <vector>
 #include <cstring>
@@ -691,6 +692,203 @@ TEST(OptionValidationTest, WrapperMethodsStillTakeTheirPassthroughOptions) {
   // gzip's own policy is to ignore keys it does not recognise, which a
   // wrapper needs; that must survive validation being switched on.
   EXPECT_EQ(createEncoderWith("gzip", setForeignKey), GCOMP_OK);
+}
+
+namespace {
+
+/// One string option, the values it takes, and one it must not.
+struct StringOptionCase {
+  const char * method;
+  const char * key;
+  const char * const * good; ///< NULL-terminated
+  const char * const * bad;  ///< NULL-terminated
+};
+
+const char * const k_rle_good[] = {"packbits", "tga", nullptr};
+const char * const k_rle_bad[] = {"rle", "RLE", "packbits ", "", nullptr};
+const char * const k_lzw_fmt_good[] = {"gif", "tiff", nullptr};
+const char * const k_lzw_fmt_bad[] = {"lzw", "TIFF", "", nullptr};
+const char * const k_lzw_lookup_good[] = {"linear", "hash", nullptr};
+const char * const k_lzw_lookup_bad[] = {"hsah", "Hash", "", nullptr};
+const char * const k_deflate_good[] = {
+    "default", "lazy", "huffman_only", "rle", "fixed", nullptr};
+const char * const k_deflate_bad[] = {"lasy", "Default", "", nullptr};
+
+const StringOptionCase k_string_options[] = {
+    {"rle", "rle.format", k_rle_good, k_rle_bad},
+    {"lzw", "lzw.format", k_lzw_fmt_good, k_lzw_fmt_bad},
+    {"lzw", "lzw.encoder_lookup", k_lzw_lookup_good, k_lzw_lookup_bad},
+    {"deflate", "deflate.strategy", k_deflate_good, k_deflate_bad},
+};
+
+} // namespace
+
+/**
+ * @brief A string option with a fixed set refuses everything outside it.
+ *
+ * These were enforced but not declared, which put the refusal in the wrong
+ * place or lost it entirely:
+ *
+ * - `rle.format` accepted any string and failed later as "RLE profile encode
+ *   failed", which names nothing the caller set.
+ * - `lzw.encoder_lookup` was worse than that: the encoder selects the linear
+ *   scan on an exact "linear" and treats *everything else* as "hash", so a
+ *   typo silently chose a mode. Both modes produce identical bytes, so no
+ *   later check could ever have caught it.
+ * - `deflate.strategy` already refused an unknown name, but from inside the
+ *   encoder rather than from validation.
+ *
+ * The schema had no way to say any of it, because min and max are numeric.
+ */
+TEST(Options, AStringOptionRefusesValuesOutsideItsDeclaredSet) {
+  gcomp_registry_t * reg = gcomp_registry_default();
+  ASSERT_NE(reg, nullptr);
+
+  for (const StringOptionCase & c : k_string_options) {
+    for (const char * const * v = c.good; *v; v++) {
+      gcomp_options_t * o = nullptr;
+      ASSERT_EQ(gcomp_options_create(&o), GCOMP_OK);
+      ASSERT_EQ(gcomp_options_set_string(o, c.key, *v), GCOMP_OK);
+      gcomp_encoder_t * enc = nullptr;
+      EXPECT_EQ(gcomp_encoder_create(reg, c.method, o, &enc), GCOMP_OK)
+          << c.key << " = \"" << *v << "\" is valid and was refused";
+      if (enc) {
+        gcomp_encoder_destroy(enc);
+      }
+      gcomp_options_destroy(o);
+    }
+
+    for (const char * const * v = c.bad; *v; v++) {
+      gcomp_options_t * o = nullptr;
+      ASSERT_EQ(gcomp_options_create(&o), GCOMP_OK);
+      ASSERT_EQ(gcomp_options_set_string(o, c.key, *v), GCOMP_OK);
+      gcomp_encoder_t * enc = nullptr;
+      EXPECT_NE(gcomp_encoder_create(reg, c.method, o, &enc), GCOMP_OK)
+          << c.key << " = \"" << *v << "\" is not a value this option takes "
+          << "and an encoder was created for it";
+      if (enc) {
+        gcomp_encoder_destroy(enc);
+      }
+      gcomp_options_destroy(o);
+    }
+  }
+}
+
+/**
+ * @brief The set is discoverable, not merely enforced.
+ *
+ * Half the point of declaring it: a caller can ask what a mode selector takes
+ * instead of parsing the help text.
+ */
+TEST(Options, ADeclaredSetIsVisibleThroughIntrospection) {
+  gcomp_registry_t * reg = gcomp_registry_default();
+  ASSERT_NE(reg, nullptr);
+
+  for (const StringOptionCase & c : k_string_options) {
+    const gcomp_method_t * method = gcomp_registry_find(reg, c.method);
+    ASSERT_NE(method, nullptr) << c.method;
+    const gcomp_option_schema_t * schema = nullptr;
+    ASSERT_EQ(gcomp_method_get_option_schema(method, c.key, &schema), GCOMP_OK)
+        << c.key;
+    ASSERT_NE(schema, nullptr) << c.key;
+    ASSERT_NE(schema->allowed, nullptr)
+        << c.key << " enforces a set of values but does not declare it";
+
+    // Every value the option accepts is named, and in the same order the
+    // method documents, so the list can be printed as-is.
+    size_t n = 0;
+    for (const char * const * p = schema->allowed; *p; p++) {
+      n++;
+    }
+    size_t expected = 0;
+    for (const char * const * v = c.good; *v; v++) {
+      expected++;
+    }
+    EXPECT_EQ(n, expected) << c.key;
+    for (size_t i = 0; i < n && i < expected; i++) {
+      EXPECT_STREQ(schema->allowed[i], c.good[i]) << c.key << " index " << i;
+    }
+  }
+}
+
+/**
+ * @brief A free-form string option declares no set, and must not.
+ *
+ * RFC 1952 section 2.3.1 makes FNAME and FCOMMENT arbitrary text. A list here
+ * would be wrong rather than missing, so this is the case that says the new
+ * field means "these and no others" rather than "nobody filled this in yet".
+ */
+TEST(Options, AFreeFormStringOptionDeclaresNoSet) {
+  gcomp_registry_t * reg = gcomp_registry_default();
+  const gcomp_method_t * method = gcomp_registry_find(reg, "gzip");
+  ASSERT_NE(method, nullptr);
+
+  for (const char * key : {"gzip.name", "gzip.comment"}) {
+    const gcomp_option_schema_t * schema = nullptr;
+    ASSERT_EQ(gcomp_method_get_option_schema(method, key, &schema), GCOMP_OK)
+        << key;
+    ASSERT_NE(schema, nullptr) << key;
+    EXPECT_EQ(schema->allowed, nullptr)
+        << key << " declares a set of permitted values, but a gzip filename "
+        << "or comment is arbitrary text";
+
+    gcomp_options_t * o = nullptr;
+    ASSERT_EQ(gcomp_options_create(&o), GCOMP_OK);
+    ASSERT_EQ(gcomp_options_set_string(o, key, "anything at all.txt"),
+        GCOMP_OK);
+    gcomp_encoder_t * enc = nullptr;
+    EXPECT_EQ(gcomp_encoder_create(reg, "gzip", o, &enc), GCOMP_OK) << key;
+    if (enc) {
+      gcomp_encoder_destroy(enc);
+    }
+    gcomp_options_destroy(o);
+  }
+}
+
+/**
+ * @brief A set that fails leaves the options object exactly as it was.
+ *
+ * set_entry() used to link the entry, free the value it was replacing, and
+ * only then allocate the new one. A failed allocation therefore reported
+ * GCOMP_ERR_MEMORY - correctly - while having already destroyed the previous
+ * value and left a string entry holding NULL.
+ *
+ * Nothing read that field, so it stayed invisible for as long as no string
+ * option declared the values it accepts. Once one did, validation saw a string
+ * entry with no string and refused the whole object with
+ * GCOMP_ERR_INVALID_ARG, naming neither the real problem nor the memory that
+ * caused it. tests/core/test_alloc_failure.cpp found it at allocation 12
+ * of 24.
+ */
+TEST(Options, AFailedSetLeavesThePreviousValueIntact) {
+  FailingAllocator fa;
+  gcomp_options_t * o = nullptr;
+  ASSERT_EQ(gcomp_options_create_with_allocator(fa.allocator(), &o), GCOMP_OK);
+  ASSERT_EQ(gcomp_options_set_string(o, "rle.format", "tga"), GCOMP_OK);
+
+  // Fail the very next allocation, which is the copy of the new string.
+  fa.fail_from(fa.calls() + 1);
+  EXPECT_EQ(gcomp_options_set_string(o, "rle.format", "packbits"),
+      GCOMP_ERR_MEMORY);
+  fa.fail_from(0);
+
+  const char * value = nullptr;
+  ASSERT_EQ(gcomp_options_get_string(o, "rle.format", &value), GCOMP_OK)
+      << "a failed set removed the option that was already there";
+  ASSERT_NE(value, nullptr)
+      << "a failed set left the option present but holding no string";
+  EXPECT_STREQ(value, "tga")
+      << "a failed set destroyed the value it was replacing";
+
+  // And the object is still usable, which is the point of saying it is
+  // unchanged rather than merely non-crashing.
+  gcomp_encoder_t * enc = nullptr;
+  EXPECT_EQ(
+      gcomp_encoder_create(gcomp_registry_default(), "rle", o, &enc), GCOMP_OK);
+  if (enc) {
+    gcomp_encoder_destroy(enc);
+  }
+  gcomp_options_destroy(o);
 }
 
 int main(int argc, char ** argv) {

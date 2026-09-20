@@ -30,7 +30,7 @@ See [Auto-Registration](../auto-registration.md) for details on disabling auto-r
 | Key | Type | Default | Range | Description |
 |-----|------|---------|-------|-------------|
 | `deflate.level` | int64 | 6 | 0..9 | Compression level (0 = none, 9 = best). Encoder only. |
-| `deflate.strategy` | string | "default" | see below | Compression strategy. Encoder only. |
+| `deflate.strategy` | string | "default" | see below | Compression strategy. Encoder only. Declared in the schema, so any other value is refused when the encoder or decoder is created. |
 | `deflate.window_bits` | uint64 | 15 | 8..15 | LZ77 window size in bits (max 32 KiB). |
 | `limits.max_output_bytes` | uint64 | 512 MiB | 0 = unlimited | Max decompressed size (decoder). |
 | `limits.max_memory_bytes` | uint64 | 256 MiB | 0 = unlimited | Max working memory (decoder). |

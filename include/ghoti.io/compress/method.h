@@ -98,6 +98,23 @@ typedef struct gcomp_option_schema_s {
    * @brief Optional help text (may be NULL).
    */
   const char * help;
+
+  /**
+   * @brief Permitted values for a ::GCOMP_OPT_STRING option, or NULL.
+   *
+   * A NULL-terminated array of the strings this option accepts. NULL means
+   * the option takes any string, which is the right answer for a filename or
+   * a comment but the wrong one for a mode selector.
+   *
+   * Declaring them is what lets @ref gcomp_options_validate() refuse a bad
+   * value where the caller set it, naming the key, rather than leaving the
+   * method to fail later with a message about something further downstream.
+   * It is also the only way a caller can discover the set by introspection
+   * instead of by reading prose in @ref help.
+   *
+   * Ignored for every other type.
+   */
+  const char * const * allowed;
 } gcomp_option_schema_t;
 
 /**

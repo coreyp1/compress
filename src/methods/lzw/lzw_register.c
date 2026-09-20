@@ -48,6 +48,22 @@
 static const char LZW_DEFAULT_FORMAT[] = "gif";
 static const char LZW_DEFAULT_ENCODER_LOOKUP[] = "hash";
 
+/// The profiles lzw_profile.c implements; see LZW_FORMAT_* in lzw_internal.h.
+static const char * const g_lzw_format_values[] = {
+    LZW_FORMAT_GIF, LZW_FORMAT_TIFF, NULL};
+
+/**
+ * @brief The two lookup modes the encoder implements.
+ *
+ * Declaring them matters more here than it looks. The encoder switches to the
+ * linear scan only on an exact "linear" and treats everything else as "hash",
+ * so before this a typo silently selected a mode instead of being refused -
+ * and since both produce identical bytes, nothing downstream would ever have
+ * said so.
+ */
+static const char * const g_lzw_encoder_lookup_values[] = {
+    "linear", "hash", NULL};
+
 static const gcomp_option_schema_t g_lzw_option_schemas[] = {
     {
         "lzw.format",                // key
@@ -61,6 +77,7 @@ static const gcomp_option_schema_t g_lzw_option_schemas[] = {
         0,                           // min_uint
         0,                           // max_uint
         "LZW format: gif or tiff",   // help
+        g_lzw_format_values, // allowed
     },
     {
         "lzw.lit_width",  // key
@@ -74,6 +91,7 @@ static const gcomp_option_schema_t g_lzw_option_schemas[] = {
         0,                // min_uint
         0,                // max_uint
         "Initial code width in bits (e.g. 8 for GIF, 9 for TIFF)",
+        NULL, // allowed
     },
     {
         "lzw.max_code_bits", // key
@@ -94,6 +112,7 @@ static const gcomp_option_schema_t g_lzw_option_schemas[] = {
         9,                      // min_uint
         LZW_CORE_MAX_CODE_BITS, // max_uint
         "Maximum code width in bits, 9 to 12 (12 gives 4096 entries)",
+        NULL, // allowed
     },
     {
         "lzw.encoder_lookup",                // key
@@ -107,6 +126,7 @@ static const gcomp_option_schema_t g_lzw_option_schemas[] = {
         0,
         0,
         "Encoder lookup mode: linear or hash (hash is faster)",
+        g_lzw_encoder_lookup_values, // allowed
     },
     {
         "limits.max_output_bytes",
@@ -120,6 +140,7 @@ static const gcomp_option_schema_t g_lzw_option_schemas[] = {
         0,
         0,
         "Maximum decompressed output bytes",
+        NULL, // allowed
     },
     {
         "limits.max_memory_bytes",
@@ -133,6 +154,7 @@ static const gcomp_option_schema_t g_lzw_option_schemas[] = {
         0,
         0,
         "Maximum memory usage",
+        NULL, // allowed
     },
     {
         "limits.max_expansion_ratio",
@@ -146,6 +168,7 @@ static const gcomp_option_schema_t g_lzw_option_schemas[] = {
         0,
         0,
         "Maximum output/input ratio; default is this format's own ceiling",
+        NULL, // allowed
     },
 };
 

@@ -68,6 +68,7 @@ static const gcomp_option_schema_t g_zstd_option_schemas[] = {
         0,                           // min_uint
         0,                           // max_uint
         "Compression level (1-22, higher = better compression)", // help
+        NULL, // allowed
     },
     // zstd.checksum - Enable content checksum
     {
@@ -82,6 +83,7 @@ static const gcomp_option_schema_t g_zstd_option_schemas[] = {
         0,                                  // min_uint
         0,                                  // max_uint
         "Enable xxHash64 content checksum", // help
+        NULL, // allowed
     },
     // zstd.window_log - Window log (10-31, or 0 for auto)
     {
@@ -96,6 +98,7 @@ static const gcomp_option_schema_t g_zstd_option_schemas[] = {
         0,                                       // min_uint (0 = auto allowed)
         ZSTD_WINDOW_LOG_MAX,                     // max_uint
         "Window log (10-31, 0=auto from level)", // help
+        NULL, // allowed
     },
     // zstd.content_size - Content size for header (optional)
     {
@@ -110,6 +113,7 @@ static const gcomp_option_schema_t g_zstd_option_schemas[] = {
         0,                                         // min_uint
         0,                                         // max_uint
         "Content size (written to header if set)", // help
+        NULL, // allowed
     },
     // zstd.concat - Decoder: support concatenated frames
     {
@@ -125,6 +129,7 @@ static const gcomp_option_schema_t g_zstd_option_schemas[] = {
         0,                                           // max_uint
         "Decoder: decode every frame in the input (RFC 8878 section 3.1); "
         "set false to stop after the first",                              // help
+        NULL, // allowed
     },
     // zstd.dictionary - Dictionary data (RFC 8878 §5; raw or formatted)
     {
@@ -139,6 +144,7 @@ static const gcomp_option_schema_t g_zstd_option_schemas[] = {
         0,                    // min_uint
         0,                    // max_uint
         "Dictionary data (raw content or zstd --train format)", // help
+        NULL, // allowed
     },
     // zstd.dictionary_id - Dictionary ID to write/validate (optional)
     {
@@ -154,6 +160,7 @@ static const gcomp_option_schema_t g_zstd_option_schemas[] = {
         0,                    // max_uint
         "Dictionary ID (encoder: write to header; decoder: validate if "
         "present)", // help
+        NULL, // allowed
     },
     // limits.max_output_bytes - Maximum decompressed output
     {
@@ -168,6 +175,7 @@ static const gcomp_option_schema_t g_zstd_option_schemas[] = {
         0,                                       // min_uint (0 means unlimited)
         0,                                       // max_uint
         "Maximum decompressed output bytes",     // help
+        NULL, // allowed
     },
     // limits.max_window_bytes - Maximum window size
     {
@@ -182,6 +190,7 @@ static const gcomp_option_schema_t g_zstd_option_schemas[] = {
         0,                                       // min_uint
         0,                                       // max_uint
         "Maximum window size in bytes",          // help
+        NULL, // allowed
     },
     // limits.max_memory_bytes - Maximum memory usage
     {
@@ -196,6 +205,7 @@ static const gcomp_option_schema_t g_zstd_option_schemas[] = {
         0,                                        // min_uint
         0,                                        // max_uint
         "Maximum memory usage (buffers, tables)", // help
+        NULL, // allowed
     },
     // limits.max_expansion_ratio - Decompression bomb protection
     {
@@ -210,6 +220,7 @@ static const gcomp_option_schema_t g_zstd_option_schemas[] = {
         0,                                          // min_uint
         0,                                          // max_uint
         "Maximum output/input ratio; default is this format's own ceiling", // help
+        NULL, // allowed
     },
     // threads.count - Number of worker threads for parallel compression
     {
@@ -224,6 +235,7 @@ static const gcomp_option_schema_t g_zstd_option_schemas[] = {
         0,                                                     // min_uint
         0,                                                     // max_uint
         "Number of worker threads (0 or 1 = single-threaded)", // help
+        NULL, // allowed
     },
     // zstd.job_size - Size of each compression job in parallel mode
     {
@@ -238,6 +250,7 @@ static const gcomp_option_schema_t g_zstd_option_schemas[] = {
         0,                 // min_uint (0 = auto)
         ZSTD_MAX_JOB_SIZE, // max_uint
         "Job size for parallel compression (0=auto, min 64KB)", // help
+        NULL, // allowed
     },
 };
 

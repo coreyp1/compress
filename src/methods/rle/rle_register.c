@@ -33,6 +33,10 @@
 
 static const char RLE_DEFAULT_FORMAT[] = "packbits";
 
+/// The profiles rle_profile.c implements; see RLE_FORMAT_* in rle_internal.h.
+static const char * const g_rle_format_values[] = {
+    RLE_FORMAT_PACKBITS, RLE_FORMAT_TGA, NULL};
+
 static const gcomp_option_schema_t g_rle_option_schemas[] = {
     {
         "rle.format",                  // key
@@ -46,6 +50,7 @@ static const gcomp_option_schema_t g_rle_option_schemas[] = {
         0,                             // min_uint
         0,                             // max_uint
         "RLE format: packbits or tga", // help
+        g_rle_format_values, // allowed
     },
     {
         "limits.max_output_bytes", // key
@@ -59,6 +64,7 @@ static const gcomp_option_schema_t g_rle_option_schemas[] = {
         0,                         // min_uint
         0,                         // max_uint
         "Maximum decompressed output bytes",
+        NULL, // allowed
     },
     {
         "limits.max_memory_bytes", // key
@@ -72,6 +78,7 @@ static const gcomp_option_schema_t g_rle_option_schemas[] = {
         0,                         // min_uint
         0,                         // max_uint
         "Maximum memory usage",
+        NULL, // allowed
     },
     {
         "limits.max_expansion_ratio", // key
@@ -85,6 +92,7 @@ static const gcomp_option_schema_t g_rle_option_schemas[] = {
         0,                            // min_uint
         0,                            // max_uint
         "Maximum output/input ratio; default is this format's own ceiling",
+        NULL, // allowed
     },
 };
 

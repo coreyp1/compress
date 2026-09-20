@@ -97,6 +97,16 @@
 #define DEFLATE_WINDOW_BITS_MAX 15
 #define DEFLATE_STRATEGY_DEFAULT "default"
 
+/**
+ * @brief The strategies deflate_encode.c knows.
+ *
+ * It already refuses a name it does not know rather than falling back to the
+ * default silently. Declaring them moves that refusal to where the caller set
+ * the value, and lets introspection report the set.
+ */
+static const char * const g_deflate_strategy_values[] = {
+    "default", "lazy", "huffman_only", "rle", "fixed", NULL};
+
 static const gcomp_option_schema_t g_deflate_option_schemas[] = {
     {
         "deflate.level",                          // key
@@ -110,6 +120,7 @@ static const gcomp_option_schema_t g_deflate_option_schemas[] = {
         0,                                        // min_uint
         0,                                        // max_uint
         "Compression level 0 (none) to 9 (best)", // help
+        NULL, // allowed
     },
     {
         "deflate.window_bits",                         // key
@@ -123,6 +134,7 @@ static const gcomp_option_schema_t g_deflate_option_schemas[] = {
         DEFLATE_WINDOW_BITS_MIN,                       // min_uint
         DEFLATE_WINDOW_BITS_MAX,                       // max_uint
         "LZ77 window size in bits (8..15, 32KiB max)", // help
+        NULL, // allowed
     },
     {
         // RFC 1950 section 2.2's preset dictionary, which is history rather
@@ -142,6 +154,7 @@ static const gcomp_option_schema_t g_deflate_option_schemas[] = {
         0,                    // min_uint
         0,                    // max_uint
         "Preset dictionary: history the stream starts from (RFC 1950 2.2)",
+        NULL, // allowed
     },
     {
         "deflate.strategy",                // key
@@ -155,6 +168,7 @@ static const gcomp_option_schema_t g_deflate_option_schemas[] = {
         0,                                 // min_uint
         0,                                 // max_uint
         "Strategy: default, lazy, huffman_only, rle, fixed", // help
+        g_deflate_strategy_values, // allowed
     },
     // Core limit options.  Declared here because this method honours them --
     // a schema that omits what the method accepts cannot be used to validate
@@ -172,6 +186,7 @@ static const gcomp_option_schema_t g_deflate_option_schemas[] = {
         0,                                   // min_uint
         0,                                   // max_uint
         "Maximum decompressed output bytes", // help
+        NULL, // allowed
     },
     {
         "limits.max_memory_bytes",    // key
@@ -185,6 +200,7 @@ static const gcomp_option_schema_t g_deflate_option_schemas[] = {
         0,                            // min_uint
         0,                            // max_uint
         "Maximum memory usage bytes", // help
+        NULL, // allowed
     },
     {
         "limits.max_expansion_ratio",              // key
@@ -198,6 +214,7 @@ static const gcomp_option_schema_t g_deflate_option_schemas[] = {
         0,                                         // min_uint
         0,                                         // max_uint
         "Maximum output/input ratio; default is this format's own ceiling",  // help
+        NULL, // allowed
     },
     {
         "limits.max_window_bytes",        // key
@@ -211,6 +228,7 @@ static const gcomp_option_schema_t g_deflate_option_schemas[] = {
         0,                                // min_uint
         0,                                // max_uint
         "Maximum decoder window bytes",   // help
+        NULL, // allowed
     },
 };
 

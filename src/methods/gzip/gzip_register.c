@@ -89,6 +89,7 @@ static const gcomp_option_schema_t g_gzip_option_schemas[] = {
         0,                                    // min_uint
         0,                                    // max_uint
         "Modification time (Unix timestamp)", // help
+        NULL, // allowed
     },
     {
         "gzip.os",                                 // key
@@ -102,6 +103,7 @@ static const gcomp_option_schema_t g_gzip_option_schemas[] = {
         0,                                         // min_uint
         255,                                       // max_uint
         "Operating system (0-255, 255 = unknown)", // help
+        NULL, // allowed
     },
     {
         "gzip.name",         // key
@@ -115,6 +117,7 @@ static const gcomp_option_schema_t g_gzip_option_schemas[] = {
         0,                   // min_uint
         0,                   // max_uint
         "Original filename", // help
+        NULL, // allowed
     },
     {
         "gzip.comment",   // key
@@ -128,6 +131,7 @@ static const gcomp_option_schema_t g_gzip_option_schemas[] = {
         0,                // min_uint
         0,                // max_uint
         "File comment",   // help
+        NULL, // allowed
     },
     {
         "gzip.extra",       // key
@@ -141,6 +145,7 @@ static const gcomp_option_schema_t g_gzip_option_schemas[] = {
         0,                  // min_uint
         0,                  // max_uint
         "Extra field data", // help
+        NULL, // allowed
     },
     {
         "gzip.header_crc",                 // key
@@ -154,6 +159,7 @@ static const gcomp_option_schema_t g_gzip_option_schemas[] = {
         0,                                 // min_uint
         0,                                 // max_uint
         "Include header CRC (FHCRC flag)", // help
+        NULL, // allowed
     },
     {
         "gzip.text",                                     // key
@@ -167,6 +173,7 @@ static const gcomp_option_schema_t g_gzip_option_schemas[] = {
         0,                                               // min_uint
         0,                                               // max_uint
         "Set FTEXT flag to indicate ASCII text content", // help
+        NULL, // allowed
     },
     {
         "gzip.xfl",       // key
@@ -180,6 +187,7 @@ static const gcomp_option_schema_t g_gzip_option_schemas[] = {
         0,                // min_uint
         255,              // max_uint
         "Extra flags (auto-calculated if not set)", // help
+        NULL, // allowed
     },
     {
         "gzip.header_flags", // key
@@ -193,6 +201,7 @@ static const gcomp_option_schema_t g_gzip_option_schemas[] = {
         0,                   // min_uint
         255,                 // max_uint
         "Header flags byte (auto-calculated if not set)", // help
+        NULL, // allowed
     },
     {
         "gzip.concat",                           // key
@@ -206,6 +215,7 @@ static const gcomp_option_schema_t g_gzip_option_schemas[] = {
         0,                                       // min_uint
         0,                                       // max_uint
         "Decoder: support concatenated members", // help
+        NULL, // allowed
     },
     {
         "gzip.max_name_bytes",                 // key
@@ -219,6 +229,7 @@ static const gcomp_option_schema_t g_gzip_option_schemas[] = {
         1,                                     // min_uint
         0,                                     // max_uint
         "Decoder: max FNAME length in bytes",  // help
+        NULL, // allowed
     },
     {
         "gzip.max_comment_bytes",                 // key
@@ -232,6 +243,7 @@ static const gcomp_option_schema_t g_gzip_option_schemas[] = {
         1,                                        // min_uint
         0,                                        // max_uint
         "Decoder: max FCOMMENT length in bytes",  // help
+        NULL, // allowed
     },
     {
         "gzip.max_extra_bytes",                 // key
@@ -245,6 +257,7 @@ static const gcomp_option_schema_t g_gzip_option_schemas[] = {
         1,                                      // min_uint
         0,                                      // max_uint
         "Decoder: max FEXTRA length in bytes",  // help
+        NULL, // allowed
     },
     // Core limit options.  Declared here because this method honours them --
     // a schema that omits what the method accepts cannot be used to validate
@@ -262,6 +275,7 @@ static const gcomp_option_schema_t g_gzip_option_schemas[] = {
         0,                                   // min_uint
         0,                                   // max_uint
         "Maximum decompressed output bytes", // help
+        NULL, // allowed
     },
     {
         "limits.max_memory_bytes",    // key
@@ -275,6 +289,7 @@ static const gcomp_option_schema_t g_gzip_option_schemas[] = {
         0,                            // min_uint
         0,                            // max_uint
         "Maximum memory usage bytes", // help
+        NULL, // allowed
     },
     {
         "limits.max_expansion_ratio",              // key
@@ -288,6 +303,7 @@ static const gcomp_option_schema_t g_gzip_option_schemas[] = {
         0,                                         // min_uint
         0,                                         // max_uint
         "Maximum output/input ratio; default is this format's own ceiling",  // help
+        NULL, // allowed
     },
 };
 

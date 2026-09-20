@@ -132,6 +132,51 @@ static gcomp_status_t set_entry(gcomp_options_t * opts, const char * key,
   uint32_t hash = hash_string(key);
   uint32_t bucket = hash % GCOMP_OPTIONS_HASH_SIZE;
 
+  // Copy whatever needs copying BEFORE touching the table.
+  //
+  // This used to link the entry, free the value it was replacing, and only
+  // then allocate the new one - so a failed allocation left a string entry
+  // holding NULL and destroyed the value that had been there, while reporting
+  // GCOMP_ERR_MEMORY as though nothing had happened. Nothing read the field
+  // during validation, so the inconsistency stayed invisible until a string
+  // option started declaring the values it accepts: validation then saw a
+  // string entry with no string and refused the whole options object with
+  // GCOMP_ERR_INVALID_ARG, which named neither the real problem nor the
+  // memory that caused it. tests/core/test_alloc_failure.cpp is what found
+  // it, by failing allocation 12 of 24.
+  //
+  // A set that fails now leaves the object exactly as it was.
+  char * new_str = NULL;
+  void * new_bytes = NULL;
+  size_t new_bytes_size = 0;
+  if (type == GCOMP_OPT_STRING) {
+    const char * str = *(const char **)value_ptr;
+    new_str = gcomp_strdup(alloc, str);
+    if (!new_str) {
+      return GCOMP_ERR_MEMORY;
+    }
+  }
+  else if (type == GCOMP_OPT_BYTES) {
+    const struct {
+      const void * data;
+      size_t size;
+    } * bytes = value_ptr;
+    // Empty bytes need no allocation, and must not be turned into one: a
+    // zero-size malloc may return NULL, which is not a failure.
+    if (bytes->size > 0) {
+      new_bytes = gcomp_malloc(alloc, bytes->size);
+      if (!new_bytes) {
+        return GCOMP_ERR_MEMORY;
+      }
+      memcpy(new_bytes, bytes->data, bytes->size);
+      new_bytes_size = bytes->size;
+    }
+  }
+  else if (type != GCOMP_OPT_INT64 && type != GCOMP_OPT_UINT64 &&
+      type != GCOMP_OPT_BOOL && type != GCOMP_OPT_FLOAT) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
   // Check if entry exists
   gcomp_option_entry_t * entry = find_entry(opts, key);
 
@@ -151,6 +196,8 @@ static gcomp_status_t set_entry(gcomp_options_t * opts, const char * key,
     // Create new entry
     entry = create_entry(alloc, key);
     if (!entry) {
+      gcomp_free(alloc, new_str);
+      gcomp_free(alloc, new_bytes);
       return GCOMP_ERR_MEMORY;
     }
 
@@ -159,7 +206,7 @@ static gcomp_status_t set_entry(gcomp_options_t * opts, const char * key,
     opts->buckets[bucket] = entry;
   }
 
-  // Set the value
+  // Nothing below here can fail.
   entry->type = type;
   switch (type) {
   case GCOMP_OPT_INT64:
@@ -171,38 +218,18 @@ static gcomp_status_t set_entry(gcomp_options_t * opts, const char * key,
   case GCOMP_OPT_BOOL:
     entry->value.b = *(const int *)value_ptr;
     break;
-  case GCOMP_OPT_STRING: {
-    const char * str = *(const char **)value_ptr;
-    entry->value.str = gcomp_strdup(alloc, str);
-    if (!entry->value.str) {
-      return GCOMP_ERR_MEMORY;
-    }
+  case GCOMP_OPT_STRING:
+    entry->value.str = new_str;
     break;
-  }
-  case GCOMP_OPT_BYTES: {
-    const struct {
-      const void * data;
-      size_t size;
-    } * bytes = value_ptr;
-    // Handle empty bytes (size 0) - no allocation or copy needed
-    if (bytes->size == 0) {
-      entry->value.bytes.data = NULL;
-      entry->value.bytes.size = 0;
-    } else {
-      entry->value.bytes.data = gcomp_malloc(alloc, bytes->size);
-      if (!entry->value.bytes.data) {
-        return GCOMP_ERR_MEMORY;
-      }
-      memcpy(entry->value.bytes.data, bytes->data, bytes->size);
-      entry->value.bytes.size = bytes->size;
-    }
+  case GCOMP_OPT_BYTES:
+    entry->value.bytes.data = new_bytes;
+    entry->value.bytes.size = new_bytes_size;
     break;
-  }
   case GCOMP_OPT_FLOAT:
     entry->value.f = *(const double *)value_ptr;
     break;
   default:
-    return GCOMP_ERR_INVALID_ARG;
+    break;
   }
 
   return GCOMP_OK;
@@ -427,6 +454,25 @@ gcomp_status_t gcomp_options_freeze(gcomp_options_t * options) {
   return GCOMP_OK;
 }
 
+/**
+ * @brief Is this string one of the values the option declares?
+ *
+ * A NULL value never is: a string option's value is the thing being checked,
+ * and an absent one cannot be checked against a list.
+ */
+static int gcomp_option_value_allowed(
+    const gcomp_option_schema_t * opt_schema, const char * value) {
+  if (!value) {
+    return 0;
+  }
+  for (const char * const * p = opt_schema->allowed; *p; p++) {
+    if (strcmp(*p, value) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 GCOMP_API gcomp_status_t gcomp_options_validate(
     const gcomp_options_t * options, const struct gcomp_method_s * method) {
   const gcomp_method_t * typed_method = (const gcomp_method_t *)method;
@@ -500,6 +546,14 @@ GCOMP_API gcomp_status_t gcomp_options_validate(
           return GCOMP_ERR_INVALID_ARG;
         }
       }
+      // A string option that declares the values it accepts.  Checked here so
+      // that the refusal names the key the caller set, rather than arriving
+      // later from inside the method as a failure to do something else.
+      else if (entry->type == GCOMP_OPT_STRING && opt_schema->allowed) {
+        if (!gcomp_option_value_allowed(opt_schema, entry->value.str)) {
+          return GCOMP_ERR_INVALID_ARG;
+        }
+      }
 
       entry = entry->next;
     }
@@ -550,6 +604,11 @@ GCOMP_API gcomp_status_t gcomp_options_validate_key(
       return GCOMP_ERR_INVALID_ARG;
     }
     if (opt_schema->has_max && entry->value.ui64 > opt_schema->max_uint) {
+      return GCOMP_ERR_INVALID_ARG;
+    }
+  }
+  else if (entry->type == GCOMP_OPT_STRING && opt_schema->allowed) {
+    if (!gcomp_option_value_allowed(opt_schema, entry->value.str)) {
       return GCOMP_ERR_INVALID_ARG;
     }
   }
