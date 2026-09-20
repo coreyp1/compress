@@ -142,8 +142,17 @@ gcomp_status_t zstd_dict_parse(const uint8_t * buf, size_t buf_size,
       goto cleanup_tables;
     }
     size_t fse_bytes = 0;
+    // zstd_fse_build_decoding_table() reports the largest symbol it saw, and
+    // refuses a NULL there rather than skipping the store. All three calls
+    // here passed NULL, so every formatted dictionary failed at the first FSE
+    // table with GCOMP_ERR_INVALID_ARG - which zstd_dict_parse() turned into
+    // GCOMP_ERR_CORRUPT, so the dictionary looked malformed rather than
+    // unread. Nothing noticed because our own encoder writes raw dictionaries
+    // and no test had ever fed this a formatted one; the first `zstd --train`
+    // dictionary did.
+    unsigned fse_max_symbol = 0;
     status = zstd_fse_build_decoding_table(buf + pos, buf_size - pos,
-        out->fse_of_table, out->fse_of_size, &out->fse_of_log, NULL,
+        out->fse_of_table, out->fse_of_size, &out->fse_of_log, &fse_max_symbol,
         &fse_bytes);
     if (status != GCOMP_OK) {
       goto cleanup_tables;
@@ -171,8 +180,9 @@ gcomp_status_t zstd_dict_parse(const uint8_t * buf, size_t buf_size,
       goto cleanup_tables;
     }
     size_t fse_bytes = 0;
+    unsigned fse_max_symbol = 0;
     status = zstd_fse_build_decoding_table(buf + pos, buf_size - pos,
-        out->fse_ml_table, out->fse_ml_size, &out->fse_ml_log, NULL,
+        out->fse_ml_table, out->fse_ml_size, &out->fse_ml_log, &fse_max_symbol,
         &fse_bytes);
     if (status != GCOMP_OK) {
       goto cleanup_tables;
@@ -200,8 +210,9 @@ gcomp_status_t zstd_dict_parse(const uint8_t * buf, size_t buf_size,
       goto cleanup_tables;
     }
     size_t fse_bytes = 0;
+    unsigned fse_max_symbol = 0;
     status = zstd_fse_build_decoding_table(buf + pos, buf_size - pos,
-        out->fse_ll_table, out->fse_ll_size, &out->fse_ll_log, NULL,
+        out->fse_ll_table, out->fse_ll_size, &out->fse_ll_log, &fse_max_symbol,
         &fse_bytes);
     if (status != GCOMP_OK) {
       goto cleanup_tables;
