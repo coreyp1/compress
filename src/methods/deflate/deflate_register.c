@@ -126,10 +126,11 @@ static const gcomp_option_schema_t g_deflate_option_schemas[] = {
     },
     {
         // RFC 1950 section 2.2's preset dictionary, which is history rather
-        // than anything RFC 1951 defines: the bytes are loaded into the
-        // window and the first block's distances reach back into them.  The
-        // decoder accepts one; the encoder does not write one yet and says so
-        // rather than ignoring it.
+        // than anything RFC 1951 defines: the bytes go into the window and
+        // the hash chains ahead of the first block, and the first distances
+        // reach back into them.  A raw deflate stream has no way to say it
+        // needs one, so this is the caller saying so; under the zlib wrapper
+        // FDICT and DICTID carry that instead.
         "deflate.dictionary", // key
         GCOMP_OPT_BYTES,      // type
         0,                    // has_default
@@ -140,7 +141,7 @@ static const gcomp_option_schema_t g_deflate_option_schemas[] = {
         0,                    // max_int
         0,                    // min_uint
         0,                    // max_uint
-        "Preset dictionary: decoding only, not yet written by the encoder",
+        "Preset dictionary: history the stream starts from (RFC 1950 2.2)",
     },
     {
         "deflate.strategy",                // key

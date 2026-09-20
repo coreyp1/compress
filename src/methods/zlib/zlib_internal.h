@@ -147,7 +147,8 @@ typedef struct {
 
   zlib_encoder_stage_t stage;
 
-  uint8_t header_buf[ZLIB_HEADER_SIZE];
+  /// Two bytes, or six when FDICT carries a DICTID after them.
+  uint8_t header_buf[ZLIB_HEADER_SIZE + ZLIB_DICTID_SIZE];
   size_t header_len;
   size_t header_pos;
 
@@ -201,11 +202,12 @@ typedef struct {
  *
  * @param window_bits Window the deflate encoder will use, 8 to 15.
  * @param level Compression level 0 to 9, for the FLEVEL hint.
+ * @param fdict Non-zero to set FDICT; the caller then writes DICTID itself.
  * @param out Receives ZLIB_HEADER_SIZE bytes.
  * @return GCOMP_OK, or GCOMP_ERR_INVALID_ARG for a window that has no CINFO.
  */
 gcomp_status_t zlib_write_header(
-    unsigned window_bits, int level, uint8_t * out);
+    unsigned window_bits, int level, int fdict, uint8_t * out);
 
 /**
  * @brief Parse and validate the two header bytes.

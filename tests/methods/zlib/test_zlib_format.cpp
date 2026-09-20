@@ -365,10 +365,13 @@ TEST_F(ZlibFormatTest, PeekTellsZlibFromRawDeflate) {
 }
 
 //
-// Preset dictionaries: the one part of RFC 1950 this does not do
+// Preset dictionaries (RFC 1950 section 2.2)
+//
+// The header side of them.  What the dictionary does to the compressed data
+// is tested against the real zlib in test_zlib_dictionary.cpp.
 //
 
-TEST_F(ZlibFormatTest, APresetDictionaryIsRefusedRatherThanIgnored) {
+TEST_F(ZlibFormatTest, APresetDictionarySetsFdictAndDictid) {
   const uint8_t dict[] = {'h', 'e', 'l', 'l', 'o'};
   gcomp_options_t * opts = nullptr;
   ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
@@ -377,11 +380,29 @@ TEST_F(ZlibFormatTest, APresetDictionaryIsRefusedRatherThanIgnored) {
       GCOMP_OK);
 
   gcomp_encoder_t * encoder = nullptr;
-  EXPECT_EQ(gcomp_encoder_create(registry_, "zlib", opts, &encoder),
-      GCOMP_ERR_UNSUPPORTED)
-      << "silently dropping FDICT would produce a stream that decodes to the "
-         "wrong bytes for whoever had the dictionary";
+  ASSERT_EQ(
+      gcomp_encoder_create(registry_, "zlib", opts, &encoder), GCOMP_OK);
+  ASSERT_NE(encoder, nullptr);
+
+  const uint8_t payload[] = {'h', 'e', 'l', 'l', 'o', ' ', 'y', 'o', 'u'};
+  std::vector<uint8_t> out(256);
+  gcomp_buffer_t in = {payload, sizeof(payload), 0};
+  gcomp_buffer_t ob = {out.data(), out.size(), 0};
+  ASSERT_EQ(gcomp_encoder_update(encoder, &in, &ob), GCOMP_OK);
+  ASSERT_EQ(gcomp_encoder_finish(encoder, &ob), GCOMP_OK);
+  out.resize(ob.used);
+  gcomp_encoder_destroy(encoder);
   gcomp_options_destroy(opts);
+
+  ASSERT_GE(out.size(), 6u);
+  // Section 2.2: the two header bytes are a multiple of 31, FDICT is bit 5 of
+  // FLG, and DICTID follows them as four bytes, most significant first.
+  EXPECT_EQ((((unsigned)out[0] << 8) | out[1]) % 31u, 0u)
+      << "FDICT has to be set before FCHECK is computed, not after";
+  EXPECT_NE(out[1] & 0x20u, 0u) << "FDICT not set";
+  uint32_t dict_id = ((uint32_t)out[2] << 24) | ((uint32_t)out[3] << 16) |
+      ((uint32_t)out[4] << 8) | (uint32_t)out[5];
+  EXPECT_EQ(dict_id, gcomp_adler32(dict, sizeof(dict)));
 }
 
 TEST_F(ZlibFormatTest, AStreamNeedingAPresetDictionaryIsRefused) {
@@ -393,6 +414,7 @@ TEST_F(ZlibFormatTest, AStreamNeedingAPresetDictionaryIsRefused) {
       << "the test's own header is malformed";
   ASSERT_NE(stream[1] & 0x20u, 0u) << "the test's own header lacks FDICT";
 
+  // No zlib.dictionary supplied, so there is nothing to decode against.
   gcomp_status_t status = GCOMP_OK;
   Decode(stream, 64, &status);
   EXPECT_EQ(status, GCOMP_ERR_UNSUPPORTED)

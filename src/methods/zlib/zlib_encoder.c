@@ -68,20 +68,17 @@ gcomp_status_t zlib_encoder_init(gcomp_registry_t * registry,
     }
   }
 
-  // A preset dictionary is the one part of RFC 1950 this cannot do, because
-  // the deflate encoder has no way to be given one.  Refusing at create time
-  // is the only honest answer: silently clearing FDICT would produce a stream
-  // that decodes to the wrong bytes for anyone who supplied the dictionary.
+  // A preset dictionary (RFC 1950 section 2.2): FDICT in the header, DICTID
+  // after it, and the same bytes handed to deflate as the history the stream
+  // starts from.
+  const void * dict = NULL;
+  size_t dict_len = 0;
   if (options) {
-    const void * dict = NULL;
-    size_t dict_len = 0;
-    if (gcomp_options_get_bytes(options, "zlib.dictionary", &dict, &dict_len) ==
-            GCOMP_OK &&
-        dict && dict_len > 0) {
-      gcomp_free(alloc, state);
-      return gcomp_encoder_set_error(encoder, GCOMP_ERR_UNSUPPORTED,
-          "zlib preset dictionaries need a deflate encoder that accepts one, "
-          "which this library does not have yet");
+    if (gcomp_options_get_bytes(options, "zlib.dictionary", &dict, &dict_len) !=
+            GCOMP_OK ||
+        !dict || dict_len == 0) {
+      dict = NULL;
+      dict_len = 0;
     }
   }
 
@@ -111,14 +108,26 @@ gcomp_status_t zlib_encoder_init(gcomp_registry_t * registry,
   state->window_bits = (uint8_t)window_bits;
   state->level = (int)level;
 
-  gcomp_status_t status =
-      zlib_write_header((unsigned)window_bits, (int)level, state->header_buf);
+  gcomp_status_t status = zlib_write_header(
+      (unsigned)window_bits, (int)level, dict != NULL, state->header_buf);
   if (status != GCOMP_OK) {
     gcomp_free(alloc, state);
     return gcomp_encoder_set_error(
         encoder, status, "failed to build zlib header");
   }
   state->header_len = ZLIB_HEADER_SIZE;
+  if (dict) {
+    // DICTID is the Adler-32 of the dictionary as supplied, in network byte
+    // order.  Of the whole of it, not of the tail deflate will actually match
+    // against: section 2.2 identifies what the caller handed over, and zlib's
+    // deflateSetDictionary hashes the same thing.
+    uint32_t dict_id = gcomp_adler32((const uint8_t *)dict, dict_len);
+    state->header_buf[ZLIB_HEADER_SIZE + 0] = (uint8_t)(dict_id >> 24);
+    state->header_buf[ZLIB_HEADER_SIZE + 1] = (uint8_t)(dict_id >> 16);
+    state->header_buf[ZLIB_HEADER_SIZE + 2] = (uint8_t)(dict_id >> 8);
+    state->header_buf[ZLIB_HEADER_SIZE + 3] = (uint8_t)dict_id;
+    state->header_len = ZLIB_HEADER_SIZE + ZLIB_DICTID_SIZE;
+  }
   state->header_pos = 0;
 
   gcomp_options_t * deflate_options = NULL;
@@ -129,6 +138,19 @@ gcomp_status_t zlib_encoder_init(gcomp_registry_t * registry,
     return gcomp_encoder_set_error(
         encoder, status, "failed to prepare deflate options");
   }
+  // zlib.dictionary and deflate.dictionary are different keys, so the filtered
+  // clone does not carry it across; it is put in by name.
+  if (dict && deflate_options) {
+    status = gcomp_options_set_bytes(
+        deflate_options, "deflate.dictionary", dict, dict_len);
+    if (status != GCOMP_OK) {
+      gcomp_options_destroy(deflate_options);
+      gcomp_free(alloc, state);
+      return gcomp_encoder_set_error(
+          encoder, status, "failed to hand the preset dictionary to deflate");
+    }
+  }
+
   status = gcomp_encoder_create(
       registry, "deflate", deflate_options, &state->inner_encoder);
   if (deflate_options) {

@@ -581,6 +581,18 @@ typedef struct gcomp_deflate_encoder_state_s {
   uint32_t lazy_distance; ///< Distance of the held match; valid with length.
   size_t total_in;    ///< Total bytes written to window (for hash validity).
 
+  /**
+   * @brief A preset dictionary, copied because the options may not outlive us.
+   *
+   * RFC 1950 section 2.2's dictionary is history, not data: these bytes go
+   * into the window and the hash chains ahead of the first input byte and are
+   * never emitted.  Kept so that gcomp_encoder_reset() can lay them down
+   * again - a reset starts a new stream, and a new stream starts from the
+   * same history this one did.
+   */
+  uint8_t * dict_bytes;
+  size_t dict_len;
+
   //
   // Hash chain for LZ77 match finding
   // ==================================
@@ -1401,6 +1413,64 @@ static void deflate_insert_hash(
   st->hash_head[hash] = (uint16_t)idx;
   st->hash_pos[idx] = stream_pos;
   st->hash_at[idx] = (uint16_t)hash;
+}
+
+/**
+ * @brief Lay a preset dictionary down as the history the stream starts from.
+ *
+ * RFC 1951 has no notion of a dictionary, and that is what makes this simple:
+ * the bytes are history.  They go into the window and into the hash chains by
+ * the same route input takes, and then the encoder starts on the real input
+ * with the window already full.  Nothing is emitted for them.
+ *
+ * Only the last @c window_size bytes are laid down, because a distance cannot
+ * exceed the window and anything further back could never be referenced.  zlib's
+ * @c deflateSetDictionary keeps the same tail.
+ *
+ * Two details that are easy to get wrong:
+ *
+ * - Only positions with three whole dictionary bytes ahead of them are
+ *   indexed.  The hash reads three bytes and wraps at the window's end, so
+ *   indexing the last two would hash dictionary bytes together with whatever
+ *   the window holds at position zero.
+ * - deflate_insert_hash() refuses to insert while the lookahead is under
+ *   three bytes, which is right for input and wrong here: the dictionary is
+ *   not lookahead, there is simply a lot of it.  It is lent the length for the
+ *   duration and given back zero, because none of these bytes is waiting to be
+ *   encoded.
+ */
+static void deflate_prime_dictionary(gcomp_deflate_encoder_state_t * st) {
+  if (!st || !st->window || !st->dict_bytes || st->dict_len == 0) {
+    return;
+  }
+
+  size_t take = st->dict_len;
+  if (take > st->window_size) {
+    take = st->window_size;
+  }
+  const uint8_t * tail = st->dict_bytes + (st->dict_len - take);
+
+  const size_t start = st->window_pos;
+  for (size_t i = 0; i < take; i++) {
+    st->window[st->window_pos] = tail[i];
+    st->window_pos = (st->window_pos + 1u) & st->window_mask;
+  }
+  st->total_in += take;
+  st->window_fill += take;
+  if (st->window_fill > st->window_size) {
+    st->window_fill = st->window_size;
+  }
+
+  if (take >= DEFLATE_MIN_MATCH_LENGTH) {
+    const size_t saved_lookahead = st->lookahead;
+    st->lookahead = take;
+    const size_t base_stream = st->total_in - take;
+    for (size_t i = 0; i + DEFLATE_MIN_MATCH_LENGTH <= take; i++) {
+      deflate_insert_hash(
+          st, (start + i) & st->window_mask, base_stream + i);
+    }
+    st->lookahead = saved_lookahead;
+  }
 }
 
 //
@@ -2319,21 +2389,25 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
     }
   }
 
-  // The decoder accepts a preset dictionary; this does not write one yet.
-  // Refusing is the only honest answer, and it is the same one zlib's encoder
-  // gives for zlib.dictionary: quietly encoding without it would produce a
-  // stream that decodes to the wrong bytes for anyone who supplied it.
+  // A preset dictionary is history the stream starts from.  Copied because the
+  // options object need not outlive the encoder, and because a reset has to be
+  // able to lay the same history down again.
+  st->dict_bytes = NULL;
+  st->dict_len = 0;
   if (options) {
     const void * dict = NULL;
     size_t dict_len = 0;
     if (gcomp_options_get_bytes(options, "deflate.dictionary", &dict,
             &dict_len) == GCOMP_OK &&
         dict && dict_len > 0) {
-      status = GCOMP_ERR_UNSUPPORTED;
-      gcomp_encoder_set_error(encoder, status,
-          "deflate.dictionary is read by the decoder but not yet written by "
-          "the encoder");
-      goto cleanup;
+      st->dict_bytes = (uint8_t *)gcomp_malloc(alloc, dict_len);
+      if (!st->dict_bytes) {
+        status = GCOMP_ERR_MEMORY;
+        goto cleanup;
+      }
+      memcpy(st->dict_bytes, dict, dict_len);
+      st->dict_len = dict_len;
+      gcomp_memory_track_alloc(&st->mem_tracker, dict_len);
     }
   }
 
@@ -2423,6 +2497,10 @@ gcomp_status_t gcomp_deflate_encoder_init(gcomp_registry_t * registry,
   gcomp_memory_track_alloc(&st->mem_tracker, hash_at_size);
 
   st->total_in = 0;
+
+  // The window and the hash chains both exist now, which is everything the
+  // dictionary needs to be laid into.
+  deflate_prime_dictionary(st);
 
   // For level 0, allocate block buffer
   if (st->level == 0) {
@@ -2535,6 +2613,7 @@ cleanup:
   gcomp_free(alloc, st->dist_buf);
   gcomp_free(alloc, st->lit_buf);
   gcomp_free(alloc, st->block_buffer);
+  gcomp_free(alloc, st->dict_bytes);
   gcomp_free(alloc, st->hash_at);
   gcomp_free(alloc, st->hash_pos);
   gcomp_free(alloc, st->hash_prev);
@@ -2566,6 +2645,7 @@ void gcomp_deflate_encoder_destroy(gcomp_encoder_t * encoder) {
   gcomp_free(alloc, st->dist_buf);
   gcomp_free(alloc, st->lit_buf);
   gcomp_free(alloc, st->block_buffer);
+  gcomp_free(alloc, st->dict_bytes);
   gcomp_free(alloc, st->hash_at);
   gcomp_free(alloc, st->hash_pos);
   gcomp_free(alloc, st->hash_prev);
@@ -2613,6 +2693,12 @@ gcomp_status_t gcomp_deflate_encoder_reset(gcomp_encoder_t * encoder) {
   memset(st->hash_pos, 0, st->window_size * sizeof(size_t));
   memset(st->hash_at, 0, st->window_size * sizeof(uint16_t));
   st->hash_value = 0;
+
+  // A reset starts a new stream, and a new stream starts from the same history
+  // this one did.  After the tables are cleared, not before.  A *flush* is a
+  // different thing: deflate_drop_history() throws history away on purpose and
+  // the decoder does the same, so nothing is laid back down there.
+  deflate_prime_dictionary(st);
 
   // Reset bitwriter state
   gcomp_deflate_bitwriter_reset(&st->bitwriter);

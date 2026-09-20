@@ -36,7 +36,7 @@
  * window given there is also what goes into the header's CINFO field, so a
  * decoder is told the truth about what it needs.
  *
- * - `zlib.dictionary` (bytes): **not yet supported.**  See below.
+ * - `zlib.dictionary` (bytes): a preset dictionary.  See below.
  * - `limits.max_output_bytes`, `limits.max_memory_bytes`,
  *   `limits.max_expansion_ratio`: as elsewhere.
  *
@@ -44,20 +44,30 @@
  *
  * RFC 1950 allows a stream to be compressed against a preset dictionary,
  * flagged by FDICT and identified by a four-byte Adler-32 of the dictionary.
- * That requires the *deflate* encoder and decoder to accept a dictionary, and
- * this library's do not yet.
+ * RFC 1951 has no notion of one, which is what makes it work: a dictionary is
+ * simply history.  The bytes go into deflate's window ahead of the first block
+ * and the first distances reach back into them.
  *
- * Rather than pretend otherwise:
+ * Set `zlib.dictionary` on an encoder and the header carries FDICT and DICTID;
+ * set the same bytes on a decoder and the stream decodes.  Only the last
+ * 32 KB of a dictionary is reachable, since a distance cannot exceed the
+ * window, so a longer one is used from its tail - but DICTID covers the whole
+ * of what was supplied, as RFC 1950 section 2.2 specifies.
  *
- * - Setting `zlib.dictionary` on an encoder fails at creation with
- *   `GCOMP_ERR_UNSUPPORTED`.  Quietly clearing FDICT would produce a stream
- *   that decodes to the wrong bytes for anyone who had the dictionary.
- * - Decoding a stream with FDICT set fails with `GCOMP_ERR_UNSUPPORTED` and
- *   an error naming the dictionary id, rather than producing plausible
- *   nonsense.
+ * The identifier is checked, which is what it is for.  Decoding a stream whose
+ * FDICT is set without supplying `zlib.dictionary` is `GCOMP_ERR_UNSUPPORTED`
+ * and names the id wanted; supplying the wrong one is `GCOMP_ERR_CORRUPT` and
+ * names both.  Neither produces plausible nonsense.
+ *
+ * gcomp_peek() reports the requirement before you commit to a decode:
+ * `has_dictionary` and `dictionary_id`.
+ *
+ * A raw deflate stream has no FDICT bit to announce the need, so there the
+ * caller says so with `deflate.dictionary`.
  *
  * FDICT is rare in practice: PNG forbids it outright (PNG §10.3), and HTTP
- * and PDF do not use it.
+ * and PDF do not use it.  It earns its keep where many small, similar messages
+ * are compressed independently.
  *
  * ## Usage
  *

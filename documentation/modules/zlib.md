@@ -83,7 +83,7 @@ Compression is configured with the deflate keys, which pass straight through:
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `zlib.dictionary` | bytes | none | Preset dictionary. Decoding only; see below. |
+| `zlib.dictionary` | bytes | none | Preset dictionary (RFC 1950 FDICT); see below. |
 
 ### Limits
 
@@ -101,7 +101,7 @@ has no notion of one: a dictionary is simply history, so decoding such a stream
 means loading those bytes into deflate's window before the first block and
 letting the first distances reach back into them.
 
-**Decoding is supported. Encoding is not.**
+**Both directions are supported.**
 
 ### Decoding
 
@@ -133,11 +133,26 @@ creation.
 
 ### Encoding
 
-Setting `zlib.dictionary` or `deflate.dictionary` on an **encoder** fails at
-creation with `GCOMP_ERR_UNSUPPORTED`. The deflate encoder cannot yet be primed
-with history, and quietly encoding without the dictionary would produce a
-stream that decodes to the wrong bytes for whoever supplied it — a failure
-landing on the reader, who did nothing wrong.
+```c
+gcomp_options_set_bytes(opts, "zlib.dictionary", dict, dict_len);
+gcomp_encode_alloc(NULL, "zlib", opts, data, len, &out, &out_len);
+```
+
+The header carries FDICT and DICTID, and the deflate encoder starts with the
+dictionary already in its window and hash chains.
+
+DICTID is the Adler-32 of the **whole** dictionary supplied, not of the 32 KB
+tail that is actually reachable — RFC 1950 §2.2 identifies what the caller
+handed over, and zlib's `deflateSetDictionary` hashes the same thing.
+
+`gcomp_encoder_reset()` lays the dictionary down again, because a reset starts
+a new stream and a new stream starts from the same history. A **full flush** is
+different: it drops history deliberately and the decoder does the same, so
+nothing is reinstated there.
+
+Verified by handing our output to zlib itself to decode, across dictionary
+sizes from 1 byte to 70 KB and every level. A dictionary stream only we can
+read would be a stream nobody else can.
 
 ### Where it matters
 
@@ -174,7 +189,7 @@ cheapest way to tell a zlib stream from a raw deflate one.
 | Status | Cause |
 |---|---|
 | `GCOMP_ERR_CORRUPT` | CM is not 8, CINFO above 7, the FCHECK modulus fails, the Adler-32 does not match, or the stream is truncated |
-| `GCOMP_ERR_UNSUPPORTED` | FDICT is set and no `zlib.dictionary` was supplied, or one was given to an encoder |
+| `GCOMP_ERR_UNSUPPORTED` | FDICT is set and no `zlib.dictionary` was supplied |
 | `GCOMP_ERR_LIMIT` | An output or expansion-ratio limit was exceeded |
 
 The Adler-32 is checked at the end, against output the caller has already been

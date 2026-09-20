@@ -17,12 +17,17 @@
  *
  * The reference is Python's zlib, which is CPython's binding to zlib itself.
  *
- * Writing such a stream is not implemented; the encoder says so rather than
- * quietly dropping the dictionary, and the last tests here hold it to that.
+ * Both directions are covered. Our encoder's output is handed to the reference
+ * to decode, because a dictionary stream only we can read is one nobody else
+ * can - and every mistake available on that side (priming from the wrong end of
+ * the dictionary, hashing positions that run off it, hashing the tail instead
+ * of the whole for DICTID) produces a stream that round-trips through us and
+ * fails there.
  *
  * Copyright 2026 by Corey Pennycuff
  */
 
+#include <ghoti.io/compress/adler32.h>
 #include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/deflate.h>
 #include <ghoti.io/compress/errors.h>
@@ -133,6 +138,57 @@ std::vector<uint8_t> referenceCompress(const std::vector<uint8_t> & data,
   unlink(dict_path.c_str());
   unlink(data_path.c_str());
   return out;
+}
+
+/**
+ * @brief Decompress with the reference, against a dictionary.
+ *
+ * The direction that matters for our encoder: a stream only we can read is a
+ * stream nobody else can.
+ */
+std::vector<uint8_t> referenceDecompress(const std::vector<uint8_t> & stream,
+    const std::vector<uint8_t> & dict, int wbits) {
+  const std::string dict_path = tempPath(".dict");
+  const std::string in_path = tempPath(".z");
+  if (!writeFile(dict_path, dict) || !writeFile(in_path, stream)) {
+    return {};
+  }
+  std::string cmd = std::string(pythonCommand()) +
+      " -c \"import sys,zlib;"
+      "d=open(sys.argv[1],'rb').read();"
+      "z=open(sys.argv[2],'rb').read();"
+      "o=zlib.decompressobj(" +
+      std::to_string(wbits) +
+      ",zdict=d);"
+      "sys.stdout.buffer.write(o.decompress(z)+o.flush())\" " +
+      dict_path + " " + in_path;
+  std::vector<uint8_t> out = runCapture(cmd);
+  unlink(dict_path.c_str());
+  unlink(in_path.c_str());
+  return out;
+}
+
+/// Encode with our library, with the dictionary supplied under @p key.
+gcomp_status_t encodeWithDict(const char * method, const char * key,
+    const std::vector<uint8_t> & data, const std::vector<uint8_t> * dict,
+    int level, std::vector<uint8_t> * out) {
+  gcomp_options_t * o = nullptr;
+  EXPECT_EQ(gcomp_options_create(&o), GCOMP_OK);
+  EXPECT_EQ(gcomp_options_set_int64(o, "deflate.level", level), GCOMP_OK);
+  if (dict) {
+    EXPECT_EQ(gcomp_options_set_bytes(o, key, dict->data(), dict->size()),
+        GCOMP_OK);
+  }
+  void * buf = nullptr;
+  size_t len = 0;
+  gcomp_status_t s = gcomp_encode_alloc(
+      nullptr, method, o, data.data(), data.size(), &buf, &len);
+  if (s == GCOMP_OK) {
+    out->assign((uint8_t *)buf, (uint8_t *)buf + len);
+  }
+  gcomp_buffer_free(nullptr, buf);
+  gcomp_options_destroy(o);
+  return s;
 }
 
 /// Deterministic content from a small vocabulary, so a dictionary can pay.
@@ -359,41 +415,214 @@ TEST(ZlibDictionary, PeekReportsTheRequirement) {
 }
 
 //
-// The half that is not implemented
+// Encoding
 //
 
 /**
- * @brief Encoding against a dictionary is refused, not silently ignored.
+ * @brief Streams we write, decoded by the reference.
  *
- * Dropping the dictionary and encoding anyway would produce a stream that
- * decodes to the wrong bytes for anyone who supplied it - the failure would
- * land on the reader, who did nothing wrong.
+ * The direction that matters: a dictionary stream only we can read is one
+ * nobody else can. Every mistake available here - priming the window with the
+ * wrong end of the dictionary, hashing positions that are not all dictionary
+ * bytes, writing DICTID over the tail instead of the whole - produces a stream
+ * that round-trips through us and fails here.
  */
-TEST(ZlibDictionary, EncoderRefusesRatherThanIgnoring) {
-  const std::vector<uint8_t> dict = corpus(1024, 41);
-
+TEST(ZlibDictionary, ReferenceDecodesWhatWeWrite) {
   struct Case {
-    const char * method;
-    const char * key;
+    size_t dict_len;
+    size_t data_len;
   };
-  for (const Case & c :
-      {Case{"zlib", "zlib.dictionary"}, Case{"deflate", "deflate.dictionary"}}) {
-    gcomp_options_t * o = nullptr;
-    ASSERT_EQ(gcomp_options_create(&o), GCOMP_OK);
-    ASSERT_EQ(
-        gcomp_options_set_bytes(o, c.key, dict.data(), dict.size()), GCOMP_OK);
+  const Case cases[] = {
+      {1, 500},
+      {64, 64},
+      {1000, 5000},
+      {4096, 2000},
+      {32767, 5000},
+      {32768, 5000},
+      {32769, 5000},
+      {70000, 5000},
+  };
 
-    gcomp_encoder_t * enc = nullptr;
-    EXPECT_EQ(
-        gcomp_encoder_create(gcomp_registry_default(), c.method, o, &enc),
-        GCOMP_ERR_UNSUPPORTED)
-        << c.method << ": a dictionary the encoder cannot use must be "
-                       "refused, not ignored";
-    if (enc) {
-      gcomp_encoder_destroy(enc);
+  for (const Case & c : cases) {
+    for (int level : {1, 6, 9}) {
+      const std::vector<uint8_t> dict = corpus(c.dict_len, 301);
+      const std::vector<uint8_t> data = corpus(c.data_len, 302);
+
+      std::vector<uint8_t> stream;
+      ASSERT_EQ(encodeWithDict("zlib", "zlib.dictionary", data, &dict, level,
+                    &stream),
+          GCOMP_OK)
+          << "dict=" << c.dict_len << " level=" << level;
+
+      // RFC 1950 2.2: FDICT is bit 5 of FLG and DICTID is the four bytes after
+      // the header, most significant byte first.
+      ASSERT_GE(stream.size(), 6u);
+      EXPECT_TRUE(stream[1] & 0x20)
+          << "dict=" << c.dict_len << ": FDICT not set";
+      uint32_t written = ((uint32_t)stream[2] << 24) |
+          ((uint32_t)stream[3] << 16) | ((uint32_t)stream[4] << 8) |
+          (uint32_t)stream[5];
+      EXPECT_EQ(written, gcomp_adler32(dict.data(), dict.size()))
+          << "dict=" << c.dict_len
+          << ": DICTID is the Adler-32 of the whole dictionary supplied";
+
+      std::vector<uint8_t> back = referenceDecompress(stream, dict, 15);
+      ASSERT_EQ(back.size(), data.size())
+          << "dict=" << c.dict_len << " level=" << level
+          << ": the reference could not read it back";
+      EXPECT_EQ(std::memcmp(back.data(), data.data(), back.size()), 0)
+          << "dict=" << c.dict_len << " level=" << level;
     }
-    gcomp_options_destroy(o);
   }
+}
+
+/// The same for raw deflate, where the caller carries the dictionary itself.
+TEST(ZlibDictionary, ReferenceDecodesOurRawDeflate) {
+  for (size_t dict_len : {64u, 4096u, 70000u}) {
+    const std::vector<uint8_t> dict = corpus(dict_len, 401);
+    const std::vector<uint8_t> data = corpus(3000, 402);
+
+    std::vector<uint8_t> stream;
+    ASSERT_EQ(encodeWithDict(
+                  "deflate", "deflate.dictionary", data, &dict, 6, &stream),
+        GCOMP_OK);
+
+    std::vector<uint8_t> back = referenceDecompress(stream, dict, -15);
+    ASSERT_EQ(back.size(), data.size()) << "dict=" << dict_len;
+    EXPECT_EQ(std::memcmp(back.data(), data.data(), back.size()), 0)
+        << "dict=" << dict_len;
+  }
+}
+
+/// And we read our own back, which the sweep above does not cover.
+TEST(ZlibDictionary, RoundTripsThroughOurselves) {
+  const std::vector<uint8_t> dict = corpus(4096, 501);
+  const std::vector<uint8_t> data = corpus(4000, 502);
+
+  for (const char * method : {"zlib", "deflate"}) {
+    const char * key =
+        std::strcmp(method, "zlib") == 0 ? "zlib.dictionary" : "deflate.dictionary";
+    std::vector<uint8_t> stream;
+    ASSERT_EQ(encodeWithDict(method, key, data, &dict, 6, &stream), GCOMP_OK);
+
+    std::vector<uint8_t> out;
+    ASSERT_EQ(decodeWithDict(method, key, stream, &dict, &out), GCOMP_OK)
+        << method;
+    ASSERT_EQ(out.size(), data.size()) << method;
+    EXPECT_EQ(std::memcmp(out.data(), data.data(), out.size()), 0) << method;
+  }
+}
+
+/**
+ * @brief The dictionary has to actually make the output smaller.
+ *
+ * A dictionary that is copied into the window but never indexed into the hash
+ * chains still round-trips and still passes every test above. Only the size
+ * tells the difference.
+ */
+TEST(ZlibDictionary, DictionaryMakesOutputSmaller) {
+  const std::vector<uint8_t> dict = corpus(8192, 601);
+  // Drawn from the same generator, so the dictionary holds the phrases.
+  const std::vector<uint8_t> data = corpus(3000, 601);
+
+  for (int level : {1, 6, 9}) {
+    std::vector<uint8_t> with, without;
+    ASSERT_EQ(encodeWithDict("zlib", "zlib.dictionary", data, &dict, level,
+                  &with),
+        GCOMP_OK);
+    ASSERT_EQ(
+        encodeWithDict("zlib", "zlib.dictionary", data, nullptr, level,
+            &without),
+        GCOMP_OK);
+    EXPECT_LT(with.size(), without.size())
+        << "level " << level << ": a dictionary holding this very content did "
+        << "not help (" << with.size() << " against " << without.size() << ")";
+  }
+}
+
+/**
+ * @brief A reset starts the next stream from the same history.
+ *
+ * The dictionary is the stream's starting history, so a reset has to lay it
+ * down again - and the encoder keeps its own copy for that reason, since the
+ * caller's options need not outlive it.
+ */
+TEST(ZlibDictionary, ResetPrimesAgain) {
+  const std::vector<uint8_t> dict = corpus(4096, 701);
+  const std::vector<uint8_t> data = corpus(2500, 702);
+
+  gcomp_options_t * o = nullptr;
+  ASSERT_EQ(gcomp_options_create(&o), GCOMP_OK);
+  ASSERT_EQ(gcomp_options_set_bytes(
+                o, "deflate.dictionary", dict.data(), dict.size()),
+      GCOMP_OK);
+
+  gcomp_encoder_t * enc = nullptr;
+  ASSERT_EQ(
+      gcomp_encoder_create(gcomp_registry_default(), "deflate", o, &enc),
+      GCOMP_OK);
+
+  auto encode_one = [&](std::vector<uint8_t> * out) {
+    out->clear();
+    uint8_t buf[512];
+    gcomp_buffer_t in = {data.data(), data.size(), 0};
+    while (in.used < in.size) {
+      gcomp_buffer_t ob = {buf, sizeof(buf), 0};
+      ASSERT_EQ(gcomp_encoder_update(enc, &in, &ob), GCOMP_OK);
+      out->insert(out->end(), buf, buf + ob.used);
+    }
+    for (;;) {
+      gcomp_buffer_t ob = {buf, sizeof(buf), 0};
+      gcomp_status_t s = gcomp_encoder_finish(enc, &ob);
+      out->insert(out->end(), buf, buf + ob.used);
+      if (s == GCOMP_OK) {
+        break;
+      }
+      ASSERT_EQ(s, GCOMP_ERR_LIMIT);
+    }
+  };
+
+  std::vector<uint8_t> first;
+  encode_one(&first);
+  ASSERT_EQ(gcomp_encoder_reset(enc), GCOMP_OK);
+  std::vector<uint8_t> second;
+  encode_one(&second);
+
+  gcomp_encoder_destroy(enc);
+  gcomp_options_destroy(o);
+
+  EXPECT_EQ(first, second)
+      << "the stream after a reset differs from the one before it, so the "
+         "dictionary was not laid down again";
+
+  // And the reference reads the second one, which is the part that would go
+  // wrong silently if reset primed the window but not the hash chains.
+  std::vector<uint8_t> back = referenceDecompress(second, dict, -15);
+  ASSERT_EQ(back.size(), data.size());
+  EXPECT_EQ(std::memcmp(back.data(), data.data(), back.size()), 0);
+}
+
+/**
+ * @brief Without a dictionary, nothing changes.
+ *
+ * The priming path runs for every encoder; it must be inert when there is
+ * nothing to prime.
+ */
+TEST(ZlibDictionary, NoDictionaryIsUnchanged) {
+  const std::vector<uint8_t> data = corpus(5000, 801);
+  std::vector<uint8_t> stream;
+  ASSERT_EQ(encodeWithDict("zlib", "zlib.dictionary", data, nullptr, 6,
+                &stream),
+      GCOMP_OK);
+  ASSERT_GE(stream.size(), 2u);
+  EXPECT_FALSE(stream[1] & 0x20) << "FDICT set without a dictionary";
+
+  gcomp_stream_info_t info;
+  ASSERT_EQ(gcomp_peek(nullptr, "zlib", nullptr, stream.data(), stream.size(),
+                &info, nullptr),
+      GCOMP_OK);
+  EXPECT_FALSE(info.has_dictionary);
+  EXPECT_EQ(info.header_size, 2u);
 }
 
 } // namespace

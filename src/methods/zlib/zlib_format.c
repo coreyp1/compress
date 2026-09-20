@@ -36,7 +36,7 @@ uint8_t zlib_flevel_for_level(int level) {
 }
 
 gcomp_status_t zlib_write_header(
-    unsigned window_bits, int level, uint8_t * out) {
+    unsigned window_bits, int level, int fdict, uint8_t * out) {
   if (!out) {
     return GCOMP_ERR_INVALID_ARG;
   }
@@ -51,9 +51,13 @@ gcomp_status_t zlib_write_header(
   uint8_t cmf =
       (uint8_t)((cinfo << ZLIB_CMF_CINFO_SHIFT) | ZLIB_CM_DEFLATE);
 
-  // FDICT stays clear: a preset dictionary would need the deflate encoder to
-  // accept one, and it does not.  See the note in zlib.h.
+  // FDICT says a preset dictionary is required to decode, and DICTID follows
+  // the two header bytes to say which one (section 2.2).  It is set before
+  // FCHECK is computed, because FCHECK is computed over both bytes.
   uint8_t flg = (uint8_t)(zlib_flevel_for_level(level) << ZLIB_FLG_FLEVEL_SHIFT);
+  if (fdict) {
+    flg = (uint8_t)(flg | ZLIB_FLG_FDICT);
+  }
 
   // FCHECK is whatever makes the pair a multiple of 31.  Five bits is always
   // enough: the remainder is at most 30, and subtracting it from 31 lands
