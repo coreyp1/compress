@@ -165,7 +165,20 @@ gcomp_status_t zstd_block_decompress_compressed(zstd_decoder_state_t * state,
 // Maximum sequences per block (block_size / min_match)
 #define MAX_SEQUENCES_PER_BLOCK (ZSTD_BLOCK_SIZE_MAX / 3)
 
-// Minimum input size to attempt compression (small blocks rarely compress well)
+/**
+ * @brief Below this, a block with nothing behind it is stored raw.
+ *
+ * A short block with no history has almost nothing to match against, so the
+ * sequences and entropy tables cost more than the bytes they describe.
+ *
+ * With history the opposite is true, and that is the whole point of a
+ * dictionary: a 60-byte log line against a dictionary of log lines is nearly
+ * all match. Applying this threshold regardless made dictionaries useless for
+ * exactly the message sizes they exist for - 300 records of 60 bytes came to
+ * 20700 bytes with a trained dictionary and 20700 without, because every one
+ * of them was stored raw before the dictionary was ever consulted. See
+ * zstd_block_worth_compressing().
+ */
 #define MIN_COMPRESSION_SIZE 64
 
 /**
@@ -192,6 +205,32 @@ static void zstd_block_slide_window(
       state->mf_window_len - shift);
   state->mf_window_len -= shift;
   zstd_mf_slide(state->match_finder, shift);
+}
+
+/**
+ * @brief Is this block worth trying to compress, or should it be stored?
+ *
+ * Long enough on its own, or short with something behind it to match against.
+ * The second half is what makes a dictionary work on short messages: without
+ * it, every block below MIN_COMPRESSION_SIZE was stored raw before the
+ * dictionary was consulted, so a dictionary changed nothing at all for the
+ * message sizes it is for.
+ *
+ * The match finder reads four bytes at a time, so below that there is nothing
+ * to find whatever history exists.
+ */
+static bool zstd_block_worth_compressing(
+    const zstd_encoder_state_t * state, size_t input_len) {
+  if (input_len >= MIN_COMPRESSION_SIZE) {
+    return true;
+  }
+  if (input_len < 4u) {
+    return false;
+  }
+  const bool has_dictionary =
+      state->dict_parsed.content && state->dict_parsed.content_size > 0;
+  const bool has_history = state->mf_window && state->mf_window_len > 0;
+  return has_dictionary || has_history;
 }
 
 gcomp_status_t zstd_block_compress(zstd_encoder_state_t * state,
@@ -238,7 +277,7 @@ gcomp_status_t zstd_block_compress(zstd_encoder_state_t * state,
 
   // Try compressed block if we have a match finder and sufficient input
   if (state && state->match_finder && state->seq_buffer &&
-      state->literals_buffer && input_len >= MIN_COMPRESSION_SIZE) {
+      state->literals_buffer && zstd_block_worth_compressing(state, input_len)) {
     stepdown = GCOMP_STEPDOWN_ENCODE_FAILED;
     size_t num_sequences = 0;
     size_t literals_size = 0;

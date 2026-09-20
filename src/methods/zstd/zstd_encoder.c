@@ -1823,7 +1823,21 @@ gcomp_status_t zstd_encoder_reset(gcomp_encoder_t * encoder) {
     // headerless bytes that decoded to nothing.
     state->parallel_epilogue_staged = false;
     // A reset starts a new frame, so nothing precedes its first job.
+    //
+    // Both halves are needed. Clearing the saved overlap stops the *next* job
+    // being seeded from the old stream; re-seeding the job that is still held
+    // clears the overlap it was already given. Without the second, a job left
+    // over from the previous stream kept that stream's bytes and its
+    // overlap_len, and the first block of the new frame matched against data
+    // the decoder had never seen - "Second parallel stream after reset"
+    // encoded the words "parallel stream " as a match into the frame before
+    // it, and decoded to nothing.
+    //
+    // That was invisible until short blocks with history started being
+    // compressed at all: every input below MIN_COMPRESSION_SIZE used to be
+    // stored raw, which hid the stale history rather than fixing it.
     state->parallel_overlap_len = 0;
+    zstd_encoder_seed_parallel_job(state);
     status = zstd_write_frame_header(&state->header, state->parallel_output_buf,
         state->parallel_output_buf_cap, &state->header_len);
     if (status != GCOMP_OK) {

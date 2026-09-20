@@ -107,6 +107,7 @@
 #define gcomp_buffer_free GHOTIIO_COMPRESS(gcomp_buffer_free)
 #define gcomp_decode_alloc GHOTIIO_COMPRESS(gcomp_decode_alloc)
 #define gcomp_detect GHOTIIO_COMPRESS(gcomp_detect)
+#define gcomp_dict_train GHOTIIO_COMPRESS(gcomp_dict_train)
 #define gcomp_encode_alloc GHOTIIO_COMPRESS(gcomp_encode_alloc)
 #define gcomp_encode_bound GHOTIIO_COMPRESS(gcomp_encode_bound)
 #define gcomp_peek GHOTIIO_COMPRESS(gcomp_peek)
