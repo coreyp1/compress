@@ -1257,6 +1257,16 @@ void zstd_mf_slide(zstd_match_finder_t * mf, size_t shift);
  * @param dict_end One past the last dictionary position, in window coordinates
  * @param mem_tracker Optional; charged for the table
  */
+/**
+ * @brief Decode a whole Zstandard stream with several threads, or decline.
+ *
+ * The ::gcomp_method_s::decode_parallel hook. Only a stream of several frames
+ * that each declare their size can be split; see zstd_decode_parallel.c.
+ */
+gcomp_status_t zstd_decode_parallel(gcomp_registry_t * registry,
+    gcomp_options_t * options, const void * input, size_t input_size,
+    void * output, size_t output_capacity, size_t * output_size_out);
+
 void zstd_mf_note_dictionary(zstd_match_finder_t * mf,
     const gcomp_allocator_t * alloc, size_t dict_end,
     gcomp_memory_tracker_t * mem_tracker);

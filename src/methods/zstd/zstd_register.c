@@ -561,6 +561,7 @@ static const gcomp_method_t g_zstd_method = {
     .get_schema = zstd_get_schema,
     .encode_bound = zstd_encode_bound,
     .peek = zstd_peek,
+    .decode_parallel = zstd_decode_parallel,
 };
 
 //

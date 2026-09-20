@@ -107,7 +107,7 @@ Compressed blocks contain two sections:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `threads.count` | uint64 | 1 | Number of worker threads (0 or 1 = single-threaded) |
+| `threads.count` | uint64 | 1 | Number of worker threads (0 or 1 = single-threaded). On decode it applies only to a stream of several frames that each declare a content size — blocks inside one frame share a window and cannot be split. See [Threading](../threading.md). |
 
 When `threads.count > 1`, the encoder uses parallel compression where input is split into independent jobs. See [Parallel Compression](#parallel-compression) below.
 

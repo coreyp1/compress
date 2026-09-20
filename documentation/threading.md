@@ -137,7 +137,7 @@ That is a property of how the stream was written:
 | Method | Can decode in parallel? |
 |--------|-------------------------|
 | `lz4` | Yes, when the frame sets `B.Indep` (this library's default). Every block is a job, so a single frame parallelises. |
-| `zstd` | Only across frames. Blocks inside one frame share a window (RFC 8878 §3.1.1.1.2) and cannot be split, and our encoder emits one frame. |
+| `zstd` | Only across frames, and only when every frame declares its content size. Blocks inside one frame share a window (RFC 8878 §3.1.1.1.2) and cannot be split, and our encoder emits one frame — so this benefits streams somebody made multi-frame on purpose: concatenated files, one frame per thread, and the seekable files Phase D will write. |
 | `deflate`, `gzip`, `zlib`, `lzw`, `rle` | No. Each is one stream of back-references from beginning to end. |
 
 A method opts in through `gcomp_method_s::decode_parallel` (method ABI 3), which
@@ -150,9 +150,21 @@ streaming decoder is given the stream a piece at a time.
 The hook returns `GCOMP_ERR_UNSUPPORTED` to say "not this stream", and the
 caller then decodes it the ordinary way. LZ4 declines a frame with linked
 blocks, a frame with one block, a frame compressed against a dictionary, and
-anything it could not walk. A method must decline anything it is not certain
-of: the single-threaded path is always correct, so declining costs speed and
-guessing costs a wrong decode.
+anything it could not walk. Zstandard declines a single-frame stream, and one
+where any frame omits `Frame_Content_Size` — a job needs somewhere to put its
+output before the frames ahead of it have finished, so it has to know how big
+that is first.
+
+A method must decline anything it is not certain of: the single-threaded path
+is always correct, so declining costs speed and guessing costs a wrong decode.
+Nothing is decoded until every frame has been examined, so a stream that
+declines cannot leave bytes in the caller's buffer for the fallback to write
+over.
+
+A declared size is not a trusted one. It bounds an allocation that the caller's
+own limits are checked against first, and the decode that follows enforces
+everything it normally would: a frame that lies about its size fails exactly as
+it does single-threaded.
 
 ### What a parallel decoder must not change
 
