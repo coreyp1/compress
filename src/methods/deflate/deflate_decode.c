@@ -829,6 +829,42 @@ static gcomp_status_t deflate_copy_stored(gcomp_deflate_decoder_state_t * st,
  *   already written -- so it is a memcpy and not a memmove, and it is defined
  *   behaviour rather than a libc that happens to copy forward.
  */
+/**
+ * @brief Copy eight bytes, whatever their alignment.
+ *
+ * memcpy of a constant eight is the portable spelling of one unaligned load
+ * and one unaligned store; every compiler this library is built with turns it
+ * into exactly that, with no call.  Written out rather than left to a
+ * `memcpy(dst, src, run)` with a runtime length, because that one really is a
+ * call -- and at a mean match length of about nine bytes the call costs more
+ * than the copying does.
+ */
+static inline void deflate_copy8(uint8_t * dst, const uint8_t * src) {
+  uint64_t word;
+  memcpy(&word, src, sizeof(word));
+  memcpy(dst, &word, sizeof(word));
+}
+
+/**
+ * @brief Copy @p run bytes from @p src to @p dst eight at a time.
+ *
+ * Writes up to seven bytes past @p run, so every caller must have checked
+ * that there is that much room to spare.  Overrunning deliberately is what
+ * makes it branchless: a match of nine bytes is two stores rather than a loop
+ * that has to ask, twice, how much is left.
+ *
+ * Requires the two ranges to be at least eight bytes apart when they overlap,
+ * which for a match means a distance of eight or more.
+ */
+static inline void deflate_copy_run8(
+    uint8_t * dst, const uint8_t * src, size_t run) {
+  size_t i = 0;
+  do {
+    deflate_copy8(dst + i, src + i);
+    i += 8u;
+  } while (i < run);
+}
+
 static gcomp_status_t deflate_copy_match(
     gcomp_deflate_decoder_state_t * st, gcomp_buffer_t * output) {
   if (!st || !output) {
@@ -911,7 +947,16 @@ static gcomp_status_t deflate_copy_match(
       if (lim != GCOMP_OK) {
         return lim;
       }
-      memcpy(out + output->used, win + src_pos, run);
+      // Both ends need seven bytes of slack for the wide copy: the output so
+      // that the overrun stays inside the caller's buffer, and the window so
+      // that the last load does not read past the allocation.  Neither is
+      // usually short, and the ordinary memcpy is there for when one is.
+      if (out_room - run >= 8u && window_size - src_pos - run >= 8u) {
+        deflate_copy_run8(out + output->used, win + src_pos, run);
+      }
+      else {
+        memcpy(out + output->used, win + src_pos, run);
+      }
     }
     else {
       uint8_t * const dst = out + output->used;
@@ -920,13 +965,23 @@ static gcomp_status_t deflate_copy_match(
       if (lim != GCOMP_OK) {
         return lim;
       }
-      if (distance == 1u) {
+      if (distance >= 8u && out_room - run >= 8u) {
+        // The ordinary case, and the reason the history moved into the output
+        // buffer at all.  Source and destination are eight or more bytes
+        // apart in one flat buffer, so the run is a handful of 64-bit
+        // load/store pairs with no call and nothing to decide per byte.
+        deflate_copy_run8(dst, src, run);
+      }
+      else if (distance == 1u) {
         memset(dst, src[0], run);
       }
       else if (run <= distance) {
         memcpy(dst, src, run);
       }
       else {
+        // A pattern shorter than the match.  Lay down one period and then
+        // double what is there, so each copy is non-overlapping by
+        // construction: it never copies more than it has already written.
         memcpy(dst, src, distance);
         size_t copied = distance;
         while (copied < run) {

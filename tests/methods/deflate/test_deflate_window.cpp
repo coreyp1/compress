@@ -33,6 +33,7 @@
  */
 
 #include "test_helpers.h"
+#include <cstdlib>
 #include <cstring>
 #include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/deflate.h>
@@ -550,6 +551,81 @@ TEST_F(DeflateWindowTest, APresetDictionaryIsHistoryTheOutputNeverHeld) {
     ASSERT_EQ(produced, raw.size()) << "chunk " << chunk;
     ASSERT_EQ(std::memcmp(sink.data(), raw.data(), raw.size()), 0)
         << "chunk " << chunk;
+  }
+}
+
+/**
+ * Decode into a buffer with not one byte to spare.
+ *
+ * The match copy moves eight bytes at a time and lets the last of those
+ * overrun the end of the run, which is what makes it branchless -- so it is
+ * allowed only where there are eight bytes of slack to overrun into, and
+ * falls back to a plain memcpy where there are not.  Every other test here
+ * hands over a buffer with room after it, which means an overrun would land
+ * on the test's own spare bytes and nothing would notice.
+ *
+ * This one allocates exactly what the decode produces, so the byte after the
+ * last one belongs to the allocator.  Under AddressSanitizer or Valgrind
+ * that is a redzone and a single byte over is a reported error; in an
+ * ordinary build it is at least a buffer the decoder has no business
+ * touching.  The chunk sizes matter for the same reason: each one makes the
+ * final buffer of the decode end at a different point inside a match.
+ */
+TEST_F(DeflateWindowTest, DecodeIntoExactlyEnoughRoom) {
+  for (const auto & [name, raw] : Corpora()) {
+    for (const char * method : kMethods) {
+      std::vector<uint8_t> enc = Encode(method, raw, 6);
+      for (size_t chunk : {1u, 3u, 9u, 64u, 4096u, 40000u, 1000000u}) {
+        if (chunk < 64 && raw.size() > 40000u) {
+          continue;
+        }
+        // Not a vector: an exact-sized allocation of our own, so that the
+        // byte after the buffer is the allocator's and not slack a vector
+        // happened to round up to.
+        uint8_t * sink = (uint8_t *)malloc(raw.size());
+        ASSERT_NE(sink, nullptr);
+        gcomp_decoder_t * dec = nullptr;
+        ASSERT_EQ(gcomp_decoder_create(registry_, method, nullptr, &dec),
+            GCOMP_OK);
+
+        size_t produced = 0;
+        gcomp_buffer_t input = {enc.data(), enc.size(), 0};
+        for (;;) {
+          size_t before_in = input.used, before_out = produced;
+          size_t want = std::min(chunk, raw.size() - produced);
+          gcomp_buffer_t output = {sink + produced, want, 0};
+          ASSERT_EQ(gcomp_decoder_update(dec, &input, &output), GCOMP_OK)
+              << name << " " << method << " chunk " << chunk << ": "
+              << gcomp_decoder_get_error_detail(dec);
+          produced += output.used;
+          if (produced >= raw.size()) {
+            break;
+          }
+          if (input.used == before_in && produced == before_out) {
+            break;
+          }
+        }
+        for (;;) {
+          size_t want = std::min(chunk, raw.size() - produced);
+          gcomp_buffer_t output = {sink + produced, want, 0};
+          gcomp_status_t s = gcomp_decoder_finish(dec, &output);
+          produced += output.used;
+          if (s == GCOMP_OK) {
+            break;
+          }
+          ASSERT_EQ(s, GCOMP_ERR_LIMIT)
+              << name << " " << method << " chunk " << chunk << ": "
+              << gcomp_decoder_get_error_detail(dec);
+          ASSERT_GT(output.used, 0u) << name << " " << method;
+        }
+        EXPECT_EQ(produced, raw.size()) << name << " " << method
+                                        << " chunk " << chunk;
+        EXPECT_EQ(std::memcmp(sink, raw.data(), raw.size()), 0)
+            << name << " " << method << " chunk " << chunk;
+        gcomp_decoder_destroy(dec);
+        free(sink);
+      }
+    }
   }
 }
 
