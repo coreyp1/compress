@@ -150,7 +150,8 @@ TEST(DeflateHuffmanDecodeTable, BuildFromRfcExample) {
   gcomp_deflate_huffman_decode_table_t table;
 
   ASSERT_EQ(
-      gcomp_deflate_huffman_build_decode_table(nullptr, lengths, 8u, 15u, &table),
+      gcomp_deflate_huffman_build_decode_table(nullptr, lengths, 8u, 15u,
+          GCOMP_DEFLATE_ALPHABET_CODELEN, &table),
       GCOMP_OK);
 
   // The table is indexed by the bits as they arrive, which is the code
@@ -171,8 +172,8 @@ TEST(DeflateHuffmanDecodeTable, BuildFromRfcExample) {
   struct {
     unsigned index;
     unsigned stride;
-    uint16_t symbol;
-    uint8_t nbits;
+    uint32_t symbol;
+    uint32_t nbits;
   } const expected[] = {
       {0u, 4u, 5u, 2u},
       {1u, 8u, 2u, 3u},
@@ -189,9 +190,9 @@ TEST(DeflateHuffmanDecodeTable, BuildFromRfcExample) {
     // replicated across the table and decoding relies on all of them.
     for (unsigned i = e.index; i < GCOMP_DEFLATE_HUFFMAN_FAST_SIZE;
          i += e.stride) {
-      EXPECT_EQ(table.fast_table[i].symbol, e.symbol)
+      EXPECT_EQ(gcomp_deflate_entry_value(table.fast_table[i]), e.symbol)
           << "fast_table[" << i << "]";
-      EXPECT_EQ(table.fast_table[i].nbits, e.nbits)
+      EXPECT_EQ(gcomp_deflate_entry_nbits(table.fast_table[i]), e.nbits)
           << "fast_table[" << i << "]";
     }
   }
@@ -208,19 +209,182 @@ TEST(DeflateHuffmanDecodeTable, LongCodesUseLongTable) {
   gcomp_deflate_huffman_decode_table_t table;
 
   ASSERT_EQ(
-      gcomp_deflate_huffman_build_decode_table(nullptr, lengths, 1u, 15u, &table),
+      gcomp_deflate_huffman_build_decode_table(nullptr, lengths, 1u, 15u,
+          GCOMP_DEFLATE_ALPHABET_CODELEN, &table),
       GCOMP_OK);
 
-  // Code 0, length 10. High 9 bits = 0, extra = 1. So fast_table[0].nbits = 0,
-  // long_base[0] = 0, long_extra_bits[0] = 1. long_table has 2 entries.
-  EXPECT_EQ(table.fast_table[0].nbits, 0u);
-  EXPECT_EQ(table.long_extra_bits[0], 1u);
+  // Code 0, length 10. The first 9 bits give index 0, so fast_table[0] is a
+  // sub-table pointer: nbits 0, one bit of index, based at 0.  The sub-table
+  // has two entries and both hold the symbol.
+  EXPECT_EQ(gcomp_deflate_entry_nbits(table.fast_table[0]), 0u);
+  EXPECT_EQ(gcomp_deflate_entry_extra(table.fast_table[0]), 1u);
+  EXPECT_EQ(gcomp_deflate_entry_value(table.fast_table[0]), 0u);
   EXPECT_EQ(table.long_table_count, 2u);
   EXPECT_NE(table.long_table, nullptr);
-  EXPECT_EQ(table.long_table[0].symbol, 0u);
-  EXPECT_EQ(table.long_table[0].nbits, 10u);
+  EXPECT_EQ(gcomp_deflate_entry_value(table.long_table[0]), 0u);
+  EXPECT_EQ(gcomp_deflate_entry_nbits(table.long_table[0]), 10u);
 
   gcomp_deflate_huffman_decode_table_cleanup(&table);
+}
+
+/**
+ * @brief The entry for one symbol of an alphabet.
+ *
+ * Two symbols of length one make a complete code, and equal lengths are
+ * assigned in symbol order (RFC 1951 3.2.2), so the lower of the two gets
+ * code 0 and fills the even slots while the higher gets code 1 and the odd
+ * ones.  That puts any one symbol's entry somewhere findable without
+ * depending on the rest of the alphabet.
+ */
+static gcomp_deflate_huffman_entry_t EntryFor(
+    gcomp_deflate_alphabet_t alphabet, size_t num_symbols, unsigned sym) {
+  std::vector<uint8_t> lengths(num_symbols, 0u);
+  const unsigned other = (sym == 0u) ? 1u : 0u;
+  lengths[sym] = 1u;
+  lengths[other] = 1u;
+
+  gcomp_deflate_huffman_decode_table_t table;
+  EXPECT_EQ(gcomp_deflate_huffman_build_decode_table(nullptr, lengths.data(),
+                num_symbols, 15u, alphabet, &table),
+      GCOMP_OK);
+  const unsigned slot = (sym < other) ? 0u : 1u;
+  const gcomp_deflate_huffman_entry_t e = table.fast_table[slot];
+  gcomp_deflate_huffman_decode_table_cleanup(&table);
+  return e;
+}
+
+/**
+ * An entry says what the symbol means, not which symbol it was.
+ *
+ * The decoder has no use for a symbol number: what it needs is a byte to
+ * emit, or a base and an extra-bit count, or the fact that the block has
+ * ended.  Working that out belongs to the table build, which happens once per
+ * block, and not to the decode, which happens hundreds of thousands of times.
+ * These tests pin the translation, because a decoder that reads the entry and
+ * acts on it has no second copy of RFC 1951 section 3.2.5 to check it against.
+ */
+TEST(DeflateHuffmanEntry, LiteralLengthAlphabet) {
+  const size_t n = 288u;
+  for (unsigned sym : {0u, 1u, 128u, 255u}) {
+    const gcomp_deflate_huffman_entry_t e =
+        EntryFor(GCOMP_DEFLATE_ALPHABET_LITLEN, n, sym);
+    EXPECT_EQ(gcomp_deflate_entry_op(e), GCOMP_DEFLATE_OP_LITERAL) << sym;
+    EXPECT_EQ(gcomp_deflate_entry_value(e), sym) << sym;
+    EXPECT_EQ(gcomp_deflate_entry_extra(e), 0u) << sym;
+  }
+
+  const gcomp_deflate_huffman_entry_t eob =
+      EntryFor(GCOMP_DEFLATE_ALPHABET_LITLEN, n, 256u);
+  EXPECT_EQ(gcomp_deflate_entry_op(eob), GCOMP_DEFLATE_OP_END);
+
+  // RFC 1951 section 3.2.5's length table: both ends and a few in between.
+  struct {
+    unsigned sym;
+    uint32_t base;
+    uint32_t extra;
+  } const lengths[] = {
+      {257u, 3u, 0u},
+      {264u, 10u, 0u},
+      {265u, 11u, 1u},
+      {269u, 19u, 2u},
+      {280u, 115u, 4u},
+      {284u, 227u, 5u},
+      {285u, 258u, 0u}, // The one length at the top with no extra bits.
+  };
+  for (const auto & l : lengths) {
+    const gcomp_deflate_huffman_entry_t e =
+        EntryFor(GCOMP_DEFLATE_ALPHABET_LITLEN, n, l.sym);
+    EXPECT_EQ(gcomp_deflate_entry_op(e), GCOMP_DEFLATE_OP_MATCH) << l.sym;
+    EXPECT_EQ(gcomp_deflate_entry_value(e), l.base) << l.sym;
+    EXPECT_EQ(gcomp_deflate_entry_extra(e), l.extra) << l.sym;
+  }
+}
+
+TEST(DeflateHuffmanEntry, DistanceAlphabet) {
+  const size_t n = 32u;
+  struct {
+    unsigned sym;
+    uint32_t base;
+    uint32_t extra;
+  } const dists[] = {
+      {0u, 1u, 0u},
+      {3u, 4u, 0u},
+      {4u, 5u, 1u},
+      {15u, 193u, 6u},
+      {28u, 16385u, 13u},
+      {29u, 24577u, 13u},
+  };
+  for (const auto & d : dists) {
+    const gcomp_deflate_huffman_entry_t e =
+        EntryFor(GCOMP_DEFLATE_ALPHABET_DISTANCE, n, d.sym);
+    EXPECT_EQ(gcomp_deflate_entry_op(e), GCOMP_DEFLATE_OP_MATCH) << d.sym;
+    EXPECT_EQ(gcomp_deflate_entry_value(e), d.base) << d.sym;
+    EXPECT_EQ(gcomp_deflate_entry_extra(e), d.extra) << d.sym;
+  }
+}
+
+/**
+ * The symbols the format reserves are marked, not left out.
+ *
+ * A stream may give them a code -- HLIT reaches 286, HDIST reaches 32, and
+ * the fixed alphabets define all four -- so a decoder can arrive at one and
+ * must refuse.  Marking them in the table is what makes that one test in the
+ * decoder rather than a comparison against a number from the specification,
+ * written out once in each of the two decode paths and forgettable in either.
+ *
+ * They keep their code length, which is not a detail.  A decoder holding
+ * fewer bits than the code is long must be able to say "not yet" rather than
+ * "corrupt": a short buffer's zero padding can land on any slot, and a
+ * reserved entry that looked like an empty one would turn a good stream into
+ * a refused one.
+ */
+TEST(DeflateHuffmanEntry, ReservedSymbolsAreMarkedAndKeepTheirLength) {
+  for (unsigned sym : {286u, 287u}) {
+    const gcomp_deflate_huffman_entry_t e =
+        EntryFor(GCOMP_DEFLATE_ALPHABET_LITLEN, 288u, sym);
+    EXPECT_EQ(gcomp_deflate_entry_op(e), GCOMP_DEFLATE_OP_BAD) << sym;
+    EXPECT_EQ(gcomp_deflate_entry_nbits(e), 1u) << sym;
+  }
+  for (unsigned sym : {30u, 31u}) {
+    const gcomp_deflate_huffman_entry_t e =
+        EntryFor(GCOMP_DEFLATE_ALPHABET_DISTANCE, 32u, sym);
+    EXPECT_EQ(gcomp_deflate_entry_op(e), GCOMP_DEFLATE_OP_BAD) << sym;
+    EXPECT_EQ(gcomp_deflate_entry_nbits(e), 1u) << sym;
+  }
+}
+
+TEST(DeflateHuffmanEntry, CodeLengthAlphabetCarriesTheSymbol) {
+  for (unsigned sym = 0u; sym < 19u; sym++) {
+    const gcomp_deflate_huffman_entry_t e =
+        EntryFor(GCOMP_DEFLATE_ALPHABET_CODELEN, 19u, sym);
+    EXPECT_EQ(gcomp_deflate_entry_op(e), GCOMP_DEFLATE_OP_LITERAL) << sym;
+    EXPECT_EQ(gcomp_deflate_entry_value(e), sym) << sym;
+  }
+}
+
+TEST(DeflateHuffmanEntry, PackAndUnpackRoundTrip) {
+  for (uint32_t op = 0u; op < 4u; op++) {
+    for (uint32_t nbits = 0u; nbits <= 15u; nbits++) {
+      for (uint32_t extra = 0u; extra <= 15u; extra++) {
+        for (uint32_t value : {0u, 1u, 258u, 24577u, 65535u}) {
+          const gcomp_deflate_huffman_entry_t e =
+              gcomp_deflate_entry_make(op, value, extra, nbits);
+          EXPECT_EQ(gcomp_deflate_entry_op(e), op);
+          EXPECT_EQ(gcomp_deflate_entry_nbits(e), nbits);
+          EXPECT_EQ(gcomp_deflate_entry_extra(e), extra);
+          EXPECT_EQ(gcomp_deflate_entry_value(e), value);
+        }
+      }
+    }
+  }
+}
+
+TEST(DeflateHuffmanDecodeTable, UnknownAlphabetRefused) {
+  const uint8_t lengths[] = {1};
+  gcomp_deflate_huffman_decode_table_t table;
+  EXPECT_EQ(gcomp_deflate_huffman_build_decode_table(nullptr, lengths, 1u, 15u,
+                (gcomp_deflate_alphabet_t)7, &table),
+      GCOMP_ERR_INVALID_ARG);
 }
 
 TEST(DeflateHuffmanDecodeTable, NullPointers) {
@@ -228,10 +392,12 @@ TEST(DeflateHuffmanDecodeTable, NullPointers) {
   gcomp_deflate_huffman_decode_table_t table;
 
   EXPECT_EQ(
-      gcomp_deflate_huffman_build_decode_table(nullptr, nullptr, 1u, 15u, &table),
+      gcomp_deflate_huffman_build_decode_table(nullptr, nullptr, 1u, 15u,
+          GCOMP_DEFLATE_ALPHABET_CODELEN, &table),
       GCOMP_ERR_INVALID_ARG);
   EXPECT_EQ(
-      gcomp_deflate_huffman_build_decode_table(nullptr, lengths, 1u, 15u, nullptr),
+      gcomp_deflate_huffman_build_decode_table(nullptr, lengths, 1u, 15u,
+          GCOMP_DEFLATE_ALPHABET_CODELEN, nullptr),
       GCOMP_ERR_INVALID_ARG);
 }
 
@@ -244,7 +410,8 @@ TEST(DeflateHuffmanDecodeTable, CleanupIdempotent) {
   gcomp_deflate_huffman_decode_table_t table;
 
   ASSERT_EQ(
-      gcomp_deflate_huffman_build_decode_table(nullptr, lengths, 1u, 15u, &table),
+      gcomp_deflate_huffman_build_decode_table(nullptr, lengths, 1u, 15u,
+          GCOMP_DEFLATE_ALPHABET_CODELEN, &table),
       GCOMP_OK);
   gcomp_deflate_huffman_decode_table_cleanup(&table);
   gcomp_deflate_huffman_decode_table_cleanup(&table);
@@ -257,7 +424,8 @@ TEST(DeflateHuffmanDecodeTable, TooManySymbols) {
 
   // 289 symbols exceeds internal limit (288).
   EXPECT_EQ(
-      gcomp_deflate_huffman_build_decode_table(nullptr, lengths, 289u, 15u, &table),
+      gcomp_deflate_huffman_build_decode_table(nullptr, lengths, 289u, 15u,
+          GCOMP_DEFLATE_ALPHABET_CODELEN, &table),
       GCOMP_ERR_INVALID_ARG);
 }
 

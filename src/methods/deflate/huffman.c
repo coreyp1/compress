@@ -295,6 +295,69 @@ gcomp_status_t gcomp_deflate_huffman_build_codes(const uint8_t * lengths,
 //
 
 /**
+ * @brief What a literal/length or distance symbol means (RFC 1951 3.2.5).
+ *
+ * The decoder's copies. The encoder has its own in deflate_encode.c, which is
+ * not duplication for its own sake: it needs them the other way round, as a
+ * map from a length or distance to the symbol that codes it, and it looks
+ * things up in them per match rather than per table build.
+ */
+static const uint16_t k_length_base[29] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15,
+    17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227,
+    258};
+static const uint8_t k_length_extra[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1,
+    2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+static const uint16_t k_distance_base[30] = {1, 2, 3, 4, 5, 7, 9, 13, 17, 25,
+    33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097,
+    6145, 8193, 12289, 16385, 24577};
+static const uint8_t k_distance_extra[30] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4,
+    5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+
+/**
+ * @brief Turn a symbol number into the entry that says what it means.
+ *
+ * Called once per used symbol per table build -- a few hundred times per
+ * block -- in place of the two array lookups the decoder used to do per
+ * symbol decoded, of which there are hundreds of thousands.
+ *
+ * The reserved symbols get an entry of their own rather than being left out.
+ * A stream is allowed to give them a code (HLIT can reach 286 and HDIST 32,
+ * and the fixed alphabets define all of 286, 287, 30 and 31), so a decoder
+ * can legitimately arrive at one; what it may not do is act on it. Marking
+ * them GCOMP_DEFLATE_OP_BAD is what turns "the format reserves this" from a
+ * comparison the decoder has to remember to make into a fact about the table.
+ */
+static gcomp_deflate_huffman_entry_t gcomp_deflate_entry_for_symbol(
+    gcomp_deflate_alphabet_t alphabet, unsigned sym, unsigned len) {
+  if (alphabet == GCOMP_DEFLATE_ALPHABET_LITLEN) {
+    if (sym < 256u) {
+      return gcomp_deflate_entry_make(GCOMP_DEFLATE_OP_LITERAL, sym, 0u, len);
+    }
+    if (sym == 256u) {
+      return gcomp_deflate_entry_make(GCOMP_DEFLATE_OP_END, 0u, 0u, len);
+    }
+    if (sym <= 285u) {
+      const unsigned i = sym - 257u;
+      return gcomp_deflate_entry_make(
+          GCOMP_DEFLATE_OP_MATCH, k_length_base[i], k_length_extra[i], len);
+    }
+    return gcomp_deflate_entry_make(GCOMP_DEFLATE_OP_BAD, sym, 0u, len);
+  }
+
+  if (alphabet == GCOMP_DEFLATE_ALPHABET_DISTANCE) {
+    if (sym < 30u) {
+      return gcomp_deflate_entry_make(GCOMP_DEFLATE_OP_MATCH,
+          k_distance_base[sym], k_distance_extra[sym], len);
+    }
+    return gcomp_deflate_entry_make(GCOMP_DEFLATE_OP_BAD, sym, 0u, len);
+  }
+
+  // The code length alphabet codes nothing but itself: the decoder reads the
+  // symbol number and acts on it directly (RFC 1951 3.2.7).
+  return gcomp_deflate_entry_make(GCOMP_DEFLATE_OP_LITERAL, sym, 0u, len);
+}
+
+/**
  * @brief Reverse the low @p nbits bits of @p code.
  *
  * Called at most once per symbol per block, where the decoder used to call
@@ -311,12 +374,17 @@ static inline unsigned gcomp_deflate_reverse_code(unsigned code,
 
 gcomp_status_t gcomp_deflate_huffman_build_decode_table(
     const gcomp_allocator_t * allocator, const uint8_t * lengths,
-    size_t num_symbols, unsigned max_bits,
+    size_t num_symbols, unsigned max_bits, gcomp_deflate_alphabet_t alphabet,
     gcomp_deflate_huffman_decode_table_t * table) {
   uint16_t codes[288]; // DEFLATE literal/length max 286 + slack
   uint8_t code_lens[288];
+  // The width and base offset of each prefix's sub-table, while they are
+  // being worked out.  They end up inside the fast entry that points at the
+  // sub-table, so they are scratch here rather than fields of the table.
+  uint8_t sub_width[GCOMP_DEFLATE_HUFFMAN_FAST_SIZE];
+  uint16_t sub_base[GCOMP_DEFLATE_HUFFMAN_FAST_SIZE];
   size_t i;
-  uint16_t long_offset;
+  uint32_t long_offset;
   const gcomp_allocator_t * alloc;
 
   if (!lengths || !table) {
@@ -331,14 +399,20 @@ gcomp_status_t gcomp_deflate_huffman_build_decode_table(
     return GCOMP_ERR_INVALID_ARG;
   }
 
+  if (alphabet != GCOMP_DEFLATE_ALPHABET_CODELEN &&
+      alphabet != GCOMP_DEFLATE_ALPHABET_LITLEN &&
+      alphabet != GCOMP_DEFLATE_ALPHABET_DISTANCE) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
   // Use provided allocator or default
   alloc = gcomp_alloc_or_default(allocator);
 
   table->long_table = NULL;
   table->long_table_count = 0;
   table->allocator = alloc;
-  memset(table->long_base, 0, sizeof(table->long_base));
-  memset(table->long_extra_bits, 0, sizeof(table->long_extra_bits));
+  memset(sub_width, 0, sizeof(sub_width));
+  memset(sub_base, 0, sizeof(sub_base));
 
   {
     gcomp_status_t st = gcomp_deflate_huffman_build_codes(
@@ -348,10 +422,11 @@ gcomp_status_t gcomp_deflate_huffman_build_decode_table(
     }
   }
 
-  // Initialize fast table: nbits=0 means "use long table" or no code.
+  // An all-zero entry is nbits 0 with extra 0: no code begins with these
+  // bits.  Every slot starts that way and the passes below overwrite the ones
+  // that do.
   for (i = 0; i < GCOMP_DEFLATE_HUFFMAN_FAST_SIZE; i++) {
-    table->fast_table[i].symbol = 0;
-    table->fast_table[i].nbits = 0;
+    table->fast_table[i] = 0u;
   }
 
   long_offset = 0;
@@ -376,9 +451,10 @@ gcomp_status_t gcomp_deflate_huffman_build_decode_table(
       if (start >= GCOMP_DEFLATE_HUFFMAN_FAST_SIZE) {
         return GCOMP_ERR_CORRUPT;
       }
+      const gcomp_deflate_huffman_entry_t entry =
+          gcomp_deflate_entry_for_symbol(alphabet, (unsigned)i, len);
       for (j = start; j < GCOMP_DEFLATE_HUFFMAN_FAST_SIZE; j += stride) {
-        table->fast_table[j].symbol = (uint16_t)i;
-        table->fast_table[j].nbits = (uint8_t)len;
+        table->fast_table[j] = entry;
       }
     }
     else {
@@ -395,24 +471,35 @@ gcomp_status_t gcomp_deflate_huffman_build_decode_table(
           code >> extra, GCOMP_DEFLATE_HUFFMAN_FAST_BITS);
 
       // Update to maximum extra bits for this prefix
-      if (table->long_extra_bits[high] < extra) {
-        table->long_extra_bits[high] = (uint8_t)extra;
+      if (sub_width[high] < extra) {
+        sub_width[high] = (uint8_t)extra;
       }
     }
   }
 
-  // Calculate long_offset based on maximum extra bits for each prefix
+  // Lay the sub-tables out end to end, and put each one's width and base
+  // into the fast entry that sends the decoder there.  nbits stays 0, which
+  // is what tells it apart from a finished entry.
+  //
+  // The largest this can reach is 512 prefixes of 64 entries each, so the
+  // base fits the 16 bits the entry gives it with room to spare; the check
+  // says so rather than assuming it.
   for (i = 0; i < GCOMP_DEFLATE_HUFFMAN_FAST_SIZE; i++) {
-    if (table->long_extra_bits[i] > 0) {
-      table->long_base[i] = (uint16_t)long_offset;
-      long_offset += (1u << table->long_extra_bits[i]);
+    if (sub_width[i] > 0) {
+      if (long_offset > 0xFFFFu) {
+        return GCOMP_ERR_CORRUPT;
+      }
+      sub_base[i] = (uint16_t)long_offset;
+      table->fast_table[i] = gcomp_deflate_entry_make(
+          GCOMP_DEFLATE_OP_LITERAL, long_offset, sub_width[i], 0u);
+      long_offset += (1u << sub_width[i]);
     }
   }
 
   // Allocate long_table and fill it in second pass.
   if (long_offset > 0) {
-    table->long_table = (gcomp_deflate_huffman_fast_entry_t *)gcomp_calloc(
-        alloc, (size_t)long_offset, sizeof(gcomp_deflate_huffman_fast_entry_t));
+    table->long_table = (gcomp_deflate_huffman_entry_t *)gcomp_calloc(
+        alloc, (size_t)long_offset, sizeof(gcomp_deflate_huffman_entry_t));
     if (!table->long_table) {
       return GCOMP_ERR_MEMORY;
     }
@@ -432,7 +519,9 @@ gcomp_status_t gcomp_deflate_huffman_build_decode_table(
       unsigned extra = len - GCOMP_DEFLATE_HUFFMAN_FAST_BITS;
       unsigned high = gcomp_deflate_reverse_code(
           code >> extra, GCOMP_DEFLATE_HUFFMAN_FAST_BITS);
-      unsigned max_extra = table->long_extra_bits[high];
+      unsigned max_extra = sub_width[high];
+      const gcomp_deflate_huffman_entry_t entry =
+          gcomp_deflate_entry_for_symbol(alphabet, (unsigned)i, len);
       // The code's remaining bits arrive after the prefix, reversed, so they
       // sit in the LOW `extra` bits of the sub-table index.
       unsigned low_bits =
@@ -451,16 +540,14 @@ gcomp_status_t gcomp_deflate_huffman_build_decode_table(
         unsigned step = 1u << diff;
         for (unsigned j = 0; j < step; j++) {
           unsigned low = low_bits | (j << extra);
-          size_t idx = (size_t)table->long_base[high] + (size_t)low;
-          table->long_table[idx].symbol = (uint16_t)i;
-          table->long_table[idx].nbits = (uint8_t)len;
+          size_t idx = (size_t)sub_base[high] + (size_t)low;
+          table->long_table[idx] = entry;
         }
       }
       else {
         // Code uses maximum extra bits, single entry
-        size_t idx = (size_t)table->long_base[high] + (size_t)low_bits;
-        table->long_table[idx].symbol = (uint16_t)i;
-        table->long_table[idx].nbits = (uint8_t)len;
+        size_t idx = (size_t)sub_base[high] + (size_t)low_bits;
+        table->long_table[idx] = entry;
       }
     }
   }

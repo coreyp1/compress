@@ -270,16 +270,23 @@ typedef struct gcomp_deflate_decoder_state_s {
   //
   int pending_length_valid;      // Non-zero if we have a pending length
   uint32_t pending_length_value; // The decoded length (3..258)
-  int pending_dist_valid;    // Non-zero if we have a pending distance symbol
-  uint16_t pending_dist_sym; // The decoded distance symbol (0..29)
+  int pending_dist_valid; // Non-zero if we have a pending distance
+  /**
+   * The distance's decode-table entry: its base and its extra-bit count.
+   *
+   * The entry and not the symbol number, because the symbol number is not
+   * what the decoder needs and the table has already looked up what it is.
+   */
+  gcomp_deflate_huffman_entry_t pending_dist_entry;
 
   //
   // Pending length extra bits state
   // When we've decoded a length symbol (257-285) but couldn't read the extra
   // bits, we save the symbol index here to resume on the next update() call.
   //
-  int pending_length_sym_valid; // Non-zero if we have a pending length symbol
-  uint8_t pending_length_sym;   // The length symbol index (0..28)
+  int pending_length_sym_valid; // Non-zero if we have a pending length
+  /** The length's decode-table entry, waiting on its extra bits. */
+  gcomp_deflate_huffman_entry_t pending_length_entry;
 
   //
   // Dynamic Huffman build scratch
@@ -330,7 +337,7 @@ static size_t huffman_table_dynamic_memory(
   if (!table || !table->long_table) {
     return 0;
   }
-  return table->long_table_count * sizeof(gcomp_deflate_huffman_fast_entry_t);
+  return table->long_table_count * sizeof(gcomp_deflate_huffman_entry_t);
 }
 
 /**
@@ -1040,12 +1047,11 @@ static gcomp_status_t deflate_copy_match(
  *
  * 1. **Peek FAST_BITS** (9) bits from the bit buffer (LSB-first).
  * 2. **Reverse** the bits to convert from stream order to canonical code order.
- * 3. **Fast table lookup**: If fast_table[idx].nbits > 0, we found a short
- * code; emit the symbol and consume nbits bits. Done.
- * 4. **Long code path**: If nbits == 0, read long_extra_bits[idx] more bits,
- *    reverse all (FAST_BITS + extra) bits to get the full canonical code,
- *    extract the low bits, and look up in long_table[long_base[idx] + low].
- *    Emit the symbol and consume long_table entry's nbits bits.
+ * 3. **Fast table lookup**: if the entry's nbits is non-zero it is the
+ *    answer; consume nbits bits. Done.
+ * 4. **Long code path**: if nbits is zero the entry points at a sub-table --
+ *    `extra` is its index width and `value` its base -- so read that many
+ *    more bits, index long_table with them, and consume that entry's nbits.
  *
  * **Bit reversal rationale**: DEFLATE writes codes LSB-first, but canonical
  * Huffman codes are defined MSB-first. The fast table is indexed by the
@@ -1059,16 +1065,18 @@ static gcomp_status_t deflate_copy_match(
  * @param st          Decoder state (contains bit buffer).
  * @param input       Input buffer to refill bits from.
  * @param table       Huffman decode table (from huffman.c).
- * @param sym_out     Output: decoded symbol (valid only if *decoded_out == 1).
- * @param decoded_out Output: 1 if symbol was decoded, 0 if more input needed.
+ * @param entry_out   Output: the decoded entry (valid only if
+ *                    *decoded_out == 1). What it means depends on its op,
+ *                    not on any symbol number.
+ * @param decoded_out Output: 1 if a code was decoded, 0 if more input needed.
  * @return GCOMP_OK on success or need-more-input, GCOMP_ERR_CORRUPT if the
  *         bit pattern doesn't match any valid code.
  */
 static DEFLATE_ALWAYS_INLINE gcomp_status_t deflate_huff_decode_symbol(
     gcomp_deflate_decoder_state_t * st, gcomp_buffer_t * input,
-    const gcomp_deflate_huffman_decode_table_t * table, uint16_t * sym_out,
-    int * decoded_out) {
-  if (!st || !input || !table || !sym_out || !decoded_out) {
+    const gcomp_deflate_huffman_decode_table_t * table,
+    gcomp_deflate_huffman_entry_t * entry_out, int * decoded_out) {
+  if (!st || !input || !table || !entry_out || !decoded_out) {
     return GCOMP_ERR_INVALID_ARG;
   }
 
@@ -1094,21 +1102,23 @@ static DEFLATE_ALWAYS_INLINE gcomp_status_t deflate_huff_decode_symbol(
   uint32_t idx =
       (uint32_t)(st->bit_buffer & (GCOMP_DEFLATE_HUFFMAN_FAST_SIZE - 1u));
 
-  gcomp_deflate_huffman_fast_entry_t fe = table->fast_table[idx];
+  gcomp_deflate_huffman_entry_t fe = table->fast_table[idx];
+  uint32_t fe_nbits = gcomp_deflate_entry_nbits(fe);
 
-  if (fe.nbits > 0) {
+  if (fe_nbits > 0u) {
     // Check if we have enough bits to actually read this code.
-    if (st->bit_count < fe.nbits) {
+    if (st->bit_count < fe_nbits) {
       return GCOMP_OK; // Need more input
     }
-    st->bit_buffer >>= fe.nbits;
-    st->bit_count -= fe.nbits;
-    *sym_out = fe.symbol;
+    st->bit_buffer >>= fe_nbits;
+    st->bit_count -= fe_nbits;
+    *entry_out = fe;
     *decoded_out = 1;
     return GCOMP_OK;
   }
 
-  uint32_t extra = table->long_extra_bits[idx];
+  // nbits 0: either a sub-table to go to, or no code at all.
+  uint32_t extra = gcomp_deflate_entry_extra(fe);
   if (extra == 0u || !table->long_table) {
     return GCOMP_ERR_CORRUPT;
   }
@@ -1143,27 +1153,29 @@ static DEFLATE_ALWAYS_INLINE gcomp_status_t deflate_huff_decode_symbol(
 
   // Use safe math for index calculation to prevent overflow
   size_t long_idx;
-  if (!gcu_safe_add_size((size_t)table->long_base[idx], (size_t)low, &long_idx)) {
+  if (!gcu_safe_add_size(
+          (size_t)gcomp_deflate_entry_value(fe), (size_t)low, &long_idx)) {
     return GCOMP_ERR_CORRUPT;
   }
   if (long_idx >= table->long_table_count) {
     return GCOMP_ERR_CORRUPT;
   }
 
-  gcomp_deflate_huffman_fast_entry_t le = table->long_table[long_idx];
-  if (le.nbits == 0u) {
+  gcomp_deflate_huffman_entry_t le = table->long_table[long_idx];
+  uint32_t le_nbits = gcomp_deflate_entry_nbits(le);
+  if (le_nbits == 0u) {
     return GCOMP_ERR_CORRUPT;
   }
 
   // Only now is the code's real length known; consume exactly that much, and
   // only if it is there.
-  if (st->bit_count < le.nbits) {
+  if (st->bit_count < le_nbits) {
     return GCOMP_OK; // Need more input
   }
-  st->bit_buffer >>= le.nbits;
-  st->bit_count -= le.nbits;
+  st->bit_buffer >>= le_nbits;
+  st->bit_count -= le_nbits;
 
-  *sym_out = le.symbol;
+  *entry_out = le;
   *decoded_out = 1;
   return GCOMP_OK;
 }
@@ -1201,13 +1213,15 @@ static gcomp_status_t deflate_build_fixed_tables(
   }
 
   gcomp_status_t a = gcomp_deflate_huffman_build_decode_table(st->allocator,
-      litlen_lengths, DEFLATE_MAX_LITLEN_SYMBOLS, 15u, &st->fixed_litlen);
+      litlen_lengths, DEFLATE_MAX_LITLEN_SYMBOLS, 15u,
+      GCOMP_DEFLATE_ALPHABET_LITLEN, &st->fixed_litlen);
   if (a != GCOMP_OK) {
     return a;
   }
 
   gcomp_status_t b = gcomp_deflate_huffman_build_decode_table(st->allocator,
-      dist_lengths, DEFLATE_MAX_DIST_SYMBOLS, 15u, &st->fixed_dist);
+      dist_lengths, DEFLATE_MAX_DIST_SYMBOLS, 15u,
+      GCOMP_DEFLATE_ALPHABET_DISTANCE, &st->fixed_dist);
   if (b != GCOMP_OK) {
     gcomp_deflate_huffman_decode_table_cleanup(&st->fixed_litlen);
     return b;
@@ -1315,7 +1329,8 @@ static gcomp_status_t deflate_dynamic_read_codelen_lengths(
   }
 
   gcomp_status_t st_build = gcomp_deflate_huffman_build_decode_table(
-      st->allocator, st->dyn_clen_lengths, 19u, 7u, &st->dyn_clen_table);
+      st->allocator, st->dyn_clen_lengths, 19u, 7u,
+      GCOMP_DEFLATE_ALPHABET_CODELEN, &st->dyn_clen_table);
   if (st_build != GCOMP_OK) {
     return st_build == GCOMP_ERR_CORRUPT ? GCOMP_ERR_CORRUPT : st_build;
   }
@@ -1400,10 +1415,12 @@ static gcomp_status_t deflate_dynamic_decode_lengths(
       st->dyn_pending_repeat_valid = 0;
     }
     else {
-      // Decode a new symbol
+      // Decode a new symbol.  The code length alphabet codes nothing but
+      // itself, so the entry's value is the symbol (RFC 1951 3.2.7).
       int decoded = 0;
+      gcomp_deflate_huffman_entry_t e = 0;
       gcomp_status_t ds = deflate_huff_decode_symbol(
-          st, input, &st->dyn_clen_table, &sym, &decoded);
+          st, input, &st->dyn_clen_table, &e, &decoded);
       if (ds != GCOMP_OK) {
         return ds;
       }
@@ -1412,6 +1429,7 @@ static gcomp_status_t deflate_dynamic_decode_lengths(
       if (!decoded) {
         return GCOMP_OK;
       }
+      sym = (uint16_t)gcomp_deflate_entry_value(e);
     }
 
     if (sym <= 15u) {
@@ -1522,7 +1540,8 @@ static gcomp_status_t deflate_dynamic_decode_lengths(
   }
 
   gcomp_status_t a = gcomp_deflate_huffman_build_decode_table(st->allocator,
-      st->dyn_litlen_lengths, DEFLATE_MAX_LITLEN_SYMBOLS, 15u, &st->dyn_litlen);
+      st->dyn_litlen_lengths, DEFLATE_MAX_LITLEN_SYMBOLS, 15u,
+      GCOMP_DEFLATE_ALPHABET_LITLEN, &st->dyn_litlen);
   if (a != GCOMP_OK) {
     return a;
   }
@@ -1530,7 +1549,8 @@ static gcomp_status_t deflate_dynamic_decode_lengths(
   track_huffman_table_alloc(st, &st->dyn_litlen);
 
   gcomp_status_t b = gcomp_deflate_huffman_build_decode_table(st->allocator,
-      st->dyn_dist_lengths, DEFLATE_MAX_DIST_SYMBOLS, 15u, &st->dyn_dist);
+      st->dyn_dist_lengths, DEFLATE_MAX_DIST_SYMBOLS, 15u,
+      GCOMP_DEFLATE_ALPHABET_DISTANCE, &st->dyn_dist);
   if (b != GCOMP_OK) {
     track_huffman_table_free(st, &st->dyn_litlen);
     gcomp_deflate_huffman_decode_table_cleanup(&st->dyn_litlen);
@@ -1562,16 +1582,6 @@ static gcomp_status_t deflate_dynamic_decode_lengths(
 // Length/Distance decoding tables
 //
 
-static const uint16_t k_len_base[29] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17,
-    19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
-static const uint8_t k_len_extra[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2,
-    2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
-
-static const uint16_t k_dist_base[30] = {1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33,
-    49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097,
-    6145, 8193, 12289, 16385, 24577};
-static const uint8_t k_dist_extra[30] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5,
-    5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
 
 //
 // Public hooks (called from deflate_register.c)
@@ -1642,9 +1652,9 @@ gcomp_status_t gcomp_deflate_decoder_init(gcomp_registry_t * registry,
   st->pending_length_valid = 0;
   st->pending_length_value = 0;
   st->pending_dist_valid = 0;
-  st->pending_dist_sym = 0;
+  st->pending_dist_entry = 0;
   st->pending_length_sym_valid = 0;
-  st->pending_length_sym = 0;
+  st->pending_length_entry = 0;
 
   st->window_size = window_size;
   st->window_mask = window_size - 1u;
@@ -1849,9 +1859,9 @@ gcomp_status_t gcomp_deflate_decoder_reset(gcomp_decoder_t * decoder) {
   st->pending_length_valid = 0;
   st->pending_length_value = 0;
   st->pending_dist_valid = 0;
-  st->pending_dist_sym = 0;
+  st->pending_dist_entry = 0;
   st->pending_length_sym_valid = 0;
-  st->pending_length_sym = 0;
+  st->pending_length_entry = 0;
 
   // Clean up dynamic Huffman tables (keep fixed tables - they can be reused)
   if (st->dyn_ready) {
@@ -1978,18 +1988,18 @@ static gcomp_status_t deflate_process_stored_len(
 static gcomp_status_t deflate_decode_distance(
     gcomp_deflate_decoder_state_t * st, gcomp_buffer_t * input,
     gcomp_buffer_t * output, uint32_t length) {
-  uint16_t dist_sym = 0;
+  gcomp_deflate_huffman_entry_t dist_entry = 0;
 
-  // Check if we have a pending distance symbol (we decoded it before but
-  // couldn't read its extra bits)
+  // Check if we have a pending distance (we decoded it before but couldn't
+  // read its extra bits)
   if (st->pending_dist_valid) {
-    dist_sym = st->pending_dist_sym;
+    dist_entry = st->pending_dist_entry;
   }
   else {
-    // Need to decode the distance symbol
+    // Need to decode the distance
     int dist_decoded = 0;
     gcomp_status_t dd = deflate_huff_decode_symbol(
-        st, input, st->cur_dist, &dist_sym, &dist_decoded);
+        st, input, st->cur_dist, &dist_entry, &dist_decoded);
     if (dd != GCOMP_OK) {
       return dd;
     }
@@ -1999,21 +2009,24 @@ static gcomp_status_t deflate_decode_distance(
       st->pending_length_value = length;
       return GCOMP_OK;
     }
-    if (dist_sym >= 30u) {
+    // Distance symbols 30 and 31 exist in the alphabet and mean nothing (RFC
+    // 1951 3.2.5); the table has already marked them, so this is one test
+    // rather than a comparison against a number remembered from the spec.
+    if (gcomp_deflate_entry_op(dist_entry) != GCOMP_DEFLATE_OP_MATCH) {
       return GCOMP_ERR_CORRUPT;
     }
   }
 
-  uint32_t distance = k_dist_base[dist_sym];
-  uint32_t de = k_dist_extra[dist_sym];
+  uint32_t distance = gcomp_deflate_entry_value(dist_entry);
+  uint32_t de = gcomp_deflate_entry_extra(dist_entry);
   if (de > 0) {
     uint32_t extra = 0;
     if (!deflate_try_read_bits(st, input, de, &extra)) {
-      // Save both the length and distance symbol so we can resume
+      // Save both the length and the distance so we can resume
       st->pending_length_valid = 1;
       st->pending_length_value = length;
       st->pending_dist_valid = 1;
-      st->pending_dist_sym = dist_sym;
+      st->pending_dist_entry = dist_entry;
       return GCOMP_OK;
     }
     distance += extra;
@@ -2126,11 +2139,11 @@ static gcomp_status_t deflate_huffman_resume(
     return deflate_decode_distance(st, input, output, st->pending_length_value);
   }
 
-  // Resume pending length symbol decode (waiting for extra bits)
+  // Resume a pending length (waiting for extra bits)
   if (st->pending_length_sym_valid) {
-    uint32_t len_sym = st->pending_length_sym;
-    uint32_t length = k_len_base[len_sym];
-    uint32_t le = k_len_extra[len_sym];
+    const gcomp_deflate_huffman_entry_t e = st->pending_length_entry;
+    uint32_t length = gcomp_deflate_entry_value(e);
+    uint32_t le = gcomp_deflate_entry_extra(e);
     // le must be > 0 since we only save state when extra bits are needed
     uint32_t extra = 0;
     if (!deflate_try_read_bits(st, input, le, &extra)) {
@@ -2155,9 +2168,9 @@ static gcomp_status_t deflate_huffman_symbol(
     gcomp_deflate_decoder_state_t * st, gcomp_buffer_t * input,
     gcomp_buffer_t * output) {
   int decoded = 0;
-  uint16_t sym = 0;
+  gcomp_deflate_huffman_entry_t e = 0;
   gcomp_status_t ds =
-      deflate_huff_decode_symbol(st, input, st->cur_litlen, &sym, &decoded);
+      deflate_huff_decode_symbol(st, input, st->cur_litlen, &e, &decoded);
   if (ds != GCOMP_OK) {
     return ds;
   }
@@ -2167,29 +2180,30 @@ static gcomp_status_t deflate_huffman_symbol(
     return GCOMP_OK;
   }
 
-  if (sym < 256u) {
-    return deflate_emit_byte(st, output, (uint8_t)sym);
-  }
-
-  if (sym == 256u) {
+  // What the code meant was settled when the table was built.
+  switch (gcomp_deflate_entry_op(e)) {
+  case GCOMP_DEFLATE_OP_LITERAL:
+    return deflate_emit_byte(st, output, (uint8_t)gcomp_deflate_entry_value(e));
+  case GCOMP_DEFLATE_OP_END:
     return deflate_end_of_block(st, input);
-  }
-
-  if (sym > 285u) {
+  case GCOMP_DEFLATE_OP_BAD:
+    // 286 and 287: the fixed alphabet gives them codes and RFC 1951 3.2.5
+    // gives them no meaning.
     return GCOMP_ERR_CORRUPT;
+  default:
+    break;
   }
 
-  // Length code 257..285
-  uint32_t len_sym = sym - 257u;
-  uint32_t length = k_len_base[len_sym];
-  uint32_t le = k_len_extra[len_sym];
+  // A length.  Its base and its extra-bit count are both in the entry.
+  uint32_t length = gcomp_deflate_entry_value(e);
+  uint32_t le = gcomp_deflate_entry_extra(e);
   if (le > 0) {
     uint32_t extra = 0;
     if (!deflate_try_read_bits(st, input, le, &extra)) {
       // Can't get length extra bits - need more input.
-      // Save the length symbol so we can resume on the next update() call.
+      // Save the entry so we can resume on the next update() call.
       st->pending_length_sym_valid = 1;
-      st->pending_length_sym = (uint8_t)len_sym;
+      st->pending_length_entry = e;
       return GCOMP_OK;
     }
     length += extra;
@@ -2347,36 +2361,38 @@ static inline void deflate_fast_commit(gcomp_deflate_decoder_state_t * st,
  */
 static DEFLATE_ALWAYS_INLINE int deflate_fast_symbol(
     const gcomp_deflate_huffman_decode_table_t * table, uint64_t * buf,
-    uint32_t * bits, uint32_t * sym_out) {
+    uint32_t * bits, gcomp_deflate_huffman_entry_t * out) {
   uint32_t idx = (uint32_t)(*buf & (GCOMP_DEFLATE_HUFFMAN_FAST_SIZE - 1u));
-  gcomp_deflate_huffman_fast_entry_t fe = table->fast_table[idx];
+  gcomp_deflate_huffman_entry_t e = table->fast_table[idx];
+  uint32_t nbits = gcomp_deflate_entry_nbits(e);
 
-  if (fe.nbits != 0u) {
-    *buf >>= fe.nbits;
-    *bits -= fe.nbits;
-    *sym_out = fe.symbol;
+  if (nbits != 0u) {
+    *buf >>= nbits;
+    *bits -= nbits;
+    *out = e;
     return 1;
   }
 
-  uint32_t extra = table->long_extra_bits[idx];
+  const uint32_t extra = gcomp_deflate_entry_extra(e);
   if (extra == 0u || !table->long_table) {
     return 0;
   }
-  uint32_t low = (uint32_t)((*buf >> GCOMP_DEFLATE_HUFFMAN_FAST_BITS) &
+  const uint32_t low = (uint32_t)((*buf >> GCOMP_DEFLATE_HUFFMAN_FAST_BITS) &
       (((uint64_t)1u << extra) - 1u));
-  // long_base is 16 bits wide and `low` is at most 63, so the sum is a long
-  // way from overflowing a size_t; the bound check is what matters.
-  size_t long_idx = (size_t)table->long_base[idx] + (size_t)low;
+  // The sub-table base is 16 bits wide and `low` is at most 63, so the sum is
+  // a long way from overflowing a size_t; the bound check is what matters.
+  const size_t long_idx = (size_t)gcomp_deflate_entry_value(e) + (size_t)low;
   if (long_idx >= table->long_table_count) {
     return 0;
   }
-  gcomp_deflate_huffman_fast_entry_t le = table->long_table[long_idx];
-  if (le.nbits == 0u) {
+  e = table->long_table[long_idx];
+  nbits = gcomp_deflate_entry_nbits(e);
+  if (nbits == 0u) {
     return 0;
   }
-  *buf >>= le.nbits;
-  *bits -= le.nbits;
-  *sym_out = le.symbol;
+  *buf >>= nbits;
+  *bits -= nbits;
+  *out = e;
   return 1;
 }
 
@@ -2491,45 +2507,48 @@ static gcomp_status_t deflate_huffman_fast(gcomp_deflate_decoder_state_t * st,
     }
     // There are now at least 56 bits, and 48 is the worst a symbol can need.
 
-    uint32_t sym = 0;
-    if (!deflate_fast_symbol(litlen, &buf, &bits, &sym)) {
+    gcomp_deflate_huffman_entry_t e = 0;
+    if (!deflate_fast_symbol(litlen, &buf, &bits, &e)) {
       status = GCOMP_ERR_CORRUPT;
       break;
     }
 
-    if (sym < 256u) {
-      *out_ptr++ = (uint8_t)sym;
+    // One field, already decided when the table was built.  This used to be
+    // three comparisons against numbers out of the specification followed by
+    // two array lookups to find out what the number meant.
+    const uint32_t op = gcomp_deflate_entry_op(e);
+    if (op == GCOMP_DEFLATE_OP_LITERAL) {
+      *out_ptr++ = (uint8_t)gcomp_deflate_entry_value(e);
       continue;
     }
-    if (sym == 256u) {
+    if (op == GCOMP_DEFLATE_OP_END) {
       block_ended = 1;
       break;
     }
-    if (sym > 285u) {
+    if (op == GCOMP_DEFLATE_OP_BAD) {
       status = GCOMP_ERR_CORRUPT;
       break;
     }
 
-    uint32_t len_sym = sym - 257u;
-    uint32_t length = k_len_base[len_sym];
-    uint32_t len_extra = k_len_extra[len_sym];
+    uint32_t length = gcomp_deflate_entry_value(e);
+    const uint32_t len_extra = gcomp_deflate_entry_extra(e);
     if (len_extra != 0u) {
       length += (uint32_t)(buf & (((uint32_t)1u << len_extra) - 1u));
       buf >>= len_extra;
       bits -= len_extra;
     }
 
-    uint32_t dist_sym = 0;
-    if (!deflate_fast_symbol(dist_tab, &buf, &bits, &dist_sym)) {
+    gcomp_deflate_huffman_entry_t de = 0;
+    if (!deflate_fast_symbol(dist_tab, &buf, &bits, &de)) {
       status = GCOMP_ERR_CORRUPT;
       break;
     }
-    if (dist_sym >= 30u) {
+    if (gcomp_deflate_entry_op(de) != GCOMP_DEFLATE_OP_MATCH) {
       status = GCOMP_ERR_CORRUPT;
       break;
     }
-    size_t distance = k_dist_base[dist_sym];
-    uint32_t dist_extra = k_dist_extra[dist_sym];
+    size_t distance = gcomp_deflate_entry_value(de);
+    const uint32_t dist_extra = gcomp_deflate_entry_extra(de);
     if (dist_extra != 0u) {
       distance += (size_t)(buf & (((uint32_t)1u << dist_extra) - 1u));
       buf >>= dist_extra;
