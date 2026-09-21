@@ -13,7 +13,7 @@
  * and it is the difference between "this looks suspicious" and "this file
  * says it is 900 MB and I will not hold that".
  *
- *   cc detect_and_decode.c -lghoti.io-compress-0
+ *   cc detect_and_decode.c -lghoti.io-compress-0 -lghoti.io-cutil-0
  *   ./detect_and_decode some-file.gz
  *
  * Copyright 2026 by Corey Pennycuff
@@ -21,6 +21,7 @@
 
 #include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/options.h>
+#include <ghoti.io/cutil/file.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,37 +29,10 @@
 /// Our own ceiling on what we are willing to hold, whatever a file claims.
 #define MAX_ACCEPTABLE_OUTPUT (256u * 1024u * 1024u)
 
-static unsigned char * read_file(const char * path, size_t * size_out) {
-  FILE * f = fopen(path, "rb");
-  if (!f) {
-    perror(path);
-    return NULL;
-  }
-  if (fseek(f, 0, SEEK_END) != 0) {
-    fclose(f);
-    return NULL;
-  }
-  long n = ftell(f);
-  if (n < 0) {
-    fclose(f);
-    return NULL;
-  }
-  rewind(f);
-
-  unsigned char * buf = malloc((size_t)n ? (size_t)n : 1);
-  if (!buf) {
-    fclose(f);
-    return NULL;
-  }
-  if (fread(buf, 1, (size_t)n, f) != (size_t)n) {
-    free(buf);
-    fclose(f);
-    return NULL;
-  }
-  fclose(f);
-  *size_out = (size_t)n;
-  return buf;
-}
+/// And one on the compressed file itself.  gcu_file_read() treats this as a
+/// promise rather than a truncation: a larger file yields
+/// GCU_FILE_ERR_LIMIT and nothing is allocated at all.
+#define MAX_ACCEPTABLE_INPUT (64u * 1024u * 1024u)
 
 int main(int argc, char ** argv) {
   if (argc != 2) {
@@ -66,9 +40,15 @@ int main(int argc, char ** argv) {
     return 2;
   }
 
+  // cutil reads in chunks rather than sizing the file first, so this works
+  // on the things fseek/ftell quietly return nothing for - a pipe, a
+  // character device, anything under /proc.
+  void * in = NULL;
   size_t in_len = 0;
-  unsigned char * in = read_file(argv[1], &in_len);
-  if (!in) {
+  GCU_File_Result fr =
+      gcu_file_read(argv[1], MAX_ACCEPTABLE_INPUT, NULL, &in, &in_len);
+  if (fr != GCU_FILE_OK) {
+    fprintf(stderr, "%s: %s\n", argv[1], gcu_file_result_string(fr));
     return 1;
   }
 
@@ -79,13 +59,13 @@ int main(int argc, char ** argv) {
   gcomp_status_t s = gcomp_detect(in, in_len, &method, &needed);
   if (s == GCOMP_ERR_UNSUPPORTED) {
     fprintf(stderr, "%s: not a format that identifies itself\n", argv[1]);
-    free(in);
+    gcu_file_free(NULL, in);
     return 1;
   }
   if (s != GCOMP_OK) {
     fprintf(stderr, "%s: %s (needs %zu bytes)\n", argv[1],
         gcomp_status_to_string(s), needed);
-    free(in);
+    gcu_file_free(NULL, in);
     return 1;
   }
   printf("%s: %s\n", argv[1], method);
@@ -95,7 +75,7 @@ int main(int argc, char ** argv) {
   s = gcomp_peek(NULL, method, NULL, in, in_len, &info, &needed);
   if (s != GCOMP_OK) {
     fprintf(stderr, "  header: %s\n", gcomp_status_to_string(s));
-    free(in);
+    gcu_file_free(NULL, in);
     return 1;
   }
   printf("  header      %zu bytes\n", info.header_size);
@@ -107,7 +87,7 @@ int main(int argc, char ** argv) {
 
   gcomp_options_t * opts = NULL;
   if (gcomp_options_create(&opts) != GCOMP_OK) {
-    free(in);
+    gcu_file_free(NULL, in);
     return 1;
   }
 
@@ -117,7 +97,7 @@ int main(int argc, char ** argv) {
     if (info.content_size > MAX_ACCEPTABLE_OUTPUT) {
       fprintf(stderr, "  refusing: larger than we are willing to hold\n");
       gcomp_options_destroy(opts);
-      free(in);
+      gcu_file_free(NULL, in);
       return 1;
     }
     // An exact ceiling beats a ratio: the ratio has to guess, and a file with
@@ -137,7 +117,7 @@ int main(int argc, char ** argv) {
   size_t out_len = 0;
   s = gcomp_decode_alloc(NULL, method, opts, in, in_len, &out, &out_len);
   gcomp_options_destroy(opts);
-  free(in);
+  gcu_file_free(NULL, in);
 
   if (s != GCOMP_OK) {
     fprintf(stderr, "  decode: %s\n", gcomp_status_to_string(s));

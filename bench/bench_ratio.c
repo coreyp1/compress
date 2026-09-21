@@ -63,6 +63,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <ghoti.io/compress/compress.h>
+#include <ghoti.io/cutil/file.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
 #include <dlfcn.h>
@@ -563,26 +564,40 @@ static uint8_t * bench_make_skewed(size_t n) {
   return out;
 }
 
+/**
+ * Read a corpus file.
+ *
+ * Through cutil rather than fseek/ftell: the size-first version returned NULL
+ * for anything that reports no size, and assigned fread()'s result to *n_out,
+ * so a short read quietly benchmarked fewer bytes than it had allocated.  The
+ * buffer comes from cutil's allocator, so bench_free_input() below releases it
+ * rather than free().
+ */
 static uint8_t * bench_read_file(const char * path, size_t * n_out) {
-  FILE * f = fopen(path, "rb");
-  if (!f) {
+  void * data = NULL;
+  size_t len = 0;
+  if (gcu_file_read(path, GCU_FILE_UNLIMITED, NULL, &data, &len)
+      != GCU_FILE_OK) {
     return NULL;
   }
-  fseek(f, 0, SEEK_END);
-  long size = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  if (size <= 0) {
-    fclose(f);
-    return NULL;
+  *n_out = len;
+  return (uint8_t *)data;
+}
+
+/**
+ * Release an input buffer.
+ *
+ * The generated corpora come from malloc() and the read ones from cutil, and
+ * an allocator has to be given back what it handed out.  The flag is carried
+ * rather than guessed.
+ */
+static void bench_free_input(uint8_t * data, int from_file) {
+  if (from_file) {
+    gcu_file_free(NULL, data);
   }
-  uint8_t * data = (uint8_t *)malloc((size_t)size);
-  if (!data) {
-    fclose(f);
-    return NULL;
+  else {
+    free(data);
   }
-  *n_out = fread(data, 1, (size_t)size, f);
-  fclose(f);
-  return data;
 }
 
 int main(int argc, char ** argv) {
@@ -633,6 +648,7 @@ int main(int argc, char ** argv) {
     const char * name;
     uint8_t * data = NULL;
     size_t n = 0;
+    int data_from_file = 0;
 
     if (argc > 1) {
       name = argv[a + 1];
@@ -641,6 +657,7 @@ int main(int argc, char ** argv) {
         name = slash + 1;
       }
       data = bench_read_file(argv[a + 1], &n);
+      data_from_file = 1;
     }
     else {
       n = 1u << 20;
@@ -658,7 +675,7 @@ int main(int argc, char ** argv) {
       }
     }
     if (!data || n == 0) {
-      free(data);
+      bench_free_input(data, data_from_file);
       continue;
     }
 
@@ -702,7 +719,7 @@ int main(int argc, char ** argv) {
         ref_decode_s[c] += reference.decode;
       }
     }
-    free(data);
+    bench_free_input(data, data_from_file);
   }
 
   printf("\n%-16s %-16s %10s %10s %10s %9s\n", "TOTAL", "case", "raw", "ours",

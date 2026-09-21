@@ -24,6 +24,7 @@
 
 #include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/registry.h>
+#include <ghoti.io/cutil/file.h>
 
 // Include golden vectors (redefine nullptr for C compatibility)
 #ifdef __cplusplus
@@ -90,19 +91,18 @@ static int mkdir_p(const char * path) {
 }
 
 static int write_file(const char * path, const uint8_t * data, size_t size) {
-  FILE * f = fopen(path, "wb");
-  if (!f) {
-    fprintf(stderr, "Error: cannot create %s: %s\n", path, strerror(errno));
+  // Through cutil, which writes to a temporary file beside the destination
+  // and renames it into place.  A corpus is regenerated rather than kept, so
+  // GCU_FILE_SYNC_NONE is the right end of file.h's trade: the rename is
+  // still atomic, so a re-run interrupted halfway cannot leave a fuzzer
+  // reading a half-written seed.
+  GCU_File_Result r =
+      gcu_file_write_atomic(path, data, size, GCU_FILE_SYNC_NONE, NULL);
+  if (r != GCU_FILE_OK) {
+    fprintf(stderr, "Error: cannot write %s: %s\n", path,
+        gcu_file_result_string(r));
     return -1;
   }
-  if (size > 0) {
-    if (fwrite(data, 1, size, f) != size) {
-      fprintf(stderr, "Error: write failed for %s\n", path);
-      fclose(f);
-      return -1;
-    }
-  }
-  fclose(f);
   printf("  Created: %s (%zu bytes)\n", path, size);
   return 0;
 }

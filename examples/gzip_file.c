@@ -19,6 +19,7 @@
 #include <ghoti.io/compress/gzip.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/stream.h>
+#include <ghoti.io/cutil/path.h>
 
 #include <stdint.h>
 #include <stdio.h>
@@ -78,12 +79,11 @@ static int compress_file(gcomp_registry_t * registry, const char * input_path,
     goto cleanup;
   }
 
-  // Set original filename (extracted basename from path)
-  const char * basename = strrchr(input_path, '/');
-  if (!basename) {
-    basename = strrchr(input_path, '\\'); // Windows path separator
-  }
-  basename = basename ? basename + 1 : input_path;
+  // RFC 1952 section 2.3.1.5: FNAME is the original name with its directory
+  // removed.  Looking for '/' first and '\\' only when there is none gets
+  // "a/b\\c" wrong on Windows, where both separate; cutil applies the host's
+  // rules to both at once.
+  const char * basename = gcu_path_basename(GCU_PATH_NATIVE, input_path);
   gcomp_options_set_string(options, "gzip.name", basename);
 
   // Set modification time to current time
