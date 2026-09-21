@@ -51,6 +51,7 @@
 #include <ghoti.io/compress/macros.h>
 #include "../../core/alloc_internal.h"
 #include "../../core/registry_internal.h"
+#include "../../core/endian.h"
 #include <ghoti.io/cutil/safemath.h>
 #include "../../core/stream_internal.h"
 #include "deflate_internal.h"
@@ -86,6 +87,14 @@ typedef enum {
   DEFLATE_STAGE_DONE,
 } gcomp_deflate_decoder_stage_t;
 
+/**
+ * Width of the decoder's bit buffer, in bytes.
+ *
+ * Everything sized by the buffer derives from this, so that widening it
+ * cannot leave a companion array behind.
+ */
+#define DEFLATE_BIT_BUFFER_BYTES 8u
+
 typedef struct gcomp_deflate_decoder_state_s {
   //
   // Allocator (for internal memory operations)
@@ -95,7 +104,21 @@ typedef struct gcomp_deflate_decoder_state_s {
   //
   // Bitstream state (LSB-first)
   //
-  uint32_t bit_buffer;
+  /**
+   * Bits read but not yet consumed, least-significant first.
+   *
+   * Sixty-four rather than thirty-two so that a refill can take eight bytes
+   * with one unaligned load instead of eight passes of a loop, which is what
+   * `deflate_try_fill_bits` does whenever the input has that much left.  It
+   * also holds the longest thing the decoder asks for -- a 15-bit code plus
+   * its extra bits -- several times over, so the refill happens once per
+   * several symbols rather than once per symbol.
+   *
+   * Every bit at or above @ref bit_count is zero.  The Huffman fast path
+   * relies on that: it indexes its table with the low bits of this buffer
+   * and lets a short buffer pad the index with zeros.
+   */
+  uint64_t bit_buffer;
   uint32_t bit_count;
 
   //
@@ -105,7 +128,17 @@ typedef struct gcomp_deflate_decoder_state_s {
   // are saved here. Container formats like gzip can retrieve these bytes
   // to use them for their own trailer parsing.
   //
-  uint8_t unconsumed_bytes[4]; ///< Saved unconsumed bytes (max 3 + safety)
+  /**
+   * Whole bytes that were pulled into @ref bit_buffer but not used.
+   *
+   * Sized from the bit buffer rather than written as a number, because it is
+   * the bit buffer's width that decides how many there can be.  It used to be
+   * four, "max 3 + safety", which was right for a 32-bit buffer and silently
+   * wrong the moment that widened: the count below was clamped to the array,
+   * so the bytes past it were dropped rather than reported, and a gzip
+   * trailer read that way went missing.
+   */
+  uint8_t unconsumed_bytes[DEFLATE_BIT_BUFFER_BYTES];
   uint8_t unconsumed_count;    ///< Number of saved unconsumed bytes
 
   //
@@ -294,11 +327,32 @@ static int deflate_try_fill_bits(gcomp_deflate_decoder_state_t * st,
 
   const uint8_t * src = (const uint8_t *)input->data;
   while (st->bit_count < want_bits) {
+    // Eight bytes in one load where they are there.  DEFLATE packs bits
+    // least-significant first (RFC 1951 section 3.1.1), so a little-endian
+    // 64-bit read puts the stream's next byte in the lowest eight bits,
+    // which is exactly where the buffer wants it.
+    if (src && st->bit_count <= 56u && input->size - input->used >= 8u) {
+      uint64_t chunk = gcomp_read_le64(src + input->used);
+      // Only whole bytes that fit above what is already held are taken; the
+      // rest stay in the input.  `room` is 1 to 8, and the mask is what keeps
+      // the promise that bits at or above `bit_count` are zero -- without it
+      // a partial eighth byte would leave stray bits up there and the
+      // Huffman fast path would index its table with them.
+      uint32_t room = (64u - st->bit_count) >> 3;
+      if (room < 8u) {
+        chunk &= ((uint64_t)1u << (room * 8u)) - 1u;
+      }
+      st->bit_buffer |= chunk << st->bit_count;
+      st->bit_count += room * 8u;
+      input->used += room;
+      st->total_input_bytes += room;
+      continue;
+    }
     if (input->used >= input->size) {
       return 0;
     }
     uint8_t byte = src ? src[input->used] : 0u;
-    st->bit_buffer |= ((uint32_t)byte) << st->bit_count;
+    st->bit_buffer |= ((uint64_t)byte) << st->bit_count;
     st->bit_count += 8u;
     input->used += 1u;
     st->total_input_bytes += 1u;
@@ -317,15 +371,11 @@ static int deflate_try_read_bits(gcomp_deflate_decoder_state_t * st,
     return 0;
   }
 
-  // Avoid undefined behavior: (1u << 32) is UB in C.
-  uint32_t mask = (nbits == 32u) ? 0xFFFFFFFFu : ((1u << nbits) - 1u);
-  *out = st->bit_buffer & mask;
-  if (nbits == 32u) {
-    st->bit_buffer = 0;
-  }
-  else {
-    st->bit_buffer >>= nbits;
-  }
+  // nbits is 32 or fewer and the buffer is 64 wide, so neither the mask nor
+  // the shift is at risk of the undefined behaviour a 32-bit buffer had to
+  // step around here.
+  *out = (uint32_t)(st->bit_buffer & (((uint64_t)1u << nbits) - 1u));
+  st->bit_buffer >>= nbits;
   st->bit_count -= nbits;
   return 1;
 }
@@ -345,33 +395,6 @@ static void deflate_align_to_byte(gcomp_deflate_decoder_state_t * st) {
 // Bit reversal (needed because DEFLATE transmits Huffman codes LSB-first)
 //
 
-/**
- * @brief Reverse the low @p nbits of @p v.
- *
- * DEFLATE writes Huffman codes least significant bit first, while canonical
- * codes are defined most significant bit first, so a peeked code has to be
- * turned around before it can index a table built from canonical codes.  That
- * happens at least once for every symbol decoded, which makes this one of the
- * hottest few lines in the decoder.
- *
- * It used to shift one bit at a time, nine times per symbol.  This does all
- * sixteen at once by swapping neighbouring pairs, then pairs of pairs, and so
- * on, and then drops the bits that were not asked for.  RFC 1951 section 3.2.7
- * caps a code at fifteen bits, so sixteen is always enough.
- *
- * @param nbits Must be 16 or fewer.
- */
-static inline uint32_t reverse_bits(uint32_t v, uint32_t nbits) {
-  if (nbits == 0u) {
-    return 0u;
-  }
-  v &= 0xFFFFu;
-  v = ((v >> 1u) & 0x5555u) | ((v & 0x5555u) << 1u);
-  v = ((v >> 2u) & 0x3333u) | ((v & 0x3333u) << 2u);
-  v = ((v >> 4u) & 0x0F0Fu) | ((v & 0x0F0Fu) << 4u);
-  v = ((v >> 8u) & 0x00FFu) | ((v & 0x00FFu) << 8u);
-  return v >> (16u - nbits);
-}
 
 //
 // Output helpers (window + limits)
@@ -477,6 +500,41 @@ static gcomp_status_t deflate_copy_stored(gcomp_deflate_decoder_state_t * st,
 
   if (st->stored_remaining == 0) {
     return GCOMP_OK;
+  }
+
+  // Bytes the bit buffer read ahead come first.
+  //
+  // The refill takes whole bytes from the input in bulk, so when a stored
+  // block begins the next bytes of the stream may be sitting in the bit
+  // buffer rather than in `input`, and the bulk copy below -- which reads
+  // straight from `input` -- would step over them.
+  //
+  // This could not arise while the buffer was 32 bits wide: the block is
+  // aligned to a byte first, and reading LEN and NLEN took all 32 bits, so
+  // the buffer was always empty by the time the copy ran.  A 64-bit buffer
+  // has up to four whole bytes left at that point.
+  //
+  // `total_input_bytes` is not touched here: the refill counted these bytes
+  // when it pulled them out of the input.
+  {
+    uint8_t * out_bytes = (uint8_t *)output->data;
+    while (st->stored_remaining > 0u && st->bit_count >= 8u
+        && output->used < output->size && out_bytes) {
+      gcomp_status_t lim = deflate_check_output_limit(st, 1u);
+      if (lim != GCOMP_OK) {
+        return lim;
+      }
+      uint8_t b = (uint8_t)(st->bit_buffer & 0xFFu);
+      st->bit_buffer >>= 8u;
+      st->bit_count -= 8u;
+      out_bytes[output->used++] = b;
+      deflate_window_put(st, b);
+      st->total_output_bytes += 1u;
+      st->stored_remaining -= 1u;
+    }
+    if (st->stored_remaining == 0u) {
+      return GCOMP_OK;
+    }
   }
 
   size_t in_avail = input->size - input->used;
@@ -713,17 +771,16 @@ static gcomp_status_t deflate_huff_decode_symbol(
     return GCOMP_OK;
   }
 
-  // Peek whatever bits we have, padding with zeros if needed. The fast table
-  // is designed so that short codes at index (code << (FAST_BITS - len)) work
-  // correctly even with partial bits.
-  uint32_t avail_bits = (st->bit_count > GCOMP_DEFLATE_HUFFMAN_FAST_BITS)
-      ? GCOMP_DEFLATE_HUFFMAN_FAST_BITS
-      : st->bit_count;
-  uint32_t peek = st->bit_buffer & ((1u << avail_bits) - 1u);
-
-  uint32_t idx = reverse_bits(peek, avail_bits);
-  // Shift idx to align with FAST_BITS indexing.
-  idx <<= (GCOMP_DEFLATE_HUFFMAN_FAST_BITS - avail_bits);
+  // The table is indexed by the bits as they arrive, so the index is the low
+  // FAST_BITS of the buffer and nothing has to be reversed or realigned here.
+  //
+  // Fewer bits than FAST_BITS needs no special case either.  Bits above
+  // `bit_count` are zero -- the fill only ever ORs bytes in at `bit_count`,
+  // and consuming shifts down -- so a short buffer indexes one of the slots
+  // this code was replicated into, which holds the same entry.  The length
+  // check below is what decides whether the code was really all there.
+  uint32_t idx =
+      (uint32_t)(st->bit_buffer & (GCOMP_DEFLATE_HUFFMAN_FAST_SIZE - 1u));
 
   gcomp_deflate_huffman_fast_entry_t fe = table->fast_table[idx];
 
@@ -761,17 +818,16 @@ static gcomp_status_t deflate_huff_decode_symbol(
   // fits in what is available, and the length check below confirms that.
   uint32_t full_bits = GCOMP_DEFLATE_HUFFMAN_FAST_BITS + extra;
   (void)deflate_try_fill_bits(st, input, full_bits);
-  uint32_t avail_full =
-      (st->bit_count > full_bits) ? full_bits : st->bit_count;
-  if (avail_full < GCOMP_DEFLATE_HUFFMAN_FAST_BITS) {
+  if (st->bit_count < GCOMP_DEFLATE_HUFFMAN_FAST_BITS) {
     return GCOMP_OK; // Fewer bits than the prefix that got us here; wait.
   }
-  uint32_t full_peek = st->bit_buffer & ((1u << avail_full) - 1u);
-
-  uint32_t full_rev = reverse_bits(full_peek, avail_full);
-  full_rev <<= (full_bits - avail_full);
-  uint32_t low_mask = (1u << extra) - 1u;
-  uint32_t low = full_rev & low_mask;
+  // The sub-table index is the `extra` bits sitting directly above the
+  // prefix, again as they arrive.  Bits past `bit_count` are zero, which
+  // selects one of the slots a shorter code in this sub-table was replicated
+  // into -- the reason the replication above fills the high bits rather than
+  // the low ones.
+  uint32_t low = (uint32_t)((st->bit_buffer >> GCOMP_DEFLATE_HUFFMAN_FAST_BITS)
+      & (((uint64_t)1u << extra) - 1u));
 
   // Use safe math for index calculation to prevent overflow
   size_t long_idx;
@@ -1742,8 +1798,12 @@ static gcomp_status_t deflate_huffman_step(
       st->unconsumed_count = 0;
       if (st->bit_count >= 8) {
         uint32_t bytes_to_handle = st->bit_count / 8;
+        // The buffer cannot hold more whole bytes than it is wide, so this
+        // cannot fire.  It is an error rather than a clamp because clamping
+        // is what hid the problem before: dropping a byte here loses a
+        // container's trailer and reports success.
         if (bytes_to_handle > sizeof(st->unconsumed_bytes)) {
-          bytes_to_handle = sizeof(st->unconsumed_bytes);
+          return GCOMP_ERR_INTERNAL;
         }
         // Try to return bytes to input buffer (bulk mode)
         if (bytes_to_handle <= input->used) {

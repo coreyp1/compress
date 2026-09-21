@@ -226,6 +226,22 @@ gcomp_status_t gcomp_deflate_huffman_build_codes(const uint8_t * lengths,
 //
 // Two-level decode table construction
 //
+// The table is indexed by the bits AS THEY ARRIVE, which is the code
+// reversed.
+//
+// DEFLATE packs bits least-significant first (RFC 1951 section 3.1.1) but
+// Huffman codes are most-significant first, so a code of length L arrives
+// with its bits in the opposite order from the canonical value.  The decoder
+// used to fix that up per symbol, reversing the bits it had just peeked: five
+// shift-and-mask rounds on every literal, 10.8% of the whole decode.
+//
+// Reversing at build time instead costs one reversal per symbol per block -
+// at most 288 of them - and nothing at all per symbol decoded.  It also makes
+// the short-code fill the natural one: a code occupying the low L bits of the
+// index matches every index whose low L bits equal it, which is a stride of
+// 2^L, where the old layout needed the code shifted up and a run of
+// consecutive entries.
+//
 // Goal: decode one symbol by peeking at most FAST_BITS bits, then either
 // resolve immediately (short codes) or read a few more bits and index into
 // long_table (long codes).
@@ -277,6 +293,21 @@ gcomp_status_t gcomp_deflate_huffman_build_codes(const uint8_t * lengths,
 //           - If extra == max_extra: fill single entry
 //           - If extra < max_extra: replicate to 2^(max_extra - extra) entries
 //
+
+/**
+ * @brief Reverse the low @p nbits bits of @p code.
+ *
+ * Called at most once per symbol per block, where the decoder used to call
+ * its equivalent once per symbol decoded.
+ */
+static inline unsigned gcomp_deflate_reverse_code(unsigned code,
+    unsigned nbits) {
+  unsigned out = 0u;
+  for (unsigned b = 0u; b < nbits; b++) {
+    out = (out << 1u) | ((code >> b) & 1u);
+  }
+  return out;
+}
 
 gcomp_status_t gcomp_deflate_huffman_build_decode_table(
     const gcomp_allocator_t * allocator, const uint8_t * lengths,
@@ -337,16 +368,17 @@ gcomp_status_t gcomp_deflate_huffman_build_decode_table(
     }
 
     if (len <= GCOMP_DEFLATE_HUFFMAN_FAST_BITS) {
-      // Short code: index = (code << (FAST_BITS - len)) + low; fill step
-      // consecutive entries with (symbol i, nbits len).
-      unsigned step = 1u << (GCOMP_DEFLATE_HUFFMAN_FAST_BITS - len);
-      unsigned start = code << (GCOMP_DEFLATE_HUFFMAN_FAST_BITS - len);
-      if (start + step > GCOMP_DEFLATE_HUFFMAN_FAST_SIZE) {
+      // Short code.  The code arrives reversed and occupies the LOW len bits
+      // of the index, so it matches every index whose low len bits equal it:
+      // that is one entry every 2^len, not a run of consecutive ones.
+      unsigned start = gcomp_deflate_reverse_code(code, len);
+      unsigned stride = 1u << len;
+      if (start >= GCOMP_DEFLATE_HUFFMAN_FAST_SIZE) {
         return GCOMP_ERR_CORRUPT;
       }
-      for (j = 0; j < step; j++) {
-        table->fast_table[start + j].symbol = (uint16_t)i;
-        table->fast_table[start + j].nbits = (uint8_t)len;
+      for (j = start; j < GCOMP_DEFLATE_HUFFMAN_FAST_SIZE; j += stride) {
+        table->fast_table[j].symbol = (uint16_t)i;
+        table->fast_table[j].nbits = (uint8_t)len;
       }
     }
     else {
@@ -357,7 +389,10 @@ gcomp_status_t gcomp_deflate_huffman_build_decode_table(
       // different lengths. We must track the MAXIMUM extra bits needed for
       // each prefix to allocate enough space for all codes.
       unsigned extra = len - GCOMP_DEFLATE_HUFFMAN_FAST_BITS;
-      unsigned high = code >> extra;
+      // The FAST_BITS bits the decoder sees first are the code's top
+      // FAST_BITS, and they arrive reversed.
+      unsigned high = gcomp_deflate_reverse_code(
+          code >> extra, GCOMP_DEFLATE_HUFFMAN_FAST_BITS);
 
       // Update to maximum extra bits for this prefix
       if (table->long_extra_bits[high] < extra) {
@@ -395,24 +430,27 @@ gcomp_status_t gcomp_deflate_huffman_build_decode_table(
       }
 
       unsigned extra = len - GCOMP_DEFLATE_HUFFMAN_FAST_BITS;
-      unsigned high = code >> extra;
+      unsigned high = gcomp_deflate_reverse_code(
+          code >> extra, GCOMP_DEFLATE_HUFFMAN_FAST_BITS);
       unsigned max_extra = table->long_extra_bits[high];
-      unsigned low_bits = code & ((1u << extra) - 1);
+      // The code's remaining bits arrive after the prefix, reversed, so they
+      // sit in the LOW `extra` bits of the sub-table index.
+      unsigned low_bits =
+          gcomp_deflate_reverse_code(code & ((1u << extra) - 1u), extra);
 
       // If this code has fewer extra bits than the max for this prefix,
       // we need to replicate it to all matching patterns in the larger table.
       //
-      // When the decoder reads max_extra bits and reverses them, shorter codes
-      // have their actual low bits in the HIGH part of the extended low value,
-      // with trailing bits (from the next code) in the LOW part.
-      //
-      // So extended_low = (actual_low << diff) | trailing_bits
-      // We need to fill all combinations of trailing_bits (0 to 2^diff - 1).
+      // The sub-table index is max_extra bits wide.  This code's own bits
+      // arrive first, so they occupy the LOW `extra` of those; the bits above
+      // them belong to whatever follows this code and may be anything, so an
+      // entry is needed for each.  (The old layout had these the other way
+      // round, because it reversed the whole field after reading it.)
       if (extra < max_extra) {
         unsigned diff = max_extra - extra;
         unsigned step = 1u << diff;
         for (unsigned j = 0; j < step; j++) {
-          unsigned low = (low_bits << diff) | j;
+          unsigned low = low_bits | (j << extra);
           size_t idx = (size_t)table->long_base[high] + (size_t)low;
           table->long_table[idx].symbol = (uint16_t)i;
           table->long_table[idx].nbits = (uint8_t)len;

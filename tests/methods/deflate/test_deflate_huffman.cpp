@@ -145,6 +145,7 @@ TEST(DeflateHuffmanBuildCodes, ZeroLengthSymbolsSkipped) {
 }
 
 TEST(DeflateHuffmanDecodeTable, BuildFromRfcExample) {
+  // RFC 1951 section 3.2.2's worked example, symbols A..H.
   const uint8_t lengths[] = {3, 3, 3, 3, 3, 2, 4, 4};
   gcomp_deflate_huffman_decode_table_t table;
 
@@ -152,24 +153,51 @@ TEST(DeflateHuffmanDecodeTable, BuildFromRfcExample) {
       gcomp_deflate_huffman_build_decode_table(nullptr, lengths, 8u, 15u, &table),
       GCOMP_OK);
 
-  // F has code 0, length 2. Fast table index for 2-bit code 0: indices 0 and 1
-  // (code << (9-2) = 0, step = 128). So fast_table[0] and fast_table[1] =
-  // (symbol 5, 2).
-  EXPECT_EQ(table.fast_table[0].symbol, 5u);
-  EXPECT_EQ(table.fast_table[0].nbits, 2u);
-  EXPECT_EQ(table.fast_table[1].symbol, 5u);
-  EXPECT_EQ(table.fast_table[1].nbits, 2u);
+  // The table is indexed by the bits as they arrive, which is the code
+  // REVERSED -- DEFLATE packs bits low end first (section 3.1.1) while the
+  // codes themselves are high end first.  So a code of length L sits at
+  // index reverse(code, L) and repeats every 2^L, rather than at
+  // code << (FAST_BITS - L) as a run.
+  //
+  //   sym  letter  len  code    index  stride
+  //     5    F      2   00        0       4
+  //     2    C      3   100       1       8
+  //     0    A      3   010       2       8
+  //     4    E      3   110       3       8
+  //     3    D      3   101       5       8
+  //     1    B      3   011       6       8
+  //     6    G      4   1110      7      16
+  //     7    H      4   1111     15      16
+  struct {
+    unsigned index;
+    unsigned stride;
+    uint16_t symbol;
+    uint8_t nbits;
+  } const expected[] = {
+      {0u, 4u, 5u, 2u},
+      {1u, 8u, 2u, 3u},
+      {2u, 8u, 0u, 3u},
+      {3u, 8u, 4u, 3u},
+      {5u, 8u, 3u, 3u},
+      {6u, 8u, 1u, 3u},
+      {7u, 16u, 6u, 4u},
+      {15u, 16u, 7u, 4u},
+  };
 
-  // A has code 2, length 3. Indices 2<<6 = 128 .. 128+63 = 191.
-  EXPECT_EQ(table.fast_table[128].symbol, 0u);
-  EXPECT_EQ(table.fast_table[128].nbits, 3u);
+  for (const auto & e : expected) {
+    // Every slot the code matches, not just the first: a short code is
+    // replicated across the table and decoding relies on all of them.
+    for (unsigned i = e.index; i < GCOMP_DEFLATE_HUFFMAN_FAST_SIZE;
+         i += e.stride) {
+      EXPECT_EQ(table.fast_table[i].symbol, e.symbol)
+          << "fast_table[" << i << "]";
+      EXPECT_EQ(table.fast_table[i].nbits, e.nbits)
+          << "fast_table[" << i << "]";
+    }
+  }
 
-  // G has code 14, length 4 (long code). Should be in long_table.
-  EXPECT_EQ(table.long_extra_bits[14], 0u); // 4 - 9 is negative, so G is
-  // actually in fast table: 4 <= 9. Code 14, len 4 -> start = 14<<5 = 448, step
-  // = 32. So fast_table[448..479] = (symbol 6, 4).
-  EXPECT_EQ(table.fast_table[448].symbol, 6u);
-  EXPECT_EQ(table.fast_table[448].nbits, 4u);
+  // Nothing landed in the long table: the longest code here is 4 bits.
+  EXPECT_EQ(table.long_table_count, 0u);
 
   gcomp_deflate_huffman_decode_table_cleanup(&table);
 }
