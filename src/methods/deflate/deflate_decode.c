@@ -1889,17 +1889,37 @@ gcomp_status_t gcomp_deflate_decoder_reset(gcomp_decoder_t * decoder) {
   return GCOMP_OK;
 }
 
+/**
+ * @brief Read a block header: BFINAL and BTYPE (RFC 1951 section 3.2.3).
+ *
+ * All three bits at once, because two reads cannot be undone.  BFINAL was
+ * read on its own and BTYPE after it, and when the input ran out between them
+ * -- one bit held, nothing left to fill with -- the function returned "need
+ * more input" having already consumed BFINAL and stored it nowhere.  The next
+ * call started again from BTYPE's low bit, and from there every bit in the
+ * stream was off by one: the header came out as BTYPE 3, which is the
+ * reserved value, and a perfectly good stream was reported corrupt.
+ *
+ * It needs the bit buffer to hold exactly one bit at a block boundary with no
+ * input behind it, so it takes a caller that hands over small pieces and a
+ * stream whose blocks happen to end in the right place.  A 70,000-byte
+ * incompressible file fed a byte at a time does it: three dynamic blocks, and
+ * the second one ends one bit into byte 53,792.
+ *
+ * The same reasoning is already written on deflate_process_stored_len() and
+ * deflate_dynamic_read_header(), both of which take their whole header in one
+ * read for exactly this reason.  This was the one place that did not.
+ */
 static gcomp_status_t deflate_process_block_header(
     gcomp_deflate_decoder_state_t * st, gcomp_buffer_t * input) {
-  uint32_t bfinal = 0;
-  uint32_t btype = 0;
+  uint32_t header = 0;
 
-  if (!deflate_try_read_bits(st, input, 1u, &bfinal)) {
+  if (!deflate_try_read_bits(st, input, 3u, &header)) {
     return GCOMP_OK;
   }
-  if (!deflate_try_read_bits(st, input, 2u, &btype)) {
-    return GCOMP_OK;
-  }
+
+  uint32_t bfinal = header & 1u;
+  uint32_t btype = (header >> 1u) & 3u;
 
   st->last_block = bfinal;
   st->block_type = btype;
