@@ -1,11 +1,29 @@
+/*
+ * SPDX-License-Identifier: LGPL-3.0-only
+ *
+ * Copyright (C) 2026 Corey Pennycuff
+ *
+ * This file is part of Ghoti.io Compress.
+ *
+ * Ghoti.io Compress is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU Lesser General Public License version 3 as
+ * published by the Free Software Foundation.
+ *
+ * Ghoti.io Compress is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public
+ * License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 /**
  * @file lzw_core.h
  *
  * LZW core: dictionary (prefix_code, append_char), decode stack, KwKwK
  * handling, dictionary reset, max dictionary size. Used by encoder and
  * decoder; profile drives code-width and CLEAR/EOI semantics.
- *
- * Copyright 2026 by Corey Pennycuff
  */
 
 #ifndef GHOTI_IO_GCOMP_SRC_METHODS_LZW_LZW_CORE_H
