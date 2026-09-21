@@ -29,6 +29,17 @@
 
 #define LZW_BITIO_MAX_BITS 12
 
+/**
+ * The narrowest code either profile can ask for.
+ *
+ * A code is one bit wider than a literal, and the narrowest literal GIF allows
+ * is two bits (89a 22), so three.  This used to be nine, which is the width a
+ * stream opens at when literals are eight bits - true of TIFF always and of
+ * GIF only when the image has a full 256-colour table.  A GIF with four
+ * colours opens at three bits, and the reader refused to read it.
+ */
+#define LZW_BITIO_MIN_BITS 3
+
 void lzw_bitreader_init(lzw_bitreader_t * reader, const uint8_t * data,
     size_t size, lzw_bitio_order_t order) {
   if (!reader) {
@@ -101,7 +112,7 @@ static gcomp_status_t read_msb(
  * RUNNING OUT OF INPUT IS NOT CORRUPTION
  * ======================================
  *
- * Codes are 9 to 12 bits and do not stop on byte boundaries, so a window of
+ * Codes are 3 to 12 bits and do not stop on byte boundaries, so a window of
  * input almost always ends part-way through one.  For a streaming decoder
  * that is the ordinary case -- the rest of the code is in the bytes that have
  * not arrived yet -- and it is reported as GCOMP_ERR_LIMIT, meaning "come
@@ -123,7 +134,7 @@ gcomp_status_t lzw_bitreader_read_bits(
   if (!reader || !out) {
     return GCOMP_ERR_INVALID_ARG;
   }
-  if (num_bits < 9 || num_bits > LZW_BITIO_MAX_BITS) {
+  if (num_bits < LZW_BITIO_MIN_BITS || num_bits > LZW_BITIO_MAX_BITS) {
     return GCOMP_ERR_INVALID_ARG;
   }
   if (reader->order == LZW_BITIO_LSB) {
@@ -230,7 +241,7 @@ gcomp_status_t lzw_bitwriter_write_bits(
   if (!writer) {
     return GCOMP_ERR_INVALID_ARG;
   }
-  if (num_bits < 9 || num_bits > LZW_BITIO_MAX_BITS) {
+  if (num_bits < LZW_BITIO_MIN_BITS || num_bits > LZW_BITIO_MAX_BITS) {
     return GCOMP_ERR_INVALID_ARG;
   }
   if (writer->order == LZW_BITIO_LSB) {

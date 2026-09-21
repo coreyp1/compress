@@ -12,11 +12,21 @@
  * - Bit packing order (LSB for GIF, MSB for TIFF)
  * - When code width increases as the table grows (GIF vs TIFF rule)
  *
- * Note: the public options include `lzw.lit_width` for compatibility and future
- * extension. For the reference profiles implemented here, CLEAR/EOI are fixed
- * to 256/257 and the starting code width is 9 bits, which matches common GIF
- * and TIFF LZW streams. `lzw.lit_width` primarily affects defaults and schema
- * validation at the method layer.
+ * `lit_width` is the width of a literal code: GIF calls it the "LZW minimum
+ * code size" and writes it in front of every image's data (89a 22); TIFF fixes
+ * it at 8 (TIFF 6.0 section 13).  Everything else here follows from it -
+ * CLEAR is the first code above the literals, EOI the one after that, and the
+ * stream opens one bit wider than a literal so that both of them are
+ * expressible.
+ *
+ * These three used to ignore `lit_width` and return 256, 257 and 9, on the
+ * stated grounds that this "matches common GIF and TIFF LZW streams".  It
+ * matches TIFF, whose literals are always 8 bits.  It does not match GIF: of
+ * 121 GIFs installed on one Debian machine, 71 contained at least one image
+ * below width 8, and every one of those 71 failed to decode while no file of
+ * only width-8 images did.  Widths 2, 3, 4, 6 and 7 were rejected outright;
+ * width 5 was worse, returning success after writing 8 bytes of a 128-byte
+ * image, because a wrong code width can happen to hit EOI early.
  *
  * Copyright 2026 by Corey Pennycuff
  */
@@ -24,9 +34,6 @@
 #include <ghoti.io/compress/macros.h>
 #include "lzw_profile.h"
 #include <string.h>
-
-#define LZW_CLEAR_DEFAULT 256u
-#define LZW_EOI_DEFAULT 257u
 
 lzw_profile_id_t lzw_profile_from_string(const char * format) {
   if (!format) {
@@ -42,22 +49,22 @@ lzw_profile_id_t lzw_profile_from_string(const char * format) {
 }
 
 uint32_t lzw_profile_clear_code(lzw_profile_id_t profile, unsigned lit_width) {
+  // The same rule in both profiles: CLEAR sits directly above the literals.
+  // At TIFF's fixed width of 8 it is 256, which is what section 13 names.
   (void)profile;
-  (void)lit_width;
-  return LZW_CLEAR_DEFAULT;
+  return 1u << lit_width;
 }
 
 uint32_t lzw_profile_eoi_code(lzw_profile_id_t profile, unsigned lit_width) {
   (void)profile;
-  (void)lit_width;
-  return LZW_EOI_DEFAULT;
+  return (1u << lit_width) + 1u;
 }
 
 unsigned lzw_profile_initial_code_bits(
     lzw_profile_id_t profile, unsigned lit_width) {
+  // One wider than a literal, so that CLEAR and EOI can be written at all.
   (void)profile;
-  (void)lit_width;
-  return 9;
+  return lit_width + 1u;
 }
 
 lzw_bitio_order_t lzw_profile_bit_order(lzw_profile_id_t profile) {

@@ -45,8 +45,14 @@
 #include <string.h>
 
 #define LZW_FORMAT_DEFAULT LZW_FORMAT_GIF
+// The width of a LITERAL code, not the width the stream opens at.  TIFF 6.0
+// section 13 fixes its literals at 8 bits and its first code at 9; this is the
+// 8.  It read 9 while the profile layer ignored the value and returned 9 for
+// the opening width regardless, so the two errors cancelled and TIFF worked.
+// Now that the profile derives from this, 9 here would open TIFF at 10 bits
+// with CLEAR at 512.
 #define LZW_LIT_WIDTH_GIF 8
-#define LZW_LIT_WIDTH_TIFF 9
+#define LZW_LIT_WIDTH_TIFF 8
 #define LZW_MAX_CODE_BITS_DEFAULT 12
 #define LZW_NO_PREFIX UINT32_MAX
 
@@ -147,7 +153,22 @@ gcomp_status_t lzw_encoder_init(gcomp_registry_t * registry,
     }
   }
 
+  // Eight is the ceiling because a literal decodes to one byte: the code
+  // table's append_char is a uint8_t, so a ninth bit of literal has nowhere
+  // to go.  Two is the floor because GIF says so (89a 22).  The core checks
+  // max_code_bits; nothing checked this, because until the profile began
+  // reading lit_width an out-of-range value changed nothing.
   unsigned lit = (unsigned)state->lit_width;
+  unsigned enc_max_bits = (unsigned)state->max_code_bits;
+  if (enc_max_bits > LZW_CORE_MAX_CODE_BITS) {
+    enc_max_bits = LZW_CORE_MAX_CODE_BITS;
+  }
+  unsigned lit_ceiling = enc_max_bits - 1u < 8u ? enc_max_bits - 1u : 8u;
+  if (lit < 2u || lit > lit_ceiling) {
+    gcomp_free(alloc, state);
+    return gcomp_encoder_set_error(encoder, GCOMP_ERR_INVALID_ARG,
+        "LZW lit_width must be 2..%u", lit_ceiling);
+  }
   state->clear_code = lzw_profile_clear_code(state->profile_id, lit);
   state->eoi_code = lzw_profile_eoi_code(state->profile_id, lit);
   state->current_bits = lzw_profile_initial_code_bits(state->profile_id, lit);

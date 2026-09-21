@@ -91,16 +91,25 @@ gcomp_status_t lzw_core_decoder_init(lzw_core_decoder_t * core,
 
   core->allocator = allocator;
   core->capacity = capacity;
-  core->next_code = first_sequence_code(clear_code, eoi_code);
+  core->first_code = first_sequence_code(clear_code, eoi_code);
+  core->next_code = core->first_code;
   core->prev_code = 0;
   core->prev_first_byte = 0;
   core->has_prev = 0;
 
-  for (uint32_t i = 0; i < 256u; i++) {
+  // The literals run from zero up to CLEAR, and the dictionary starts above
+  // EOI.  That boundary is 256 only when a literal is eight bits wide: a GIF
+  // with four colours clears at 4, and seeding 256 literals would leave codes
+  // 6..255 looking like single bytes when they are dictionary entries waiting
+  // to be defined.  The symptom was not a refusal but a short read - a code
+  // that should have expanded to a string produced one byte, the stream fell
+  // out of step, and some later code landed on EOI.
+  uint32_t literals = clear_code < capacity ? clear_code : capacity;
+  for (uint32_t i = 0; i < literals; i++) {
     core->prefix_code[i] = (uint16_t)LZW_SENTINEL;
     core->append_char[i] = (uint8_t)i;
   }
-  for (uint32_t i = 256; i < capacity; i++) {
+  for (uint32_t i = literals; i < capacity; i++) {
     core->prefix_code[i] = (uint16_t)LZW_SENTINEL;
     core->append_char[i] = 0;
   }
@@ -113,11 +122,16 @@ void lzw_core_decoder_reset(
   if (!core || !core->prefix_code) {
     return;
   }
-  core->next_code = first_sequence_code(clear_code, eoi_code);
+  core->first_code = first_sequence_code(clear_code, eoi_code);
+  core->next_code = core->first_code;
   core->prev_code = 0;
   core->prev_first_byte = 0;
   core->has_prev = 0;
-  for (uint32_t i = 256; i < core->capacity; i++) {
+  // Clear everything above the literals, which is where CLEAR sits.  Starting
+  // at a fixed 256 left a narrow stream's stale entries in place across a
+  // CLEAR, which is the same defect as in init and just harder to reach.
+  uint32_t literals = clear_code < core->capacity ? clear_code : core->capacity;
+  for (uint32_t i = literals; i < core->capacity; i++) {
     core->prefix_code[i] = (uint16_t)LZW_SENTINEL;
     core->append_char[i] = 0;
   }
@@ -150,7 +164,15 @@ static size_t decode_to_stack(const lzw_core_decoder_t * core, uint32_t code,
   size_t n = 0;
   uint32_t c = code;
 
-  while (c > 257u && c < capacity && core->prefix_code[c] != LZW_SENTINEL) {
+  // Walk the chain while the code names a dictionary entry.  This compared
+  // against a hardcoded 257, which is the boundary only for eight-bit
+  // literals: with a narrower one, every dictionary code looked like a
+  // literal root, the walk stopped at once and each code produced a single
+  // byte.  A 128-pixel four-colour image came back as 36 bytes, reported as
+  // success, because the codes themselves read correctly and only their
+  // expansion was wrong.
+  while (c >= core->first_code && c < capacity &&
+      core->prefix_code[c] != LZW_SENTINEL) {
     if (n >= capacity) {
       return 0;
     }
@@ -268,13 +290,22 @@ gcomp_status_t lzw_core_encoder_init(lzw_core_encoder_t * core,
 
   core->allocator = allocator;
   core->capacity = capacity;
-  core->next_code = first_sequence_code(clear_code, eoi_code);
+  core->first_code = first_sequence_code(clear_code, eoi_code);
+  core->next_code = core->first_code;
 
-  for (uint32_t i = 0; i < 256u; i++) {
+  // The literals run from zero up to CLEAR, and the dictionary starts above
+  // EOI.  That boundary is 256 only when a literal is eight bits wide: a GIF
+  // with four colours clears at 4, and seeding 256 literals would leave codes
+  // 6..255 looking like single bytes when they are dictionary entries waiting
+  // to be defined.  The symptom was not a refusal but a short read - a code
+  // that should have expanded to a string produced one byte, the stream fell
+  // out of step, and some later code landed on EOI.
+  uint32_t literals = clear_code < capacity ? clear_code : capacity;
+  for (uint32_t i = 0; i < literals; i++) {
     core->prefix_code[i] = (uint16_t)LZW_SENTINEL;
     core->append_char[i] = (uint8_t)i;
   }
-  for (uint32_t i = 256; i < capacity; i++) {
+  for (uint32_t i = literals; i < capacity; i++) {
     core->prefix_code[i] = (uint16_t)LZW_SENTINEL;
     core->append_char[i] = 0;
   }
@@ -287,8 +318,13 @@ void lzw_core_encoder_reset(
   if (!core || !core->prefix_code) {
     return;
   }
-  core->next_code = first_sequence_code(clear_code, eoi_code);
-  for (uint32_t i = 256; i < core->capacity; i++) {
+  core->first_code = first_sequence_code(clear_code, eoi_code);
+  core->next_code = core->first_code;
+  // Clear everything above the literals, which is where CLEAR sits.  Starting
+  // at a fixed 256 left a narrow stream's stale entries in place across a
+  // CLEAR, which is the same defect as in init and just harder to reach.
+  uint32_t literals = clear_code < core->capacity ? clear_code : core->capacity;
+  for (uint32_t i = literals; i < core->capacity; i++) {
     core->prefix_code[i] = (uint16_t)LZW_SENTINEL;
     core->append_char[i] = 0;
   }
@@ -316,7 +352,7 @@ int lzw_core_encoder_find(const lzw_core_encoder_t * core, uint32_t prefix,
     return 0;
   }
   uint32_t next = core->next_code;
-  for (uint32_t i = 258; i < next; i++) {
+  for (uint32_t i = core->first_code; i < next; i++) {
     if (core->prefix_code[i] == (uint16_t)(prefix & 0xFFFFu) &&
         core->append_char[i] == byte) {
       *code_out = i;

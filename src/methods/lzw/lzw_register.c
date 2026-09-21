@@ -90,7 +90,8 @@ static const gcomp_option_schema_t g_lzw_option_schemas[] = {
         0,                // max_int
         0,                // min_uint
         0,                // max_uint
-        "Initial code width in bits (e.g. 8 for GIF, 9 for TIFF)",
+        "Literal code width in bits, 2..11: GIF's \"LZW minimum code size\", "
+        "fixed at 8 by TIFF. The stream opens one bit wider",
         NULL, // allowed
     },
     {

@@ -94,10 +94,105 @@ TEST_F(LzwRoundtripTest, ProfileFromString) {
 }
 
 TEST_F(LzwRoundtripTest, ProfileClearEoi) {
+  // At eight-bit literals - TIFF always, GIF with a full colour table - these
+  // are the familiar 256 and 257.  They are not constants, though: they are
+  // where the literals end, and this used to return 256 and 257 whatever it
+  // was asked.  The TIFF line below passed 9 and expected 256, which is how
+  // the error stayed invisible - 9 is TIFF's opening code width, not its
+  // literal width, and the function ignored the argument anyway.
   EXPECT_EQ(lzw_profile_clear_code(LZW_PROFILE_GIF, 8), 256u);
   EXPECT_EQ(lzw_profile_eoi_code(LZW_PROFILE_GIF, 8), 257u);
-  EXPECT_EQ(lzw_profile_clear_code(LZW_PROFILE_TIFF, 9), 256u);
-  EXPECT_EQ(lzw_profile_eoi_code(LZW_PROFILE_TIFF, 9), 257u);
+  EXPECT_EQ(lzw_profile_clear_code(LZW_PROFILE_TIFF, 8), 256u);
+  EXPECT_EQ(lzw_profile_eoi_code(LZW_PROFILE_TIFF, 8), 257u);
+
+  // Every width GIF allows (89a 22).  A four-colour image clears at 4.
+  for (unsigned lit = 2; lit <= 8; lit++) {
+    EXPECT_EQ(lzw_profile_clear_code(LZW_PROFILE_GIF, lit), 1u << lit)
+        << "lit_width=" << lit;
+    EXPECT_EQ(lzw_profile_eoi_code(LZW_PROFILE_GIF, lit), (1u << lit) + 1u)
+        << "lit_width=" << lit;
+    EXPECT_EQ(lzw_profile_initial_code_bits(LZW_PROFILE_GIF, lit), lit + 1u)
+        << "lit_width=" << lit;
+  }
+}
+
+TEST_F(LzwRoundtripTest, RoundTripAtEveryLiteralWidth) {
+  // The widths below eight were unreachable: the profile opened every stream
+  // at nine bits, the bit reader refused anything narrower, and the table
+  // treated code 257 as the top literal, so a narrow stream either failed or
+  // came back short.  Of 121 GIFs on one Debian machine, 71 held an image
+  // below width 8.
+  for (unsigned lit = 2; lit <= 8; lit++) {
+    const unsigned colors = 1u << lit;
+    std::vector<uint8_t> data(512);
+    for (size_t i = 0; i < data.size(); i++) {
+      // Runs and repeats, so the dictionary actually grows and the code width
+      // has to widen more than once.
+      data[i] = (uint8_t)(((i / 3) + (i % 7)) % colors);
+    }
+    gcomp_options_t * opts = nullptr;
+    gcomp_options_create(&opts);
+    gcomp_options_set_string(opts, "lzw.format", "gif");
+    gcomp_options_set_uint64(opts, "lzw.lit_width", lit);
+
+    gcomp_encoder_t * enc = nullptr;
+    ASSERT_EQ(gcomp_encoder_create(registry_, "lzw", opts, &enc), GCOMP_OK)
+        << "lit_width=" << lit;
+    std::vector<uint8_t> encoded(data.size() * 2 + 128);
+    gcomp_buffer_t in_buf = {data.data(), data.size(), 0};
+    gcomp_buffer_t out_buf = {encoded.data(), encoded.size(), 0};
+    ASSERT_EQ(gcomp_encoder_update(enc, &in_buf, &out_buf), GCOMP_OK);
+    ASSERT_EQ(gcomp_encoder_finish(enc, &out_buf), GCOMP_OK);
+    const size_t encoded_len = out_buf.used;
+    gcomp_encoder_destroy(enc);
+
+    gcomp_decoder_t * dec = nullptr;
+    ASSERT_EQ(gcomp_decoder_create(registry_, "lzw", opts, &dec), GCOMP_OK)
+        << "lit_width=" << lit;
+    std::vector<uint8_t> decoded(data.size() + 64);
+    gcomp_buffer_t enc_in = {encoded.data(), encoded_len, 0};
+    gcomp_buffer_t dec_out = {decoded.data(), decoded.size(), 0};
+    ASSERT_EQ(gcomp_decoder_update(dec, &enc_in, &dec_out), GCOMP_OK)
+        << "lit_width=" << lit;
+    ASSERT_EQ(gcomp_decoder_finish(dec, &dec_out), GCOMP_OK)
+        << "lit_width=" << lit;
+    gcomp_decoder_destroy(dec);
+    gcomp_options_destroy(opts);
+
+    // Length first: the failure this guards against returned success with a
+    // short buffer, which a content-only check reads as a prefix match.
+    ASSERT_EQ(dec_out.used, data.size()) << "lit_width=" << lit;
+    EXPECT_TRUE(test_helpers_buffers_equal(
+        data.data(), data.size(), decoded.data(), dec_out.used))
+        << "lit_width=" << lit;
+  }
+}
+
+TEST_F(LzwRoundtripTest, LiteralWidthOutOfRangeIsRefused) {
+  // Two is the floor GIF states; eight is the ceiling a byte imposes, because
+  // a literal decodes to one.  Nothing rejected either end while the value
+  // was ignored.
+  for (unsigned lit : {0u, 1u, 9u, 12u, 64u}) {
+    gcomp_options_t * opts = nullptr;
+    gcomp_options_create(&opts);
+    gcomp_options_set_string(opts, "lzw.format", "gif");
+    gcomp_options_set_uint64(opts, "lzw.lit_width", lit);
+    gcomp_decoder_t * dec = nullptr;
+    const gcomp_status_t s =
+        gcomp_decoder_create(registry_, "lzw", opts, &dec);
+    if (lit == 0u) {
+      // Zero means "unset" at the option layer, so it takes the format's
+      // default rather than being refused.
+      EXPECT_EQ(s, GCOMP_OK) << "lit_width=" << lit;
+    }
+    else {
+      EXPECT_EQ(s, GCOMP_ERR_INVALID_ARG) << "lit_width=" << lit;
+    }
+    if (dec) {
+      gcomp_decoder_destroy(dec);
+    }
+    gcomp_options_destroy(opts);
+  }
 }
 
 TEST_F(LzwRoundtripTest, ProfileBitOrder) {

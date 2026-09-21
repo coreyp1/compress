@@ -42,6 +42,10 @@ typedef struct lzw_core_decoder_s {
   uint8_t * append_char;  ///< Append byte for each table entry.
   uint8_t * stack;        ///< Decode stack (reverse output); length capacity.
   uint32_t capacity;      ///< Max codes (e.g. 4096).
+  /** First dictionary code: one above EOI, so CLEAR and EOI sit below it.
+   * Everything under this is a literal root.  It is 258 only when a literal
+   * is eight bits wide; a four-colour GIF clears at 4 and starts here at 6. */
+  uint32_t first_code;
   uint32_t next_code;     ///< Next code to assign.
   uint32_t prev_code;     ///< Previous code decoded (for KwKwK).
   uint8_t prev_first_byte; ///< First byte of previous string (for KwKwK).
@@ -58,6 +62,7 @@ typedef struct lzw_core_encoder_s {
   uint16_t * prefix_code;
   uint8_t * append_char;
   uint32_t capacity;
+  uint32_t first_code; ///< First dictionary code; see the decoder's.
   uint32_t next_code;
 } lzw_core_encoder_t;
 

@@ -38,8 +38,14 @@
 #include <string.h>
 
 #define LZW_FORMAT_DEFAULT LZW_FORMAT_GIF
+// The width of a LITERAL code, not the width the stream opens at.  TIFF 6.0
+// section 13 fixes its literals at 8 bits and its first code at 9; this is the
+// 8.  It read 9 while the profile layer ignored the value and returned 9 for
+// the opening width regardless, so the two errors cancelled and TIFF worked.
+// Now that the profile derives from this, 9 here would open TIFF at 10 bits
+// with CLEAR at 512.
 #define LZW_LIT_WIDTH_GIF 8
-#define LZW_LIT_WIDTH_TIFF 9
+#define LZW_LIT_WIDTH_TIFF 8
 #define LZW_MAX_CODE_BITS_DEFAULT 12
 
 gcomp_status_t lzw_decoder_init(gcomp_registry_t * registry,
@@ -109,17 +115,29 @@ gcomp_status_t lzw_decoder_init(gcomp_registry_t * registry,
   state->max_expansion_ratio = gcomp_limits_read_expansion_ratio_max(
       options, GCOMP_LZW_MAX_EXPANSION_RATIO);
 
-  unsigned lit = (unsigned)state->lit_width;
-  state->clear_code = lzw_profile_clear_code(state->profile_id, lit);
-  state->eoi_code = lzw_profile_eoi_code(state->profile_id, lit);
-  state->current_bits = lzw_profile_initial_code_bits(state->profile_id, lit);
-
   unsigned max_bits = (unsigned)state->max_code_bits;
   if (max_bits == 0 || max_bits > LZW_CORE_MAX_CODE_BITS) {
     gcomp_free(alloc, state);
     return gcomp_decoder_set_error(decoder, GCOMP_ERR_INVALID_ARG,
         "LZW decoder max_code_bits must be 1..%u", LZW_CORE_MAX_CODE_BITS);
   }
+
+  // Eight is the ceiling because a literal decodes to one byte: the code
+  // table's append_char is a uint8_t, so a ninth bit of literal has nowhere
+  // to go.  Two is the floor because GIF says so (89a 22).  Below two there is no room
+  // for a dictionary at all.  Nothing checked this while the profile ignored
+  // the value; now that CLEAR is 1 << lit_width, an unchecked width shifts by
+  // whatever the caller passed.
+  unsigned lit = (unsigned)state->lit_width;
+  unsigned lit_ceiling = max_bits - 1u < 8u ? max_bits - 1u : 8u;
+  if (lit < 2u || lit > lit_ceiling) {
+    gcomp_free(alloc, state);
+    return gcomp_decoder_set_error(decoder, GCOMP_ERR_INVALID_ARG,
+        "LZW lit_width must be 2..%u", lit_ceiling);
+  }
+  state->clear_code = lzw_profile_clear_code(state->profile_id, lit);
+  state->eoi_code = lzw_profile_eoi_code(state->profile_id, lit);
+  state->current_bits = lzw_profile_initial_code_bits(state->profile_id, lit);
   state->pending_cap = (size_t)(1u << max_bits);
 
   state->mem_tracker.current_bytes = 0;
