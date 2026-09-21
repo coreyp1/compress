@@ -320,6 +320,52 @@ TEST_F(GzipRoundtripTest, AllLevels) {
   }
 }
 
+/**
+ * Level 0 on payloads too small to drain the decoder's bit buffer.
+ *
+ * A stored block is byte-aligned and its LEN/NLEN take four bytes, and the
+ * decoder's refill takes eight at a time, so when a stored block ends a
+ * stream the buffer is still holding some of the gzip trailer.  Those bytes
+ * have to be handed back or the trailer cannot be checked and a perfectly
+ * good stream is reported as a failure.
+ *
+ * `Level0NoCompression` and `AllLevels` above did not catch that, because a
+ * payload of 38 or 2000 bytes is long enough that copying the stored data
+ * empties the buffer on the way past.  Only inputs of a few bytes leave
+ * anything in it, so the sizes here start at zero.
+ *
+ * Found by `make fuzz-replay`, not by this suite, on four tracked inputs.
+ */
+TEST_F(GzipRoundtripTest, Level0SurvivesPayloadsTooSmallToDrainTheBitBuffer) {
+  for (size_t n = 0; n <= 64; n++) {
+    std::vector<uint8_t> data(n);
+    for (size_t i = 0; i < n; i++) {
+      data[i] = static_cast<uint8_t>(i * 7u + 1u);
+    }
+
+    // The optional header fields move where the deflate stream starts, which
+    // moves every bulk refill along with it.
+    for (int extras = 0; extras < 4; extras++) {
+      gcomp_options_t * opts = nullptr;
+      ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+      ASSERT_EQ(gcomp_options_set_int64(opts, "deflate.level", 0), GCOMP_OK);
+      if (extras & 1) {
+        gcomp_options_set_string(opts, "gzip.name", "roundtrip.bin");
+      }
+      if (extras & 2) {
+        gcomp_options_set_bool(opts, "gzip.header_crc", 1);
+      }
+
+      std::string desc =
+          "level 0, " + std::to_string(n) + " bytes, extras " +
+          std::to_string(extras);
+      verifyRoundtrip(data.data(), n, opts, desc.c_str());
+
+      gcomp_options_destroy(opts);
+    }
+  }
+}
+
 //
 // Optional Header Fields
 //

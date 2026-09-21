@@ -492,6 +492,59 @@ static gcomp_status_t deflate_emit_byte(
   return GCOMP_OK;
 }
 
+/**
+ * @brief Hand back whole bytes the bit buffer read past the end of the stream.
+ *
+ * The refill takes bytes in bulk, so when a deflate stream ends the buffer
+ * usually holds some of whatever follows it -- for gzip and zlib, that is the
+ * trailer, and losing it turns a good stream into a failed one.
+ *
+ * Whole bytes are what is handed back; the remaining `bit_count % 8` bits are
+ * the encoder's padding to a byte boundary and are discarded.
+ *
+ * Two ways back, because there are two ways the bytes were taken:
+ *
+ * - If they came from the input buffer this call was given, rewind it.  The
+ *   container reads them from there as if the decoder had never touched them.
+ * - If they were taken during an earlier call, that buffer is gone, so they
+ *   are kept for ::gcomp_deflate_decoder_get_unconsumed_data().
+ *
+ * This must run at every end of stream, not just the end of a Huffman block.
+ * A stored block was the case that got missed: while the bit buffer was 32
+ * bits wide it was always empty by then -- the block is byte-aligned and
+ * LEN/NLEN took all 32 bits -- so a stored block ending a stream left nothing
+ * to give back and nothing called this.  At 64 bits it leaves three bytes,
+ * and every gzip stream whose last block was stored lost its trailer.
+ */
+static gcomp_status_t deflate_release_buffered_bytes(
+    gcomp_deflate_decoder_state_t * st, gcomp_buffer_t * input) {
+  st->unconsumed_count = 0;
+  if (st->bit_count >= 8u) {
+    uint32_t bytes_to_handle = st->bit_count / 8u;
+    // The buffer cannot hold more whole bytes than it is wide, so this cannot
+    // fire.  It is an error rather than a clamp because clamping is what hid
+    // the problem before: dropping a byte here loses a container's trailer
+    // and reports success.
+    if (bytes_to_handle > sizeof(st->unconsumed_bytes)) {
+      return GCOMP_ERR_INTERNAL;
+    }
+    if (bytes_to_handle <= input->used) {
+      input->used -= bytes_to_handle;
+      st->total_input_bytes -= bytes_to_handle;
+    }
+    else {
+      for (uint32_t i = 0; i < bytes_to_handle; i++) {
+        st->unconsumed_bytes[i] = (uint8_t)(st->bit_buffer >> (i * 8u));
+      }
+      st->unconsumed_count = (uint8_t)bytes_to_handle;
+    }
+  }
+  // The padding bits that remain are not part of anything.
+  st->bit_buffer = 0;
+  st->bit_count = 0;
+  return GCOMP_OK;
+}
+
 static gcomp_status_t deflate_copy_stored(gcomp_deflate_decoder_state_t * st,
     gcomp_buffer_t * input, gcomp_buffer_t * output) {
   if (!st || !input || !output) {
@@ -1795,35 +1848,10 @@ static gcomp_status_t deflate_huffman_step(
       // - In streaming mode (bytes were consumed in previous calls), save
       //   them for retrieval via gcomp_deflate_decoder_get_unconsumed_data().
       //   The container format retrieves them explicitly.
-      st->unconsumed_count = 0;
-      if (st->bit_count >= 8) {
-        uint32_t bytes_to_handle = st->bit_count / 8;
-        // The buffer cannot hold more whole bytes than it is wide, so this
-        // cannot fire.  It is an error rather than a clamp because clamping
-        // is what hid the problem before: dropping a byte here loses a
-        // container's trailer and reports success.
-        if (bytes_to_handle > sizeof(st->unconsumed_bytes)) {
-          return GCOMP_ERR_INTERNAL;
-        }
-        // Try to return bytes to input buffer (bulk mode)
-        if (bytes_to_handle <= input->used) {
-          // Bulk mode: bytes can be returned to input
-          input->used -= bytes_to_handle;
-          st->total_input_bytes -= bytes_to_handle;
-          // Don't save to unconsumed_bytes - gzip will read from input
-        }
-        else {
-          // Streaming mode: bytes were consumed in previous calls
-          // Save them for explicit retrieval by the container format
-          for (uint32_t i = 0; i < bytes_to_handle; i++) {
-            st->unconsumed_bytes[i] = (uint8_t)(st->bit_buffer >> (i * 8));
-          }
-          st->unconsumed_count = (uint8_t)bytes_to_handle;
-        }
+      gcomp_status_t rel = deflate_release_buffered_bytes(st, input);
+      if (rel != GCOMP_OK) {
+        return rel;
       }
-      // Clear the bit buffer (padding bits are discarded)
-      st->bit_buffer = 0;
-      st->bit_count = 0;
     }
     else {
       st->stage = DEFLATE_STAGE_BLOCK_HEADER;
@@ -1975,8 +2003,15 @@ gcomp_status_t gcomp_deflate_decoder_update(gcomp_decoder_t * decoder,
     case DEFLATE_STAGE_STORED_COPY:
       s = deflate_copy_stored(st, input, output);
       if (s == GCOMP_OK && st->stored_remaining == 0) {
-        st->stage =
-            st->last_block ? DEFLATE_STAGE_DONE : DEFLATE_STAGE_BLOCK_HEADER;
+        if (st->last_block) {
+          // Same as the end of a Huffman block: whatever the bit buffer read
+          // past the end of the stream belongs to whoever wraps it.
+          s = deflate_release_buffered_bytes(st, input);
+          st->stage = DEFLATE_STAGE_DONE;
+        }
+        else {
+          st->stage = DEFLATE_STAGE_BLOCK_HEADER;
+        }
       }
       break;
     case DEFLATE_STAGE_DYNAMIC_HEADER:
