@@ -7,10 +7,10 @@
  */
 
 #include "test_helpers.h"
+#include <ghoti.io/cutil/file.h>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <fstream>
 #include <vector>
 
 extern "C" {
@@ -89,26 +89,30 @@ bool test_helpers_load_file(
     return false;
   }
 
-  std::ifstream file(filepath, std::ios::binary | std::ios::ate);
-  if (!file.is_open()) {
+  // cutil reads in chunks rather than seeking to the end first, so this works
+  // on inputs that report no size - a pipe, or anything under /proc - which
+  // the ifstream/tellg version returned zero bytes for.  It also removes the
+  // empty-file case, where malloc(0) may hand back NULL and the old code read
+  // that as failure.
+  void * data = nullptr;
+  size_t len = 0;
+  if (gcu_file_read(filepath, GCU_FILE_UNLIMITED, nullptr, &data, &len)
+      != GCU_FILE_OK) {
     return false;
   }
 
-  std::streamsize size = file.tellg();
-  file.seekg(0, std::ios::beg);
-
-  std::vector<uint8_t> buffer(static_cast<size_t>(size));
-  if (!file.read(reinterpret_cast<char *>(buffer.data()), size)) {
+  // The contract hands the caller a std::malloc() buffer, so the bytes are
+  // copied out of cutil's allocator rather than the contract being changed.
+  uint8_t * out = static_cast<uint8_t *>(std::malloc(len ? len : 1));
+  if (out == nullptr) {
+    gcu_file_free(nullptr, data);
     return false;
   }
+  std::memcpy(out, data, len);
+  gcu_file_free(nullptr, data);
 
-  *buffer_out = static_cast<uint8_t *>(std::malloc(buffer.size()));
-  if (*buffer_out == nullptr) {
-    return false;
-  }
-
-  std::memcpy(*buffer_out, buffer.data(), buffer.size());
-  *len_out = buffer.size();
+  *buffer_out = out;
+  *len_out = len;
   return true;
 }
 

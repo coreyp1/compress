@@ -26,9 +26,6 @@
 #include <io.h>
 #include <process.h>
 #include <windows.h>
-#define close _close
-#define write _write
-#define unlink _unlink
 #define popen _popen
 #define pclose _pclose
 #else
@@ -43,6 +40,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <temp_file.h>
 #include <vector>
 
 // Check if oracle tests should be skipped
@@ -117,62 +115,6 @@ protected:
     }
   }
 
-  // Helper to write bytes to a temporary file
-  std::string writeTempFile(
-      const std::vector<uint8_t> & data, const std::string & suffix = ".bin") {
-#ifdef _WIN32
-    // Windows implementation
-    char tmpdir[MAX_PATH];
-    if (GetTempPathA(MAX_PATH, tmpdir) == 0) {
-      return "";
-    }
-    char tmpname[MAX_PATH];
-    // Generate a unique filename using process ID and a counter
-    static int counter = 0;
-    snprintf(tmpname, sizeof(tmpname), "%sgcomp_oracle_%d_%d%s", tmpdir,
-        _getpid(), counter++, suffix.c_str());
-
-    int fd = _open(tmpname, _O_CREAT | _O_WRONLY | _O_BINARY | _O_EXCL, 0600);
-    if (fd < 0) {
-      return "";
-    }
-    int written =
-        _write(fd, data.data(), static_cast<unsigned int>(data.size()));
-    _close(fd);
-    if (written < 0 || static_cast<size_t>(written) != data.size()) {
-      _unlink(tmpname);
-      return "";
-    }
-    return tmpname;
-#else
-    // POSIX implementation
-    char tmpname[256];
-    snprintf(
-        tmpname, sizeof(tmpname), "/tmp/gcomp_oracle_XXXXXX%s", suffix.c_str());
-    int fd = mkstemps(tmpname, static_cast<int>(suffix.length()));
-    if (fd < 0) {
-      return "";
-    }
-    ssize_t written = write(fd, data.data(), data.size());
-    close(fd);
-    if (written < 0 || static_cast<size_t>(written) != data.size()) {
-      unlink(tmpname);
-      return "";
-    }
-    return tmpname;
-#endif
-  }
-
-  // Helper to read bytes from a file
-  std::vector<uint8_t> readFile(const std::string & path) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) {
-      return {};
-    }
-    return std::vector<uint8_t>(
-        std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
-  }
-
   // Helper to run a command and capture stdout
   std::vector<uint8_t> runCommandGetOutput(const std::string & cmd) {
 #ifdef _WIN32
@@ -201,21 +143,15 @@ protected:
       return {};
     }
 
-    std::string tmpfile = writeTempFile(data);
-    if (tmpfile.empty()) {
+    gcomp_test::TempFile tmp("gcomp_oracle", ".bin");
+    if (!tmp.valid() || !tmp.write(data)) {
       return {};
     }
 
     // Python script to compress and output raw deflate
-    // Use escaped quotes and forward slashes for cross-platform compatibility
-    std::string escaped_path = tmpfile;
-#ifdef _WIN32
-    // Convert backslashes to forward slashes for Python
-    for (char & c : escaped_path) {
-      if (c == '\\')
-        c = '/';
-    }
-#endif
+    // Python wants forward slashes in the string literal below whatever the
+    // host uses; cutil copies unchanged on POSIX, so this is not an #ifdef.
+    std::string escaped_path = gcomp_test::toPosixPath(tmp.path());
     std::stringstream cmd;
     cmd << getPythonCommand() << " -c \""
         << "import zlib,sys;"
@@ -224,9 +160,8 @@ protected:
         << "sys.stdout.buffer.write(comp.compress(data) + comp.flush());"
         << "\"";
 
-    std::vector<uint8_t> result = runCommandGetOutput(cmd.str());
-    unlink(tmpfile.c_str());
-    return result;
+    // No unlink: ~TempFile does it, on every path out of this function.
+    return runCommandGetOutput(cmd.str());
   }
 
   // Use Python zlib to decompress data (expects raw deflate stream)
@@ -235,21 +170,15 @@ protected:
       return {};
     }
 
-    std::string tmpfile = writeTempFile(data);
-    if (tmpfile.empty()) {
+    gcomp_test::TempFile tmp("gcomp_oracle", ".bin");
+    if (!tmp.valid() || !tmp.write(data)) {
       return {};
     }
 
     // Python script to decompress raw deflate
-    // Use escaped quotes and forward slashes for cross-platform compatibility
-    std::string escaped_path = tmpfile;
-#ifdef _WIN32
-    // Convert backslashes to forward slashes for Python
-    for (char & c : escaped_path) {
-      if (c == '\\')
-        c = '/';
-    }
-#endif
+    // Python wants forward slashes in the string literal below whatever the
+    // host uses; cutil copies unchanged on POSIX, so this is not an #ifdef.
+    std::string escaped_path = gcomp_test::toPosixPath(tmp.path());
     std::stringstream cmd;
     cmd << getPythonCommand() << " -c \""
         << "import zlib,sys;"
@@ -258,9 +187,8 @@ protected:
         << "sys.stdout.buffer.write(decomp.decompress(data));"
         << "\"";
 
-    std::vector<uint8_t> result = runCommandGetOutput(cmd.str());
-    unlink(tmpfile.c_str());
-    return result;
+    // No unlink: ~TempFile does it, on every path out of this function.
+    return runCommandGetOutput(cmd.str());
   }
 
   // Compress with our library

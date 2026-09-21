@@ -23,7 +23,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/options.h>
@@ -32,17 +31,8 @@
 #include <ghoti.io/compress/zlib.h>
 #include <gtest/gtest.h>
 #include <string>
+#include <temp_file.h>
 #include <vector>
-
-#ifdef _WIN32
-#include <fcntl.h>
-#include <io.h>
-#define popen _popen
-#define pclose _pclose
-#define unlink _unlink
-#else
-#include <unistd.h>
-#endif
 
 namespace {
 
@@ -69,55 +59,24 @@ bool HasPythonZlib() {
   return system(cmd.c_str()) == 0;
 }
 
-std::string WriteTemp(const std::vector<uint8_t> & data) {
-#ifdef _WIN32
-  char name[L_tmpnam];
-  if (!tmpnam(name)) {
-    return "";
-  }
-  std::ofstream f(name, std::ios::binary);
-  if (!f) {
-    return "";
-  }
-  f.write((const char *)data.data(), (std::streamsize)data.size());
-  f.close();
-  return name;
-#else
-  char name[] = "/tmp/gcomp_zlib_oracle_XXXXXX";
-  int fd = mkstemp(name);
-  if (fd < 0) {
-    return "";
-  }
-  if (!data.empty()) {
-    if (write(fd, data.data(), data.size()) < 0) {
-      close(fd);
-      unlink(name);
-      return "";
-    }
-  }
-  close(fd);
-  return name;
-#endif
-}
-
 std::vector<uint8_t> RunPython(const std::string & script,
     const std::vector<uint8_t> & input, bool * ok) {
   *ok = false;
-  std::string in_path = WriteTemp(input);
-  if (in_path.empty()) {
-    return {};
-  }
-  std::string out_path = WriteTemp({});
-  if (out_path.empty()) {
-    unlink(in_path.c_str());
+  // Both files are created before the command runs, so the one the script
+  // writes to already exists and the rename it replaces stays on one
+  // filesystem.  Both remove themselves when this function returns, by any
+  // path, which the two unlinks at the bottom only did on the last one.
+  gcomp_test::TempFile in("gcomp_zlib_oracle", ".in");
+  gcomp_test::TempFile out("gcomp_zlib_oracle", ".out");
+  if (!in.valid() || !out.valid() || !in.write(input)) {
     return {};
   }
 
   // Keep the script on one line: quoting a multi-line program through the
   // shell is exactly the kind of thing that fails differently on Windows.
   std::string cmd = std::string(PythonCommand()) + " -c \"import zlib,sys;" +
-      "src=open(r'" + in_path + "','rb').read();" + script +
-      "open(r'" + out_path + "','wb').write(dst)\"";
+      "src=open(r'" + in.path() + "','rb').read();" + script +
+      "open(r'" + out.path() + "','wb').write(dst)\"";
 #ifdef _WIN32
   cmd += " >NUL 2>&1";
 #else
@@ -127,15 +86,9 @@ std::vector<uint8_t> RunPython(const std::string & script,
   int rc = system(cmd.c_str());
   std::vector<uint8_t> result;
   if (rc == 0) {
-    std::ifstream f(out_path, std::ios::binary);
-    if (f) {
-      result.assign(std::istreambuf_iterator<char>(f),
-          std::istreambuf_iterator<char>());
-      *ok = true;
-    }
+    result = gcomp_test::readWholeFile(out.path());
+    *ok = true;
   }
-  unlink(in_path.c_str());
-  unlink(out_path.c_str());
   return result;
 }
 

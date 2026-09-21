@@ -41,6 +41,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <temp_file.h>
 #include <vector>
 
 #ifdef _WIN32
@@ -86,15 +87,9 @@ std::vector<uint8_t> runCapture(const std::string & cmd) {
 }
 
 std::string tempPath(const std::string & suffix) {
-  static int counter = 0;
-  const char * dir = getenv("TMPDIR");
-  if (!dir || !*dir) {
-    dir = "/tmp";
-  }
-  char name[512];
-  snprintf(name, sizeof(name), "%s/gcomp_zlib_dict_%d_%d%s", dir, (int)getpid(),
-      counter++, suffix.c_str());
-  return name;
+  // cutil creates the file as it names it, so nothing can occupy the
+  // name in between, and it puts it where gcu_path_temp_dir() says.
+  return gcomp_test::uniqueTempPath("gcomp_zlib_dict", suffix);
 }
 
 bool writeFile(const std::string & path, const std::vector<uint8_t> & v) {

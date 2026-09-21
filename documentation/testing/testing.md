@@ -419,8 +419,49 @@ tests/
 │       └── (data/ as needed)
 └── common/
     ├── test_helpers.h            # Test utility functions
-    └── test_helpers.cpp          # Test utility implementations
+    ├── test_helpers.cpp          # Test utility implementations
+    ├── failing_allocator.h       # Allocator that fails on demand
+    ├── passthru_method.h         # A method that copies, for the core tests
+    └── temp_file.h               # Temporary files, through cutil
 ```
+
+### Temporary files
+
+Anything that shells out to an oracle needs a file to hand it, and
+`tests/common/temp_file.h` is where that comes from.  Use it rather than
+writing another one:
+
+```cpp
+#include <temp_file.h>
+
+gcomp_test::TempFile in("gcomp_gzip_oracle", ".gz");
+ASSERT_TRUE(in.valid());
+ASSERT_TRUE(in.write(compressed));
+
+std::string cmd = "gunzip -c \"" + in.path() + "\"";
+// ... run it ...
+// No unlink: the file removes itself when `in` goes out of scope, on every
+// path out of the test including a failed assertion.
+```
+
+The suffix is not decoration - `gzip` and `zstd` both dispatch on the
+extension - so it is part of the name rather than something added afterwards.
+
+| you want | call |
+| --- | --- |
+| a scratch file that cleans itself up | `TempFile(prefix, suffix)` |
+| a second name beside it, e.g. the oracle's output | `t.derived(".out")` |
+| a name whose lifetime is not a scope | `uniqueTempPath(prefix, suffix)` |
+| read a whole file | `readWholeFile(path)`, or the `(path, &out)` form when a missing file must be told apart from an empty one |
+| write a whole file | `writeWholeFile(path, data)` |
+| a path a Python one-liner can embed | `toPosixPath(path)` |
+
+All of it is cutil underneath (`ghoti.io/cutil/file.h` and `path.h`), which
+matters for two reasons.  The name and the file are created in one step that
+fails if the name is taken, so nothing can put a symbolic link there in
+between; and the directory comes from `gcu_path_temp_dir()`, which honours
+`TMPDIR`.  The twelve private copies this replaced did neither reliably, and nine of
+them carried a `#ifdef _WIN32` half that no build has ever compiled.
 
 ## Continuous Integration
 

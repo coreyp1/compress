@@ -492,7 +492,13 @@ GCOMP_AUTOREG_METHOD(gzip, gcomp_method_gzip_register)
 
 Wrapper methods should be tested against standard tools:
 
-```c
+Temporary files come from `tests/common/temp_file.h`, never from a name
+spelled out in the test - see "Temporary files" in
+`documentation/testing/testing.md`.  A hardcoded `/tmp/test.gz` ignores
+`TMPDIR`, collides when two suites run at once, and is a name anything may
+occupy before the test opens it.
+
+```cpp
 // Test that our gzip output can be decompressed by system gzip
 TEST(GzipInterop, DecompressWithSystemGzip) {
     // Compress with our library
@@ -500,25 +506,38 @@ TEST(GzipInterop, DecompressWithSystemGzip) {
     size_t compressed_size;
     gcomp_encode_buffer(NULL, "gzip", NULL, input, input_size,
                         compressed, sizeof(compressed), &compressed_size);
-    
-    // Write to temp file and decompress with system gzip
-    write_file("/tmp/test.gz", compressed, compressed_size);
-    system("gzip -d -c /tmp/test.gz > /tmp/test.out");
-    
+
+    // Hand it to system gzip through a file that removes itself.
+    gcomp_test::TempFile packed("gcomp_gzip_interop", ".gz");
+    ASSERT_TRUE(packed.valid());
+    ASSERT_TRUE(packed.write(compressed, compressed_size));
+    std::string out_path = packed.derived(".out");
+    ASSERT_EQ(system(("gzip -d -c \"" + packed.path() + "\" > \"" +
+                         out_path + "\"").c_str()),
+        0);
+
     // Verify output matches original
-    uint8_t *output = read_file("/tmp/test.out", &output_size);
-    ASSERT_EQ(output_size, input_size);
-    ASSERT_EQ(memcmp(output, input, input_size), 0);
+    std::vector<uint8_t> output = gcomp_test::readWholeFile(out_path);
+    ASSERT_EQ(output.size(), input_size);
+    ASSERT_EQ(memcmp(output.data(), input, input_size), 0);
 }
 
 // Test that we can decompress system gzip output
 TEST(GzipInterop, DecompressSystemGzip) {
     // Compress with system gzip
-    write_file("/tmp/test.txt", input, input_size);
-    system("gzip -c /tmp/test.txt > /tmp/test.gz");
-    
+    gcomp_test::TempFile raw("gcomp_gzip_interop", ".txt");
+    ASSERT_TRUE(raw.valid());
+    ASSERT_TRUE(raw.write(input, input_size));
+    std::string packed_path = raw.derived(".gz");
+    ASSERT_EQ(system(("gzip -c \"" + raw.path() + "\" > \"" + packed_path +
+                         "\"").c_str()),
+        0);
+
     // Decompress with our library
-    uint8_t *compressed = read_file("/tmp/test.gz", &compressed_size);
+    std::vector<uint8_t> compressed_in =
+        gcomp_test::readWholeFile(packed_path);
+    const uint8_t * compressed = compressed_in.data();
+    size_t compressed_size = compressed_in.size();
     uint8_t output[4096];
     size_t output_size;
     

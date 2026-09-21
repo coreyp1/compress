@@ -29,6 +29,7 @@
 #include <ghoti.io/compress/rle.h>
 #include <gtest/gtest.h>
 #include <string>
+#include <temp_file.h>
 #include <vector>
 
 #ifdef _WIN32
@@ -54,52 +55,17 @@ const char * pythonCommand() {
 }
 
 std::string tempPath(const std::string & suffix) {
-  static int counter = 0;
-#ifdef _WIN32
-  char dir[MAX_PATH];
-  if (GetTempPathA(MAX_PATH, dir) == 0) {
-    return "";
-  }
-  char name[MAX_PATH];
-  snprintf(name, sizeof(name), "%sgcomp_rle_spec_%d_%d%s", dir, _getpid(),
-      counter++, suffix.c_str());
-  return name;
-#else
-  const char * dir = getenv("TMPDIR");
-  if (!dir || !*dir) {
-    dir = "/tmp";
-  }
-  char name[1024];
-  snprintf(name, sizeof(name), "%s/gcomp_rle_spec_%d_%d%s", dir, (int)getpid(),
-      counter++, suffix.c_str());
-  return name;
-#endif
+  // cutil creates the file as it names it, so nothing can occupy the
+  // name in between, and it puts it where gcu_path_temp_dir() says.
+  return gcomp_test::uniqueTempPath("gcomp_rle_oracle", suffix);
 }
 
 bool writeFile(const std::string & path, const std::vector<uint8_t> & data) {
-  FILE * f = fopen(path.c_str(), "wb");
-  if (!f) {
-    return false;
-  }
-  bool ok =
-      data.empty() || fwrite(data.data(), 1, data.size(), f) == data.size();
-  fclose(f);
-  return ok;
+  return gcomp_test::writeWholeFile(path, data);
 }
 
 bool readFile(const std::string & path, std::vector<uint8_t> * out) {
-  FILE * f = fopen(path.c_str(), "rb");
-  if (!f) {
-    return false;
-  }
-  out->clear();
-  uint8_t buf[8192];
-  size_t n;
-  while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
-    out->insert(out->end(), buf, buf + n);
-  }
-  fclose(f);
-  return true;
+  return gcomp_test::readWholeFile(path, out);
 }
 
 const char * kReferenceProgram = R"PYSRC(

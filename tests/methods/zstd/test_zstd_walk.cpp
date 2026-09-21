@@ -41,6 +41,7 @@ extern "C" {
 #include <cstdlib>
 #include <cstring>
 #include <unistd.h>
+#include <temp_file.h>
 #include <string>
 #include <vector>
 
@@ -473,35 +474,19 @@ bool has_zstd_cli() {
 }
 
 std::string temp_path(const char * tag) {
-  char buf[256];
-  std::snprintf(buf, sizeof(buf), "/tmp/gcomp_walk_%s_%d_%p", tag, (int)getpid(),
-      (void *)buf);
-  return std::string(buf);
+  // The name this replaces was "/tmp/...%d_%p" of a stack address: the
+  // same value on every call from the same frame, in a directory named
+  // outright rather than asked for.  cutil creates the file as it names
+  // it, under gcu_path_temp_dir().
+  return gcomp_test::uniqueTempPath("gcomp_walk", std::string("_") + tag);
 }
 
 bool write_file(const std::string & p, const std::vector<uint8_t> & v) {
-  FILE * f = std::fopen(p.c_str(), "wb");
-  if (!f) {
-    return false;
-  }
-  const bool ok = v.empty() || std::fwrite(v.data(), 1, v.size(), f) == v.size();
-  std::fclose(f);
-  return ok;
+  return gcomp_test::writeWholeFile(p, v);
 }
 
 std::vector<uint8_t> read_file(const std::string & p) {
-  std::vector<uint8_t> v;
-  FILE * f = std::fopen(p.c_str(), "rb");
-  if (!f) {
-    return v;
-  }
-  uint8_t buf[65536];
-  size_t got;
-  while ((got = std::fread(buf, 1, sizeof(buf), f)) > 0) {
-    v.insert(v.end(), buf, buf + got);
-  }
-  std::fclose(f);
-  return v;
+  return gcomp_test::readWholeFile(p);
 }
 
 } // namespace

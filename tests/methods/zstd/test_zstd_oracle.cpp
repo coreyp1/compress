@@ -38,9 +38,6 @@
 #include <io.h>
 #include <process.h>
 #include <windows.h>
-#define close _close
-#define write _write
-#define unlink _unlink
 #define popen _popen
 #define pclose _pclose
 #else
@@ -58,6 +55,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <temp_file.h>
 #include <vector>
 
 // Check if oracle tests should be skipped
@@ -101,58 +99,6 @@ protected:
     }
   }
 
-  // Helper to write bytes to a temporary file
-  std::string writeTempFile(
-      const std::vector<uint8_t> & data, const std::string & suffix = ".bin") {
-#ifdef _WIN32
-    char tmpdir[MAX_PATH];
-    if (GetTempPathA(MAX_PATH, tmpdir) == 0) {
-      return "";
-    }
-    char tmpname[MAX_PATH];
-    static int counter = 0;
-    snprintf(tmpname, sizeof(tmpname), "%sgcomp_zstd_oracle_%d_%d%s", tmpdir,
-        _getpid(), counter++, suffix.c_str());
-
-    int fd = _open(tmpname, _O_CREAT | _O_WRONLY | _O_BINARY | _O_EXCL, 0600);
-    if (fd < 0) {
-      return "";
-    }
-    int written =
-        _write(fd, data.data(), static_cast<unsigned int>(data.size()));
-    _close(fd);
-    if (written < 0 || static_cast<size_t>(written) != data.size()) {
-      _unlink(tmpname);
-      return "";
-    }
-    return tmpname;
-#else
-    char tmpname[256];
-    snprintf(tmpname, sizeof(tmpname), "/tmp/gcomp_zstd_oracle_XXXXXX%s",
-        suffix.c_str());
-    int fd = mkstemps(tmpname, static_cast<int>(suffix.length()));
-    if (fd < 0) {
-      return "";
-    }
-    ssize_t written = write(fd, data.data(), data.size());
-    close(fd);
-    if (written < 0 || static_cast<size_t>(written) != data.size()) {
-      unlink(tmpname);
-      return "";
-    }
-    return tmpname;
-#endif
-  }
-
-  // Helper to read bytes from a file
-  std::vector<uint8_t> readFile(const std::string & path) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) {
-      return {};
-    }
-    return std::vector<uint8_t>(
-        std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
-  }
 
   // Helper to run a command and capture stdout
   std::vector<uint8_t> runCommandGetOutput(const std::string & cmd) {
@@ -201,17 +147,16 @@ protected:
       return {};
     }
 
-    std::string tmpfile = writeTempFile(data);
-    if (tmpfile.empty()) {
+    gcomp_test::TempFile tmp("gcomp_zstd_oracle", ".bin");
+    if (!tmp.valid() || !tmp.write(data)) {
       return {};
     }
 
     std::stringstream cmd;
-    cmd << "zstd -c \"" << tmpfile << "\"";
+    cmd << "zstd -c \"" << tmp.path() << "\"";
 
-    std::vector<uint8_t> result = runCommandGetOutput(cmd.str());
-    unlink(tmpfile.c_str());
-    return result;
+    // No unlink: ~TempFile does it, on every path out of this function.
+    return runCommandGetOutput(cmd.str());
   }
 
   // Use zstd CLI to decompress data
@@ -220,89 +165,85 @@ protected:
       return {};
     }
 
-    std::string tmpfile = writeTempFile(data, ".zst");
-    if (tmpfile.empty()) {
+    gcomp_test::TempFile tmp("gcomp_zstd_oracle", ".zst");
+    if (!tmp.valid() || !tmp.write(data)) {
       return {};
     }
 
     std::stringstream cmd;
-    cmd << "zstd -dc \"" << tmpfile << "\"";
+    cmd << "zstd -dc \"" << tmp.path() << "\"";
 
-    std::vector<uint8_t> result = runCommandGetOutput(cmd.str());
-    unlink(tmpfile.c_str());
-    return result;
+    // No unlink: ~TempFile does it, on every path out of this function.
+    return runCommandGetOutput(cmd.str());
   }
 
   // Create a raw content dictionary (>= 8 bytes). Same bytes used by our
   // encoder/decoder and written to a temp file for the zstd CLI.
-  // Returns (dict_bytes, dict_path). Caller should unlink dict_path when done.
-  std::pair<std::vector<uint8_t>, std::string> createDictionaryFromSamples() {
+  // Returns the bytes and the file, which removes itself when the caller
+  // drops it.
+  using DictFile = std::shared_ptr<gcomp_test::TempFile>;
+
+  std::pair<std::vector<uint8_t>, DictFile> createDictionaryFromSamples() {
     const size_t raw_dict_size = 8 * 1024;
     std::vector<uint8_t> dict_content(raw_dict_size);
     test_helpers_generate_random(
         dict_content.data(), dict_content.size(), 54321u);
-    std::string dictpath = writeTempFile(dict_content, ".dict");
-    if (dictpath.empty()) {
-      return {{}, ""};
+    auto dict = std::make_shared<gcomp_test::TempFile>(
+        "gcomp_zstd_oracle", ".dict");
+    if (!dict->valid() || !dict->write(dict_content)) {
+      return {{}, nullptr};
     }
-    return {dict_content, dictpath};
+    return {dict_content, dict};
   }
 
   // Create a formatted dictionary using zstd --train so that external encoders
   // (the zstd CLI) writes Dictionary_ID and our decoder can match.
-  // Returns (dict_bytes, dict_path). Path empty on failure. Caller unlinks.
+  // Returns the bytes and the file; both the samples and the dictionary remove
+  // themselves, so the three unlink loops this used to need are gone.
   // Requires zstd CLI. Uses --maxdict and -B so small samples suffice.
-  std::pair<std::vector<uint8_t>, std::string> createFormattedDictionary() {
+  std::pair<std::vector<uint8_t>, DictFile> createFormattedDictionary() {
     if (!has_zstd_cli_) {
-      return {{}, ""};
+      return {{}, nullptr};
     }
     const size_t sample_size = 4096;
     const int num_samples = 6;
-    std::vector<std::string> paths;
-    paths.reserve(static_cast<size_t>(num_samples));
+    std::vector<std::unique_ptr<gcomp_test::TempFile>> samples;
+    samples.reserve(static_cast<size_t>(num_samples));
     for (int i = 0; i < num_samples; i++) {
       std::vector<uint8_t> sample(sample_size + i * 128);
       test_helpers_generate_random(
           sample.data(), sample.size(), static_cast<uint32_t>(12345 + i * 111));
-      std::string p = writeTempFile(sample, ".sample");
-      if (p.empty()) {
-        for (const auto & x : paths)
-          unlink(x.c_str());
-        return {{}, ""};
+      auto f = std::make_unique<gcomp_test::TempFile>(
+          "gcomp_zstd_oracle", ".sample");
+      if (!f->valid() || !f->write(sample)) {
+        return {{}, nullptr};
       }
-      paths.push_back(p);
+      samples.push_back(std::move(f));
     }
-    std::string dictpath = writeTempFile(std::vector<uint8_t>(), ".zstd");
-    if (dictpath.empty()) {
-      for (const auto & x : paths)
-        unlink(x.c_str());
-      return {{}, ""};
+    auto dict = std::make_shared<gcomp_test::TempFile>(
+        "gcomp_zstd_oracle", ".zstd");
+    if (!dict->valid()) {
+      return {{}, nullptr};
     }
     std::stringstream cmd;
     cmd << "zstd --train --maxdict=512 -B2048";
-    for (const auto & x : paths) {
-      cmd << " \"" << x << "\"";
+    for (const auto & f : samples) {
+      cmd << " \"" << f->path() << "\"";
     }
-    cmd << " -o \"" << dictpath << "\"";
+    cmd << " -o \"" << dict->path() << "\"";
 #ifdef _WIN32
     cmd << " >NUL 2>&1";
 #else
     cmd << " 2>/dev/null";
 #endif
-    bool ok = runCommand(cmd.str());
-    for (const auto & x : paths) {
-      unlink(x.c_str());
+    if (!runCommand(cmd.str())) {
+      return {{}, nullptr};
     }
-    if (!ok) {
-      unlink(dictpath.c_str());
-      return {{}, ""};
+    std::vector<uint8_t> dict_bytes = gcomp_test::readWholeFile(dict->path());
+    if (dict_bytes.size() < 8) {
+      return {{}, nullptr};
     }
-    std::vector<uint8_t> dict_bytes = readFile(dictpath);
-    if (dict_bytes.empty() || dict_bytes.size() < 8) {
-      unlink(dictpath.c_str());
-      return {{}, ""};
-    }
-    return {dict_bytes, dictpath};
+    return {dict_bytes, dict};
   }
 
   // Compress with our library (optional dictionary)
@@ -381,17 +322,16 @@ protected:
       return {};
     }
 
-    std::string tmpfile = writeTempFile(data);
-    if (tmpfile.empty()) {
+    gcomp_test::TempFile tmp("gcomp_zstd_oracle", ".bin");
+    if (!tmp.valid() || !tmp.write(data)) {
       return {};
     }
 
     std::stringstream cmd;
-    cmd << "zstd " << flags << " -c \"" << tmpfile << "\"";
+    cmd << "zstd " << flags << " -c \"" << tmp.path() << "\"";
 
-    std::vector<uint8_t> result = runCommandGetOutput(cmd.str());
-    unlink(tmpfile.c_str());
-    return result;
+    // No unlink: ~TempFile does it, on every path out of this function.
+    return runCommandGetOutput(cmd.str());
   }
 
   std::vector<uint8_t> zstdCliCompressWithDict(
@@ -399,15 +339,15 @@ protected:
     if (!has_zstd_cli_ || dict_path.empty()) {
       return {};
     }
-    std::string datafile = writeTempFile(data);
-    if (datafile.empty()) {
+    gcomp_test::TempFile datafile("gcomp_zstd_oracle", ".bin");
+    if (!datafile.valid() || !datafile.write(data)) {
       return {};
     }
     std::stringstream cmd;
-    cmd << "zstd -D \"" << dict_path << "\" -c \"" << datafile << "\"";
-    std::vector<uint8_t> result = runCommandGetOutput(cmd.str());
-    unlink(datafile.c_str());
-    return result;
+    cmd << "zstd -D \"" << dict_path << "\" -c \"" << datafile.path()
+        << "\"";
+    // No unlink: ~TempFile does it.
+    return runCommandGetOutput(cmd.str());
   }
 
   // Use zstd CLI to decompress with dictionary
@@ -416,15 +356,14 @@ protected:
     if (!has_zstd_cli_ || data.empty() || dict_path.empty()) {
       return {};
     }
-    std::string tmpfile = writeTempFile(data, ".zst");
-    if (tmpfile.empty()) {
+    gcomp_test::TempFile tmp("gcomp_zstd_oracle", ".zst");
+    if (!tmp.valid() || !tmp.write(data)) {
       return {};
     }
     std::stringstream cmd;
-    cmd << "zstd -D \"" << dict_path << "\" -dc \"" << tmpfile << "\"";
-    std::vector<uint8_t> result = runCommandGetOutput(cmd.str());
-    unlink(tmpfile.c_str());
-    return result;
+    cmd << "zstd -D \"" << dict_path << "\" -dc \"" << tmp.path() << "\"";
+    // No unlink: ~TempFile does it, on every path out of this function.
+    return runCommandGetOutput(cmd.str());
   }
 
 
@@ -826,8 +765,8 @@ TEST_F(ZstdOracleTest, OurEncoder_ZstdCli_WithDictionary) {
     GTEST_SKIP() << "zstd CLI not available";
   }
 
-  auto [dict_bytes, dict_path] = createDictionaryFromSamples();
-  if (dict_bytes.empty() || dict_path.empty()) {
+  auto [dict_bytes, dict] = createDictionaryFromSamples();
+  if (dict_bytes.empty() || !dict) {
     GTEST_SKIP() << "Could not create dictionary";
   }
 
@@ -837,12 +776,11 @@ TEST_F(ZstdOracleTest, OurEncoder_ZstdCli_WithDictionary) {
   ASSERT_FALSE(compressed.empty()) << "Our compression with dict failed";
 
   std::vector<uint8_t> decompressed =
-      zstdCliDecompressWithDict(compressed, dict_path);
+      zstdCliDecompressWithDict(compressed, dict->path());
   ASSERT_EQ(decompressed.size(), original.size()) << "Size mismatch";
   ASSERT_EQ(memcmp(decompressed.data(), original.data(), original.size()), 0)
       << "Data mismatch";
 
-  unlink(dict_path.c_str());
 }
 
 TEST_F(ZstdOracleTest, ZstdCli_OurDecoder_WithDictionary) {
@@ -850,14 +788,14 @@ TEST_F(ZstdOracleTest, ZstdCli_OurDecoder_WithDictionary) {
     GTEST_SKIP() << "zstd CLI not available";
   }
 
-  auto [dict_bytes, dict_path] = createDictionaryFromSamples();
-  if (dict_bytes.empty() || dict_path.empty()) {
+  auto [dict_bytes, dict] = createDictionaryFromSamples();
+  if (dict_bytes.empty() || !dict) {
     GTEST_SKIP() << "Could not create dictionary";
   }
 
   std::vector<uint8_t> original = generateTextData(4 * 1024);
   std::vector<uint8_t> compressed =
-      zstdCliCompressWithDict(original, dict_path);
+      zstdCliCompressWithDict(original, dict->path());
   ASSERT_FALSE(compressed.empty()) << "zstd CLI compression with dict failed";
 
   std::vector<uint8_t> decompressed =
@@ -867,7 +805,6 @@ TEST_F(ZstdOracleTest, ZstdCli_OurDecoder_WithDictionary) {
   ASSERT_EQ(memcmp(decompressed.data(), original.data(), original.size()), 0)
       << "Data mismatch";
 
-  unlink(dict_path.c_str());
 }
 
 //
