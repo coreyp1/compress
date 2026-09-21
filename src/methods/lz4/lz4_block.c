@@ -109,6 +109,7 @@
 #include <ghoti.io/cutil/safemath.h>
 #include <ghoti.io/compress/macros.h>
 #include "lz4_internal.h"
+#include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
 
@@ -429,6 +430,21 @@ gcomp_status_t lz4_block_decompress(const uint8_t * input, size_t input_len,
   uint8_t * dst = output;
   uint8_t * dst_end = output + output_cap;
 
+  // Copies below are made in whole 16-byte groups where there is room, rather
+  // than asked of libc by an exact count.  Decoding spent 29% of its
+  // instructions inside `memcpy` for copies averaging a dozen bytes, which is
+  // call and dispatch overhead rather than moving: a group of sixteen is two
+  // instructions.
+  //
+  // A group may write up to LZ4_WIDE_SLACK bytes past the last byte actually
+  // wanted, so the wide path is used only while that much room is left inside
+  // the caller's buffer, and the end of a block goes through the exact path
+  // below it.  Nothing is ever written at or past `dst_end`, so the API
+  // promises no slack it did not promise before -- which is what
+  // `DECODER-PERFORMANCE.md` item 2 said stood in the way.
+  uint8_t * const dst_wide_end =
+      (output_cap > LZ4_WIDE_SLACK) ? dst_end - LZ4_WIDE_SLACK : output;
+
   while (src < src_end) {
     // Read token
     uint8_t token = *src++;
@@ -456,8 +472,16 @@ gcomp_status_t lz4_block_decompress(const uint8_t * input, size_t input_len,
       return GCOMP_ERR_LIMIT;
     }
 
-    // Copy literals
-    memcpy(dst, src, lit_len);
+    // Copy literals.  A whole group where both buffers have room for one --
+    // the read needs the room too, since a group reads sixteen bytes whatever
+    // `lit_len` says, and the last literals of a block sit against `src_end`.
+    if (lit_len <= LZ4_WIDE_GROUP && dst < dst_wide_end
+        && src + LZ4_WIDE_GROUP <= src_end) {
+      memcpy(dst, src, LZ4_WIDE_GROUP);
+    }
+    else {
+      memcpy(dst, src, lit_len);
+    }
     src += lit_len;
     dst += lit_len;
 
@@ -490,18 +514,31 @@ gcomp_status_t lz4_block_decompress(const uint8_t * input, size_t input_len,
       }
     }
 
-    // Find match source
+    // Find match source.
+    //
+    // This branch is the bounds check, and the only untrusted value in it is
+    // `offset`.  In the first case 1 <= offset <= dst_offset, so `dst -
+    // offset` lands in [output, dst); in the second 1 <= offset - dst_offset
+    // <= history_len, so the pointer lands inside the history.  Anything else
+    // is refused here.  Which of the two it was is then carried rather than
+    // asked again: the code below used to re-derive it by comparing pointers,
+    // at thirteen instructions per sequence, and comparing pointers into
+    // different allocations is also a question C does not actually define an
+    // answer to.
     const uint8_t * match_src;
     size_t dst_offset = dst - output;
+    bool match_in_history;
 
     if (offset <= dst_offset) {
       // Match is within output buffer
       match_src = dst - offset;
+      match_in_history = false;
     }
     else if (history && offset <= dst_offset + history_len) {
       // Match is in history buffer
       size_t history_offset = offset - dst_offset;
       match_src = history + history_len - history_offset;
+      match_in_history = true;
     }
     else {
       return GCOMP_ERR_CORRUPT; // Invalid back-reference
@@ -525,7 +562,7 @@ gcomp_status_t lz4_block_decompress(const uint8_t * input, size_t input_len,
     // The part that comes from the previous block's tail, if any.  It is a
     // flat run, so it goes in one piece, and what follows continues at the
     // start of this block's output.
-    if (history && match_src >= history && match_src < history + history_len) {
+    if (match_in_history) {
       size_t from_history = (size_t)((history + history_len) - match_src);
       if (from_history > remaining) {
         from_history = remaining;
@@ -542,16 +579,32 @@ gcomp_status_t lz4_block_decompress(const uint8_t * input, size_t input_len,
     // the two ranges cannot overlap and memcpy is exact.  A distance of one
     // is a single byte repeated.
     //
-    // The offset was checked against what has been written before match_src
-    // was computed, and the history branch above leaves match_src at the
-    // start of the output with at least one byte already written, so this
-    // holds on entry; each pass moves source and destination together and so
-    // preserves it.  It is checked anyway, once rather than per run, because
-    // what follows is a memcpy driven by a length that came out of untrusted
-    // input.
-    if (remaining > 0u && (match_src < output || match_src >= dst)) {
-      return GCOMP_ERR_CORRUPT; // Back-reference outside what exists.
+    // `match_src` is inside [output, dst) here and stays there: the branch
+    // that chose it put it there, and the history case above leaves it at the
+    // start of the output with at least one byte already written, since it
+    // copies at least one.  Each pass moves source and destination together
+    // by the same amount, so the distance between them never shrinks.
+
+    // A short match far enough behind is two groups and no loop at all.
+    //
+    // "Far enough" is one group, not two.  Each group reads sixteen bytes
+    // starting sixteen or more bytes behind the byte it writes, so every byte
+    // it reads was already final -- the second group may read bytes the first
+    // one wrote, and those are exactly the bytes a byte-at-a-time copy would
+    // have read there.  Neither group's source overlaps its own destination,
+    // so neither is the overlapping `memcpy` that C leaves undefined.
+    //
+    // Below one group the two do overlap, and LZ4 gives a match nearer than
+    // its own length the meaning that the pattern repeats: that is the loop
+    // underneath, and it stays the only implementation of it.
+    if (remaining <= LZ4_WIDE_SLACK && dst < dst_wide_end
+        && (size_t)(dst - match_src) >= LZ4_WIDE_GROUP) {
+      memcpy(dst, match_src, LZ4_WIDE_GROUP);
+      memcpy(dst + LZ4_WIDE_GROUP, match_src + LZ4_WIDE_GROUP, LZ4_WIDE_GROUP);
+      dst += remaining;
+      remaining = 0u;
     }
+
     while (remaining > 0u) {
       size_t distance = (size_t)(dst - match_src);
       size_t run = (distance < remaining) ? distance : remaining;

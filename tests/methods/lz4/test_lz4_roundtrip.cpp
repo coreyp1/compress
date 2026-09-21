@@ -510,6 +510,80 @@ TEST_F(Lz4RoundtripTest, VaryingBlockSizes) {
   }
 }
 
+//
+// The wide copy path's distance boundary
+//
+
+/**
+ * Short matches at every distance from 1 to 80.
+ *
+ * `lz4_block_decompress` copies a short match in whole 16-byte groups where
+ * the match is far enough behind that a group reads only bytes already
+ * final.  "Far enough" is one group, not two: each group reads at least
+ * LZ4_WIDE_GROUP bytes behind the byte it writes, so what it reads was
+ * written by the group before it.  A distance below that is the LZ4 pattern
+ * fill, which repeats a period byte at a time and is left to the exact loop.
+ *
+ * The boundary is the whole claim, so it is tested at every distance either
+ * side of it rather than at a sample.  Two things this must keep doing, both
+ * of which a weaker version of this test missed:
+ *
+ *   - The repeats are SHORT, 12 to 28 bytes.  One pattern repeated across
+ *     the whole buffer becomes a single enormous match, longer than the 32
+ *     bytes the wide path takes, so the path under test never runs.
+ *   - The filler is noise rather than more pattern, so each repeat is a
+ *     match at the intended distance instead of an extension of the one
+ *     before it.
+ *
+ * Setting the guard to 8 rather than 16 fails this at distances 8 to 15 and
+ * nowhere else.
+ */
+TEST_F(Lz4RoundtripTest, ShortMatchesAtEveryDistanceAcrossTheWideCopyBoundary) {
+  for (size_t period = 1; period <= 80; period++) {
+    const size_t n = 4096;
+    std::vector<uint8_t> data(n);
+    unsigned r = 12345u + static_cast<unsigned>(period);
+    for (size_t i = 0; i < n; i++) {
+      r = r * 1103515245u + 12345u;
+      data[i] = static_cast<uint8_t>(r >> 16);
+    }
+    for (size_t at = period + 64; at + 64 < n; at += period + 40) {
+      size_t len = 12 + (at % 17);
+      // A byte at a time, forwards.  `memcpy` here would be an overlapping
+      // copy whenever `period` is shorter than `len` -- ASan reports it, and
+      // it would also build the wrong bytes: a period shorter than the run
+      // means the run repeats the pattern, which is propagation rather than
+      // a copy.  That is the same rule the decoder follows.
+      for (size_t k = 0; k < len; k++) {
+        data[at + k] = data[at + k - period];
+      }
+    }
+    std::string desc = "match distance " + std::to_string(period);
+    verifyRoundtrip(data.data(), data.size(), nullptr, desc.c_str());
+  }
+}
+
+/**
+ * The same, with the block ending at every offset near the buffer's end.
+ *
+ * The wide path stops LZ4_WIDE_SLACK bytes short of the end of the caller's
+ * buffer and lets the exact path finish, which is what keeps the overcopy
+ * inside the buffer the caller supplied.  Lengths either side of that
+ * boundary are where a mistake in the changeover would show.
+ */
+TEST_F(Lz4RoundtripTest, LengthsAroundTheEndOfTheWideCopyPath) {
+  for (size_t n = 1; n <= 200; n++) {
+    std::vector<uint8_t> data(n);
+    unsigned r = 987u + static_cast<unsigned>(n);
+    for (size_t i = 0; i < n; i++) {
+      r = r * 1103515245u + 12345u;
+      data[i] = static_cast<uint8_t>((r >> 16) & 0x0Fu); // compressible
+    }
+    std::string desc = "length " + std::to_string(n);
+    verifyRoundtrip(data.data(), data.size(), nullptr, desc.c_str());
+  }
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

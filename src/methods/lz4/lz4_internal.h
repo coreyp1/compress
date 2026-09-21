@@ -124,6 +124,26 @@ extern "C" {
 #define LZ4_BLOCK_UNCOMPRESSED_FLAG 0x80000000U ///< High bit = uncompressed
 #define LZ4_BLOCK_SIZE_MASK 0x7FFFFFFFU         ///< Size without flag bit
 #define LZ4_MIN_MATCH 4                         ///< Minimum match length
+
+/**
+ * Bytes moved by one wide copy in the block decoder.
+ *
+ * Sixteen is one SSE2 register, so the group is a load and a store on every
+ * x86-64 target without asking for a newer instruction set, and compilers
+ * turn a 16-byte `memcpy` of a constant size into exactly that rather than
+ * calling libc.
+ */
+#define LZ4_WIDE_GROUP 16u
+
+/**
+ * Bytes a wide copy may write past the last one actually wanted.
+ *
+ * The decoder keeps this much room between its write cursor and the end of
+ * the caller's buffer while it uses the wide path, and finishes the block
+ * with exact copies, so the slack never leaves the buffer.  Two groups,
+ * because the longest match the wide path takes is two groups.
+ */
+#define LZ4_WIDE_SLACK 32u
 #define LZ4_LAST_LITERALS 5    ///< Minimum literals in last sequence
 
 /**
