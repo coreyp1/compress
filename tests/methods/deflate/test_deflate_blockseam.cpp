@@ -35,6 +35,7 @@
  */
 
 #include "deflate_bits.h"
+#include "deflate_noise.h"
 #include "test_helpers.h"
 #include <cstdlib>
 #include <cstring>
@@ -49,44 +50,8 @@
 
 namespace {
 
-/// Deterministic noise, so a failure can be reproduced from the seed alone.
-class Lcg {
-public:
-  explicit Lcg(uint32_t seed) : state_(seed ? seed : 1u) {}
-  uint32_t Next() {
-    state_ = state_ * 1103515245u + 12345u;
-    return state_ >> 8;
-  }
-  uint8_t Byte() { return (uint8_t)(Next() & 0xFFu); }
-
-private:
-  uint32_t state_;
-};
-
-/**
- * @brief A second generator, because the first one's noise is not noisy
- *        enough for this.
- *
- * The encoder decides per block whether to store the bytes or code them, and
- * for data it cannot compress the decision is close to the line.  The Lcg
- * above lands on the stored side, and a stored block is byte-aligned at both
- * ends -- so the header after it never starts mid-byte and the seam this file
- * is about cannot occur.  This one lands on the coded side.  The distinction
- * is invisible in the corpus and decides whether the test tests anything.
- */
-class Xorshift {
-public:
-  explicit Xorshift(uint64_t seed) : state_(seed ? seed : 1u) {}
-  uint8_t Byte() {
-    state_ ^= state_ << 13u;
-    state_ ^= state_ >> 7u;
-    state_ ^= state_ << 17u;
-    return (uint8_t)(state_ & 0xFFu);
-  }
-
-private:
-  uint64_t state_;
-};
+using gcomp_test::Lcg;
+using gcomp_test::Xorshift;
 
 using gcomp_test::BitWriter;
 

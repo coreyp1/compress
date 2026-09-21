@@ -2315,7 +2315,11 @@ static inline size_t deflate_fast_out_budget(
 static inline void deflate_fast_commit(gcomp_deflate_decoder_state_t * st,
     gcomp_buffer_t * input, gcomp_buffer_t * output, uint64_t buf,
     uint32_t bits, const uint8_t * in_ptr, const uint8_t * out_ptr) {
-  st->bit_buffer = buf;
+  // Everything above `bits` is the stream's continuation, which the refill
+  // above leaves in place on purpose.  Outside this loop the decoder is
+  // promised zeros there, so this is where the promise is put back.
+  st->bit_buffer =
+      (bits >= 64u) ? buf : (buf & ((((uint64_t)1u) << bits) - 1u));
   st->bit_count = bits;
 
   size_t taken = (size_t)(in_ptr - (const uint8_t *)input->data) - input->used;
@@ -2440,23 +2444,52 @@ static gcomp_status_t deflate_huffman_fast(gcomp_deflate_decoder_state_t * st,
   int block_ended = 0;
 
   while (in_ptr <= in_stop && out_ptr <= out_stop) {
-    // Refill.  Whole bytes only, and only those that fit above what is
-    // already held, so the promise that bits at or above `bits` are zero
-    // survives -- the table lookup below indexes with them.  Skipped when the
-    // buffer is already too full to take a byte, which is also what keeps the
-    // shift below 64 and defined.
-    if (bits <= 56u) {
-      uint64_t chunk = gcomp_read_le64(in_ptr);
-      uint32_t room = (64u - bits) >> 3; // 1 to 8
-      if (room < 8u) {
-        chunk &= ((uint64_t)1u << (room * 8u)) - 1u;
-      }
-      buf |= chunk << bits;
-      bits += room * 8u;
-      in_ptr += room;
+    // Refill: one 64-bit load, no branch inside it, and no arithmetic to
+    // work out how much of it fits.  The whole load goes in; the cursor
+    // advances only by the whole bytes that fit below bit 64; and what is
+    // left sitting above `bits` afterwards is not rubbish but the stream's
+    // own continuation -- the bytes the cursor did not advance past.  The
+    // next refill loads from exactly there and shifts to exactly the same
+    // place, so it ORs the same bits over themselves and the result is
+    // right without anything being masked off in between.  (The shifts in
+    // between preserve that: consuming n bits shifts the continuation down
+    // by n and brings zeros in at the top, which the next OR fills.)
+    //
+    // `bits | 56u` is `bits + 8 * ((63 - bits) >> 3)` for every bits <= 63,
+    // and leaves 56 or more alone, which is why the refill needs no
+    // condition beyond the one that keeps the shift defined.
+    //
+    // That one condition is never false in practice: the refill itself cannot
+    // produce 64, and every path that reaches DEFLATE_STAGE_HUFFMAN_DATA ends
+    // by consuming bits with no fill after it, so the entry value is 63 at
+    // most.  It stays because that argument runs through four other functions
+    // and a shift of 64 is undefined rather than merely wrong.  It is also
+    // not free to remove: hoisting it to the caller takes 1.8% off the
+    // instruction count and put 3% back on the clock, in nine of eleven
+    // alternating rounds.
+    //
+    // Only inside this loop, though.  deflate_fast_commit() masks the
+    // continuation off on the way out, and that mask is not tidiness:
+    // deflate_try_fill_bits() ORs new bytes into the buffer at `bit_count`
+    // and can only do that if there is nothing already there.  The
+    // relationship that makes the OR above safe -- leftover bits are the
+    // bytes the cursor is pointing at -- does not survive the rest of the
+    // decoder: a stored block copies its payload straight from the input in
+    // bulk (deflate_copy_stored()), moving the cursor tens of kilobytes
+    // without the bit buffer following, and from then on the leftovers are
+    // bits from somewhere else entirely.  A stream that mixes coded and
+    // stored blocks then decodes a block header that was never written.
+    // deflate_huff_decode_symbol() needs the zeros too, for a different
+    // reason: it reads short codes out of the padding at the end of a buffer.
+    //
+    // Every read of `buf` inside this loop is masked to the width it wants,
+    // so the continuation is invisible here.
+    if (bits < 64u) {
+      buf |= gcomp_read_le64(in_ptr) << bits;
+      in_ptr += (63u - bits) >> 3;
+      bits |= 56u;
     }
-    // Either way there are now at least 56 bits, and 48 is the worst a symbol
-    // can need.
+    // There are now at least 56 bits, and 48 is the worst a symbol can need.
 
     uint32_t sym = 0;
     if (!deflate_fast_symbol(litlen, &buf, &bits, &sym)) {

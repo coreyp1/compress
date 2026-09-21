@@ -37,6 +37,7 @@
  */
 
 #include "deflate_bits.h"
+#include "deflate_noise.h"
 #include "test_helpers.h"
 #include <algorithm>
 #include <cstdlib>
@@ -64,18 +65,8 @@ using gcomp_test::BitWriter;
  */
 constexpr size_t kBelowFastThreshold = 265u;
 
-class Lcg {
-public:
-  explicit Lcg(uint32_t seed) : state_(seed ? seed : 1u) {}
-  uint32_t Next() {
-    state_ = state_ * 1103515245u + 12345u;
-    return state_ >> 8;
-  }
-  uint8_t Byte() { return (uint8_t)(Next() & 0xFFu); }
-
-private:
-  uint32_t state_;
-};
+using gcomp_test::Lcg;
+using gcomp_test::Xorshift;
 
 std::vector<uint8_t> Wordy(size_t n, uint32_t seed) {
   static const char * words[] = {"the ", "quick ", "brown ", "fox ", "jumps ",
@@ -332,59 +323,108 @@ TEST(DeflateFastPath, ACorruptStreamIsRefusedByBothLoopsOrNeither) {
  * @brief The last bytes of the input belong to the ordinary loop.
  *
  * The fast loop refills with a single eight-byte load, so it stops with seven
- * bytes still unread and the ordinary loop finishes the stream.  That handover
+ * bytes still unread and the ordinary loop finishes from there.  That handover
  * happens in the middle of a Huffman block, with a bit buffer that is part
  * full, and it must be invisible.
  *
- * Withholding the tail until the decoder has asked for it moves the handover
- * around: with the last k bytes held back the fast loop stops k+7 bytes from
- * the end the first time and again at the real end.
+ * It is also where the two loops disagree about what is in that buffer.  The
+ * fast loop's refill leaves the stream's continuation sitting above the bit
+ * count on purpose; the ordinary loop is promised zeros there, because that is
+ * what lets it decode a short code out of the padding when the input has run
+ * out.  Hand it the continuation instead and it indexes its table with bits
+ * that are not padding, decodes a symbol that was never written, and reports
+ * a good stream as corrupt -- which is why deflate_fast_commit() masks.
+ *
+ * Reaching it takes a caller whose input runs out with a long code pending,
+ * so the input chunk size is swept and several corpora are used: the pending
+ * code has to be longer than what is left in the buffer, and how often that
+ * happens depends on the code lengths the encoder chose.
  */
 TEST(DeflateFastPath, TheHandoverAtTheEndOfTheInputIsInvisible) {
-  const std::vector<uint8_t> raw = Wordy(80000u, 14u);
-  for (const char * method : {"deflate", "zlib", "gzip"}) {
-    const std::vector<uint8_t> enc = Encode(method, raw, 6);
-    for (size_t hold = 0; hold <= 20u; hold++) {
-      if (hold >= enc.size()) {
-        break;
-      }
-      gcomp_registry_t * reg = gcomp_registry_default();
-      gcomp_decoder_t * dec = nullptr;
-      ASSERT_EQ(gcomp_decoder_create(reg, method, nullptr, &dec), GCOMP_OK);
-      std::vector<uint8_t> out(raw.size() + 1024u, 0u);
-      size_t produced = 0;
-      size_t revealed = enc.size() - hold;
-      gcomp_buffer_t input = {(void *)enc.data(), revealed, 0u};
-      for (;;) {
-        gcomp_buffer_t output = {
-            out.data() + produced, out.size() - produced, 0u};
-        const size_t before = input.used;
-        ASSERT_EQ(gcomp_decoder_update(dec, &input, &output), GCOMP_OK)
-            << method << " holding " << hold;
-        produced += output.used;
-        if (input.used == before && output.used == 0u) {
-          if (input.size == enc.size()) {
-            break;
+  struct Corpus {
+    const char * name;
+    std::vector<uint8_t> bytes;
+  };
+  std::vector<Corpus> corpora;
+  corpora.push_back({"wordy", Wordy(200000u, 14u)});
+  {
+    // Noise: long codes everywhere, which is what the padding trick is for.
+    Lcg rng(31u);
+    std::vector<uint8_t> noise(200000u);
+    for (auto & b : noise) {
+      b = rng.Byte();
+    }
+    corpora.push_back({"noise", std::move(noise)});
+  }
+  {
+    // Half fixed, half noise: a mixture of very short and very long codes.
+    Lcg rng(32u);
+    std::vector<uint8_t> mixed(200000u);
+    for (auto & b : mixed) {
+      b = (rng.Byte() & 1u) ? (uint8_t)'q' : rng.Byte();
+    }
+    corpora.push_back({"mixed", std::move(mixed)});
+  }
+
+  // Well above the fast loop's threshold, so it does all but the last few
+  // hundred bytes and the handover is the thing under test.
+  const size_t kWholeBuffer = 0u;
+  const size_t in_chunks[] = {1u, 2u, 3u, 7u, 8u, 9u, 13u, 16u, 64u, 1024u,
+      4096u, 65536u};
+
+  for (const Corpus & corpus : corpora) {
+    for (const char * method : {"deflate", "zlib", "gzip"}) {
+      for (int level : {1, 6, 9}) {
+        const std::vector<uint8_t> enc = Encode(method, corpus.bytes, level);
+        for (size_t in_chunk : in_chunks) {
+          gcomp_registry_t * reg = gcomp_registry_default();
+          gcomp_decoder_t * dec = nullptr;
+          ASSERT_EQ(gcomp_decoder_create(reg, method, nullptr, &dec), GCOMP_OK);
+          std::vector<uint8_t> out(corpus.bytes.size() + 1024u, 0u);
+          size_t produced = 0;
+          size_t revealed = 0;
+          gcomp_buffer_t input = {(void *)enc.data(), 0u, 0u};
+          const std::string where = std::string(corpus.name) + " " + method +
+              " level " + std::to_string(level) + " revealed " +
+              std::to_string(in_chunk);
+          for (;;) {
+            if (revealed < enc.size()) {
+              revealed += in_chunk;
+              if (revealed > enc.size()) {
+                revealed = enc.size();
+              }
+            }
+            input.size = revealed;
+            gcomp_buffer_t output = {
+                out.data() + produced, out.size() - produced, 0u};
+            const size_t before = input.used;
+            ASSERT_EQ(gcomp_decoder_update(dec, &input, &output), GCOMP_OK)
+                << where;
+            produced += output.used;
+            if (input.used == before && output.used == 0u &&
+                revealed >= enc.size()) {
+              break;
+            }
           }
-          input.size = enc.size(); // Let the tail through.
+          for (;;) {
+            gcomp_buffer_t output = {
+                out.data() + produced, out.size() - produced, 0u};
+            gcomp_status_t st = gcomp_decoder_finish(dec, &output);
+            produced += output.used;
+            if (st == GCOMP_OK) {
+              break;
+            }
+            ASSERT_EQ(st, GCOMP_ERR_LIMIT) << where;
+            ASSERT_GT(output.used, 0u) << where;
+          }
+          gcomp_decoder_destroy(dec);
+          out.resize(produced);
+          ASSERT_EQ(out, corpus.bytes) << where;
         }
       }
-      for (;;) {
-        gcomp_buffer_t output = {
-            out.data() + produced, out.size() - produced, 0u};
-        gcomp_status_t s = gcomp_decoder_finish(dec, &output);
-        produced += output.used;
-        if (s == GCOMP_OK) {
-          break;
-        }
-        ASSERT_EQ(s, GCOMP_ERR_LIMIT) << method << " holding " << hold;
-        ASSERT_GT(output.used, 0u) << method << " holding " << hold;
-      }
-      gcomp_decoder_destroy(dec);
-      out.resize(produced);
-      EXPECT_EQ(out, raw) << method << " holding " << hold;
     }
   }
+  (void)kWholeBuffer;
 }
 
 /**
@@ -699,6 +739,62 @@ TEST(DeflateFastPath, EachCallFillsItsOwnBufferToTheBrim) {
     ASSERT_EQ(got.size(), raw.size()) << "chunk " << chunk;
     ASSERT_EQ(std::memcmp(got.data(), raw.data(), got.size()), 0)
         << "chunk " << chunk;
+  }
+}
+
+/**
+ * @brief A stored block after the fast loop has been running.
+ *
+ * The fast loop's refill leaves the stream's continuation in the bit buffer
+ * above the bit count, on purpose, and commits it masked off.  That mask is
+ * the whole of what keeps a mixed stream decodable, and the reason is not the
+ * obvious one.
+ *
+ * deflate_try_fill_bits() ORs new bytes into the buffer at the bit count, so
+ * it needs nothing to be there already.  Inside the fast loop that is fine:
+ * the leftovers are the bytes the cursor is pointing at, so the next load ORs
+ * the same bits over themselves.  A stored block breaks the relationship --
+ * its payload is copied straight out of the input in bulk, moving the cursor
+ * tens of kilobytes with the bit buffer standing still -- and from then on
+ * the leftovers are bits from somewhere else.  The next header read ORs them
+ * into a good byte and comes back with a BFINAL that was never written; the
+ * decoder then stops three quarters of the way through a valid stream and
+ * reports that it finished.
+ *
+ * The corpus has to make the encoder emit both kinds of block, and that turns
+ * out not to be something a test can arrange by mixing compressible and
+ * incompressible data by hand -- do that and the encoder codes the lot.  It
+ * has to be uniform data near enough to the line that the encoder decides
+ * differently from one block to the next, which for this encoder is noise of
+ * a few hundred kilobytes.  Xorshift and not Lcg for the reason in
+ * deflate_noise.h: Lcg noise is stored end to end, and a stream with no coded
+ * blocks never enters the fast loop at all.
+ *
+ * Everything here is whole buffers -- the fast loop in full charge -- because
+ * this has nothing to do with running out of room or out of input.
+ */
+TEST(DeflateFastPath, AStoredBlockAfterTheFastLoopHasBeenRunning) {
+  Xorshift noise(88172645463325252ull);
+  std::vector<uint8_t> raw(300000u);
+  for (auto & b : raw) {
+    b = noise.Byte();
+  }
+
+  for (const char * method : {"deflate", "zlib", "gzip"}) {
+    for (int level : {1, 5, 9}) {
+      const std::vector<uint8_t> enc = Encode(method, raw, level);
+      // If this ever stops holding, the encoder has stopped storing anything
+      // and the test is no longer about a mixed stream.
+      ASSERT_GT(enc.size(), raw.size())
+          << method << " level " << level << ": corpus is compressible now";
+      Decoded got = Decode(method, enc, 0u, raw.size() + 1024u, nullptr);
+      const std::string where =
+          std::string(method) + " level " + std::to_string(level);
+      ASSERT_EQ(got.status, GCOMP_OK) << where;
+      ASSERT_EQ(got.bytes.size(), raw.size()) << where;
+      ASSERT_EQ(std::memcmp(got.bytes.data(), raw.data(), raw.size()), 0)
+          << where;
+    }
   }
 }
 
