@@ -104,6 +104,10 @@ Compressed blocks contain two sections:
 | `zstd.seekable_checksum` | bool | true | Record each frame's checksum in the seek table. |
 | `zstd.concat` | bool | true | Decoder: decode every frame in the input (RFC 8878 §3.1). Set false to stop after the first frame |
 | `zstd.job_size` | uint64 | 0 (auto) | Encoder: job size for parallel compression (64KB–16MB, 0=auto) |
+| `zstd.long` | bool | false | Find matches across the whole window, not just the nearest 8 MB. See [Long-distance matching](#long-distance-matching) |
+| `zstd.ldm_min_match` | uint64 | 64 | Bytes a long-distance match must have (16–4096) |
+| `zstd.ldm_hash_log` | uint64 | 0 (auto) | Log2 of the long-distance table (6–30). 0 = sized from the window |
+| `zstd.ldm_hash_rate_log` | uint64 | 6 | Index one position in 2^this for long-distance matching (0–12) |
 
 ### Threading options (encoder only)
 
@@ -212,6 +216,55 @@ data. Larger windows compress better and cost more memory.
 When `zstd.window_log=0` (the default) the window comes from the level, as
 above. Setting it explicitly overrides the level, and the decoder enforces
 `limits.max_window_bytes` against whatever the frame declares.
+
+## Long-distance matching
+
+The ordinary match finder reaches about 8 MB back. A file holding two copies
+of the same megabyte thirty megabytes apart therefore compresses as though the
+second copy were new, however large `zstd.window_log` is: the window says how
+far a sequence *may* point, and the finder's tables say how far it actually
+looks.
+
+`zstd.long=true` adds a second, much coarser index that covers the whole
+declared window. It hashes 64 bytes at a time (`zstd.ldm_min_match`) and
+records one position in every 64 (`zstd.ldm_hash_rate_log`), so the cost of
+covering a gigabyte stays proportional to the input rather than to the window.
+It looks only for long matches, which is what makes a distant offset worth its
+bits.
+
+```c
+gcomp_options_set_bool(opts, "zstd.long", true);
+gcomp_options_set_uint64(opts, "zstd.window_log", 27);  // 128 MB
+```
+
+Nothing about it reaches the format. RFC 8878 constrains an offset only by the
+window the frame header declares (§3.1.1.1.2), so the output is an ordinary
+Zstandard stream that any decoder reads — this was measured both ways against
+the reference `zstd` before the feature was written.
+
+On 32 MB holding two copies of the same 4 MB block 24 MB apart:
+
+| | bytes |
+|---|---|
+| input | 33,554,432 |
+| `zstd.level=19`, no long | 33,555,209 |
+| reference `zstd -19` | 33,555,214 |
+| `zstd.level=19`, `zstd.long` | **29,361,427** |
+| reference `zstd -19 --long=27` | 29,361,171 |
+
+It is worth turning on only for data that actually repeats itself at long
+range — backups, VM images, packfiles, concatenated logs. On data that does
+not, it costs a table and a sweep and finds nothing.
+
+### What it does not do yet
+
+`zstd.long` with `threads.count > 1` is refused with `GCOMP_ERR_UNSUPPORTED`
+rather than quietly ignored. A parallel job compresses its block against its
+own window, so a match reaching tens of megabytes back is not available to it.
+The reference answers this by running the long scan once over the whole input
+in the calling thread and handing the matches to the jobs; that is a larger
+change, and until it exists the combination is an error rather than a stream
+that silently lacks the long matches the caller asked for.
 
 ## Content checksum
 

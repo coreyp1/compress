@@ -325,6 +325,17 @@ typedef struct {
    */
   size_t compared_bytes;
 
+  /**
+   * @brief The long-distance index, or NULL when `zstd.long` is off.
+   *
+   * A second, far coarser table that covers the whole declared window where
+   * the tables above reach only MF_MAX_DISTANCE. It is consulted before the
+   * ordinary search at each position and its matches are preferred when they
+   * are longer, which is the only way a match beyond about 8 MB is ever
+   * found. See zstd_ldm.h.
+   */
+  struct zstd_ldm_s * ldm;
+
 } zstd_match_finder_t;
 
 //
@@ -1175,6 +1186,25 @@ gcomp_status_t zstd_sequences_decode(zstd_decoder_state_t * state,
  */
 gcomp_status_t zstd_mf_init(zstd_match_finder_t * mf,
     const gcomp_allocator_t * alloc, int level, size_t window_size,
+    gcomp_memory_tracker_t * mem_tracker);
+
+/**
+ * @brief Turn long-distance matching on for this match finder.
+ *
+ * Separate from zstd_mf_init() because it is off by default and costs a table
+ * of its own: a caller that does not ask for it pays nothing, and one that
+ * does can be told what it will cost first, through
+ * zstd_ldm_memory_estimate().
+ *
+ * @param window_size The declared window; an LDM offset may not exceed it
+ *   (RFC 8878 section 3.1.1.1.2).
+ * @param min_match Bytes a long match must have, or 0 for the default.
+ * @param hash_log Log2 of the table size, or 0 to size it from the window.
+ * @param hash_rate_log Index one position in `1 << this`.
+ */
+gcomp_status_t zstd_mf_enable_ldm(zstd_match_finder_t * mf,
+    const gcomp_allocator_t * alloc, size_t window_size, unsigned min_match,
+    unsigned hash_log, unsigned hash_rate_log,
     gcomp_memory_tracker_t * mem_tracker);
 
 /**

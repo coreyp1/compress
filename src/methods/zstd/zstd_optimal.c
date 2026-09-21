@@ -111,6 +111,7 @@
 #include "../../core/bitcost.h"
 #include "zstd_internal.h"
 #include "zstd_repcodes.h"
+#include "zstd_ldm.h"
 #include "zstd_matchfinder_private.h"
 #include "zstd_sequences_private.h"
 #include <string.h>
@@ -600,6 +601,18 @@ gcomp_status_t zstd_opt_generate_sequences(zstd_match_finder_t * mf,
   // inside a match never reaches the literals section -- but they are the
   // same alphabet in very nearly the same proportions, and that is what the
   // price needs.
+  // The long-distance sweep runs over the block before it is parsed, for the
+  // same reason as in zstd_mf_generate_sequences(): its hash rolls one byte
+  // at a time and needs to see every position in order, which a parse that
+  // steps over the matches it takes does not do.
+  if (mf->ldm) {
+    gcomp_status_t ldm_status =
+        zstd_ldm_scan(mf->ldm, data, start_pos, data_size, data_size);
+    if (ldm_status != GCOMP_OK) {
+      return ldm_status;
+    }
+  }
+
   zstd_opt_decay(st);
   if (!st->primed) {
     for (size_t i = start_pos; i < data_size; i++) {
@@ -794,6 +807,28 @@ gcomp_status_t zstd_opt_generate_sequences(zstd_match_finder_t * mf,
             best_forced_price = price;
             forced_len = cand[c].length;
             forced_off = cand[c].offset;
+          }
+        }
+      }
+
+      // A long-distance match, where the sweep found one starting here.  It
+      // is priced against the others rather than taken outright, so that a
+      // nearer match of the same length is still preferred -- a long offset
+      // costs more bits and zstd_opt_of_price() knows by how much.  It is
+      // offered only in the forcing test because it is at least
+      // ldm_min_match bytes, far above any force_at this parse uses, so
+      // relaxing it as an ordinary candidate could not change the answer.
+      if (mf->ldm) {
+        const zstd_ldm_match_t * lm = zstd_ldm_at(mf->ldm, p);
+        if (lm && lm->length >= force_at && (size_t)lm->offset <= p) {
+          uint32_t enc =
+              zstd_opt_encode_offset(here_rep, here_litlen, lm->offset);
+          uint32_t price =
+              zstd_opt_of_price(st, enc) + zstd_opt_ml_price(st, lm->length);
+          if (!forced_len || price < best_forced_price) {
+            best_forced_price = price;
+            forced_len = lm->length;
+            forced_off = lm->offset;
           }
         }
       }

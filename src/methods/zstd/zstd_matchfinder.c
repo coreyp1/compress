@@ -96,6 +96,7 @@
 #include <assert.h>
 #endif
 #include "zstd_internal.h"
+#include "zstd_ldm.h"
 #include "zstd_matchfinder_private.h"
 #include "zstd_repcodes.h"
 #include <string.h>
@@ -435,6 +436,33 @@ static void zstd_mf_plan(const zstd_effort_t * effort, size_t window_size,
   }
 }
 
+gcomp_status_t zstd_mf_enable_ldm(zstd_match_finder_t * mf,
+    const gcomp_allocator_t * alloc, size_t window_size, unsigned min_match,
+    unsigned hash_log, unsigned hash_rate_log,
+    gcomp_memory_tracker_t * mem_tracker) {
+  if (!mf) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  if (mf->ldm) {
+    return GCOMP_OK;
+  }
+  zstd_ldm_t * ldm = gcomp_calloc(alloc, 1u, sizeof(zstd_ldm_t));
+  if (!ldm) {
+    return GCOMP_ERR_MEMORY;
+  }
+  gcomp_status_t status = zstd_ldm_init(ldm, alloc, window_size, min_match,
+      hash_log, hash_rate_log, mem_tracker);
+  if (status != GCOMP_OK) {
+    gcomp_free(alloc, ldm);
+    return status;
+  }
+  if (mem_tracker) {
+    gcomp_memory_track_alloc(mem_tracker, sizeof(zstd_ldm_t));
+  }
+  mf->ldm = ldm;
+  return GCOMP_OK;
+}
+
 size_t zstd_mf_memory_estimate(int level, size_t window_size) {
   const zstd_effort_t * effort = zstd_mf_effort(level);
   zstd_mf_plan_t plan;
@@ -546,6 +574,15 @@ void zstd_mf_destroy(zstd_match_finder_t * mf, const gcomp_allocator_t * alloc,
     gcomp_memory_tracker_t * mem_tracker) {
   if (!mf) {
     return;
+  }
+
+  if (mf->ldm) {
+    zstd_ldm_destroy(mf->ldm, alloc, mem_tracker);
+    if (mem_tracker) {
+      gcomp_memory_track_free(mem_tracker, sizeof(zstd_ldm_t));
+    }
+    gcomp_free(alloc, mf->ldm);
+    mf->ldm = NULL;
   }
 
   if (mf->hash_table) {
@@ -1149,6 +1186,12 @@ void zstd_mf_slide(zstd_match_finder_t * mf, size_t shift) {
   // nothing has to be rewritten, which is the whole reason the tree counts
   // this way.  The chain below names positions in the buffer instead, and
   // has to move every entry it holds.
+  // The long-distance index counts absolutely too, for the same reason, and
+  // it must move whether or not this level uses the tree.
+  if (mf->ldm) {
+    zstd_ldm_slide(mf->ldm, shift);
+  }
+
   if (mf->use_bt) {
     mf->base_pos += shift;
     return;
@@ -1284,6 +1327,18 @@ gcomp_status_t zstd_mf_generate_sequences(zstd_match_finder_t * mf,
   // as they were encoded.  Resetting here made every block start from nothing
   // - no match could cross a block boundary, and on a multi-megabyte file
   // that threw the history away 128 KB at a time.
+  // Long-distance matching runs as a sweep over the block before the parse
+  // rather than as another table the inner loop asks.  Its hash rolls one
+  // byte at a time, so it needs to see every position in order, which a parse
+  // that steps over the matches it takes does not do.
+  if (mf->ldm) {
+    gcomp_status_t ldm_status =
+        zstd_ldm_scan(mf->ldm, data, start_pos, data_size, data_size);
+    if (ldm_status != GCOMP_OK) {
+      return ldm_status;
+    }
+  }
+
   size_t pos = start_pos;
   size_t lit_start = start_pos;
   size_t num_seq = 0;
@@ -1295,9 +1350,57 @@ gcomp_status_t zstd_mf_generate_sequences(zstd_match_finder_t * mf,
 
   while (pos < data_size && num_seq < max_sequences) {
     zstd_match_t match;
+    bool found = zstd_mf_find_match(mf, data, pos, data_size, true, &match);
 
-    // Try to find a match
-    if (zstd_mf_find_match(mf, data, pos, data_size, true, &match)) {
+    // A long match, if the sweep found one starting here.  It is taken over
+    // whatever the ordinary search returned whenever it is longer: it reaches
+    // past MF_MAX_DISTANCE, which is the only way a match that far back is
+    // found at all, and the extra bits a distant offset costs are repaid many
+    // times over by a match of this size.  Where the ordinary search did as
+    // well or better, this is skipped rather than paying a long offset for
+    // nothing.
+    const zstd_ldm_match_t * ldm_match =
+        mf->ldm ? zstd_ldm_at(mf->ldm, pos) : NULL;
+    if (ldm_match && ldm_match->length >= MF_MIN_MATCH &&
+        (!found || match.length < ldm_match->length)) {
+      const size_t lit_len_l = pos - lit_start;
+      uint32_t rep_l[3] = {rep1, rep2, rep3};
+      const uint32_t encoded_l =
+          zstd_opt_encode_offset(rep_l, (uint32_t)lit_len_l, ldm_match->offset);
+      uint32_t rep_after_l[3];
+      zstd_opt_rep_after(rep_l, encoded_l, (uint32_t)lit_len_l,
+          ldm_match->offset, rep_after_l);
+      rep1 = rep_after_l[0];
+      rep2 = rep_after_l[1];
+      rep3 = rep_after_l[2];
+
+      memcpy(literals_out + lit_pos, data + lit_start, lit_len_l);
+      lit_pos += lit_len_l;
+
+      sequences[num_seq].lit_length = (uint32_t)lit_len_l;
+      sequences[num_seq].match_offset = encoded_l;
+      sequences[num_seq].match_length = ldm_match->length;
+      num_seq++;
+
+      // The ordinary tables still have to learn about the bytes this match
+      // covers, or the next block finds nothing to repeat inside it.  Same
+      // sampling as the fill loop below, and for the same reason.
+      const size_t end_l = pos + ldm_match->length;
+      const size_t stride_l =
+          (mf->use_bt && ldm_match->length >= mf->nice_length)
+          ? mf->nice_length
+          : 1u;
+      for (size_t i = pos + 1u;
+           i < end_l && i + MF_HASH_READ_SIZE <= data_size; i += stride_l) {
+        zstd_mf_insert_one(mf, data, i, data_size);
+      }
+
+      pos = end_l;
+      lit_start = pos;
+      continue;
+    }
+
+    if (found) {
       // Deferred matching: a match here blocks every match that starts inside
       // it, so before committing, look one byte on and keep whichever is
       // worth more.  `indexed` is the highest position these look-ahead

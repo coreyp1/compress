@@ -67,6 +67,7 @@
 
 #include <ghoti.io/compress/macros.h>
 #include "zstd_internal.h"
+#include "zstd_ldm.h"
 #include "zstd_parallel.h"
 #include <string.h>
 
@@ -657,6 +658,10 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
   size_t dict_opt_size = 0;
   uint64_t dict_id_opt = 0;
   bool dict_id_opt_set = false;
+  int ldm_enabled = 0;
+  uint64_t ldm_min_match = ZSTD_LDM_MIN_MATCH_DEFAULT;
+  uint64_t ldm_hash_log = 0;
+  uint64_t ldm_hash_rate_log = ZSTD_LDM_HASH_RATE_LOG_DEFAULT;
 
   if (options) {
     gcomp_options_get_int64(options, "zstd.level", &level);
@@ -669,6 +674,11 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
     gcomp_options_get_uint64(options, "limits.max_memory_bytes", &max_memory);
     gcomp_options_get_uint64(options, "threads.count", &num_threads);
     gcomp_options_get_uint64(options, "zstd.job_size", &job_size);
+    gcomp_options_get_bool(options, "zstd.long", &ldm_enabled);
+    gcomp_options_get_uint64(options, "zstd.ldm_min_match", &ldm_min_match);
+    gcomp_options_get_uint64(options, "zstd.ldm_hash_log", &ldm_hash_log);
+    gcomp_options_get_uint64(
+        options, "zstd.ldm_hash_rate_log", &ldm_hash_rate_log);
     if (gcomp_options_get_bytes(options, "zstd.dictionary", &dict_opt,
             &dict_opt_size) == GCOMP_OK &&
         dict_opt != NULL && dict_opt_size > 0) {
@@ -677,6 +687,21 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
         dict_id_opt_set = true;
       }
     }
+  }
+
+  // A parallel job compresses its own block with its own window, so a match
+  // reaching tens of megabytes back is not available to it: the job would
+  // have to hold the whole stream. libzstd answers this by running the long
+  // scan once over the whole input in the calling thread and handing the
+  // matches to the jobs; that is a larger change than this one, and until it
+  // exists the combination is refused rather than quietly ignored.
+  if (ldm_enabled && num_threads > 1u) {
+    status = GCOMP_ERR_UNSUPPORTED;
+    gcomp_encoder_set_error(encoder, status,
+        "zstd.long is not yet supported with threads.count > 1; the long "
+        "scan would have to run over the whole input before the jobs split "
+        "it");
+    goto cleanup;
   }
 
   // Store threading options
@@ -830,6 +855,16 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
         (uint64_t)(block_buffer_size / 3) * sizeof(zstd_sequence_t) +
         (uint64_t)block_buffer_size;
 
+    // The long-distance table is sized from the window, so at window_log 31
+    // it is the largest single allocation the encoder makes. It has to be in
+    // the projection for the same reason the match finder's tables are: a
+    // limit answered after the allocation has not limited anything.
+    if (ldm_enabled) {
+      projected += sizeof(zstd_ldm_t) +
+          (uint64_t)zstd_ldm_memory_estimate(state->mf_window_max,
+              (unsigned)ldm_hash_log, (unsigned)ldm_hash_rate_log);
+    }
+
     gcomp_memory_tracker_t projection = state->mem_tracker;
     gcomp_memory_track_alloc(&projection, projected);
     if (gcomp_memory_check_limit(&projection, max_memory) != GCOMP_OK) {
@@ -879,6 +914,17 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
   if (status != GCOMP_OK) {
     gcomp_encoder_set_error(encoder, status, "match finder init failed");
     goto cleanup;
+  }
+
+  if (ldm_enabled) {
+    status = zstd_mf_enable_ldm(state->match_finder, alloc,
+        state->mf_window_max, (unsigned)ldm_min_match, (unsigned)ldm_hash_log,
+        (unsigned)ldm_hash_rate_log, &state->mem_tracker);
+    if (status != GCOMP_OK) {
+      gcomp_encoder_set_error(
+          encoder, status, "long-distance matching could not be enabled");
+      goto cleanup;
+    }
   }
 
   // The window the match finder searches: the history carried from block to

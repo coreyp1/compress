@@ -42,6 +42,7 @@
 #include <ghoti.io/compress/compress.h>
 #include <string.h>
 #include "zstd_internal.h"
+#include "zstd_ldm.h"
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/method.h>
 #include <ghoti.io/compress/options.h>
@@ -117,6 +118,66 @@ static const gcomp_option_schema_t g_zstd_option_schemas[] = {
         0,                        // min_uint
         0,                        // max_uint
         "Record a checksum per frame in the seek table", // help
+        NULL, // allowed
+    },
+    // zstd.long - Long-distance matching (see zstd_ldm.h)
+    {
+        "zstd.long",   // key
+        GCOMP_OPT_BOOL, // type
+        1,              // has_default
+        {.b = false},   // default_value
+        0,              // has_min
+        0,              // has_max
+        0,              // min_int
+        0,              // max_int
+        0,              // min_uint
+        0,              // max_uint
+        "Find matches across the whole window, not just the nearest 8 MB", // help
+        NULL, // allowed
+    },
+    // zstd.ldm_min_match - Shortest match long-distance matching will take
+    {
+        "zstd.ldm_min_match",        // key
+        GCOMP_OPT_UINT64,            // type
+        1,                           // has_default
+        {.ui64 = ZSTD_LDM_MIN_MATCH_DEFAULT}, // default_value
+        1,                           // has_min
+        1,                           // has_max
+        0,                           // min_int
+        0,                           // max_int
+        ZSTD_LDM_MIN_MATCH_MIN,      // min_uint
+        ZSTD_LDM_MIN_MATCH_MAX,      // max_uint
+        "Bytes a long-distance match must have", // help
+        NULL, // allowed
+    },
+    // zstd.ldm_hash_log - Size of the long-distance table
+    {
+        "zstd.ldm_hash_log",     // key
+        GCOMP_OPT_UINT64,        // type
+        1,                       // has_default
+        {.ui64 = 0},             // default_value (0 = size from the window)
+        1,                       // has_min
+        1,                       // has_max
+        0,                       // min_int
+        0,                       // max_int
+        0,                       // min_uint (0 = auto allowed)
+        ZSTD_LDM_HASH_LOG_MAX,   // max_uint
+        "Log2 of the long-distance table, 0 = from the window", // help
+        NULL, // allowed
+    },
+    // zstd.ldm_hash_rate_log - How sparsely the window is indexed
+    {
+        "zstd.ldm_hash_rate_log",       // key
+        GCOMP_OPT_UINT64,               // type
+        1,                              // has_default
+        {.ui64 = ZSTD_LDM_HASH_RATE_LOG_DEFAULT}, // default_value
+        1,                              // has_min
+        1,                              // has_max
+        0,                              // min_int
+        0,                              // max_int
+        0,                              // min_uint
+        ZSTD_LDM_HASH_RATE_LOG_MAX,     // max_uint
+        "Index one position in 2^this for long-distance matching", // help
         NULL, // allowed
     },
     // zstd.window_log - Window log (10-31, or 0 for auto)
@@ -294,6 +355,10 @@ static const char * const g_zstd_option_keys[] = {
     "zstd.seekable_frame_size",
     "zstd.seekable_checksum",
     "zstd.window_log",
+    "zstd.long",
+    "zstd.ldm_min_match",
+    "zstd.ldm_hash_log",
+    "zstd.ldm_hash_rate_log",
     "zstd.content_size",
     "zstd.concat",
     "zstd.dictionary",
@@ -378,6 +443,40 @@ static gcomp_status_t zstd_create_encoder(gcomp_registry_t * registry,
       if (!zstd_validate_window_log(window_log_val)) {
         gcomp_encoder_set_error(*encoder_out, GCOMP_ERR_INVALID_ARG,
             "zstd.window_log must be 0 (auto) or between 10 and 31");
+        return GCOMP_ERR_INVALID_ARG;
+      }
+    }
+
+    // Validate the long-distance options if provided.  They are checked here
+    // rather than only in zstd_ldm_init() so that the caller is told which
+    // option was wrong and what its range is, the way window_log above is.
+    uint64_t ldm_val;
+    if (gcomp_options_get_uint64(options, "zstd.ldm_min_match", &ldm_val) ==
+        GCOMP_OK) {
+      if (ldm_val < ZSTD_LDM_MIN_MATCH_MIN ||
+          ldm_val > ZSTD_LDM_MIN_MATCH_MAX) {
+        gcomp_encoder_set_error(*encoder_out, GCOMP_ERR_INVALID_ARG,
+            "zstd.ldm_min_match must be between %u and %u",
+            ZSTD_LDM_MIN_MATCH_MIN, ZSTD_LDM_MIN_MATCH_MAX);
+        return GCOMP_ERR_INVALID_ARG;
+      }
+    }
+    if (gcomp_options_get_uint64(options, "zstd.ldm_hash_log", &ldm_val) ==
+        GCOMP_OK) {
+      if (ldm_val != 0u && (ldm_val < ZSTD_LDM_HASH_LOG_MIN ||
+                               ldm_val > ZSTD_LDM_HASH_LOG_MAX)) {
+        gcomp_encoder_set_error(*encoder_out, GCOMP_ERR_INVALID_ARG,
+            "zstd.ldm_hash_log must be 0 (auto) or between %u and %u",
+            ZSTD_LDM_HASH_LOG_MIN, ZSTD_LDM_HASH_LOG_MAX);
+        return GCOMP_ERR_INVALID_ARG;
+      }
+    }
+    if (gcomp_options_get_uint64(options, "zstd.ldm_hash_rate_log",
+            &ldm_val) == GCOMP_OK) {
+      if (ldm_val > ZSTD_LDM_HASH_RATE_LOG_MAX) {
+        gcomp_encoder_set_error(*encoder_out, GCOMP_ERR_INVALID_ARG,
+            "zstd.ldm_hash_rate_log must be at most %u",
+            ZSTD_LDM_HASH_RATE_LOG_MAX);
         return GCOMP_ERR_INVALID_ARG;
       }
     }
