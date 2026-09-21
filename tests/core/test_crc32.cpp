@@ -13,6 +13,8 @@
 #include <gtest/gtest.h>
 #include <vector>
 
+#include "../../src/core/checksum_internal.h"
+
 // Known CRC32 test vectors from RFC 1952 (standard CRC32)
 // Standard CRC32: init 0xFFFFFFFF, final XOR 0xFFFFFFFF
 // These values are computed using Python: zlib.crc32(data, 0xFFFFFFFF) &
@@ -392,6 +394,170 @@ TEST(Crc32SliceTable, UnalignedStartsAgree) {
     EXPECT_EQ(gcomp_crc32_finalize(gcomp_crc32(buf.data() + offset, len)),
         CrcBitwise(buf.data() + offset, len))
         << "offset " << offset;
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// The several implementations, against each other
+// ---------------------------------------------------------------------------
+
+// gcomp_crc32_update() picks an implementation at run time, so a test that
+// only calls it tests whichever one this machine happens to select.  These
+// call each variant by name.  See checksum_internal.h.
+
+// A build that quietly lost the vector path would still pass every test below
+// -- they would all be comparing the scalar path with itself.  On the target
+// this was written for, losing it is a build error instead.
+#if defined(__x86_64__) && defined(__GNUC__) &&                                \
+    !defined(GCOMP_NO_CHECKSUM_SIMD) && !defined(GCOMP_CRC32_NO_PCLMUL)
+#ifndef GCOMP_CRC32_PCLMUL
+#error "the folding CRC is not in this build, on a target that supports it"
+#endif
+#endif
+
+namespace {
+
+// x^n mod P, with P the IEEE 802.3 polynomial in its normal form -- the
+// 0x04C11DB7 spelling, with the x^32 term implicit.  One multiply by x per
+// step: shift up, and reduce if x^32 appeared.
+uint32_t XPowMod(unsigned n) {
+  uint32_t r = 1u; // x^0
+  for (unsigned i = 0; i < n; i++) {
+    uint32_t overflowed = r >> 31;
+    r <<= 1;
+    if (overflowed) {
+      r ^= 0x04C11DB7u;
+    }
+  }
+  return r;
+}
+
+uint64_t FoldConstant(unsigned n) {
+  // Reflected into bits 32..63 of the lane: bit j of the normal-form word
+  // carries x^j, and the lane's rule is that bit p carries x^(63-p).
+  uint64_t lane = 0;
+  uint32_t k = XPowMod(n);
+  for (unsigned j = 0; j < 32u; j++) {
+    if ((k >> j) & 1u) {
+      lane |= UINT64_C(1) << (63u - j);
+    }
+  }
+  return lane;
+}
+
+// A cheap deterministic generator, so a failure is reproducible from the seed
+// printed with it.
+struct Rng {
+  uint64_t state;
+  explicit Rng(uint64_t seed) : state(seed) {}
+  uint32_t Next() {
+    state = state * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+    return static_cast<uint32_t>(state >> 33);
+  }
+};
+
+} // namespace
+
+// The four magic numbers in checksum_internal.h, recomputed from the
+// polynomial.  Exactly what Crc32SliceTable does for the 2048 table entries,
+// and for the same reason: a constant nobody can regenerate is a constant
+// nobody can check.
+TEST(Crc32PclmulConstants, MatchThePolynomial) {
+  // The exponents are one below the algebra's, which is how the extra power
+  // of x that PCLMULQDQ's bit order introduces is paid for; crc32_pclmul.c
+  // derives that.
+  EXPECT_EQ(GCOMP_CRC32_K_BY4_HI, FoldConstant(4u * 128u + 63u)); // x^575
+  EXPECT_EQ(GCOMP_CRC32_K_BY4_LO, FoldConstant(4u * 128u - 1u));  // x^511
+  EXPECT_EQ(GCOMP_CRC32_K_BY1_HI, FoldConstant(128u + 63u));      // x^191
+  EXPECT_EQ(GCOMP_CRC32_K_BY1_LO, FoldConstant(128u - 1u));       // x^127
+}
+
+// Ten thousand random buffers, random lengths and random alignments, every
+// implementation against every other.  The byte-at-a-time loop is the one
+// that owes nothing to any of the others, so it is the reference.
+TEST(Crc32Variants, AllAgreeOnRandomBuffers) {
+  constexpr size_t kMaxLen = 1024;
+  constexpr size_t kMaxOffset = 64;
+  std::vector<uint8_t> buf(kMaxLen + kMaxOffset);
+  Rng rng(0x9E3779B97F4A7C15ull);
+  size_t pclmul_runs = 0;
+
+  for (int trial = 0; trial < 10000; trial++) {
+    size_t offset = rng.Next() % kMaxOffset;
+    size_t len = rng.Next() % (kMaxLen + 1u);
+    for (size_t i = 0; i < offset + len; i++) {
+      buf[i] = static_cast<uint8_t>(rng.Next() >> 3);
+    }
+    // A random starting value, not just GCOMP_CRC32_INIT: the folding path
+    // mixes it into the first register, and a bug there would hide behind an
+    // all-ones seed.
+    uint32_t seed = rng.Next();
+    const uint8_t * p = buf.data() + offset;
+
+    uint32_t want = gcomp_crc32_update_bytewise(seed, p, len);
+
+#ifdef GCOMP_CRC32_SLICE_BY_8
+    EXPECT_EQ(gcomp_crc32_update_slice8(seed, p, len), want)
+        << "slice8, trial " << trial << " offset " << offset
+        << " len " << len;
+#endif
+
+    if (gcomp_crc32_pclmul_available() && len >= GCOMP_CRC32_PCLMUL_MIN) {
+      EXPECT_EQ(gcomp_crc32_update_pclmul(seed, p, len), want)
+          << "pclmul, trial " << trial << " offset " << offset
+          << " len " << len;
+      pclmul_runs++;
+    }
+
+    EXPECT_EQ(gcomp_crc32_update(seed, p, len), want)
+        << "dispatch, trial " << trial << " offset " << offset
+        << " len " << len;
+  }
+
+  if (!gcomp_crc32_pclmul_available()) {
+    GTEST_SKIP() << "this CPU has no carry-less multiply; the folding path "
+                    "was not among the implementations compared";
+  }
+  // Having decided the path is available, insist it actually ran: a threshold
+  // raised past kMaxLen by some later change would otherwise leave this test
+  // green while comparing the scalar paths with each other.
+  EXPECT_GT(pclmul_runs, 5000u);
+}
+
+// Every length from nothing to well past the four-register loop, so that the
+// 64-byte body, the collapse, the 16-byte loop and the scalar tail are each
+// entered and each skipped.
+TEST(Crc32Variants, PclmulMatchesAtEveryLength) {
+  if (!gcomp_crc32_pclmul_available()) {
+    GTEST_SKIP() << "no carry-less multiply on this CPU";
+  }
+  std::vector<uint8_t> buf(600);
+  for (size_t i = 0; i < buf.size(); i++) {
+    buf[i] = static_cast<uint8_t>(i * 131u + (i >> 3));
+  }
+  for (size_t len = GCOMP_CRC32_PCLMUL_MIN; len <= buf.size(); len++) {
+    EXPECT_EQ(gcomp_crc32_update_pclmul(GCOMP_CRC32_INIT, buf.data(), len),
+        gcomp_crc32_update_bytewise(GCOMP_CRC32_INIT, buf.data(), len))
+        << "length " << len;
+  }
+}
+
+// The property the folding path is most likely to break, as it was for
+// slicing: a chunk boundary anywhere must not change the answer.  Here it
+// also crosses the dispatch threshold in both directions, so one call folds
+// and the next does not.
+TEST(Crc32Variants, DispatchAgreesAtEverySplitPoint) {
+  std::vector<uint8_t> buf(400);
+  for (size_t i = 0; i < buf.size(); i++) {
+    buf[i] = static_cast<uint8_t>(i ^ 0xA5u);
+  }
+  uint32_t whole = gcomp_crc32_finalize(gcomp_crc32(buf.data(), buf.size()));
+  for (size_t split = 0; split <= buf.size(); split++) {
+    uint32_t crc = GCOMP_CRC32_INIT;
+    crc = gcomp_crc32_update(crc, buf.data(), split);
+    crc = gcomp_crc32_update(crc, buf.data() + split, buf.size() - split);
+    EXPECT_EQ(gcomp_crc32_finalize(crc), whole) << "split at " << split;
   }
 }
 

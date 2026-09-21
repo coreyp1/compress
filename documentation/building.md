@@ -127,6 +127,50 @@ make BUILD=release
 make -j4
 ```
 
+### CPU-specific code, and turning it off
+
+Two checksums have a second implementation that uses instructions outside the
+x86-64 baseline. Both are chosen at run time from `CPUID`, so one binary runs
+correctly on every x86-64 CPU; nothing here changes what a build *requires*.
+
+| Checksum | Extra implementation | Instruction set | Used by |
+| --- | --- | --- | --- |
+| CRC-32 | carry-less multiply folding | PCLMULQDQ (+SSE2) | gzip, PNG |
+| Adler-32 | 32-byte groups via `PMADDUBSW` | SSSE3 | zlib, so every PNG |
+
+**No compiler flags are involved.** Each function carries
+`__attribute__((target(...)))`, so the widened instruction set applies to
+those functions alone. Passing `-mpclmul` or `-mssse3` on the command line is
+neither needed nor wanted: it would license the compiler to emit those
+instructions anywhere in the unit, and a binary that does that dies with
+SIGILL on a CPU that lacks them.
+
+Both scalar implementations remain in the library. They are what runs on a
+CPU without the extension, and they are what the vector paths are tested
+against -- `Crc32Variants` and `Adler32Variants` in the test suite compare
+every implementation against every other on ten thousand random buffers.
+
+To force the scalar paths, define one or more of:
+
+| Define | Effect |
+| --- | --- |
+| `GCOMP_NO_CHECKSUM_SIMD` | Both vector checksums; the translation units compile to stubs |
+| `GCOMP_CRC32_NO_PCLMUL` | The folding CRC-32 only |
+| `GCOMP_ADLER32_NO_SSSE3` | The vector Adler-32 only |
+| `GCOMP_CRC32_NO_SLICE_BY_8` | Also the scalar slice-by-8 CRC, leaving the byte loop |
+
+```bash
+# Scalar checksums throughout
+make EXTRA_CFLAGS=-DGCOMP_NO_CHECKSUM_SIMD
+```
+
+That is also how the two are A/B measured, since building both and swapping
+the shared object is the only way to compare them on the same machine.
+
+On any target that is not x86 with GCC or Clang, the vector translation units
+compile to stubs whose availability predicates answer false, and the scalar
+paths are all there is. Nothing needs to be defined for that.
+
 ## Output Directories
 
 ```
