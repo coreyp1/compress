@@ -162,6 +162,33 @@ typedef struct gcomp_deflate_decoder_state_s {
   //
   // Sliding window
   //
+  // WHERE THE HISTORY LIVES
+  // =======================
+  //
+  // RFC 1951 section 3.2.3 lets a match reach up to 32768 bytes back into
+  // what has already been decoded, so the decoder must keep that much
+  // history.  It used to keep it *only* here, in a circular buffer of its
+  // own, which meant every decoded byte was written twice -- once into the
+  // caller's output buffer and once into this window -- and every match byte
+  // was copied twice for the same reason.  The second write was 28.5% of what
+  // a gzip decode cost after the earlier passes had trimmed everything else.
+  //
+  // The bytes are already in the caller's output buffer, so the history is
+  // now split in two and this buffer holds only the part that is not:
+  //
+  //   history = window[...] (older)  ++  output[out_base .. output->used)
+  //
+  // A match whose distance falls inside the second part -- which is almost
+  // every match when the caller offers a whole file's worth of room -- is one
+  // memcpy inside the output buffer and never touches this window at all.  A
+  // match that reaches further back takes its first bytes from here and then
+  // runs on into the output buffer.
+  //
+  // The caller's buffer does not survive the call, so at the end of every
+  // update() the tail of what was written is copied in here (see
+  // deflate_window_sync()).  That is at most `window_size` bytes once per
+  // call, against the one-byte-at-a-time writes it replaces.
+  //
   uint8_t * window;
   size_t window_size;
   /**
@@ -176,7 +203,26 @@ typedef struct gcomp_deflate_decoder_state_s {
    */
   size_t window_mask;
   size_t window_pos;
+  /**
+   * @brief How many bytes of history this buffer holds.
+   *
+   * No longer the whole history: the bytes written into the caller's buffer
+   * during the current call are history too and are not here yet.  The total
+   * a distance may reach back into is deflate_history_bytes().
+   */
   size_t window_filled;
+  /**
+   * @brief Where in the caller's output buffer this call began writing.
+   *
+   * Everything from here to `output->used` was decoded by this call and so is
+   * history the next match may reach into.  Everything before it belongs to
+   * whoever owns the buffer -- a container format may have written its own
+   * bytes there -- and is never read.
+   *
+   * Set at the top of every public entry point, because a caller may hand
+   * over a different buffer, or the same one rewound, on every call.
+   */
+  size_t out_base;
 
   //
   // Block state
@@ -445,16 +491,87 @@ static gcomp_status_t deflate_check_output_limit(
       st->total_input_bytes, next, st->max_expansion_ratio);
 }
 
-static void deflate_window_put(gcomp_deflate_decoder_state_t * st, uint8_t b) {
-  if (!st || !st->window || st->window_size == 0) {
+/**
+ * @brief How far back a match may legitimately reach, right now.
+ *
+ * The window holds the older half of the history and the caller's output
+ * buffer holds the half this call has just written; see the window comment in
+ * the state struct.  A distance is valid when it reaches no further than the
+ * two together, and no further than the window the decoder was built with.
+ *
+ * That last clamp is not decoration.  RFC 1951 section 3.2.3 bounds a
+ * distance by the window size, and `deflate.window_bits` is how a caller says
+ * which window it is willing to pay for -- a zlib or gzip header states it,
+ * and honouring it is what keeps a stream from needing more history than was
+ * allocated for it.  Before the history was split this came for free, because
+ * window_filled could not exceed the window; now the output buffer's share is
+ * unbounded and a stream asking to reach 4 KB back into a 256-byte window
+ * would be quietly obliged.  zlib refuses that too, and so does this.
+ */
+static size_t deflate_history_bytes(
+    const gcomp_deflate_decoder_state_t * st, const gcomp_buffer_t * output) {
+  size_t written = (output && output->used >= st->out_base)
+      ? output->used - st->out_base
+      : 0u;
+  size_t have = st->window_filled + written;
+  return (have > st->window_size) ? st->window_size : have;
+}
+
+/**
+ * @brief Move the tail of what this call wrote into the window.
+ *
+ * The caller's output buffer is only ours for the duration of one call, so
+ * before the call returns, whatever of it a later match might still need has
+ * to be kept.  That is the last `window_size` bytes of it, and no more: a
+ * distance cannot exceed the window (RFC 1951 section 3.2.3, and the decoder
+ * refuses a longer one), so nothing older can ever be asked for again.
+ *
+ * Two memcpys at most -- one when the run fits between window_pos and the end
+ * of the circular buffer, two when it wraps -- in place of the per-byte write
+ * this replaces.  When the call wrote at least a whole window, the circular
+ * arrangement is pointless for that copy, so the window is simply refilled
+ * from the tail and the cursor put back to zero.
+ *
+ * Idempotent: it advances @c out_base to @c output->used, so calling it twice
+ * copies nothing the second time.  That matters because finish() syncs before
+ * handing the same buffer to update(), which syncs again on its way out.
+ */
+static void deflate_window_sync(
+    gcomp_deflate_decoder_state_t * st, gcomp_buffer_t * output) {
+  if (!st || !st->window || st->window_size == 0u || !output ||
+      !output->data || output->used <= st->out_base) {
+    if (st && output && output->used > st->out_base) {
+      st->out_base = output->used;
+    }
     return;
   }
 
-  st->window[st->window_pos] = b;
-  st->window_pos = (st->window_pos + 1u) & st->window_mask;
-  if (st->window_filled < st->window_size) {
-    st->window_filled += 1u;
+  const uint8_t * src = (const uint8_t *)output->data + st->out_base;
+  size_t written = output->used - st->out_base;
+  const size_t window_size = st->window_size;
+
+  if (written >= window_size) {
+    memcpy(st->window, src + (written - window_size), window_size);
+    st->window_pos = 0u;
+    st->window_filled = window_size;
   }
+  else {
+    size_t first = window_size - st->window_pos;
+    if (first > written) {
+      first = written;
+    }
+    memcpy(st->window + st->window_pos, src, first);
+    if (written > first) {
+      memcpy(st->window, src + first, written - first);
+    }
+    st->window_pos = (st->window_pos + written) & st->window_mask;
+    st->window_filled += written;
+    if (st->window_filled > window_size) {
+      st->window_filled = window_size;
+    }
+  }
+
+  st->out_base = output->used;
 }
 
 static int deflate_out_available(const gcomp_buffer_t * output) {
@@ -488,7 +605,6 @@ static gcomp_status_t deflate_emit_byte(
   }
   output->used += 1u;
   st->total_output_bytes += 1u;
-  deflate_window_put(st, b);
   return GCOMP_OK;
 }
 
@@ -588,6 +704,10 @@ static gcomp_status_t deflate_copy_stored(gcomp_deflate_decoder_state_t * st,
   //
   // `total_input_bytes` is not touched here: the refill counted these bytes
   // when it pulled them out of the input.
+  //
+  // Nothing writes to the window here.  A stored block's bytes are history
+  // like any other, but they are in the caller's output buffer now and
+  // deflate_window_sync() takes the tail of it when the call ends.
   {
     uint8_t * out_bytes = (uint8_t *)output->data;
     while (st->stored_remaining > 0u && st->bit_count >= 8u
@@ -600,7 +720,6 @@ static gcomp_status_t deflate_copy_stored(gcomp_deflate_decoder_state_t * st,
       st->bit_buffer >>= 8u;
       st->bit_count -= 8u;
       out_bytes[output->used++] = b;
-      deflate_window_put(st, b);
       st->total_output_bytes += 1u;
       st->stored_remaining -= 1u;
     }
@@ -639,11 +758,6 @@ static gcomp_status_t deflate_copy_stored(gcomp_deflate_decoder_state_t * st,
     memcpy(dst + output->used, src + input->used, to_copy);
   }
 
-  for (size_t i = 0; i < to_copy; i++) {
-    uint8_t b = src ? src[input->used + i] : 0u;
-    deflate_window_put(st, b);
-  }
-
   input->used += to_copy;
   output->used += to_copy;
   st->total_output_bytes += (uint64_t)to_copy;
@@ -652,7 +766,7 @@ static gcomp_status_t deflate_copy_stored(gcomp_deflate_decoder_state_t * st,
 }
 
 /**
- * @brief Copy the pending match from the window to the output.
+ * @brief Copy the pending match into the output.
  *
  * WHY THIS IS NOT A BYTE LOOP
  * ===========================
@@ -668,35 +782,52 @@ static gcomp_status_t deflate_copy_stored(gcomp_deflate_decoder_state_t * st,
  * null checks describe the decoder, and the limits describe a count.  So they
  * are done once per run and the bytes are moved with memcpy.
  *
+ * WHY IT NO LONGER COPIES EVERYTHING TWICE
+ * ========================================
+ *
+ * It used to read the match out of the decoder's own circular window and
+ * write it to two places: the caller's output buffer, and back into the
+ * window so that a later match could find it.  Two copies of every match
+ * byte, and the second one -- the one nobody asked for -- was most of what
+ * deflate_copy_match() still cost after the byte loop went.
+ *
+ * The bytes are already in the output buffer, so the copy back is only
+ * needed for the part of the history that has left it, and that is done once
+ * per call by deflate_window_sync() rather than once per match.  See the
+ * window comment in the state struct for how the history is split.  Here that
+ * split shows up as two sources:
+ *
+ * - `back == 0`: the whole run is inside what this call has already written.
+ *   One memcpy inside the output buffer, no window at all.  This is the
+ *   ordinary case -- a caller with room for the whole file never leaves it.
+ *
+ * - `back > 0`: the match starts `back` bytes before this call's output
+ *   began, so those bytes come out of the window.  Each pass copies a little
+ *   of that and shrinks `back` by exactly what it copied, so the run walks
+ *   into the output buffer and the case above takes over.
+ *
  * HOW LONG A RUN CAN BE
  * =====================
  *
- * The window is circular and the match reads from it while writing to it, so a
- * flat copy is only valid for as long as none of five things happen partway
- * through: the match ends, the output fills, the write cursor wraps, the read
- * cursor wraps, or the two cursors run into each other.  The last one has two
- * directions and both are bounded:
+ * A flat copy is only valid for as long as none of these happen partway
+ * through: the match ends, the output fills, the source crosses out of the
+ * window into the output buffer, or the circular window wraps.  Overlap is
+ * not one of them any more.  The old code read and wrote one buffer, so it
+ * had to stop every `distance` bytes; here the source and destination are
+ * disjoint ranges of the output buffer, and the overlapping case -- a match
+ * longer than its own distance, which is how DEFLATE spells a repeating
+ * pattern -- is handled by growing the pattern rather than by stopping:
  *
- * - The read cursor is `distance` bytes behind the write cursor, so a run of
- *   at most `distance` bytes cannot read anything this run has written.  This
- *   is what makes a three-byte-distance match copy three bytes at a time; that
- *   is inherent to reading and writing one buffer, and three bytes per memcpy
- *   is still far cheaper than three trips through the old loop.
+ * - A distance of one is a run of one byte, which is what a row of identical
+ *   pixels looks like after PNG filtering.  memset.
  *
- * - Going the other way the two can overlap, when the match reaches far
- *   enough back that the writing cursor would pass the reading cursor before
- *   the run ends.  The reading cursor is ahead in that case, so every byte is
- *   still read before anything overwrites it -- which is exactly what memmove
- *   is defined to do, and why the window copy uses it.  A clamp that kept the
- *   run short enough for memcpy was tried first and removed: it made the runs
- *   smaller for no gain, and its absence could not be detected by any test,
- *   because overlapping memcpy is undefined rather than wrong and this libc
- *   happens to copy forward.  Correctness belongs in the call, not in a guard
- *   nothing can check.
- *
- * A distance of one is a run of one byte repeated, which is common enough --
- * it is what a row of identical pixels looks like after PNG filtering -- to be
- * worth memset rather than a memcpy per byte.
+ * - Otherwise the first `distance` bytes are copied, and then the copy
+ *   doubles what it has: `distance`, 2*distance, 4*distance, and so on.  A
+ *   three-byte pattern filling a 258-byte match is seven memcpys instead of
+ *   the eighty-six the old three-at-a-time loop did.  Every one of them is
+ *   non-overlapping by construction -- it never copies more than it has
+ *   already written -- so it is a memcpy and not a memmove, and it is defined
+ *   behaviour rather than a libc that happens to copy forward.
  */
 static gcomp_status_t deflate_copy_match(
     gcomp_deflate_decoder_state_t * st, gcomp_buffer_t * output) {
@@ -707,81 +838,111 @@ static gcomp_status_t deflate_copy_match(
     return GCOMP_OK;
   }
 
-  // Checked once, because the distance belongs to the match and not to the
-  // byte.  A distance that reaches past what the window holds is a corrupt
-  // stream, not a short read.
-  if (st->match_distance == 0u ||
-      (size_t)st->match_distance > st->window_filled ||
-      (size_t)st->match_distance > st->window_size) {
-    return GCOMP_ERR_CORRUPT;
-  }
-
   // The window is allocated when the decoder is created and update() refuses
   // an output buffer that is NULL with a non-zero size, so neither of these
   // can happen.  They are an error rather than a silent substitution of zero
   // bytes, which is what the old loop did: producing zeros for a match would
   // be corruption reported as success.
-  if (!st->window || st->window_size == 0u || !output->data) {
+  //
+  // The mark being behind the write cursor cannot happen either -- every
+  // entry point sets it from output->used and output->used only grows
+  // afterwards -- and it is checked for the same reason the others are.  What
+  // is below it is `output->used - st->out_base` as an unsigned subtraction,
+  // and where that goes wrong it does not go wrong quietly: the count wraps
+  // to something near SIZE_MAX, every match then looks as though it is
+  // entirely inside the output buffer, and the copy reads from before the
+  // start of the caller's buffer.  One comparison to turn that into an error.
+  if (!st->window || st->window_size == 0u || !output->data ||
+      output->used < st->out_base) {
     return GCOMP_ERR_INTERNAL;
   }
 
-  uint8_t * const win = st->window;
+  // Checked once, because the distance belongs to the match and not to the
+  // byte.  A distance that reaches past what has been decoded, or past what
+  // the window was sized to keep, is a corrupt stream and not a short read;
+  // deflate_history_bytes() is the one place that decides which distances are
+  // reachable, and both are its business.
+  //
+  // deflate_decode_distance() asks the same question, so that a bad distance
+  // is refused before any of the match is emitted.  This one stays because
+  // this function is also entered from finish() and from a match resumed
+  // across calls, and because what is immediately below it is a memcpy from a
+  // computed address.  A redundant comparison is the cheaper of the two
+  // things that can be wrong here.
+  if (st->match_distance == 0u ||
+      (size_t)st->match_distance > deflate_history_bytes(st, output)) {
+    return GCOMP_ERR_CORRUPT;
+  }
+
+  const uint8_t * const win = st->window;
   uint8_t * const out = (uint8_t *)output->data;
-  const size_t mask = st->window_mask;
   const size_t window_size = st->window_size;
   const size_t distance = (size_t)st->match_distance;
+  size_t written = output->used - st->out_base;
 
   while (st->match_remaining > 0u && output->used < output->size) {
-    const size_t src_pos = (st->window_pos + window_size - distance) & mask;
-
     size_t run = (size_t)st->match_remaining;
     const size_t out_room = output->size - output->used;
     if (run > out_room) {
       run = out_room;
     }
-    if (run > distance) {
-      run = distance;
-    }
-    if (run > window_size - st->window_pos) {
-      run = window_size - st->window_pos;
-    }
-    if (run > window_size - src_pos) {
-      run = window_size - src_pos;
-    }
-    if (run == 0u) {
-      return GCOMP_ERR_INTERNAL; // Cannot happen; refuse to spin if it does.
-    }
 
-    gcomp_status_t lim = deflate_check_output_limit(st, run);
-    if (lim != GCOMP_OK) {
-      return lim;
-    }
+    // How far the match reaches back beyond what this call has written, and
+    // so how much of it has to come from the window.
+    const size_t back = (distance > written) ? distance - written : 0u;
 
-    if (distance == 1u) {
-      memset(out + output->used, win[src_pos], run);
-      memset(win + st->window_pos, win[src_pos], run);
+    if (back > 0u) {
+      // The last `back` bytes before window_pos are the ones wanted; `back`
+      // is at most window_filled, because the distance was checked against
+      // the history above.
+      const size_t src_pos = (st->window_pos + window_size - back) &
+          st->window_mask;
+      size_t avail = back;
+      if (avail > window_size - src_pos) {
+        avail = window_size - src_pos; // Stop at the circular buffer's seam.
+      }
+      if (run > avail) {
+        run = avail;
+      }
+      if (run == 0u) {
+        return GCOMP_ERR_INTERNAL; // Cannot happen; refuse to spin if it does.
+      }
+      gcomp_status_t lim = deflate_check_output_limit(st, run);
+      if (lim != GCOMP_OK) {
+        return lim;
+      }
+      memcpy(out + output->used, win + src_pos, run);
     }
     else {
-      // The output never overlaps the window, so that one is a memcpy.
-      memcpy(out + output->used, win + src_pos, run);
-
-      // The window copy reads and writes the same buffer, so it is a memmove.
-      // Choosing memcpy when the two ranges happen to be disjoint was measured
-      // and is not worth it: 39,879,730 instructions against memmove's
-      // 39,582,801 on the same 800 KB, because the test costs more than the
-      // cheaper call saves.
-      memmove(win + st->window_pos, win + src_pos, run);
+      uint8_t * const dst = out + output->used;
+      const uint8_t * const src = dst - distance;
+      gcomp_status_t lim = deflate_check_output_limit(st, run);
+      if (lim != GCOMP_OK) {
+        return lim;
+      }
+      if (distance == 1u) {
+        memset(dst, src[0], run);
+      }
+      else if (run <= distance) {
+        memcpy(dst, src, run);
+      }
+      else {
+        memcpy(dst, src, distance);
+        size_t copied = distance;
+        while (copied < run) {
+          size_t n = run - copied;
+          if (n > copied) {
+            n = copied;
+          }
+          memcpy(dst + copied, dst, n);
+          copied += n;
+        }
+      }
     }
 
     output->used += run;
+    written += run;
     st->total_output_bytes += (uint64_t)run;
-    st->window_pos = (st->window_pos + run) & mask;
-    if (st->window_filled < window_size) {
-      st->window_filled += run;
-      if (st->window_filled > window_size) {
-        st->window_filled = window_size;
-      }
-    }
     st->match_remaining -= (uint32_t)run;
   }
 
@@ -1426,6 +1587,7 @@ gcomp_status_t gcomp_deflate_decoder_init(gcomp_registry_t * registry,
 
   st->window_pos = 0;
   st->window_filled = 0;
+  st->out_base = 0;
 
   st->max_output_bytes =
       gcomp_limits_read_output_max(options, GCOMP_DEFAULT_MAX_OUTPUT_BYTES);
@@ -1596,6 +1758,7 @@ gcomp_status_t gcomp_deflate_decoder_reset(gcomp_decoder_t * decoder) {
   // Reset window state (keep buffer allocated)
   st->window_pos = 0;
   st->window_filled = 0;
+  st->out_base = 0;
   st->total_output_bytes = 0;
   st->total_input_bytes = 0;
 
@@ -1757,7 +1920,14 @@ static gcomp_status_t deflate_decode_distance(
     distance += extra;
   }
 
-  if (distance == 0 || distance > (uint32_t)st->window_filled) {
+  // Reaching further back than has been decoded is corruption.  The history
+  // is not the window alone any more -- what this call has written into the
+  // caller's buffer counts too -- so ask for the total rather than reading
+  // window_filled, which is now only the older half of it.  deflate_copy_
+  // match() checks the same thing, since it can also be entered from finish()
+  // and from a resumed match; this one is here so that a bad distance is
+  // refused before any of the match is emitted.
+  if (distance == 0 || (size_t)distance > deflate_history_bytes(st, output)) {
     return GCOMP_ERR_CORRUPT;
   }
 
@@ -1798,7 +1968,6 @@ static gcomp_status_t deflate_huffman_step(
     }
     output->used += 1u;
     st->total_output_bytes += 1u;
-    deflate_window_put(st, st->pending_literal_value);
     st->pending_literal_valid = 0;
     // Continue to process more data
   }
@@ -1979,24 +2148,18 @@ static const char * deflate_stage_name(gcomp_deflate_decoder_stage_t stage) {
   }
 }
 
-gcomp_status_t gcomp_deflate_decoder_update(gcomp_decoder_t * decoder,
-    gcomp_buffer_t * input, gcomp_buffer_t * output) {
-  if (!decoder || !input || !output) {
-    return GCOMP_ERR_INVALID_ARG;
-  }
-  // Check data pointers if size > 0
-  if ((input->size > 0 && !input->data) ||
-      (output->size > 0 && !output->data)) {
-    return GCOMP_ERR_INVALID_ARG;
-  }
-
-  gcomp_deflate_decoder_state_t * st =
-      (gcomp_deflate_decoder_state_t *)decoder->method_state;
-  if (!st) {
-    return gcomp_decoder_set_error(
-        decoder, GCOMP_ERR_INTERNAL, "decoder state is NULL");
-  }
-
+/**
+ * @brief The decoding itself, with the output buffer known to be ours.
+ *
+ * Split from gcomp_deflate_decoder_update() only so that the window can be
+ * brought up to date on every way out of it, of which there are a dozen.
+ * Doing that at each `return` is how a path gets missed, and a missed one is
+ * silent: the stream keeps decoding and only a match that reaches back across
+ * the gap goes wrong, which is input-dependent and may be far away.
+ */
+static gcomp_status_t deflate_decoder_decode(gcomp_decoder_t * decoder,
+    gcomp_deflate_decoder_state_t * st, gcomp_buffer_t * input,
+    gcomp_buffer_t * output) {
   for (;;) {
     if (st->stage == DEFLATE_STAGE_DONE) {
       return GCOMP_OK;
@@ -2095,6 +2258,38 @@ gcomp_status_t gcomp_deflate_decoder_update(gcomp_decoder_t * decoder,
   }
 }
 
+gcomp_status_t gcomp_deflate_decoder_update(gcomp_decoder_t * decoder,
+    gcomp_buffer_t * input, gcomp_buffer_t * output) {
+  if (!decoder || !input || !output) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  // Check data pointers if size > 0
+  if ((input->size > 0 && !input->data) ||
+      (output->size > 0 && !output->data)) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+
+  gcomp_deflate_decoder_state_t * st =
+      (gcomp_deflate_decoder_state_t *)decoder->method_state;
+  if (!st) {
+    return gcomp_decoder_set_error(
+        decoder, GCOMP_ERR_INTERNAL, "decoder state is NULL");
+  }
+
+  // This buffer is the window for the duration of this call.  Where it begins
+  // is wherever the caller left it: a container format writes its own bytes
+  // in front of ours, and nothing before this mark is ever read back.
+  st->out_base = output->used;
+
+  gcomp_status_t s = deflate_decoder_decode(decoder, st, input, output);
+
+  // Keep whatever a later call may still need, on the error path as well as
+  // the good one.  An error usually ends the stream, but "usually" is not a
+  // reason to leave the window disagreeing with what was emitted.
+  deflate_window_sync(st, output);
+  return s;
+}
+
 gcomp_status_t gcomp_deflate_decoder_finish(
     gcomp_decoder_t * decoder, gcomp_buffer_t * output) {
   if (!decoder || !output) {
@@ -2117,31 +2312,49 @@ gcomp_status_t gcomp_deflate_decoder_finish(
     return GCOMP_OK;
   }
 
-  // Drain any pending match with the output space provided.
+  // The same rule as update(): this buffer is the window for as long as the
+  // call lasts, and what gets written into it has to reach the real window
+  // before the call gives it back.
+  //
+  // Marked once, for the whole of finish, and that is deliberate.  Everything
+  // the decoder still owes the caller comes out of state it already holds --
+  // bits read out of the input but not yet turned into symbols, and a match
+  // half copied when the last output buffer filled -- so finishing is the
+  // draining of that match followed by one more turn of the loop update()
+  // runs, with nothing new to read.  Without that second half, a caller who
+  // called update() once per input chunk and then finish() -- which is the
+  // obvious way to drive it, and the way the header's own example drives the
+  // encoder -- was told the stream was corrupt whenever the last output
+  // buffer had been too small to hold the tail.
+  //
+  // It used to reach that second half through the public update(), which
+  // marks the buffer from wherever it finds it.  That put a seam in the
+  // middle of one call: the bytes the match drained were behind the new mark
+  // and so had to be in the window already, which meant a second sync,
+  // between the two halves, whose absence nothing could be made to notice.
+  // Calling the decoding directly keeps one mark and one sync over the whole
+  // call, and there is no seam to get wrong.
+  st->out_base = output->used;
+
+  gcomp_status_t s = GCOMP_OK;
   if (st->match_remaining > 0u) {
-    gcomp_status_t s = deflate_copy_match(st, output);
+    s = deflate_copy_match(st, output);
     if (s != GCOMP_OK) {
+      deflate_window_sync(st, output);
       return gcomp_decoder_set_error(decoder, s,
           "error draining pending match (%u bytes remaining)",
           st->match_remaining);
     }
     if (st->match_remaining > 0u) {
       // The buffer filled part way through the match.  More to come.
+      deflate_window_sync(st, output);
       return GCOMP_ERR_LIMIT;
     }
   }
 
-  // Everything the decoder still owes the caller comes out of state it
-  // already holds -- bits read out of the input but not yet turned into
-  // symbols -- so finishing is one more turn of the loop update() runs, with
-  // nothing new to read.  Without this, a caller who called update() once per
-  // input chunk and then finish() -- which is the obvious way to drive it,
-  // and the way the header's own example drives the encoder -- was told the
-  // stream was corrupt whenever the last output buffer had been too small to
-  // hold the tail.
   gcomp_buffer_t no_more_input = {NULL, 0, 0};
-  gcomp_status_t s =
-      gcomp_deflate_decoder_update(decoder, &no_more_input, output);
+  s = deflate_decoder_decode(decoder, st, &no_more_input, output);
+  deflate_window_sync(st, output);
   if (s != GCOMP_OK) {
     return s;
   }
