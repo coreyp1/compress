@@ -2046,6 +2046,32 @@ static gcomp_status_t deflate_decode_distance(
  * of the block; the loop that calls it is deflate_process_huffman_data().
  */
 /**
+ * @brief Symbol 256 arrived: this block is over (RFC 1951 section 3.2.3).
+ *
+ * Either another block follows -- the caller's loop reads its header -- or
+ * this was the last one and the stream is done.
+ *
+ * At the end of a stream the bit buffer usually holds bytes that belong to
+ * whatever comes after it, because the refill takes eight at a time.  For
+ * gzip and zlib that is the trailer, and a container that never gets it back
+ * cannot verify a decode this function has just finished correctly.  Whole
+ * bytes go back; the remaining `bit_count % 8` bits are the encoder's padding
+ * to a byte boundary and are not part of anything.
+ *
+ * Two callers -- the ordinary symbol path and the fast loop -- which is why
+ * it is a function and not eleven lines written twice.
+ */
+static gcomp_status_t deflate_end_of_block(
+    gcomp_deflate_decoder_state_t * st, gcomp_buffer_t * input) {
+  if (!st->last_block) {
+    st->stage = DEFLATE_STAGE_BLOCK_HEADER;
+    return GCOMP_OK;
+  }
+  st->stage = DEFLATE_STAGE_DONE;
+  return deflate_release_buffered_bytes(st, input);
+}
+
+/**
  * @brief Is the decoder in the middle of something it could not finish?
  *
  * Four pieces of state, all of which mean the same thing: the last call ran
@@ -2146,35 +2172,7 @@ static gcomp_status_t deflate_huffman_symbol(
   }
 
   if (sym == 256u) {
-    if (st->last_block) {
-      st->stage = DEFLATE_STAGE_DONE;
-      // Handle pre-read bytes from the bit buffer for container formats.
-      // This is critical for formats like gzip that need to read data
-      // (e.g., trailer) immediately after the deflate stream.
-      //
-      // We use floor division (bit_count / 8) because:
-      // - Full bytes (8 bits each) in the buffer are pre-read trailer bytes
-      // - Partial byte bits (bit_count % 8) are padding from deflate's last
-      // byte
-      //
-      // Example: if bit_count = 10, we have 1 pre-read byte (8 bits) and
-      // 2 padding bits from the last deflate byte.
-      //
-      // Strategy:
-      // - In bulk mode (when bytes can be returned to input), return them.
-      //   The container format reads from the input buffer.
-      // - In streaming mode (bytes were consumed in previous calls), save
-      //   them for retrieval via gcomp_deflate_decoder_get_unconsumed_data().
-      //   The container format retrieves them explicitly.
-      gcomp_status_t rel = deflate_release_buffered_bytes(st, input);
-      if (rel != GCOMP_OK) {
-        return rel;
-      }
-    }
-    else {
-      st->stage = DEFLATE_STAGE_BLOCK_HEADER;
-    }
-    return GCOMP_OK;
+    return deflate_end_of_block(st, input);
   }
 
   if (sym > 285u) {
@@ -2199,6 +2197,381 @@ static gcomp_status_t deflate_huffman_symbol(
 
   // Now decode distance
   return deflate_decode_distance(st, input, output, length);
+}
+
+/**
+ * @brief The longest match RFC 1951 can express (section 3.2.5, length code
+ *        285).
+ */
+#define DEFLATE_MAX_MATCH_LENGTH 258u
+
+/**
+ * @brief Input bytes that must be in hand before each fast-loop symbol.
+ *
+ * The refill is one 64-bit load, and a load of eight bytes needs eight bytes
+ * to be there.  It is not how many the symbol will consume -- a symbol takes
+ * six at the very most -- it is how many the load touches.  The last seven
+ * bytes of every input buffer are therefore decoded by the ordinary path,
+ * which reads them one at a time.
+ */
+#define DEFLATE_FAST_MIN_INPUT 8u
+
+/**
+ * @brief Output bytes the fast loop leaves alone at the end of the buffer.
+ *
+ * deflate_copy_run8() writes in eight-byte units and is allowed to overrun
+ * the run by seven.  Keeping eight bytes back means every copy the fast loop
+ * makes has that slack without having to ask for it, which is the whole point
+ * of the arrangement: the check moves out of the match and into the loop
+ * that decides whether the fast loop runs at all.
+ */
+#define DEFLATE_FAST_TAIL_SLACK 8u
+
+/**
+ * @brief How many output bytes the fast loop may write without checking
+ *        anything, or 0 if it must not run.
+ *
+ * Three things bound it, and all three are asked once here rather than once
+ * per symbol inside the loop:
+ *
+ * - the room left in the caller's buffer, less the copy slack above;
+ * - @c max_output_bytes, the cap on the whole decode;
+ * - @c max_expansion_ratio, the decompression-bomb guard, which is a cap on
+ *   output as a multiple of the input consumed so far.
+ *
+ * The ratio is evaluated against the input consumed at this moment, while the
+ * loop goes on consuming more.  That makes the number an under-estimate --
+ * the real allowance only grows as input is read -- so the loop stops sooner
+ * than it strictly had to and the ordinary path, which asks again with the
+ * current figures, carries on.  Under-estimating is the only direction that
+ * is safe here, and it is also the only one that keeps the two paths agreeing
+ * about which streams are refused.
+ *
+ * Both caps are read exactly as gcomp_limits_check_output() and
+ * gcomp_limits_check_expansion_ratio() read them, including that zero means
+ * unlimited and that a ratio whose product would overflow is unlimited for an
+ * input of that size.
+ */
+static inline size_t deflate_fast_out_budget(
+    const gcomp_deflate_decoder_state_t * st, const gcomp_buffer_t * input,
+    const gcomp_buffer_t * output) {
+  // The three things deflate_copy_match() refuses outright.  Asked here so
+  // that a decoder in that state takes the ordinary path and gets the same
+  // GCOMP_ERR_INTERNAL out of it, rather than a different answer from a
+  // second copy of the same rule.
+  if (!input->data || !output->data || !st->window || st->window_size == 0u ||
+      output->used < st->out_base) {
+    return 0u;
+  }
+  if (input->size - input->used < DEFLATE_FAST_MIN_INPUT) {
+    return 0u;
+  }
+  size_t room = output->size - output->used;
+  if (room < DEFLATE_MAX_MATCH_LENGTH + DEFLATE_FAST_TAIL_SLACK) {
+    return 0u;
+  }
+  size_t safe = room - DEFLATE_FAST_TAIL_SLACK;
+
+  // The counter is 64 bits and the buffer is a real allocation, so this is
+  // unreachable; it is here because deflate_check_output_limit() asks it and
+  // the two must agree about what they refuse.
+  if (st->total_output_bytes > UINT64_MAX - (uint64_t)safe) {
+    return 0u;
+  }
+
+  if (st->max_output_bytes != 0u) {
+    if (st->total_output_bytes >= st->max_output_bytes) {
+      return 0u;
+    }
+    uint64_t left = st->max_output_bytes - st->total_output_bytes;
+    if (left < (uint64_t)safe) {
+      safe = (size_t)left;
+    }
+  }
+
+  if (st->max_expansion_ratio != 0u && st->total_input_bytes != 0u &&
+      st->max_expansion_ratio <= UINT64_MAX / st->total_input_bytes) {
+    uint64_t cap = st->max_expansion_ratio * st->total_input_bytes;
+    if (st->total_output_bytes >= cap) {
+      return 0u;
+    }
+    uint64_t left = cap - st->total_output_bytes;
+    if (left < (uint64_t)safe) {
+      safe = (size_t)left;
+    }
+  }
+
+  return (safe >= DEFLATE_MAX_MATCH_LENGTH) ? safe : 0u;
+}
+
+/**
+ * @brief Write the fast loop's locals back into the decoder and the buffers.
+ *
+ * The loop keeps the bit buffer, the bit count and both cursors in registers
+ * and touches memory only here.  Both counters are derived from how far the
+ * cursors moved rather than tracked alongside them, so there is one place
+ * that can get the arithmetic wrong instead of one per symbol.
+ */
+static inline void deflate_fast_commit(gcomp_deflate_decoder_state_t * st,
+    gcomp_buffer_t * input, gcomp_buffer_t * output, uint64_t buf,
+    uint32_t bits, const uint8_t * in_ptr, const uint8_t * out_ptr) {
+  st->bit_buffer = buf;
+  st->bit_count = bits;
+
+  size_t taken = (size_t)(in_ptr - (const uint8_t *)input->data) - input->used;
+  input->used += taken;
+  st->total_input_bytes += (uint64_t)taken;
+
+  size_t made =
+      (size_t)(out_ptr - (const uint8_t *)output->data) - output->used;
+  output->used += made;
+  st->total_output_bytes += (uint64_t)made;
+}
+
+/**
+ * @brief Decode one Huffman symbol from a bit buffer known to be full enough.
+ *
+ * The same two-level lookup deflate_huff_decode_symbol() does, with every
+ * question about whether the bits are there removed.  The fast loop has just
+ * refilled to at least 56 bits and no code is longer than 15 (RFC 1951
+ * section 3.2.7 caps code lengths at 15, and
+ * gcomp_deflate_huffman_build_decode_table() refuses a longer one), so the
+ * "not enough bits" answer that the general version has to return -- and that
+ * every caller has to branch on -- cannot arise here.
+ *
+ * @return 1 on success, 0 if the bits match no code, which is corruption.
+ */
+static DEFLATE_ALWAYS_INLINE int deflate_fast_symbol(
+    const gcomp_deflate_huffman_decode_table_t * table, uint64_t * buf,
+    uint32_t * bits, uint32_t * sym_out) {
+  uint32_t idx = (uint32_t)(*buf & (GCOMP_DEFLATE_HUFFMAN_FAST_SIZE - 1u));
+  gcomp_deflate_huffman_fast_entry_t fe = table->fast_table[idx];
+
+  if (fe.nbits != 0u) {
+    *buf >>= fe.nbits;
+    *bits -= fe.nbits;
+    *sym_out = fe.symbol;
+    return 1;
+  }
+
+  uint32_t extra = table->long_extra_bits[idx];
+  if (extra == 0u || !table->long_table) {
+    return 0;
+  }
+  uint32_t low = (uint32_t)((*buf >> GCOMP_DEFLATE_HUFFMAN_FAST_BITS) &
+      (((uint64_t)1u << extra) - 1u));
+  // long_base is 16 bits wide and `low` is at most 63, so the sum is a long
+  // way from overflowing a size_t; the bound check is what matters.
+  size_t long_idx = (size_t)table->long_base[idx] + (size_t)low;
+  if (long_idx >= table->long_table_count) {
+    return 0;
+  }
+  gcomp_deflate_huffman_fast_entry_t le = table->long_table[long_idx];
+  if (le.nbits == 0u) {
+    return 0;
+  }
+  *buf >>= le.nbits;
+  *bits -= le.nbits;
+  *sym_out = le.symbol;
+  return 1;
+}
+
+/**
+ * @brief Decode symbols while nothing can run out.
+ *
+ * WHAT IT IS FOR
+ * ==============
+ *
+ * The ordinary path decodes a symbol the way a streaming decoder has to: any
+ * read may find the input exhausted or the output full, so the bit buffer,
+ * the bit count and both cursors live in the decoder state where a half-done
+ * symbol can be picked up again, and every step asks whether it can proceed.
+ * Correct, and about fifty-five instructions per symbol of which the decoding
+ * itself is perhaps fifteen.
+ *
+ * Almost none of that is needed almost all of the time.  Given eight bytes of
+ * input and 266 bytes of output room, no symbol -- literal, match, or end of
+ * block -- can fail to complete: 48 bits is the worst case for a length/
+ * distance pair (15 + 5 + 15 + 13, RFC 1951 sections 3.2.5 and 3.2.7) and one
+ * 64-bit refill covers it, while 258 is the longest match there is.  So this
+ * loop hoists the four pieces of state into locals, checks the two bounds
+ * once per symbol instead of the eight or nine times the general path does,
+ * and writes memory only on the way out.
+ *
+ * This is the shape zlib's inflate_fast() has, and for the same reason.
+ *
+ * WHERE IT STOPS
+ * ==============
+ *
+ * At the end of the block, at an error, or when either bound runs out -- and
+ * then the ordinary path takes over with the last seven input bytes and the
+ * last 266 output bytes, which is where a stream's final symbols and a small
+ * caller's buffer both live.  Nothing is left half-done at the boundary: the
+ * loop only ever stops between symbols.
+ *
+ * The one case it hands on rather than finishing is a match that reaches back
+ * before this call's output, which has to come out of the circular window and
+ * across its seam.  deflate_copy_match() already knows how to do that; the
+ * loop commits its locals, calls it, picks the locals back up and carries on.
+ * On the input the decoder is actually given -- a caller with room for the
+ * whole file -- that happens once per call at most.
+ */
+static gcomp_status_t deflate_huffman_fast(gcomp_deflate_decoder_state_t * st,
+    gcomp_buffer_t * input, gcomp_buffer_t * output, size_t out_budget) {
+  const gcomp_deflate_huffman_decode_table_t * const litlen = st->cur_litlen;
+  const gcomp_deflate_huffman_decode_table_t * const dist_tab = st->cur_dist;
+  const uint8_t * const in_data = (const uint8_t *)input->data;
+  uint8_t * const out_data = (uint8_t *)output->data;
+
+  // The last position from which a refill may read, and the last from which a
+  // match may be written.  Both are computed once; the loop compares against
+  // them and nothing inside it has to think about a buffer end again.
+  const uint8_t * const in_stop =
+      in_data + input->size - DEFLATE_FAST_MIN_INPUT;
+  const uint8_t * const out_stop =
+      out_data + output->used + out_budget - DEFLATE_MAX_MATCH_LENGTH;
+
+  const uint8_t * in_ptr = in_data + input->used;
+  uint8_t * out_ptr = out_data + output->used;
+  uint64_t buf = st->bit_buffer;
+  uint32_t bits = st->bit_count;
+  const size_t window_size = st->window_size;
+  gcomp_status_t status = GCOMP_OK;
+  int block_ended = 0;
+
+  while (in_ptr <= in_stop && out_ptr <= out_stop) {
+    // Refill.  Whole bytes only, and only those that fit above what is
+    // already held, so the promise that bits at or above `bits` are zero
+    // survives -- the table lookup below indexes with them.  Skipped when the
+    // buffer is already too full to take a byte, which is also what keeps the
+    // shift below 64 and defined.
+    if (bits <= 56u) {
+      uint64_t chunk = gcomp_read_le64(in_ptr);
+      uint32_t room = (64u - bits) >> 3; // 1 to 8
+      if (room < 8u) {
+        chunk &= ((uint64_t)1u << (room * 8u)) - 1u;
+      }
+      buf |= chunk << bits;
+      bits += room * 8u;
+      in_ptr += room;
+    }
+    // Either way there are now at least 56 bits, and 48 is the worst a symbol
+    // can need.
+
+    uint32_t sym = 0;
+    if (!deflate_fast_symbol(litlen, &buf, &bits, &sym)) {
+      status = GCOMP_ERR_CORRUPT;
+      break;
+    }
+
+    if (sym < 256u) {
+      *out_ptr++ = (uint8_t)sym;
+      continue;
+    }
+    if (sym == 256u) {
+      block_ended = 1;
+      break;
+    }
+    if (sym > 285u) {
+      status = GCOMP_ERR_CORRUPT;
+      break;
+    }
+
+    uint32_t len_sym = sym - 257u;
+    uint32_t length = k_len_base[len_sym];
+    uint32_t len_extra = k_len_extra[len_sym];
+    if (len_extra != 0u) {
+      length += (uint32_t)(buf & (((uint32_t)1u << len_extra) - 1u));
+      buf >>= len_extra;
+      bits -= len_extra;
+    }
+
+    uint32_t dist_sym = 0;
+    if (!deflate_fast_symbol(dist_tab, &buf, &bits, &dist_sym)) {
+      status = GCOMP_ERR_CORRUPT;
+      break;
+    }
+    if (dist_sym >= 30u) {
+      status = GCOMP_ERR_CORRUPT;
+      break;
+    }
+    size_t distance = k_dist_base[dist_sym];
+    uint32_t dist_extra = k_dist_extra[dist_sym];
+    if (dist_extra != 0u) {
+      distance += (size_t)(buf & (((uint32_t)1u << dist_extra) - 1u));
+      buf >>= dist_extra;
+      bits -= dist_extra;
+    }
+
+    // The same bound deflate_history_bytes() applies, spelled out because the
+    // write cursor is a local here: a distance may reach back through what
+    // this call has written and into the window, but no further than either,
+    // and never further than the window the decoder was built with (RFC 1951
+    // section 3.2.3).
+    size_t written = (size_t)(out_ptr - out_data) - st->out_base;
+    size_t history = st->window_filled + written;
+    if (history > window_size) {
+      history = window_size;
+    }
+    if (distance == 0u || distance > history) {
+      status = GCOMP_ERR_CORRUPT;
+      break;
+    }
+
+    if (distance > written) {
+      // Reaches into the window.  Hand it to the general copier, which owns
+      // the circular seam, and then pick the locals back up.
+      deflate_fast_commit(st, input, output, buf, bits, in_ptr, out_ptr);
+      st->match_distance = (uint32_t)distance;
+      st->match_remaining = length;
+      status = deflate_copy_match(st, output);
+      if (status != GCOMP_OK || st->match_remaining != 0u) {
+        // Already committed.  A match left part-copied is the resume path's
+        // to finish, exactly as if the ordinary path had produced it.
+        return status;
+      }
+      out_ptr = out_data + output->used;
+      continue;
+    }
+
+    // Wholly inside what this call has written, which is the ordinary case
+    // and the reason the history lives in the caller's buffer.  Source and
+    // destination are disjoint ranges of one flat buffer; see the commentary
+    // on deflate_copy_match() for why a pattern shorter than the match is
+    // grown rather than stopped at.
+    {
+      uint8_t * const dst = out_ptr;
+      const uint8_t * const src = dst - distance;
+      if (distance >= 8u) {
+        deflate_copy_run8(dst, src, length);
+      }
+      else if (distance == 1u) {
+        memset(dst, src[0], length);
+      }
+      else if ((size_t)length <= distance) {
+        memcpy(dst, src, length);
+      }
+      else {
+        memcpy(dst, src, distance);
+        size_t copied = distance;
+        while (copied < length) {
+          size_t n = (size_t)length - copied;
+          if (n > copied) {
+            n = copied;
+          }
+          memcpy(dst + copied, dst, n);
+          copied += n;
+        }
+      }
+      out_ptr += length;
+    }
+  }
+
+  deflate_fast_commit(st, input, output, buf, bits, in_ptr, out_ptr);
+  if (status == GCOMP_OK && block_ended) {
+    status = deflate_end_of_block(st, input);
+  }
+  return status;
 }
 
 /**
@@ -2248,9 +2621,30 @@ static gcomp_status_t deflate_process_huffman_data(
     const size_t in_before = input->used;
     const size_t out_before = output->used;
 
-    gcomp_status_t s = deflate_has_unfinished_work(st)
-        ? deflate_huffman_resume(st, input, output)
-        : deflate_huffman_symbol(st, input, output);
+    gcomp_status_t s;
+    if (deflate_has_unfinished_work(st)) {
+      s = deflate_huffman_resume(st, input, output);
+    }
+    else {
+      // Whichever of the two symbol paths the buffers allow.  The question is
+      // asked once per turn of this loop, and a turn in which the fast loop
+      // runs is usually thousands of symbols, so the asking is not on the
+      // per-symbol bill.  When the answer is no -- a caller handing over a
+      // few bytes at a time -- it costs a handful of comparisons on a path
+      // that was already paying far more than that per symbol.
+      //
+      // Tested against the longest match rather than against zero, even
+      // though deflate_fast_out_budget() answers 0 rather than anything
+      // smaller.  The fast loop's stopping point is `budget - 258` bytes into
+      // the buffer; hand it less than 258 and that lands before where it
+      // starts, so it decodes nothing, reports no error, and leaves the
+      // caller looping on a stream that is not finished.  One comparison
+      // spelled the other way and the two functions cannot disagree about it.
+      const size_t fast_room = deflate_fast_out_budget(st, input, output);
+      s = (fast_room >= DEFLATE_MAX_MATCH_LENGTH)
+          ? deflate_huffman_fast(st, input, output, fast_room)
+          : deflate_huffman_symbol(st, input, output);
+    }
     if (s != GCOMP_OK) {
       return s;
     }

@@ -34,6 +34,7 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
+#include "deflate_bits.h"
 #include "test_helpers.h"
 #include <cstdlib>
 #include <cstring>
@@ -87,58 +88,7 @@ private:
   uint64_t state_;
 };
 
-/**
- * @brief Writes DEFLATE's two kinds of bit field (RFC 1951 section 3.1.1).
- *
- * Plain fields go in least-significant bit first; Huffman codes go in
- * most-significant bit of the code first.  Both end up packed into bytes from
- * the low bit up.
- */
-class BitWriter {
-public:
-  void Field(uint32_t value, unsigned n) {
-    for (unsigned i = 0; i < n; i++) {
-      PutBit((value >> i) & 1u);
-    }
-  }
-  void Code(uint32_t code, unsigned n) {
-    for (unsigned i = 0; i < n; i++) {
-      PutBit((code >> (n - 1u - i)) & 1u);
-    }
-  }
-  /// A literal in the fixed alphabet (RFC 1951 section 3.2.6).
-  void FixedLiteral(unsigned lit) {
-    if (lit < 144u) {
-      Code(0x30u + lit, 8u);
-    }
-    else {
-      Code(0x190u + (lit - 144u), 9u);
-    }
-  }
-  void FixedEndOfBlock() { Code(0u, 7u); }
-  size_t BitsWritten() const { return bytes_.size() * 8u + nbits_; }
-  std::vector<uint8_t> Finish() {
-    if (nbits_ != 0u) {
-      bytes_.push_back(acc_);
-      acc_ = 0u;
-      nbits_ = 0u;
-    }
-    return bytes_;
-  }
-
-private:
-  void PutBit(uint32_t bit) {
-    acc_ = (uint8_t)(acc_ | ((bit & 1u) << nbits_));
-    if (++nbits_ == 8u) {
-      bytes_.push_back(acc_);
-      acc_ = 0u;
-      nbits_ = 0u;
-    }
-  }
-  std::vector<uint8_t> bytes_;
-  uint8_t acc_ = 0u;
-  unsigned nbits_ = 0u;
-};
+using gcomp_test::BitWriter;
 
 /**
  * @brief Decode with the input revealed @p in_chunk bytes at a time.
@@ -180,7 +130,8 @@ std::vector<uint8_t> DecodeRevealed(const char * method,
       return {};
     }
     produced += output.used;
-    if (input.used == before && output.used == 0u && revealed >= stream.size()) {
+    if (input.used == before && output.used == 0u &&
+        revealed >= stream.size()) {
       break;
     }
   }
@@ -232,14 +183,14 @@ TEST(DeflateBlockSeam, ABlockHeaderSplitBetweenBfinalAndBtype) {
   w.Field(0u, 1u); // BFINAL = 0
   w.Field(1u, 2u); // BTYPE  = 01, fixed Huffman
   for (int i = 0; i < 5; i++) {
-    w.FixedLiteral(200u); // nine bits each
+    w.FixedLitLen(200u); // nine bits each
   }
   w.FixedEndOfBlock();
   ASSERT_EQ(w.BitsWritten(), 55u) << "the seam is only at bit 55 if this holds";
 
   w.Field(1u, 1u); // BFINAL = 1
   w.Field(1u, 2u); // BTYPE  = 01
-  w.FixedLiteral('A');
+  w.FixedLitLen('A');
   w.FixedEndOfBlock();
   const std::vector<uint8_t> stream = w.Finish();
 
@@ -253,7 +204,8 @@ TEST(DeflateBlockSeam, ABlockHeaderSplitBetweenBfinalAndBtype) {
     gcomp_status_t status = GCOMP_OK;
     std::vector<uint8_t> got =
         DecodeRevealed("deflate", stream, chunk, want.size(), &status);
-    EXPECT_EQ(status, GCOMP_OK) << "input revealed " << chunk << " bytes at a time";
+    EXPECT_EQ(status, GCOMP_OK)
+        << "input revealed " << chunk << " bytes at a time";
     EXPECT_EQ(got, want) << "input revealed " << chunk << " bytes at a time";
   }
 }
