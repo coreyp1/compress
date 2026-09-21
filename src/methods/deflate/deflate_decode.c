@@ -533,8 +533,27 @@ static gcomp_status_t deflate_release_buffered_bytes(
       st->total_input_bytes -= bytes_to_handle;
     }
     else {
+      // The padding comes first and has to be shifted off.
+      //
+      // Bits are consumed from the bottom of the buffer, so what is left
+      // after the end-of-block symbol is: the rest of the stream's final byte
+      // -- the encoder's zero padding, `pad` bits of it -- and only then the
+      // whole bytes of whatever follows.  Reading from bit zero reads the
+      // padding as part of the first byte and every byte comes out shifted.
+      //
+      // The count above is right either way, since `pad` is under eight.  It
+      // was only the extraction that was wrong, and only on this branch: the
+      // other one hands whole bytes back to the input buffer, where the byte
+      // boundary is the input's own and no shift arises.  Which branch runs
+      // depends on whether the bytes came from the buffer this call was
+      // given, so a gzip or zlib trailer came out as garbage exactly when the
+      // stream happened to end on a call with nothing left to rewind -- and
+      // then only when the final block was a Huffman one, because a stored
+      // block is byte-aligned and leaves `pad` at zero.  The Adler-32 or CRC
+      // read that way failed to match data that was in fact perfect.
+      uint32_t pad = st->bit_count % 8u;
       for (uint32_t i = 0; i < bytes_to_handle; i++) {
-        st->unconsumed_bytes[i] = (uint8_t)(st->bit_buffer >> (i * 8u));
+        st->unconsumed_bytes[i] = (uint8_t)(st->bit_buffer >> (pad + i * 8u));
       }
       st->unconsumed_count = (uint8_t)bytes_to_handle;
     }

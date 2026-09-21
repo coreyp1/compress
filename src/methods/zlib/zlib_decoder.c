@@ -200,7 +200,53 @@ static gcomp_status_t zlib_take_header(
   return GCOMP_OK;
 }
 
-/// Accumulate the four trailer bytes and check them.
+/**
+ * @brief Take back whatever the deflate decoder read past the end of the
+ *        stream, which is where the trailer usually is.
+ *
+ * The deflate bit buffer refills eight bytes at a time, so by the time the
+ * final block is recognised the four trailer bytes are normally already
+ * inside it.  deflate hands them back by rewinding the input buffer they came
+ * from -- but it can only do that when they came from the buffer that call
+ * was given.  Bytes it took during an earlier call have nowhere to be put
+ * back to, so it keeps them, and they have to be asked for.
+ *
+ * Nothing here asked.  The Adler-32 therefore went missing whenever the
+ * stream happened to end on a call whose input was already spent -- which a
+ * small output buffer makes the normal case, because the input runs out long
+ * before the output does -- and a perfectly good stream was reported as
+ * truncated in its trailer.  gzip has asked all along; see the same
+ * retrieval in gzip_decoder.c.
+ *
+ * Called once, at the move to ZLIB_DEC_STAGE_TRAILER, because the count the
+ * deflate decoder reports is not cleared by reading it.
+ */
+static void zlib_take_readahead(zlib_decoder_state_t * state) {
+  state->trailer_pos = 0;
+  uint32_t held =
+      gcomp_deflate_decoder_get_unconsumed_bytes(state->inner_decoder);
+  if (held > 0 && held <= ZLIB_TRAILER_SIZE) {
+    gcomp_deflate_decoder_get_unconsumed_data(
+        state->inner_decoder, state->trailer_buf, held);
+    state->trailer_pos = held;
+  }
+}
+
+/// Compare the four accumulated trailer bytes against the running Adler-32.
+static gcomp_status_t zlib_check_trailer(
+    gcomp_decoder_t * decoder, zlib_decoder_state_t * state) {
+  uint32_t stored = zlib_read_be32(state->trailer_buf);
+  if (stored != state->adler) {
+    state->stage = ZLIB_DEC_STAGE_ERROR;
+    return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
+        "zlib Adler-32 mismatch: stream says 0x%08X, data gives 0x%08X",
+        (unsigned)stored, (unsigned)state->adler);
+  }
+  state->stage = ZLIB_DEC_STAGE_DONE;
+  return GCOMP_OK;
+}
+
+/// Accumulate the four trailer bytes from the input and check them.
 static gcomp_status_t zlib_take_trailer(
     gcomp_decoder_t * decoder, zlib_decoder_state_t * state,
     gcomp_buffer_t * input) {
@@ -212,16 +258,48 @@ static gcomp_status_t zlib_take_trailer(
     state->trailer_buf[state->trailer_pos++] = in[input->used++];
     state->total_input_bytes++;
   }
+  return zlib_check_trailer(decoder, state);
+}
 
-  uint32_t stored = zlib_read_be32(state->trailer_buf);
-  if (stored != state->adler) {
-    state->stage = ZLIB_DEC_STAGE_ERROR;
-    return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
-        "zlib Adler-32 mismatch: stream says 0x%08X, data gives 0x%08X",
-        (unsigned)stored, (unsigned)state->adler);
+/**
+ * @brief Give the inner deflate decoder room to finish, and account for what
+ *        comes out.
+ *
+ * Shared by update() and finish(), which owe the caller the same thing: the
+ * deflate decoder holds state -- bits already read, a match half copied -- and
+ * the only way to learn whether the stream has ended is to offer it somewhere
+ * to put the rest.
+ *
+ * Returns what the inner finish returned.  GCOMP_ERR_LIMIT means the output
+ * buffer filled first and there is more to come; it is not an error and the
+ * stage stays where it was.
+ */
+static gcomp_status_t zlib_drain_body(gcomp_decoder_t * decoder,
+    zlib_decoder_state_t * state, gcomp_buffer_t * output) {
+  size_t before = output->used;
+  gcomp_buffer_t tail = {(uint8_t *)output->data + output->used,
+      output->size - output->used, 0};
+  gcomp_status_t done = gcomp_decoder_finish(state->inner_decoder, &tail);
+
+  output->used += tail.used;
+  if (tail.used > 0) {
+    state->adler = gcomp_adler32_update(
+        state->adler, (const uint8_t *)output->data + before, tail.used);
+    state->total_output_bytes += tail.used;
+    if (state->max_output_bytes > 0 &&
+        state->total_output_bytes > state->max_output_bytes) {
+      state->stage = ZLIB_DEC_STAGE_ERROR;
+      return gcomp_decoder_set_error(decoder, GCOMP_ERR_LIMIT,
+          "zlib output size %llu exceeds limit %llu",
+          (unsigned long long)state->total_output_bytes,
+          (unsigned long long)state->max_output_bytes);
+    }
   }
-  state->stage = ZLIB_DEC_STAGE_DONE;
-  return GCOMP_OK;
+  if (done == GCOMP_OK) {
+    zlib_take_readahead(state);
+    state->stage = ZLIB_DEC_STAGE_TRAILER;
+  }
+  return done;
 }
 
 gcomp_status_t zlib_decoder_update(gcomp_decoder_t * decoder,
@@ -299,20 +377,10 @@ gcomp_status_t zlib_decoder_update(gcomp_decoder_t * decoder,
 
     // Nothing in the container says where the deflate data ends, so ask
     // deflate: finish() reports GCOMP_OK exactly when it has seen the final
-    // block, and leaves the trailer bytes unconsumed for us.
-    size_t tail_before = output->used;
-    gcomp_buffer_t tail = {(uint8_t *)output->data + output->used,
-        output->size - output->used, 0};
-    gcomp_status_t done = gcomp_decoder_finish(state->inner_decoder, &tail);
-    if (done == GCOMP_OK) {
-      output->used += tail.used;
-      size_t extra = output->used - tail_before;
-      if (extra > 0) {
-        state->adler = gcomp_adler32_update(
-            state->adler, (const uint8_t *)output->data + tail_before, extra);
-        state->total_output_bytes += extra;
-      }
-      state->stage = ZLIB_DEC_STAGE_TRAILER;
+    // block, and hands back the trailer bytes it had read ahead.
+    gcomp_status_t done = zlib_drain_body(decoder, state, output);
+    if (done != GCOMP_OK && state->stage == ZLIB_DEC_STAGE_ERROR) {
+      return done;
     }
   }
 
@@ -327,14 +395,51 @@ gcomp_status_t zlib_decoder_update(gcomp_decoder_t * decoder,
   return GCOMP_OK;
 }
 
+/**
+ * @brief Finish a zlib decode.
+ *
+ * WHY THIS WRITES TO THE OUTPUT BUFFER
+ * ====================================
+ *
+ * It used to ignore it -- `(void)output` -- and report any unfinished stage as
+ * a truncated stream.  That is right only if "no more input" meant "no more
+ * output", and it does not.  The deflate decoder stops the instant the output
+ * buffer is full, keeping whatever it had not room for: bits already read out
+ * of the input, and a match half copied.  A caller with a small output buffer
+ * runs out of input long before the decoder runs out of things to say -- 193
+ * bytes still owed, on the case that found this -- and was then told its
+ * perfectly good stream was truncated.
+ *
+ * So finish() drains, exactly as gcomp_deflate_decoder_finish() does, and
+ * reports GCOMP_ERR_LIMIT when the buffer fills before the stream ends: drain
+ * it and call again.  Truncation is what is left when there is room to spare
+ * and it still cannot finish.
+ */
 gcomp_status_t zlib_decoder_finish(
     gcomp_decoder_t * decoder, gcomp_buffer_t * output) {
   if (!decoder || !decoder->method_state || !output) {
     return GCOMP_ERR_INVALID_ARG;
   }
-  (void)output;
+  if (output->size > 0 && !output->data) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
 
   zlib_decoder_state_t * state = decoder->method_state;
+
+  if (state->stage == ZLIB_DEC_STAGE_BODY) {
+    gcomp_status_t done = zlib_drain_body(decoder, state, output);
+    if (done == GCOMP_ERR_LIMIT) {
+      // The buffer filled first.  Nothing is wrong; there is simply more.
+      return GCOMP_ERR_LIMIT;
+    }
+    if (done != GCOMP_OK) {
+      state->stage = ZLIB_DEC_STAGE_ERROR;
+      return gcomp_decoder_set_error(
+          decoder, GCOMP_ERR_CORRUPT, "zlib stream truncated in deflate data");
+    }
+    // zlib_drain_body() moved the stage on and collected the trailer bytes
+    // deflate had read ahead; whether all four arrived is asked below.
+  }
 
   switch (state->stage) {
   case ZLIB_DEC_STAGE_DONE:
@@ -349,6 +454,9 @@ gcomp_status_t zlib_decoder_finish(
     return gcomp_decoder_set_error(
         decoder, GCOMP_ERR_CORRUPT, "zlib stream truncated in deflate data");
   case ZLIB_DEC_STAGE_TRAILER:
+    if (state->trailer_pos >= ZLIB_TRAILER_SIZE) {
+      return zlib_check_trailer(decoder, state);
+    }
     return gcomp_decoder_set_error(decoder, GCOMP_ERR_CORRUPT,
         "zlib stream truncated in Adler-32 trailer (%zu of %u bytes)",
         state->trailer_pos, (unsigned)ZLIB_TRAILER_SIZE);
