@@ -1132,6 +1132,117 @@ TEST_F(ZstdMatchFinderTest, TheFixedPointLogarithmIsTheRealOne) {
 
 // The deferral is a ratio improvement, and the levels that do it should come
 // out ahead of the level that does not on input built to reward it.
+// Both finders reach as far back as the window they were given, whether or not
+// that window is a power of two.
+//
+// Slots are indexed by position modulo the table size, so the table is a power
+// of two and the reach is one short of it.  The size therefore has to be
+// derived from the window by rounding UP; rounding the window plus a block
+// DOWN gives the same answer for a power-of-two window and a much worse one
+// otherwise.  A caller who declares the content size gets exactly that case --
+// zstd_encoder.c sizes the match finder to the content when it is smaller than
+// the declared window, and content sizes are not powers of two -- so an
+// 825,336-byte window was rounded to 524,288 and the tree searched 64% of the
+// history the frame promised.
+//
+// It cost the whole of a match: before this was fixed the input below encoded
+// to 825,366 bytes, byte for byte what the control with no repeat in it
+// encodes to. Nothing reported it, because a match that is never found looks
+// exactly like an input that has none.
+//
+// The first half asks the finder directly, since that is where the invariant
+// lives.  The second half is what a caller would notice.
+TEST_F(ZstdMatchFinderTest, TheWindowIsReachableWhenItIsNotAPowerOfTwo) {
+  const gcomp_allocator_t * alloc = gcomp_allocator_default();
+  // A power of two, one under, one over, and two real content sizes.
+  const size_t windows[] = {825336u, 1341074u, 1048576u, 1048575u, 262145u};
+  for (size_t w : windows) {
+    for (int level : {6, 9, 11, 19}) {
+      zstd_match_finder_t mf;
+      ASSERT_EQ(zstd_mf_init(&mf, alloc, level, w, nullptr), GCOMP_OK);
+      const size_t reach = zstd_mf_max_offset(&mf);
+      const size_t ring = mf.use_bt ? mf.bt_size : mf.chain_size;
+      // One short of the ring is the most either can offer, and for a window
+      // that is not a power of two there is no reason to offer less than the
+      // window.
+      EXPECT_LE(reach, ring - 1u) << "window " << w << " level " << level;
+      if ((w & (w - 1u)) != 0u) {
+        EXPECT_EQ(reach, w)
+            << "window " << w << " level " << level << ": reaches " << reach
+            << " of a " << w << "-byte window, ring " << ring;
+      }
+      else {
+        EXPECT_EQ(reach, w - 1u) << "window " << w << " level " << level;
+      }
+      zstd_mf_destroy(&mf, alloc, nullptr);
+    }
+  }
+}
+
+// The same thing as a caller sees it: a repeat further back than the rounded
+// down table would have reached, in a stream whose declared content size is
+// what shrinks the window to a number that is not a power of two.
+TEST_F(ZstdMatchFinderTest, ADistantRepeatIsFoundWhenTheContentSizeIsDeclared) {
+  constexpr size_t kTotal = 825336u;   // not a power of two, and that is why
+  constexpr size_t kPayload = 8192u;
+  constexpr size_t kDistance = 700000u; // inside 825,336; outside 524,288
+
+  auto build = [&](bool repeat) {
+    Noise payload_noise(0x5EEDu);
+    Noise filler(0xC0FFEEu);
+    Noise other(0xABCDu);
+    std::vector<uint8_t> payload;
+    payload_noise.append(payload, kPayload);
+    std::vector<uint8_t> data = payload;
+    filler.append(data, kDistance - kPayload);
+    if (repeat) {
+      data.insert(data.end(), payload.begin(), payload.end());
+    }
+    else {
+      // The control differs only in whether these bytes are the payload
+      // again, so both inputs are the same length and equally incompressible.
+      other.append(data, kPayload);
+    }
+    Noise tail(0xBEEFu);
+    tail.append(data, kTotal - data.size());
+    EXPECT_EQ(data.size(), size_t{kTotal});
+    return data;
+  };
+
+  auto encoded_size = [](const std::vector<uint8_t> & data) -> size_t {
+    gcomp_options_t * opts = nullptr;
+    EXPECT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+    gcomp_options_set_int64(opts, "zstd.level", 9); // a tree level
+    // Declaring it is the whole point: without it the match finder keeps the
+    // declared window, which is a power of two, and the defect cannot appear.
+    gcomp_options_set_uint64(opts, "zstd.content_size", data.size());
+
+    std::vector<uint8_t> out(data.size() + data.size() / 2 + 4096);
+    size_t written = 0;
+    EXPECT_EQ(gcomp_encode_buffer(nullptr, "zstd", opts, data.data(),
+                  data.size(), out.data(), out.size(), &written),
+        GCOMP_OK);
+    std::vector<uint8_t> back(data.size() + 64);
+    size_t back_len = 0;
+    EXPECT_EQ(gcomp_decode_buffer(nullptr, "zstd", nullptr, out.data(),
+                  written, back.data(), back.size(), &back_len),
+        GCOMP_OK);
+    EXPECT_EQ(back_len, data.size());
+    if (back_len == data.size()) {
+      EXPECT_EQ(memcmp(back.data(), data.data(), data.size()), 0);
+    }
+    gcomp_options_destroy(opts);
+    return written;
+  };
+
+  const size_t with_repeat = encoded_size(build(true));
+  const size_t without = encoded_size(build(false));
+  EXPECT_LT(with_repeat + kPayload / 2u, without)
+      << "with repeat " << with_repeat << ", without " << without
+      << ": a repeat " << kDistance << " back was not found in a " << kTotal
+      << "-byte window";
+}
+
 // History the window has slid past is still matched, and the boundary is where
 // the window says it is.
 //
