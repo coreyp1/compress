@@ -797,3 +797,130 @@ TEST_F(ZstdCorruptionTest, ASequenceCountBelowWhatTheBitstreamHoldsIsRefused) {
   EXPECT_EQ(tryDecode(short_count.data(), short_count.size()),
       GCOMP_ERR_CORRUPT);
 }
+
+/**
+ * Repeat_Mode in a block with nothing to repeat.
+ *
+ * RFC 8878 section 3.1.1.3.2.1.1: Repeat_Mode re-uses the distribution table
+ * an earlier block, or a dictionary, left behind.  Nothing checked that there
+ * was one.  The tables are allocated on first use and not zeroed, so a first
+ * block asking to repeat decoded against whatever the allocator handed back:
+ * valgrind reports the read, the output is whatever that memory said, and a
+ * single bit flip in a good frame reaches it.
+ *
+ * The frames are built because our encoder never writes Repeat_Mode without
+ * having written a table first.  The first case is the control: the same
+ * shell with no sequences at all decodes to its literals, so the four that
+ * follow are failing on something the mode brought with it.
+ *
+ * A plain build cannot tell which: a frame this small is refused by several
+ * things at once -- the table it repeats is uninitialised, so the range check
+ * on it usually rejects, and the two byte bitstream does not cover the
+ * sequence the header promises either.  Removing the guard therefore leaves
+ * this test green.  So this asserts the behaviour (Repeat_Mode without a
+ * table is refused) and pins the shape of an input that reaches the read; the
+ * memory error itself is caught by the sanitizer builds over the four
+ * zstd-sequence-repeat-no-table inputs in fuzz/regression, which report
+ * "Conditional jump or move depends on uninitialised value(s)" in
+ * zstd_decode_one_sequence without the fix and nothing with it.  See
+ * CONVENTIONS section 7.
+ */
+TEST_F(ZstdCorruptionTest, RepeatModeWithNoPreviousTableIsRefused) {
+  const std::vector<uint8_t> literals = {'w', 'x', 'y', 'z'};
+
+  auto build = [&](int num_sequences, uint8_t modes) {
+    // Raw_Literals_Block, Size_Format 00: a one byte header carrying a five
+    // bit Regenerated_Size, then the literals.
+    std::vector<uint8_t> block = {
+        (uint8_t)(0u | (0u << 2) | ((uint32_t)literals.size() << 3))};
+    block.insert(block.end(), literals.begin(), literals.end());
+
+    block.push_back((uint8_t)num_sequences); // Number_Of_Sequences
+    if (num_sequences > 0) {
+      block.push_back(modes);      // Symbol_Compression_Modes
+      block.push_back(0x01);       // a bitstream that is never reached
+      block.push_back(0x01);
+    }
+
+    uint32_t bh = 1u // Last_Block
+        | (2u << 1)  // Compressed_Block
+        | ((uint32_t)block.size() << 3);
+
+    std::vector<uint8_t> frame = {0x28, 0xb5, 0x2f, 0xfd,
+        0x00, // Frame_Header_Descriptor: no content size, not single segment
+        0x00, // Window_Descriptor: Window_Log 10
+        (uint8_t)(bh & 0xFF), (uint8_t)((bh >> 8) & 0xFF),
+        (uint8_t)((bh >> 16) & 0xFF)};
+    frame.insert(frame.end(), block.begin(), block.end());
+    return frame;
+  };
+
+  // Control: the same shell, no sequences, decodes to its literals.
+  const std::vector<uint8_t> none = build(0, 0u);
+  std::vector<uint8_t> got(64);
+  size_t got_len = 0;
+  ASSERT_EQ(gcomp_decode_buffer(registry_, "zstd", nullptr, none.data(),
+                none.size(), got.data(), got.size(), &got_len),
+      GCOMP_OK);
+  got.resize(got_len);
+  EXPECT_EQ(got, literals);
+
+  // Symbol_Compression_Modes packs literal lengths in bits 6-7, offsets in
+  // 4-5 and match lengths in 2-3; mode 3 is Repeat_Mode.  Each alphabet has
+  // its own table and its own answer to "is there one", so each is asked
+  // for on its own as well as all together.
+  struct Case {
+    const char * name;
+    uint8_t modes;
+  };
+  const std::vector<Case> cases = {
+      {"all three repeat", (uint8_t)((3u << 6) | (3u << 4) | (3u << 2))},
+      {"literal lengths repeat", (uint8_t)(3u << 6)},
+      {"offsets repeat", (uint8_t)(3u << 4)},
+      {"match lengths repeat", (uint8_t)(3u << 2)},
+  };
+
+  for (const auto & c : cases) {
+    const std::vector<uint8_t> frame = build(1, c.modes);
+    EXPECT_EQ(tryDecode(frame.data(), frame.size()), GCOMP_ERR_CORRUPT)
+        << c.name;
+  }
+
+  // The same question after a frame that DID build tables, which is the case
+  // the flags exist for.  Above, the tables hold whatever the allocator
+  // returned and the range check on them refuses it -- by luck, and only
+  // while that memory happens to be out of range.  Here they hold a real
+  // table from the frame before, in range and decodable, and the only thing
+  // that knows it belongs to a different frame is the flag.  RFC 8878
+  // section 3.1.1.3.2: entropy tables do not carry across frames.
+  const std::string text =
+      "sequences and literals and sequences and literals again";
+  const std::vector<uint8_t> first = compress(text.data(), text.size());
+  ASSERT_FALSE(first.empty());
+
+  for (const auto & c : cases) {
+    std::vector<uint8_t> two = first;
+    const std::vector<uint8_t> second = build(1, c.modes);
+    two.insert(two.end(), second.begin(), second.end());
+    EXPECT_EQ(tryDecode(two.data(), two.size()), GCOMP_ERR_CORRUPT)
+        << c.name << ", after a frame that built its own tables";
+  }
+
+  // Control for that pair: the same second frame with no sequences is
+  // decoded, so the four above can only be failing on the mode.
+  {
+    std::vector<uint8_t> two = first;
+    const std::vector<uint8_t> second = build(0, 0u);
+    two.insert(two.end(), second.begin(), second.end());
+    std::vector<uint8_t> both(text.size() + literals.size() + 64u);
+    size_t both_len = 0;
+    ASSERT_EQ(gcomp_decode_buffer(registry_, "zstd", nullptr, two.data(),
+                  two.size(), both.data(), both.size(), &both_len),
+        GCOMP_OK);
+    ASSERT_EQ(both_len, text.size() + literals.size());
+    EXPECT_EQ(memcmp(both.data(), text.data(), text.size()), 0);
+    EXPECT_EQ(memcmp(both.data() + text.size(), literals.data(),
+                  literals.size()),
+        0);
+  }
+}

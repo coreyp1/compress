@@ -72,7 +72,8 @@
  * - `rep_offset_{1,2,3}`: Each frame starts with standard repeat offsets
  * - `frame_output_bytes`: For content size validation per frame
  * - `window_pos`, `window_size`: Each frame has independent history window
- * - `huf_table_valid`: Huffman tables don't carry across frames
+ * - `huf_table_valid`, `fse_{ll,ml,of}_ready`: entropy tables don't carry
+ *   across frames, so Repeat_Mode in a new frame's first block is corrupt
  *
  * ### Not Reset Between Frames
  *
@@ -450,6 +451,7 @@ static gcomp_status_t zstd_parse_frame_header(
           memcpy(state->fse_lit_table, state->dict_parsed.fse_ll_table,
               state->dict_parsed.fse_ll_size * sizeof(zstd_fse_entry_t));
           state->fse_ll_log = state->dict_parsed.fse_ll_log;
+          state->fse_ll_ready = true;
         }
       }
       if (state->dict_parsed.fse_of_table) {
@@ -467,6 +469,7 @@ static gcomp_status_t zstd_parse_frame_header(
           memcpy(state->fse_offset_table, state->dict_parsed.fse_of_table,
               state->dict_parsed.fse_of_size * sizeof(zstd_fse_entry_t));
           state->fse_of_log = state->dict_parsed.fse_of_log;
+          state->fse_of_ready = true;
         }
       }
       if (state->dict_parsed.fse_ml_table) {
@@ -484,6 +487,7 @@ static gcomp_status_t zstd_parse_frame_header(
           memcpy(state->fse_match_table, state->dict_parsed.fse_ml_table,
               state->dict_parsed.fse_ml_size * sizeof(zstd_fse_entry_t));
           state->fse_ml_log = state->dict_parsed.fse_ml_log;
+          state->fse_ml_ready = true;
         }
       }
       if (state->dict_parsed.huf_table) {
@@ -590,8 +594,12 @@ static gcomp_status_t zstd_decoder_step(gcomp_decoder_t * decoder,
       // history)
       state->window_pos = 0;
       state->window_size = 0;
-      // Reset Huffman table validity (each frame is independent)
+      // Reset entropy table validity (each frame is independent): a first
+      // block of the new frame asking for Repeat_Mode has nothing to repeat.
       state->huf_table_valid = false;
+      state->fse_ll_ready = false;
+      state->fse_ml_ready = false;
+      state->fse_of_ready = false;
       // Note: don't reset total_input_bytes/total_output_bytes - they
       // accumulate across frames for limit checking
     }
@@ -1141,8 +1149,11 @@ gcomp_status_t zstd_decoder_reset(gcomp_decoder_t * decoder) {
   state->rep_offset_2 = ZSTD_REP_OFFSET_2_INIT;
   state->rep_offset_3 = ZSTD_REP_OFFSET_3_INIT;
 
-  // Reset Huffman table state
+  // Reset entropy table state
   state->huf_table_valid = false;
+  state->fse_ll_ready = false;
+  state->fse_ml_ready = false;
+  state->fse_of_ready = false;
 
   return GCOMP_OK;
 }

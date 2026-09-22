@@ -465,6 +465,36 @@ static gcomp_status_t zstd_sequences_parse_header(const uint8_t * src,
 // FSE Table Setup
 //
 
+/**
+ * @brief Refuse a table that can decode a symbol its alphabet does not have.
+ *
+ * RFC 8878 sections 3.1.1.3.2.1.1 and 3.1.1.3.2.1.2 give literal lengths 36
+ * codes, match lengths 53 and offsets 32; a table built from a stream, from
+ * an RLE byte, or carried over from a dictionary can name anything a byte
+ * can hold.  Every use of one of those symbols is an index into a baseline
+ * table or a shift width, so the range has to be established somewhere.
+ *
+ * Somewhere is here, once per table, rather than once per sequence.  A table
+ * has at most 512 entries and a block has three of them; the loop below
+ * costs about a thousandth of what asking three times per sequence did.
+ *
+ * @param table The decoding table
+ * @param table_log Its accuracy log, so that `1 << table_log` entries are
+ *        the populated ones -- anything past that is left over from an
+ *        earlier block and would reject a good stream
+ * @param alphabet_size How many codes the alphabet has
+ */
+static gcomp_status_t zstd_seq_table_in_range(const zstd_fse_entry_t * table,
+    unsigned table_log, unsigned alphabet_size) {
+  const size_t entries = ((size_t)1u) << table_log;
+  for (size_t i = 0; i < entries; i++) {
+    if (table[i].symbol >= alphabet_size) {
+      return GCOMP_ERR_CORRUPT;
+    }
+  }
+  return GCOMP_OK;
+}
+
 static gcomp_status_t zstd_sequences_setup_tables(zstd_decoder_state_t * state,
     const uint8_t * src, size_t src_size,
     const zstd_sequences_header_t * header, size_t * bytes_read_out) {
@@ -514,6 +544,7 @@ static gcomp_status_t zstd_sequences_setup_tables(zstd_decoder_state_t * state,
       return status;
     }
     state->fse_ll_log = 6; // Predefined table has log = 6
+    state->fse_ll_ready = true;
     break;
 
   case SEQ_MODE_RLE:
@@ -528,6 +559,7 @@ static gcomp_status_t zstd_sequences_setup_tables(zstd_decoder_state_t * state,
       state->fse_lit_table[0].new_state = 0;
     }
     state->fse_ll_log = 0; // RLE mode: read 0 bits for initial state
+    state->fse_ll_ready = true;
     break;
 
   case SEQ_MODE_FSE: {
@@ -540,11 +572,16 @@ static gcomp_status_t zstd_sequences_setup_tables(zstd_decoder_state_t * state,
       return status;
     }
     state->fse_ll_log = table_log;
+    state->fse_ll_ready = true;
     pos += header_size;
   } break;
 
   case SEQ_MODE_REPEAT:
-    // Use existing table (already populated, keep existing table log)
+    // Use the table an earlier block or a dictionary left behind, keeping
+    // its log.  RFC 8878 section 3.1.1.3.2.1.1: there has to be one.
+    if (!state->fse_ll_ready) {
+      return GCOMP_ERR_CORRUPT;
+    }
     break;
   }
 
@@ -557,6 +594,7 @@ static gcomp_status_t zstd_sequences_setup_tables(zstd_decoder_state_t * state,
       return status;
     }
     state->fse_of_log = 5; // Predefined table has log = 5
+    state->fse_of_ready = true;
     break;
 
   case SEQ_MODE_RLE:
@@ -570,6 +608,7 @@ static gcomp_status_t zstd_sequences_setup_tables(zstd_decoder_state_t * state,
       state->fse_offset_table[0].new_state = 0;
     }
     state->fse_of_log = 0; // RLE mode: read 0 bits for initial state
+    state->fse_of_ready = true;
     break;
 
   case SEQ_MODE_FSE: {
@@ -582,11 +621,16 @@ static gcomp_status_t zstd_sequences_setup_tables(zstd_decoder_state_t * state,
       return status;
     }
     state->fse_of_log = table_log;
+    state->fse_of_ready = true;
     pos += header_size;
   } break;
 
   case SEQ_MODE_REPEAT:
-    // Use existing table (already populated, keep existing table log)
+    // Use the table an earlier block or a dictionary left behind, keeping
+    // its log.  RFC 8878 section 3.1.1.3.2.1.1: there has to be one.
+    if (!state->fse_of_ready) {
+      return GCOMP_ERR_CORRUPT;
+    }
     break;
   }
 
@@ -599,6 +643,7 @@ static gcomp_status_t zstd_sequences_setup_tables(zstd_decoder_state_t * state,
       return status;
     }
     state->fse_ml_log = 6; // Predefined table has log = 6
+    state->fse_ml_ready = true;
     break;
 
   case SEQ_MODE_RLE:
@@ -612,6 +657,7 @@ static gcomp_status_t zstd_sequences_setup_tables(zstd_decoder_state_t * state,
       state->fse_match_table[0].new_state = 0;
     }
     state->fse_ml_log = 0; // RLE mode: read 0 bits for initial state
+    state->fse_ml_ready = true;
     break;
 
   case SEQ_MODE_FSE: {
@@ -624,12 +670,41 @@ static gcomp_status_t zstd_sequences_setup_tables(zstd_decoder_state_t * state,
       return status;
     }
     state->fse_ml_log = table_log;
+    state->fse_ml_ready = true;
     pos += header_size;
   } break;
 
   case SEQ_MODE_REPEAT:
-    // Use existing table (already populated, keep existing table log)
+    // Use the table an earlier block or a dictionary left behind, keeping
+    // its log.  RFC 8878 section 3.1.1.3.2.1.1: there has to be one.
+    if (!state->fse_ml_ready) {
+      return GCOMP_ERR_CORRUPT;
+    }
     break;
+  }
+
+  // Whatever put the three tables there -- this block, an earlier one, or a
+  // dictionary -- the sequence loop indexes tables with what they decode, so
+  // this is where that is made safe.  SEQ_MODE_REPEAT is checked too: it
+  // costs nothing to re-read a table that was already in range, and leaving
+  // it out would mean trusting that every path that can install one has been
+  // found.
+  status = zstd_seq_table_in_range(
+      state->fse_lit_table, state->fse_ll_log, ZSTD_SEQ_LL_CODES);
+  if (status != GCOMP_OK) {
+    return status;
+  }
+  status = zstd_seq_table_in_range(
+      state->fse_match_table, state->fse_ml_log, ZSTD_SEQ_ML_CODES);
+  if (status != GCOMP_OK) {
+    return status;
+  }
+  // Offset codes are a shift width, so 31 is the largest one a 32-bit
+  // offset can carry; see zstd_decode_one_sequence().
+  status = zstd_seq_table_in_range(
+      state->fse_offset_table, state->fse_of_log, 32u);
+  if (status != GCOMP_OK) {
+    return status;
   }
 
   *bytes_read_out = pos;
@@ -671,12 +746,10 @@ static inline gcomp_status_t zstd_decode_one_sequence(
   uint8_t of_code = state->fse_offset_table[seq_state->of_state].symbol;
   uint8_t ml_code = state->fse_match_table[seq_state->ml_state].symbol;
 
-  // Read extra bits for offset first (important: offset extra bits read
-  // first). Per spec offset = 2^code + extra; code must be at most 31 to
-  // avoid undefined shift on 32-bit type.
-  if (of_code > 31) {
-    return GCOMP_ERR_CORRUPT;
-  }
+  // Per spec offset = 2^code + extra.  Every one of the three codes is in
+  // range because the table it came out of was checked when it was built --
+  // zstd_seq_table_in_range() -- which is what lets this index the baseline
+  // tables and shift by `of_code` without asking again per sequence.
   if (of_code > 0) {
     uint32_t extra = zstd_seq_bit_reader_take(br, of_code);
     out->offset = (1U << of_code) + extra;
@@ -686,16 +759,10 @@ static inline gcomp_status_t zstd_decode_one_sequence(
   }
 
   // Read extra bits for match length
-  if (ml_code >= 53) {
-    return GCOMP_ERR_CORRUPT;
-  }
   out->match_length = zstd_seq_ml_baseline[ml_code] +
       zstd_seq_bit_reader_take(br, zstd_seq_ml_extra_bits[ml_code]);
 
   // Read extra bits for literal length
-  if (ll_code >= 36) {
-    return GCOMP_ERR_CORRUPT;
-  }
   out->literal_length = zstd_seq_ll_baseline[ll_code] +
       zstd_seq_bit_reader_take(br, zstd_seq_ll_extra_bits[ll_code]);
 

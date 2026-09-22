@@ -609,6 +609,20 @@ typedef struct {
   unsigned fse_ml_log; ///< Match length FSE table log
   unsigned fse_of_log; ///< Offset FSE table log
 
+  /**
+   * @brief Whether each sequence table holds a table at all.
+   *
+   * RFC 8878 section 3.1.1.3.2.1.1: Repeat_Mode re-uses the table from an
+   * earlier block, or from a dictionary, and a block asking for one before
+   * there is one is corrupt.  Nothing said so, and the allocation is not
+   * zeroed, so such a block decoded against whatever the allocator handed
+   * back - valgrind reports the read, and a single bit flip in a good frame
+   * reaches it.
+   */
+  bool fse_ll_ready;
+  bool fse_ml_ready;
+  bool fse_of_ready;
+
   // Huffman decoding table
   zstd_huf_entry_t * huf_table;
   size_t huf_table_size;
