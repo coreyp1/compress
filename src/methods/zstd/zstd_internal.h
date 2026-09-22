@@ -317,6 +317,16 @@ typedef struct {
   unsigned search_depth;  ///< Maximum chain search depth
   unsigned lazy_depth;    ///< Positions a match may be deferred through (0 = greedy)
   uint32_t nice_length;   ///< Length at which a match is taken without looking further
+  /**
+   * @brief How the positions a match covers are indexed, at the chain levels.
+   *
+   * Dense for @ref fill_dense positions from the start of the match, then
+   * every @ref fill_sparse -th.  Both are zero and one at the tree levels,
+   * which sample by nice_length instead and never read these.  See the effort
+   * table in zstd_matchfinder.c for what each shape cost and bought.
+   */
+  unsigned fill_dense;
+  unsigned fill_sparse;
   size_t window_size;     ///< Window size for match offsets
 
   // Binary tree match finder, used instead of the chain at the levels whose

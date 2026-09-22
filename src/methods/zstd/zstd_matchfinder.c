@@ -203,6 +203,8 @@ typedef struct {
   uint32_t opt_segment;  ///< Positions one shortest-path sweep covers.
   uint32_t opt_budget;   ///< Shortened matches one position may try.
   unsigned two_pass;     ///< Parse each sweep twice; see zstd_optimal.c.
+  unsigned fill_dense;   ///< Positions after a match indexed one by one.
+  unsigned fill_sparse;  ///< Stride for the rest of them.
 } zstd_effort_t;
 
 /**
@@ -289,30 +291,65 @@ typedef struct {
 // manuals, C source and XML at a fixed depth of 32, raising it from 64 to
 // 4096 took the output from 1,602,010 bytes to 1,527,249, while depth beyond
 // about 24 was worth almost nothing.
+// THE FILL AFTER A MATCH
+// ======================
+//
+// Taking a match steps the parse over every position inside it, and each of
+// those still has to go into the tables or nothing later can match into the
+// middle of it.  At the chain levels that loop was every position, one by
+// one, and it is not a minor cost: on 4.7 MB of C source at level 1 it makes
+// 4,206,986 insertions against the search's 482,042 -- nine to one, and 90%
+// of the input's positions.  perf put zstd_mf_insert_one at 24.5% of level 1.
+//
+// Not all of those positions are worth the same.  The ones just after a match
+// begins are where the next match is most likely to source from; the ones
+// deep inside it are largely redundant with the copy the match already found.
+// So the fill is dense for `fill_dense` positions and then strides by
+// `fill_sparse`.  Measured on six corpus files against indexing every
+// position:
+//
+//   shape      level 1 size   level 1 instructions
+//   dense 32 stride 8  +0.08%   -7.5%
+//   dense 16 stride 4  +0.16%  -10.3%
+//   dense  6 stride 8  +0.73%  -19.4%
+//   dense  4 stride 16 +1.34%  -23.9%
+//   stride 2 flat      +2.68%  -19.2%
+//
+// The last row is the one that says the shape matters rather than the count:
+// a flat stride of 2 costs twice the ratio of dense-4-then-16 for less of the
+// saving.  Every dense-then-sparse point measured dominates every flat one.
+//
+// The levels are graded because the trade is: at level 8 the same shape costs
+// more ratio and saves less (+1.56% and -12.8% where level 1 gets +0.73% and
+// -19.3%).  Levels 1 and 2 are where a caller has asked for speed, and take
+// the aggressive shape; the rest take one that is nearly free.
+//
+// The tree levels ignore both fields.  They sample by nice_length instead,
+// for a different reason -- see the fill loop.
 static const zstd_effort_t k_zstd_effort[23] = {
-    {0, 0, 0, 0, 0, 0, 0, 0, 0},              // 0: unused
-    {4, 0, 128, 14, 0, 0, 0, 0, 0},           // 1: greedy, and fast because of it
-    {8, 1, 128, 14, 0, 0, 0, 0, 0},           // 2
-    {16, 1, 128, 15, 0, 0, 0, 0, 0},          // 3
-    {24, 1, 128, 16, 0, 0, 0, 0, 0},          // 4
-    {48, 1, 128, 16, 0, 0, 0, 0, 0},          // 5
-    {64, 1, 128, 16, 0, 0, 0, 0, 0},          // 6: the window steps to 2 MB next
-    {80, 1, 128, 17, 0, 0, 0, 0, 0},          // 7
-    {112, 2, 192, 17, 0, 0, 0, 0, 0},         // 8: last of the chain levels
-    {24, 2, 256, 17, 1, 0, 0, 0, 0},          // 9: first of the tree levels
-    {32, 2, 512, 17, 1, 0, 0, 0, 0},          // 10
-    {36, 0, 768, 17, 1, 1, 1024, 8, 0},       // 11: first of the optimal levels
-    {40, 0, 1024, 17, 1, 1, 1280, 12, 0},     // 12
-    {44, 0, 1280, 18, 1, 1, 1536, 16, 0},     // 13
-    {48, 0, 1536, 18, 1, 1, 2048, 24, 0},     // 14
-    {52, 0, 2048, 18, 1, 1, 2560, 32, 0},     // 15
-    {56, 0, 2560, 18, 1, 1, 3072, 48, 0},     // 16
-    {60, 0, 3072, 18, 1, 1, 4096, 64, 0},     // 17
-    {64, 0, 3584, 18, 1, 1, 5120, 96, 0},     // 18
-    {72, 0, 4096, 18, 1, 1, 6144, 128, 0},    // 19
-    {80, 0, 5120, 18, 1, 1, 8192, 192, 1}, // 20: parsed twice
-    {96, 0, 8192, 18, 1, 1, 12288, 320, 1}, // 21
-    {128, 0, 12288, 18, 1, 1, 16384, 512, 1} // 22
+    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, // 0: unused
+    {4, 0, 128, 14, 0, 0, 0, 0, 0, 4, 16}, // 1: greedy, and fast because of it
+    {8, 1, 128, 14, 0, 0, 0, 0, 0, 4, 16}, // 2
+    {16, 1, 128, 15, 0, 0, 0, 0, 0, 16, 4}, // 3
+    {24, 1, 128, 16, 0, 0, 0, 0, 0, 16, 4}, // 4
+    {48, 1, 128, 16, 0, 0, 0, 0, 0, 16, 4}, // 5
+    {64, 1, 128, 16, 0, 0, 0, 0, 0, 16, 4}, // 6: the window steps to 2 MB next
+    {80, 1, 128, 17, 0, 0, 0, 0, 0, 16, 4}, // 7
+    {112, 2, 192, 17, 0, 0, 0, 0, 0, 16, 4}, // 8: last of the chain levels
+    {24, 2, 256, 17, 1, 0, 0, 0, 0, 0, 1}, // 9: first of the tree levels
+    {32, 2, 512, 17, 1, 0, 0, 0, 0, 0, 1}, // 10
+    {36, 0, 768, 17, 1, 1, 1024, 8, 0, 0, 1}, // 11: first of the optimal levels
+    {40, 0, 1024, 17, 1, 1, 1280, 12, 0, 0, 1}, // 12
+    {44, 0, 1280, 18, 1, 1, 1536, 16, 0, 0, 1}, // 13
+    {48, 0, 1536, 18, 1, 1, 2048, 24, 0, 0, 1}, // 14
+    {52, 0, 2048, 18, 1, 1, 2560, 32, 0, 0, 1}, // 15
+    {56, 0, 2560, 18, 1, 1, 3072, 48, 0, 0, 1}, // 16
+    {60, 0, 3072, 18, 1, 1, 4096, 64, 0, 0, 1}, // 17
+    {64, 0, 3584, 18, 1, 1, 5120, 96, 0, 0, 1}, // 18
+    {72, 0, 4096, 18, 1, 1, 6144, 128, 0, 0, 1}, // 19
+    {80, 0, 5120, 18, 1, 1, 8192, 192, 1, 0, 1}, // 20: parsed twice
+    {96, 0, 8192, 18, 1, 1, 12288, 320, 1, 0, 1}, // 21
+    {128, 0, 12288, 18, 1, 1, 16384, 512, 1, 0, 1} // 22
 };
 
 /// The sizes zstd_mf_plan() computes; see zstd_mf_memory_estimate().
@@ -567,6 +604,8 @@ gcomp_status_t zstd_mf_init(zstd_match_finder_t * mf,
   mf->search_depth = effort->search_depth;
   mf->lazy_depth = effort->lazy_depth;
   mf->nice_length = effort->nice_length;
+  mf->fill_dense = effort->fill_dense;
+  mf->fill_sparse = effort->fill_sparse;
   mf->chain_size = plan.chain_size;
   mf->chain_mask = plan.chain_size - 1u;
 
@@ -1332,6 +1371,49 @@ void zstd_mf_index_range(zstd_match_finder_t * mf, const uint8_t * data,
  * @param literals_size_out Output: total literals size
  * @return GCOMP_OK on success
  */
+/**
+ * @brief Put the positions a match covers into the tables.
+ *
+ * The parse steps over them, and each one still has to be indexed or nothing
+ * later can match into the middle of this match.  Which of them are worth
+ * indexing is not uniform, and the two finders answer it differently.
+ *
+ * The CHAIN grades by distance from the start of the match: `fill_dense`
+ * positions one by one, then every `fill_sparse`-th.  The ones just after a
+ * match begins are where the next match is most likely to source from; the
+ * ones deep inside are largely redundant with the copy this match already
+ * found.  See the effort table for what each shape measured.
+ *
+ * The TREE grades by the length of the match instead, and for another reason
+ * entirely: a match at least nice_length long ends a descent on the spot, so
+ * inserting every position it covers was quadratic on periodic data -- 425a258
+ * measured 9.3 seconds for 4 MB of a 1500 byte pattern.  Sampling there is
+ * about the cost of an insertion, not about which positions are useful.
+ */
+static inline void zstd_mf_fill_match(zstd_match_finder_t * mf,
+    const uint8_t * data, size_t from, size_t to, size_t data_size,
+    uint32_t match_length) {
+  if (mf->use_bt) {
+    const size_t stride =
+        (match_length >= mf->nice_length) ? mf->nice_length : 1u;
+    for (size_t i = from; i < to && i + MF_HASH_READ_SIZE <= data_size;
+         i += stride) {
+      zstd_mf_insert_one(mf, data, i, data_size);
+    }
+    return;
+  }
+
+  const size_t dense_end = from + mf->fill_dense;
+  const size_t sparse = mf->fill_sparse ? mf->fill_sparse : 1u;
+  size_t i = from;
+  for (; i < to && i < dense_end && i + MF_HASH_READ_SIZE <= data_size; i++) {
+    zstd_mf_insert_one(mf, data, i, data_size);
+  }
+  for (; i < to && i + MF_HASH_READ_SIZE <= data_size; i += sparse) {
+    zstd_mf_insert_one(mf, data, i, data_size);
+  }
+}
+
 gcomp_status_t zstd_mf_generate_sequences(zstd_match_finder_t * mf,
     const uint8_t * data, size_t data_size, size_t start_pos,
     zstd_sequence_t * sequences, size_t max_sequences,
@@ -1417,14 +1499,8 @@ gcomp_status_t zstd_mf_generate_sequences(zstd_match_finder_t * mf,
       // covers, or the next block finds nothing to repeat inside it.  Same
       // sampling as the fill loop below, and for the same reason.
       const size_t end_l = pos + ldm_match->length;
-      const size_t stride_l =
-          (mf->use_bt && ldm_match->length >= mf->nice_length)
-          ? mf->nice_length
-          : 1u;
-      for (size_t i = pos + 1u;
-           i < end_l && i + MF_HASH_READ_SIZE <= data_size; i += stride_l) {
-        zstd_mf_insert_one(mf, data, i, data_size);
-      }
+      zstd_mf_fill_match(
+          mf, data, pos + 1u, end_l, data_size, ldm_match->length);
 
       pos = end_l;
       lit_start = pos;
@@ -1554,14 +1630,8 @@ gcomp_status_t zstd_mf_generate_sequences(zstd_match_finder_t * mf,
       // nice_length bytes, which is the same order as the bytes an insertion
       // compares, so the cost stays linear in the input.  That input is back
       // to 1,924 bytes from 2,795, and the encoder still reads it in 11 ms.
-      size_t stride = 1;
-      if (mf->use_bt && match.length >= mf->nice_length) {
-        stride = mf->nice_length;
-      }
-      for (size_t i = fill_from;
-           i < fill_to && i + MF_HASH_READ_SIZE <= data_size; i += stride) {
-        zstd_mf_insert_one(mf, data, i, data_size);
-      }
+      zstd_mf_fill_match(
+          mf, data, fill_from, fill_to, data_size, match.length);
 
       pos = match_end;
       lit_start = pos;
