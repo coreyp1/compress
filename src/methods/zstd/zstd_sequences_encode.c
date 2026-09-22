@@ -183,18 +183,22 @@ static void zstd_enc_bw_flush(zstd_enc_bit_writer_t * bw) {
  * cost 2% of encoding.
  */
 static inline void zstd_enc_bw_add_bits(
-    zstd_enc_bit_writer_t * bw, uint32_t value, unsigned nb_bits) {
+    zstd_enc_bit_writer_t * bw, uint32_t value, unsigned nb_bits,
+    const bool measuring) {
   // Measuring.  How long the stream comes out is settled by how many bits go
   // into it and nothing else, so the bits themselves are not assembled: the
   // container, the shifts and the flushing are all work towards bytes that
-  // are never written or read.  Half of the sequence encoder's time is this
-  // walk -- every block is priced with the predefined tables before being
-  // written with its own -- and a third of that was spent building a
-  // bitstream to measure and throw away.
+  // are never written or read.
   //
-  // The branch costs the writing path one perfectly predicted test: a writer
-  // either has a buffer for its whole life or never has one.
-  if (!bw->buf) {
+  // `measuring` is a parameter rather than a test of bw->buf so that it is a
+  // constant in each caller: zstd_sequences_encode_using() is one body
+  // instantiated twice (see the wrappers at the end of it), which leaves each
+  // instance with no branch here at all.  Reading it from the writer instead
+  // cost the writing path a perfectly predicted test on all six calls per
+  // sequence -- 1,957,143 instructions on 4.7 MB of C source, 0.52% of the
+  // encode, spent asking a question whose answer cannot change within one
+  // writer's life.
+  if (measuring) {
     bw->measured_bits += nb_bits;
     return;
   }
@@ -286,29 +290,17 @@ static size_t zstd_enc_bw_close(zstd_enc_bit_writer_t * bw) {
 //
 
 
-/**
- * @brief Find FSE encoding state given symbol and target next-state.
- *
- * For encoding, we need to find a state S such that:
- * - table[S].symbol == symbol
- * - table[S].new_state <= next_state < table[S].new_state + (1 <<
- * table[S].nb_bits)
- *
- * The bits to output are: next_state - table[S].new_state
- *
- * @param table FSE decoding table
- * @param table_size Table size
- * @param symbol Symbol to encode
- * @param next_state Target state after decoding (state decoder will be in)
- * @param bits_out Output: bits to write to bitstream
- * @param nb_bits_out Output: number of bits to write
- * @return State index, or 0xFFFF if not found
- */
-// The transition value is next_state - base, which spans the whole table
-// entry's range: up to 2^nb_bits - 1, and nb_bits reaches 9 for the literal
-// length and match length tables (RFC 8878 3.1.1.3.2.1).  Returning it in a
-// uint8_t silently truncated it at Accuracy_Log 9 -- which only per-block
-// tables ever reach, since the predefined ones are log 6, 5 and 6.
+// So the question asked once per symbol per sequence is: which state S has
+// table[S].symbol == symbol and table[S].new_state <= target < new_state +
+// 2^nb_bits?  zstd_seq_next_state() answers it without a search; the derivation
+// is above zstd_seq_index_table().
+//
+// The transition value it returns spans the whole entry's range: up to
+// 2^nb_bits - 1, and nb_bits reaches 9 for the literal length and match length
+// tables (RFC 8878 3.1.1.3.2.1).  It was once returned in a uint8_t, which
+// silently truncated it at Accuracy_Log 9 -- a width only per-block tables
+// reach, since the predefined ones are log 6, 5 and 6, so the predefined path
+// and every small block were unaffected and the bug hid behind them.
 
 //
 // Public API: Encode Sequences
@@ -325,10 +317,20 @@ static size_t zstd_enc_bw_close(zstd_enc_bit_writer_t * bw) {
 #define ZSTD_SEQ_MAX_TABLE_SIZE (1u << 9)
 #define ZSTD_SEQ_MAX_CODES ZSTD_SEQ_ML_CODES
 
-// One symbol of normalized count n needs fewer than 2n state-block slots in
-// the index below, so every symbol together needs fewer than twice the
-// table size.  The derivation is with zstd_seq_index_table().
-#define ZSTD_SEQ_ENC_MAP_SIZE (2u * ZSTD_SEQ_MAX_TABLE_SIZE)
+/**
+ * @brief Everything the encoder needs about one symbol, in one 8-byte load.
+ *
+ * The inner loop asks three questions per symbol -- is it in the table, how
+ * many bits does this transition cost, and which entry makes it -- and they
+ * used to be three separate arrays, so three loads. Packed like this they are
+ * one, and the answers come out of arithmetic rather than a second indirection.
+ * The derivation is above zstd_seq_index_table().
+ */
+typedef struct {
+  int32_t delta_nb_bits;   ///< `(state + this) >> 16` is the transition width.
+  int16_t delta_find_state; ///< Added to `state >> width` to index state_table.
+  uint16_t count;          ///< Entries carrying this symbol; 0 means absent.
+} zstd_seq_symtt_t;
 
 typedef struct {
   const zstd_fse_entry_t * entries;
@@ -339,21 +341,24 @@ typedef struct {
   const int16_t * norm; ///< Normalized counts, mode 2 only.
   unsigned max_symbol;  ///< Highest symbol in `norm`, mode 2 only.
 
-  // Index over `entries` for the encoder's reverse state search, described
-  // in full above zstd_seq_index_table().  `map` names the covering entry
-  // for every aligned block of states, `map_start` and `map_shift` say
-  // where one symbol's blocks begin and how wide they are, and `count` is
-  // zero for a symbol the table does not carry at all.
-  uint16_t map[ZSTD_SEQ_ENC_MAP_SIZE];
-  uint16_t map_start[ZSTD_SEQ_MAX_CODES + 1];
-  uint16_t count[ZSTD_SEQ_MAX_CODES + 1];
-  uint8_t map_shift[ZSTD_SEQ_MAX_CODES + 1];
+  // The encoder's reverse state machine, described in full above
+  // zstd_seq_index_table().  `state_table` holds `size` plus an entry index,
+  // which is the form the inner loop carries its state in; `min_bits` is the
+  // narrowest transition a symbol has, which the predefined-table lower bound
+  // in zstd_sequences_encode() needs and the loop does not.
+  zstd_seq_symtt_t symtt[ZSTD_SEQ_MAX_CODES + 1];
+  // Twice the largest table, of which only the first `size` entries are ever
+  // filled.  The slack is not used: it bounds what a symbol the table does not
+  // carry could index, which zstd_seq_covers() is what actually prevents.  See
+  // the precondition on zstd_seq_next_state().
+  uint16_t state_table[2u * ZSTD_SEQ_MAX_TABLE_SIZE];
+  uint8_t min_bits[ZSTD_SEQ_MAX_CODES + 1];
 } zstd_seq_enc_table_t;
 
-// Fill in the per-symbol index described above.
+// Fill in the per-symbol state machine described above.
 //
-// WHY A PLAIN ARRAY IS ENOUGH
-// ===========================
+// NO SEARCH, NO INDIRECTION: TWO NUMBERS PER SYMBOL
+// =================================================
 //
 // The decoding table gives each state entry a symbol, an nb_bits and a
 // new_state, built (zstd_fse.c, and RFC 8878 4.1.1) as
@@ -363,110 +368,177 @@ typedef struct {
 //
 // where `next` counts a symbol's occurrences and runs over [n, 2n-1] for a
 // symbol of normalized count n.  The encoder has to run that backwards: given
-// the state the decoder must end up in, which entry of this symbol takes it
+// the state S the decoder must end up in, which entry of this symbol takes it
 // there?  That entry is the one whose range [new_state, new_state + 2^nb_bits)
-// contains the target, and those ranges tile [0, table_size) exactly.
+// contains S, and one symbol's ranges tile [0, table_size) exactly.
 //
-// Two facts about the formula make the search unnecessary.  First, table_size
-// is 2^table_log and nb_bits <= table_log, so table_size is a multiple of
-// 2^nb_bits -- and so, therefore, is new_state.  Every range is a power-of-two
-// block *aligned* to its own width.  Second, floor(log2(next)) takes only two
-// values across [n, 2n-1], so one symbol's ranges have only two widths, the
-// wider being twice the narrower.
+// Invert the formula rather than searching for it.  Carry the state as
 //
-// Aligned blocks of one of two widths tile the state space, so indexing by
-// the narrower width lands in exactly one block: the covering entry for a
-// target state is map[map_start[sym] + (target >> map_shift[sym])], where
-// 2^map_shift is that symbol's narrowest range.  A wide block simply fills
-// two adjacent slots.
+//   value = table_size + S
 //
-// The cost is bounded.  With h = floor(log2(n)), a symbol whose count is a
-// power of two has one width and takes n slots; any other takes 2^(h+1) < 2n.
-// Summed over the symbols that is under 2 * table_size, which is the size of
-// `map`.
+// and the second line above reads `next = value >> nb_bits` -- so if nb_bits
+// were known, the entry would follow from a shift.  It is known from one
+// comparison, because floor(log2(next)) takes only two values across
+// [n, 2n-1].  Writing max_bits for the wider of the two widths,
 //
-// This replaced a bisection over the symbol's entries sorted by new_state,
-// which in turn had replaced a scan of the whole table.  At three lookups per
-// sequence the bisection was still the single largest cost in encoding --
-// 45% of it, with the midpoint calculation alone at 6.5%.
+//   nb_bits = max_bits      when value >= (n << max_bits)
+//   nb_bits = max_bits - 1  otherwise
+//
+// and both cases come out of one addition and one shift if the threshold is
+// folded into a bias:
+//
+//   delta_nb_bits = (max_bits << 16) - (n << max_bits)
+//   nb_bits       = (value + delta_nb_bits) >> 16
+//
+// which works because (n << max_bits) <= 2 * table_size <= 1024, far below the
+// 65536 a borrow would have to reach to move the answer by more than one.
+//
+// The bits to write are S - new_state, and
+//
+//   S - new_state = (table_size + S) - (next << nb_bits) = value mod 2^nb_bits
+//
+// so they are the low nb_bits of the state itself -- no second load of the
+// entry to subtract from.  What remains is to name the entry: `next` indexes
+// this symbol's occurrences from n, so
+//
+//   state_table[cumul[sym] + (next - n)]
+//
+// with cumul[sym] the running total of earlier symbols' counts, and the
+// subtraction folded into delta_find_state = cumul[sym] - n.  state_table
+// holds table_size + i rather than i, which is the form the next iteration
+// wants, so one iteration ends exactly where the next begins.
+//
+// Two loads then, one of them dependent: the symbol's 8-byte descriptor, and
+// the state_table slot it points at.  The scheme this replaced indexed a map
+// of aligned state blocks -- correct, and the right first thing to build after
+// a bisection, but four loads deep by three to answer the same question, and
+// 4.21% of level 1 encoding on a general corpus.  Before the map it was a
+// bisection over the symbol's entries, and before that a scan of the whole
+// table: 45% of encoding, with the midpoint calculation alone at 6.5%.
 static void zstd_seq_index_table(zstd_seq_enc_table_t * t) {
-  memset(t->count, 0, sizeof(t->count));
+  memset(t->symtt, 0, sizeof(t->symtt));
+  memset(t->min_bits, 0, sizeof(t->min_bits));
+  // Zero is not a state, so an unfilled slot -- including all of the slack --
+  // is one the lookup cannot follow into whatever was there before.
+  memset(t->state_table, 0, sizeof(t->state_table));
 
-  // Narrowest range per symbol, as a shift.  A symbol absent from the table
-  // keeps count 0 and is never indexed.
-  uint8_t min_bits[ZSTD_SEQ_MAX_CODES + 1];
-  memset(min_bits, 0xFF, sizeof(min_bits));
+  uint8_t max_bits[ZSTD_SEQ_MAX_CODES + 1];
+  uint8_t low_bits[ZSTD_SEQ_MAX_CODES + 1];
+  memset(max_bits, 0, sizeof(max_bits));
+  memset(low_bits, 0xFF, sizeof(low_bits));
 
   for (size_t i = 0; i < t->size; i++) {
     unsigned sym = t->entries[i].symbol;
     if (sym > ZSTD_SEQ_MAX_CODES) {
       sym = ZSTD_SEQ_MAX_CODES;
     }
-    t->count[sym]++;
-    if (t->entries[i].nb_bits < min_bits[sym]) {
-      min_bits[sym] = t->entries[i].nb_bits;
+    t->symtt[sym].count++;
+    if (t->entries[i].nb_bits > max_bits[sym]) {
+      max_bits[sym] = t->entries[i].nb_bits;
+    }
+    if (t->entries[i].nb_bits < low_bits[sym]) {
+      low_bits[sym] = t->entries[i].nb_bits;
     }
   }
 
   unsigned running = 0;
   for (unsigned sym = 0; sym <= ZSTD_SEQ_MAX_CODES; sym++) {
-    t->map_start[sym] = (uint16_t)running;
-    if (t->count[sym] == 0) {
-      t->map_shift[sym] = 0;
+    const unsigned n = t->symtt[sym].count;
+    if (n == 0) {
       continue;
     }
-    t->map_shift[sym] = min_bits[sym];
-    unsigned slots = (unsigned)(t->size >> min_bits[sym]);
-    if (running + slots > ZSTD_SEQ_ENC_MAP_SIZE) {
-      // Unreachable given the bound derived above; the table is left short
-      // rather than written past, and the lookup reports the miss.
-      t->count[sym] = 0;
-      continue;
-    }
-    running += slots;
+    t->min_bits[sym] = low_bits[sym];
+    t->symtt[sym].delta_nb_bits =
+        (int32_t)((uint32_t)max_bits[sym] << 16) - (int32_t)(n << max_bits[sym]);
+    t->symtt[sym].delta_find_state = (int16_t)((int)running - (int)n);
+    running += n;
   }
+  // The counts are one per entry, so they sum to the table size and the slots
+  // handed out above are exactly state_table's.
+#ifdef GCOMP_TEST_BUILD
+  assert(running == t->size);
+#endif
 
   for (size_t i = 0; i < t->size; i++) {
     unsigned sym = t->entries[i].symbol;
     if (sym > ZSTD_SEQ_MAX_CODES) {
       sym = ZSTD_SEQ_MAX_CODES;
     }
-    if (t->count[sym] == 0) {
+    const unsigned nb = t->entries[i].nb_bits;
+    const unsigned next =
+        ((unsigned)t->entries[i].new_state + (unsigned)t->size) >> nb;
+    const int slot = (int)next + t->symtt[sym].delta_find_state;
+#ifdef GCOMP_TEST_BUILD
+    assert(slot >= 0 && (size_t)slot < t->size);
+#endif
+    // Unreachable for a table zstd_fse.c built: `next` runs over [n, 2n-1] for
+    // a symbol of count n, and delta_find_state subtracts that n.  A table that
+    // broke the invariant would leave slots at zero, which the lookup reports
+    // as a miss and the caller turns into GCOMP_ERR_CORRUPT -- a wrong answer
+    // the caller can see, rather than a write past the array.
+    if (slot < 0 || (size_t)slot >= t->size) {
       continue;
     }
-    unsigned shift = t->map_shift[sym];
-    unsigned base = t->map_start[sym] + (t->entries[i].new_state >> shift);
-    unsigned slots = 1u << (t->entries[i].nb_bits - shift);
-    for (unsigned k = 0; k < slots; k++) {
-      t->map[base + k] = (uint16_t)i;
+    t->state_table[slot] = (uint16_t)(t->size + i);
+  }
+}
+
+// The entry of `symbol` that leaves the decoder in the state `value` names,
+// where `value` is table_size plus that state; see zstd_seq_index_table().
+// Returns table_size plus the entry's own index -- the same form.
+//
+// PRECONDITION: the table carries `symbol`, which zstd_seq_covers() establishes
+// for the whole block before any of this runs.  It used to be tested here
+// instead, once per symbol per sequence -- 4.5 million instructions on 4.7 MB
+// of C source to ask a question whose answer is fixed for the block, and which
+// the caller has to know anyway in order to choose a table at all.  A symbol
+// the table does not carry has a zeroed descriptor, which indexes the slack at
+// the end of state_table and reads a zero: a wrong stream rather than a read
+// past the array, and the sanitizer build asserts against it.
+static inline uint16_t zstd_seq_next_state(const zstd_seq_enc_table_t * t,
+    uint8_t symbol, unsigned value, uint32_t * bits_out,
+    unsigned * nb_bits_out) {
+  const unsigned sym =
+      (symbol > ZSTD_SEQ_MAX_CODES) ? ZSTD_SEQ_MAX_CODES : symbol;
+  const zstd_seq_symtt_t tt = t->symtt[sym];
+#ifdef GCOMP_TEST_BUILD
+  assert(tt.count != 0);
+#endif
+  const unsigned nb = (unsigned)(((int32_t)value + tt.delta_nb_bits) >> 16);
+  *nb_bits_out = nb;
+  *bits_out = value & ((1u << nb) - 1u);
+  return t->state_table[(value >> nb) + tt.delta_find_state];
+}
+
+// Does this table carry every code the block uses?
+//
+// The encoder cannot write a symbol through a table that has no state for it,
+// and the predefined tables do not reach every code (RFC 8878 3.1.1.3.2.1): a
+// literal length code above 35, a match length above 52 or an offset above 28
+// is outside them, and a per-block table normalized from this block's histogram
+// is outside nothing.  Asked once per table per block, from the histogram the
+// table was built from.
+static bool zstd_seq_covers(const zstd_seq_enc_table_t * t,
+    const uint32_t * freq, unsigned num_codes) {
+  for (unsigned c = 0; c < num_codes && c <= ZSTD_SEQ_MAX_CODES; c++) {
+    if (freq[c] != 0u && t->symtt[c].count == 0u) {
+      return false;
     }
   }
+  return true;
 }
 
-// The entry of `symbol` whose transition range contains `next_state`.
-static uint16_t zstd_seq_lookup_encode_state(const zstd_seq_enc_table_t * t,
-    uint8_t symbol, uint16_t next_state, uint16_t * bits_out,
-    uint8_t * nb_bits_out) {
-  unsigned sym = (symbol > ZSTD_SEQ_MAX_CODES) ? ZSTD_SEQ_MAX_CODES : symbol;
-  if (t->count[sym] == 0) {
-    *bits_out = 0;
-    *nb_bits_out = 0;
-    return 0xFFFF;
-  }
-
-  uint16_t idx = t->map[t->map_start[sym] + (next_state >> t->map_shift[sym])];
-  *bits_out = (uint16_t)(next_state - t->entries[idx].new_state);
-  *nb_bits_out = t->entries[idx].nb_bits;
-  return idx;
-}
-
-// Any state carrying `symbol`; used for the last sequence, which has no
-// transition out of it.  One symbol's ranges tile [0, size), so the first
-// slot of its map is the entry whose range starts at state zero.
+// A state carrying `symbol`; used for the last sequence, which has no
+// transition out of it and so may start anywhere the symbol appears.  One
+// symbol's ranges tile [0, size), so asking for the entry that leaves the
+// decoder in state zero names one, and naming it this way rather than by a
+// rule of its own keeps the choice identical to what the map-based index
+// made -- the stream is byte for byte what it was.
 static uint16_t zstd_seq_lookup_any_state(
     const zstd_seq_enc_table_t * t, uint8_t symbol) {
-  unsigned sym = (symbol > ZSTD_SEQ_MAX_CODES) ? ZSTD_SEQ_MAX_CODES : symbol;
-  return (t->count[sym] == 0) ? 0 : t->map[t->map_start[sym]];
+  uint32_t bits = 0;
+  unsigned nb = 0;
+  return zstd_seq_next_state(t, symbol, (unsigned)t->size, &bits, &nb);
 }
 
 /**
@@ -474,16 +546,15 @@ static uint16_t zstd_seq_lookup_any_state(
  *
  * Pass output == NULL to measure the encoded size without writing it.
  */
-static gcomp_status_t zstd_sequences_encode_using(
+static inline gcomp_status_t zstd_sequences_encode_using_impl(
     const zstd_sequence_t * sequences, size_t num_sequences,
     const zstd_seq_enc_table_t * ll_t, const zstd_seq_enc_table_t * of_t,
     const zstd_seq_enc_table_t * ml_t, uint8_t * output, size_t output_cap,
-    size_t * output_len_out) {
+    size_t * output_len_out, const bool measuring) {
   if (!output_len_out) {
     return GCOMP_ERR_INVALID_ARG;
   }
 
-  const bool measuring = (output == NULL);
   size_t pos = 0;
 
   // Writing a byte, or just counting it when measuring.
@@ -595,43 +666,48 @@ static gcomp_status_t zstd_sequences_encode_using(
       enc_state_ml = zstd_seq_lookup_any_state(ml_t, ml_code);
     }
     else {
-      uint16_t bits_out;
-      uint8_t nb_bits_out;
+      uint32_t of_bits, ml_bits, ll_bits;
+      unsigned of_nb, ml_nb, ll_nb;
 
-      uint16_t new_of_state = zstd_seq_lookup_encode_state(
-          of_t, of_code, enc_state_of, &bits_out, &nb_bits_out);
-      if (new_of_state == 0xFFFF) {
-        return GCOMP_ERR_CORRUPT;
-      }
-      zstd_enc_bw_add_bits(&bw, bits_out, nb_bits_out);
-      enc_state_of = new_of_state;
+      enc_state_of =
+          zstd_seq_next_state(of_t, of_code, enc_state_of, &of_bits, &of_nb);
+      enc_state_ml =
+          zstd_seq_next_state(ml_t, ml_code, enc_state_ml, &ml_bits, &ml_nb);
+      enc_state_ll =
+          zstd_seq_next_state(ll_t, ll_code, enc_state_ll, &ll_bits, &ll_nb);
 
-      uint16_t new_ml_state = zstd_seq_lookup_encode_state(
-          ml_t, ml_code, enc_state_ml, &bits_out, &nb_bits_out);
-      if (new_ml_state == 0xFFFF) {
-        return GCOMP_ERR_CORRUPT;
-      }
-      zstd_enc_bw_add_bits(&bw, bits_out, nb_bits_out);
-      enc_state_ml = new_ml_state;
-
-      uint16_t new_ll_state = zstd_seq_lookup_encode_state(
-          ll_t, ll_code, enc_state_ll, &bits_out, &nb_bits_out);
-      if (new_ll_state == 0xFFFF) {
-        return GCOMP_ERR_CORRUPT;
-      }
-      zstd_enc_bw_add_bits(&bw, bits_out, nb_bits_out);
-      enc_state_ll = new_ll_state;
+      // One write for all three transitions.  Appending at the high end makes
+      // the first value appended the lowest bits of the stream, so packing
+      // them in the same order -- OF, then ML above it, then LL above that --
+      // lays down exactly the bits three separate calls did.  An accuracy log
+      // is at most 9 (RFC 8878 3.1.1.3.2.1), so this is at most 27 bits and
+      // cannot overflow the 32 a call carries.
+      uint32_t packed = of_bits;
+      unsigned packed_nb = of_nb;
+      packed |= (uint32_t)ml_bits << packed_nb;
+      packed_nb += ml_nb;
+      packed |= (uint32_t)ll_bits << packed_nb;
+      packed_nb += ll_nb;
+      zstd_enc_bw_add_bits(&bw, packed, packed_nb, measuring);
     }
 
-    zstd_enc_bw_add_bits(&bw, ll_extra_val, ll_nb_extra);
-    zstd_enc_bw_add_bits(&bw, ml_extra_val, ml_nb_extra);
-    zstd_enc_bw_add_bits(&bw, of_extra_val, of_nb_extra);
+    // Literal and match length extra bits together: each is at most 16 bits
+    // (RFC 8878 3.1.1.3.2.1), so the pair fits the 32 a call carries.  The
+    // offset's are up to 31 and go on their own.
+    zstd_enc_bw_add_bits(&bw, ll_extra_val | (ml_extra_val << ll_nb_extra),
+        ll_nb_extra + ml_nb_extra, measuring);
+    zstd_enc_bw_add_bits(&bw, of_extra_val, of_nb_extra, measuring);
   }
 
-  // Initial states, read LL then OF then ML, so written in reverse.
-  zstd_enc_bw_add_bits(&bw, enc_state_ml, ml_t->log);
-  zstd_enc_bw_add_bits(&bw, enc_state_of, of_t->log);
-  zstd_enc_bw_add_bits(&bw, enc_state_ll, ll_t->log);
+  // Initial states, read LL then OF then ML, so written in reverse.  The loop
+  // carries a state as `size` plus an entry index (zstd_seq_index_table()); the
+  // stream wants the index, in `log` bits.
+  zstd_enc_bw_add_bits(
+      &bw, (uint32_t)(enc_state_ml - ml_t->size), ml_t->log, measuring);
+  zstd_enc_bw_add_bits(
+      &bw, (uint32_t)(enc_state_of - of_t->size), of_t->log, measuring);
+  zstd_enc_bw_add_bits(
+      &bw, (uint32_t)(enc_state_ll - ll_t->size), ll_t->log, measuring);
 
   size_t bitstream_size = zstd_enc_bw_close(&bw);
   if (bw.overflow) {
@@ -640,6 +716,24 @@ static gcomp_status_t zstd_sequences_encode_using(
 
   *output_len_out = pos + bitstream_size;
   return GCOMP_OK;
+}
+
+// The two instantiations.  Writing and measuring differ only in whether the
+// bits are assembled, and every test of that would be answered the same way
+// for the whole of one call; making it a template parameter in the only sense
+// C has lets each instance be compiled without it.  There is still one body,
+// so the two cannot drift apart.
+static gcomp_status_t zstd_sequences_encode_using(
+    const zstd_sequence_t * sequences, size_t num_sequences,
+    const zstd_seq_enc_table_t * ll_t, const zstd_seq_enc_table_t * of_t,
+    const zstd_seq_enc_table_t * ml_t, uint8_t * output, size_t output_cap,
+    size_t * output_len_out) {
+  if (output == NULL) {
+    return zstd_sequences_encode_using_impl(sequences, num_sequences, ll_t,
+        of_t, ml_t, NULL, 0, output_len_out, true);
+  }
+  return zstd_sequences_encode_using_impl(sequences, num_sequences, ll_t, of_t,
+      ml_t, output, output_cap, output_len_out, false);
 }
 
 /**
@@ -790,7 +884,7 @@ gcomp_status_t zstd_sequences_encode(const zstd_sequence_t * sequences,
   // states cost one accuracy log each, and the marker is one bit.  A state
   // transition costs at least the narrowest range width the symbol has in
   // the table, which zstd_seq_index_table() already worked out as
-  // map_shift.  All of that is a sum over the 36 or so codes rather than a
+  // min_bits.  All of that is a sum over the 36 or so codes rather than a
   // walk over the sequences.
   //
   // If the per-block tables come out no larger than this bound they are no
@@ -802,35 +896,35 @@ gcomp_status_t zstd_sequences_encode(const zstd_sequence_t * sequences,
     if (!ll_freq[c]) {
       continue;
     }
-    if (!ll_pre.count[c]) {
+    if (!ll_pre.symtt[c].count) {
       pre_lb_usable = false; // Predefined cannot carry this code at all.
       break;
     }
     pre_lb_bits += (uint64_t)ll_freq[c] *
-        (zstd_seq_ll_extra_bits[c] + ll_pre.map_shift[c]);
+        (zstd_seq_ll_extra_bits[c] + ll_pre.min_bits[c]);
   }
   for (unsigned c = 0; pre_lb_usable && c < ZSTD_SEQ_ML_CODES; c++) {
     if (!ml_freq[c]) {
       continue;
     }
-    if (!ml_pre.count[c]) {
+    if (!ml_pre.symtt[c].count) {
       pre_lb_usable = false;
       break;
     }
     pre_lb_bits += (uint64_t)ml_freq[c] *
-        (zstd_seq_ml_extra_bits[c] + ml_pre.map_shift[c]);
+        (zstd_seq_ml_extra_bits[c] + ml_pre.min_bits[c]);
   }
   for (unsigned c = 0; pre_lb_usable && c < ZSTD_SEQ_OF_CODES; c++) {
     if (!of_freq[c]) {
       continue;
     }
-    if (!of_pre.count[c]) {
+    if (!of_pre.symtt[c].count) {
       pre_lb_usable = false;
       break;
     }
     // An offset code's extra bits are the code itself
     // (RFC 8878 3.1.1.3.2.1.1).
-    pre_lb_bits += (uint64_t)of_freq[c] * (c + of_pre.map_shift[c]);
+    pre_lb_bits += (uint64_t)of_freq[c] * (c + of_pre.min_bits[c]);
   }
 
   // The last sequence has no successor and writes no state transitions at
@@ -843,8 +937,8 @@ gcomp_status_t zstd_sequences_encode(const zstd_sequence_t * sequences,
     uint8_t last_ll = zstd_enc_get_ll_code(last->lit_length);
     uint8_t last_ml = zstd_enc_get_ml_code(last->match_length);
     uint8_t last_of = zstd_enc_get_of_code(last->match_offset);
-    uint64_t back = (uint64_t)ll_pre.map_shift[last_ll] +
-        ml_pre.map_shift[last_ml] + of_pre.map_shift[last_of];
+    uint64_t back = (uint64_t)ll_pre.min_bits[last_ll] +
+        ml_pre.min_bits[last_ml] + of_pre.min_bits[last_of];
     pre_lb_bits = (pre_lb_bits > back) ? (pre_lb_bits - back) : 0u;
   }
 
@@ -902,6 +996,16 @@ gcomp_status_t zstd_sequences_encode(const zstd_sequence_t * sequences,
           kMlMaxLog, norm_ml, cus_ml, sizeof(cus_ml) / sizeof(cus_ml[0]),
           &ml_cus) == GCOMP_OK;
 
+  // Every code this block uses has a state in the per-block tables, or they
+  // cannot be used: see zstd_seq_next_state().  Normalization is supposed to
+  // give every nonzero frequency a count, so this is a check on
+  // zstd_seq_build_custom_table() rather than on the data, and failing it costs
+  // only the fall through to the predefined tables below.
+  custom_ok = custom_ok &&
+      zstd_seq_covers(&ll_cus, ll_freq, ZSTD_SEQ_LL_CODES) &&
+      zstd_seq_covers(&of_cus, of_freq, ZSTD_SEQ_OF_CODES) &&
+      zstd_seq_covers(&ml_cus, ml_freq, ZSTD_SEQ_ML_CODES);
+
   if (custom_ok) {
     size_t cus_size = 0;
     gcomp_status_t cus_status = zstd_sequences_encode_using(sequences,
@@ -915,10 +1019,16 @@ gcomp_status_t zstd_sequences_encode(const zstd_sequence_t * sequences,
         return GCOMP_OK;
       }
 
-      // Too close to call from the bound, so price it properly.
+      // Too close to call from the bound, so price it properly -- unless the
+      // predefined tables cannot carry this block at all, which is the same
+      // condition that made the bound unusable.  Pricing them then used to walk
+      // the sequences and come back with GCOMP_ERR_CORRUPT, which is this
+      // answer arrived at the long way.
       size_t pre_size = 0;
-      gcomp_status_t pre_status = zstd_sequences_encode_using(sequences,
-          num_sequences, &ll_pre, &of_pre, &ml_pre, NULL, 0, &pre_size);
+      gcomp_status_t pre_status = pre_lb_usable
+          ? zstd_sequences_encode_using(sequences, num_sequences, &ll_pre,
+                &of_pre, &ml_pre, NULL, 0, &pre_size)
+          : GCOMP_ERR_CORRUPT;
       if (pre_status != GCOMP_OK || cus_size <= pre_size) {
         *output_len_out = cus_size;
         return GCOMP_OK;
@@ -929,6 +1039,13 @@ gcomp_status_t zstd_sequences_encode(const zstd_sequence_t * sequences,
   // Predefined it is.  Writing it reports whatever pricing it would have:
   // there is nothing left to compare it against, so there is no reason to
   // walk the sequences a second time to find out first.
+  //
+  // Unless they do not reach every code this block uses, which leaves nothing
+  // that can write it -- the per-block tables are already known to have failed
+  // to get here.  The caller stores the block raw.
+  if (!pre_lb_usable) {
+    return GCOMP_ERR_CORRUPT;
+  }
   return zstd_sequences_encode_using(sequences, num_sequences, &ll_pre, &of_pre,
       &ml_pre, output, output_cap, output_len_out);
 }

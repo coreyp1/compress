@@ -926,7 +926,11 @@ static bool zstd_mf_find_match(zstd_match_finder_t * mf, const uint8_t * data,
   size_t best_len = MF_MIN_MATCH - 1;
   size_t best_offset = 0;
   const uint8_t * const limit = data + data_size;
-  unsigned depth = mf->search_depth;
+  // The fast strategy has one candidate and no chain to follow -- and no
+  // chain_table allocated to follow it with (zstd_mf_plan()), so the depth is
+  // clamped here rather than trusted to the effort table.  Spending the budget
+  // is what stops the walk below; nothing in it tests the strategy.
+  unsigned depth = mf->use_fast ? 1u : mf->search_depth;
 
   // Everything the walk tests that does not change while it walks, worked out
   // once.  This loop is two thirds of encoding at the middle levels, and it
@@ -952,52 +956,77 @@ static bool zstd_mf_find_match(zstd_match_finder_t * mf, const uint8_t * data,
     min_abs = cur_abs - max_offset;
   }
 
-  // The first byte of the position being matched never changes.  The byte one
-  // past the best match so far, and whether it is inside the buffer at all,
-  // change only when the best match does -- which is rare, and is where they
-  // are worked out again.
+  // The first bytes of the position being matched never change.  The byte one
+  // past the best match so far changes only when the best match does, which is
+  // rare, and is where it is worked out again.
+  //
+  // Measured and rejected: widening this to the three bytes MF_MIN_MATCH needs,
+  // as one masked four-byte load, is exactly as permissive (a candidate that
+  // improves on best_len matches at least three bytes) and byte for byte the
+  // same output -- and 1.8% more instructions at level 1, 3.8% at level 3.  The
+  // load and the mask cost more than the candidates they turn away, because the
+  // frontier byte below is already doing most of the filtering.
   const uint8_t cur_byte = data[pos];
-  bool probe_ok = (pos + best_len < data_size);
-  uint8_t probe_byte = probe_ok ? data[pos + best_len] : 0u;
 
-  while (depth > 0 && m_abs < cur_abs) {
-    if (m_abs < min_abs) {
-      break;
-    }
-    const size_t m = m_abs - mf->base_pos; // where it sits in `data`
+  // The walk runs only while that byte is inside the buffer, rather than
+  // testing for it per candidate.  Once it is not, nothing can improve on what
+  // is already held: count_match() stops at the end of the buffer, so a
+  // best_len that reaches it is the longest any match here can be.  The test
+  // was an invariant of the loop dressed as a condition inside it.
+  uint8_t probe_byte = 0u;
+  if (pos + best_len < data_size) {
+    probe_byte = data[pos + best_len];
 
-    // Quick check: compare first and last bytes before full comparison.
-    // m < pos and pos + best_len < data_size together keep the second read
-    // inside the buffer.
-    if (probe_ok && data[m] == cur_byte && data[m + best_len] == probe_byte) {
-      // Count matching bytes
-      size_t match_len = zstd_mf_count_match(data + pos, data + m, limit);
+    // A candidate is in range when min_abs <= m_abs < cur_abs, which is two
+    // comparisons written out and one written like this: measured from
+    // min_abs, a position below it wraps to a value larger than any position
+    // above it.  Two tests per candidate is not much until you count them --
+    // 27.4 million instructions on 4.7 MB of C source, 7.3% of the encode.
+    const size_t span = cur_abs - min_abs;
 
-      if (match_len > best_len) {
-        best_len = match_len;
-        best_offset = pos - m;
+    while ((size_t)(m_abs - min_abs) < span) {
+      const size_t m = m_abs - mf->base_pos; // where it sits in `data`
 
-        // A match this long is taken as it stands; see nice_length.
-        if (match_len >= mf->nice_length) {
-          break;
+      // Quick check: compare first and last bytes before full comparison.
+      // m < pos and pos + best_len < data_size together keep the second read
+      // inside the buffer.
+      if (data[m + best_len] == probe_byte && data[m] == cur_byte) {
+        // Count matching bytes
+        size_t match_len = zstd_mf_count_match(data + pos, data + m, limit);
+
+        if (match_len > best_len) {
+          best_len = match_len;
+          best_offset = pos - m;
+
+          // A match this long is taken as it stands; see nice_length.  So is
+          // one that runs to the end of the buffer, for the reason above.
+          if (match_len >= mf->nice_length || pos + best_len >= data_size) {
+            break;
+          }
+          probe_byte = data[pos + best_len];
         }
-        probe_ok = (pos + best_len < data_size);
-        probe_byte = probe_ok ? data[pos + best_len] : 0u;
       }
-    }
 
-    // Follow chain.  There is none for the fast strategy: the one candidate
-    // the head named is the whole of its search.
-    if (mf->use_fast) {
-      break;
+      // Spend a step of the budget before following the chain, not after.  The
+      // last candidate the budget allows needs no successor, and reading one
+      // was a load from the chain ring -- the single largest source of cache
+      // misses in the encoder -- for a position no comparison would ever look
+      // at.  It is also what makes the fast strategy safe here: depth is 1 for
+      // it, so this returns before chain_table, which it does not have, is
+      // touched.
+      if (--depth == 0u) {
+        break;
+      }
+      // End of chain, or an entry that does not walk backwards.  Widening
+      // before subtracting is what folds the two into one comparison: a zero
+      // entry becomes SIZE_MAX, which is above every position there is,
+      // whatever width positions happen to be stored in.
+      const size_t next = (size_t)mf->chain_table[m_abs & mf->chain_mask] - 1u;
+      if (next >= m_abs) {
+        break;
+      }
+      m_abs = next;
     }
-    uint32_t next = mf->chain_table[m_abs & mf->chain_mask];
-    if (next == 0 || next - 1u >= m_abs) {
-      break; // End of chain or invalid
-    }
-    m_abs = (size_t)next - 1u;
-
-    depth--;
   }
 
   // The dictionary, with a budget of its own.
@@ -1018,7 +1047,9 @@ static bool zstd_mf_find_match(zstd_match_finder_t * mf, const uint8_t * data,
   // off.  Once the dictionary has gone off the front of the buffer, min_abs
   // is above every position in it and the walk below ends on its first test,
   // which is the same answer the old countdown to zero gave.
-  if (mf->dict_hash_table && mf->dict_end > 0 && cur_abs >= mf->dict_end) {
+  if (mf->dict_hash_table && mf->dict_end > 0 && cur_abs >= mf->dict_end
+      && pos + best_len < data_size) {
+    probe_byte = data[pos + best_len];
     uint32_t dict_chain = mf->dict_hash_table[hash];
     if (dict_chain != 0) {
       size_t dict_abs = (size_t)dict_chain - 1u;
@@ -1039,24 +1070,25 @@ static bool zstd_mf_find_match(zstd_match_finder_t * mf, const uint8_t * data,
       while (dict_depth > 0 && dict_abs < mf->dict_end
           && dict_abs >= min_abs) {
         const size_t d = dict_abs - mf->base_pos;
-        if (probe_ok && data[d] == cur_byte
-            && data[d + best_len] == probe_byte) {
+        if (data[d + best_len] == probe_byte && data[d] == cur_byte) {
           size_t match_len = zstd_mf_count_match(data + pos, data + d, limit);
           if (match_len > best_len) {
             best_len = match_len;
             best_offset = pos - d;
-            if (match_len >= mf->nice_length) {
+            // Long enough to take as it stands, or long enough that nothing
+            // can be compared past it; either way the walk is over.
+            if (match_len >= mf->nice_length || pos + best_len >= data_size) {
               break;
             }
-            probe_ok = (pos + best_len < data_size);
-            probe_byte = probe_ok ? data[pos + best_len] : 0u;
+            probe_byte = data[pos + best_len];
           }
         }
-        uint32_t next = mf->chain_table[dict_abs & mf->chain_mask];
-        if (next == 0 || next - 1u >= dict_abs) {
+        const size_t next =
+            (size_t)mf->chain_table[dict_abs & mf->chain_mask] - 1u;
+        if (next >= dict_abs) {
           break;
         }
-        dict_abs = (size_t)next - 1u;
+        dict_abs = next;
         dict_depth--;
       }
     }
@@ -1465,6 +1497,35 @@ void zstd_mf_index_range(zstd_match_finder_t * mf, const uint8_t * data,
  * measured 9.3 seconds for 4 MB of a 1500 byte pattern.  Sampling there is
  * about the cost of an insertion, not about which positions are useful.
  */
+// What a fill run needs to know, which is fixed for the whole of one fill.
+//
+// Passed as a struct rather than read from the match finder per position: the
+// insert is six instructions of work behind four questions whose answers cannot
+// change while the loop runs, and asking them per position was 24 instructions
+// an insert against about ten for the indexing itself.  One body serves both
+// runs below, so the dense and sparse passes cannot drift apart.
+typedef struct {
+  uint32_t * hash_table;
+  uint32_t * chain_table; ///< NULL under the fast strategy, which has no chain.
+  size_t base_pos;
+  size_t chain_mask;
+  unsigned hash_log;
+  bool fast;
+} zstd_mf_fill_ctx_t;
+
+static inline void zstd_mf_fill_run(const zstd_mf_fill_ctx_t * ctx,
+    const uint8_t * data, size_t from, size_t to, size_t step) {
+  for (size_t i = from; i < to; i += step) {
+    const size_t cur_abs = ctx->base_pos + i;
+    const uint32_t hash = zstd_mf_hash4(data + i, ctx->hash_log);
+    const uint32_t prev = ctx->hash_table[hash];
+    ctx->hash_table[hash] = (uint32_t)(cur_abs + 1u);
+    if (!ctx->fast) {
+      ctx->chain_table[cur_abs & ctx->chain_mask] = prev;
+    }
+  }
+}
+
 static inline void zstd_mf_fill_match(zstd_match_finder_t * mf,
     const uint8_t * data, size_t from, size_t to, size_t data_size,
     uint32_t match_length) {
@@ -1478,14 +1539,40 @@ static inline void zstd_mf_fill_match(zstd_match_finder_t * mf,
     return;
   }
 
-  const size_t dense_end = from + mf->fill_dense;
-  const size_t sparse = mf->fill_sparse ? mf->fill_sparse : 1u;
-  size_t i = from;
-  for (; i < to && i < dense_end && i + MF_HASH_READ_SIZE <= data_size; i++) {
-    zstd_mf_insert_one(mf, data, i, data_size);
+  // The chain insert, with everything it tests lifted out of the loop.
+  //
+  // zstd_mf_insert_one() asks four questions per position -- is this a tree, is
+  // there room for a hash read, is this the fast strategy, and where are the
+  // tables -- and the answers are the same for every position in a fill.  Asked
+  // per position they were 24 instructions per insert on a general corpus,
+  // against about ten for the work itself: the loads, the multiply and the two
+  // stores that actually index a position.  The bound replaces the per-position
+  // room check with one subtraction.
+  if (data_size < MF_HASH_READ_SIZE) {
+    return;
   }
-  for (; i < to && i + MF_HASH_READ_SIZE <= data_size; i += sparse) {
-    zstd_mf_insert_one(mf, data, i, data_size);
+  const size_t last = data_size - MF_HASH_READ_SIZE; // highest hashable position
+  if (to > last + 1u) {
+    to = last + 1u;
+  }
+  const zstd_mf_fill_ctx_t ctx = {
+    .hash_table = mf->hash_table,
+    .chain_table = mf->chain_table,
+    .base_pos = mf->base_pos,
+    .chain_mask = mf->chain_mask,
+    .hash_log = mf->hash_log,
+    .fast = mf->use_fast != 0u,
+  };
+
+  // Dense over the first fill_dense positions, then every fill_sparse'th; see
+  // fill_dense in zstd_internal.h for why the shape matters more than the count.
+  const size_t dense_end = from + mf->fill_dense;
+  const size_t dense_to = (to < dense_end) ? to : dense_end;
+  const size_t sparse = mf->fill_sparse ? mf->fill_sparse : 1u;
+  zstd_mf_fill_run(&ctx, data, from, dense_to, 1u);
+  if (dense_to < to) {
+    // Where the dense run stopped, rounded up onto the sparse stride.
+    zstd_mf_fill_run(&ctx, data, dense_to, to, sparse);
   }
 }
 
@@ -1628,30 +1715,50 @@ gcomp_status_t zstd_mf_generate_sequences(zstd_match_finder_t * mf,
       size_t lit_len = pos - lit_start;
       uint32_t rep[3] = {rep1, rep2, rep3};
 
-      // What the list offers here, nearest first.  With literals that is the
-      // three distances themselves; without, it is the shifted set the codes
-      // can name.
-      uint32_t rep_try[3];
-      if (lit_len > 0u) {
-        rep_try[0] = rep[0];
-        rep_try[1] = rep[1];
-        rep_try[2] = rep[2];
-      }
-      else {
-        rep_try[0] = rep[1];
-        rep_try[1] = rep[2];
-        rep_try[2] = (rep[0] > 1u) ? (rep[0] - 1u) : 0u;
-      }
-
-      // The repeat-offset probe costs three zstd_mf_count_match() calls at
+      // The repeat-offset probe costs a zstd_mf_count_match() per candidate at
       // every match, and the fast strategy does not pay for it: on the corpus
-      // it is 10.5% of level 0's instructions for 0.42% of its size.  The
-      // levels that are competing on ratio keep it -- there it is worth far
-      // more than that, and the reasoning below is about them.
+      // the whole probe is 10.5% of level 0's instructions for 0.42% of its
+      // size.
+      //
+      // Every other level keeps all three candidates, and dropping the far two
+      // was built and rejected on measurement.  It is worth less than an
+      // instruction count says in both directions.  On speed: -8.00% of level
+      // 1's instructions converts to +3.9% of its throughput, and at levels 2
+      // and 3 to nothing outside the noise -- the probe reads at `pos - roff`,
+      // close behind the position and usually in cache, so what it removes is
+      // cheap instructions rather than stalls, and taking a more distant match
+      // instead makes the reads that follow less local.  D1 misses go *up* 11.6%
+      // at level 1 while instructions go down 8%.  On size: +0.011% over twelve
+      // files hides +0.17% to +0.26% on source and binaries, cancelled in the
+      // total by one skewed file that happens to be the largest.
+      //
+      // ENCODER-PERFORMANCE.md has both tables.  Anything that changes how many
+      // candidates are examined has to be timed, not counted.
       if (match.length < mf->nice_length && !mf->use_fast) {
+        // What the list offers here, nearest first.  With literals that is the
+        // three distances themselves; without, it is the shifted set the codes
+        // can name.  Built inside the guard rather than above it: every match
+        // already at nice_length, and every match at all under the fast
+        // strategy, skips the probe and was building this list for nothing.
+        uint32_t rep_try[3];
+        if (lit_len > 0u) {
+          rep_try[0] = rep[0];
+          rep_try[1] = rep[1];
+          rep_try[2] = rep[2];
+        }
+        else {
+          rep_try[0] = rep[1];
+          rep_try[1] = rep[2];
+          rep_try[2] = (rep[0] > 1u) ? (rep[0] - 1u) : 0u;
+        }
+
         for (unsigned r = 0; r < 3u; r++) {
           const uint32_t roff = rep_try[r];
-          if (roff == 0u || (size_t)roff > pos) {
+          // Usable when 1 <= roff <= pos: below that there is no such distance
+          // in the list, above it the source is in front of the buffer.
+          // Measured from one, both are the same unsigned comparison, because
+          // a roff of zero wraps above every position there is.
+          if ((size_t)roff - 1u >= pos) {
             continue;
           }
           size_t rlen = zstd_mf_count_match(
