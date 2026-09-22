@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <ghoti.io/cutil/dir.h>
 #include <temp_file.h>
 
 using gcomp_test::TempFile;
@@ -51,18 +52,65 @@ TEST(TempFile, TwoFilesDoNotCollide) {
   EXPECT_NE(a.path(), b.path());
 }
 
-TEST(TempFile, HonoursTmpdir) {
-  // The behavioural point of moving to cutil: the mkstemp copies this
-  // replaces named "/tmp" outright, so a machine whose TMPDIR points
-  // elsewhere had its tests writing somewhere it had not been told to.
-  const char * tmpdir = getenv("TMPDIR");
-  if (!tmpdir || !*tmpdir) {
-    GTEST_SKIP() << "TMPDIR is not set; nothing to compare against";
+namespace {
+
+/// Set or clear TMPDIR.  A test that changes it has to put it back, and
+/// getenv's pointer does not survive the setenv, so the old value is copied.
+void setTmpdir(const char * value) {
+#ifdef _WIN32
+  _putenv_s("TMPDIR", value ? value : "");
+#else
+  if (value) {
+    setenv("TMPDIR", value, 1);
   }
-  TempFile t("gcomp_test", ".bin");
-  ASSERT_TRUE(t.valid());
-  EXPECT_EQ(t.path().compare(0, strlen(tmpdir), tmpdir), 0)
-      << "wrote to " << t.path() << " rather than under " << tmpdir;
+  else {
+    unsetenv("TMPDIR");
+  }
+#endif
+}
+
+} // namespace
+
+/**
+ * The behavioural point of moving to cutil: the mkstemp copies this replaces
+ * named "/tmp" outright, so a machine whose TMPDIR points elsewhere had its
+ * tests writing somewhere it had not been told to.
+ *
+ * This used to read TMPDIR and skip when it was unset, which on this machine
+ * is every run -- so the only coverage of TMPDIR handling in the library
+ * reported the same green as a passing test while asking nothing, through a
+ * release that rewrote the temp-file path underneath it.  A test that skips
+ * is a test that is not telling you anything (CONVENTIONS section 7).
+ *
+ * So it sets TMPDIR rather than waiting to be given one.  The directory
+ * comes from cutil rather than a hardcoded "/tmp", which would be the same
+ * assumption the test exists to catch.
+ */
+TEST(TempFile, HonoursTmpdir) {
+  char * dir = nullptr;
+  ASSERT_EQ(gcu_dir_temp_create(nullptr, "gcomp_tmpdir", nullptr, &dir),
+      GCU_FILE_OK);
+  ASSERT_NE(dir, nullptr);
+
+  const char * previous = getenv("TMPDIR");
+  const std::string saved = previous ? std::string(previous) : std::string();
+  const bool had_tmpdir = previous != nullptr;
+
+  setTmpdir(dir);
+  {
+    TempFile t("gcomp_test", ".bin");
+    EXPECT_TRUE(t.valid());
+    if (t.valid()) {
+      EXPECT_EQ(t.path().compare(0, strlen(dir), dir), 0)
+          << "wrote to " << t.path() << " rather than under " << dir;
+    }
+  }
+  setTmpdir(had_tmpdir ? saved.c_str() : nullptr);
+
+  // The file above removed itself with its scope, so the directory is empty
+  // again and this is the non-recursive remove.
+  EXPECT_EQ(gcu_dir_remove(dir), GCU_FILE_OK);
+  gcu_dir_free_path(nullptr, dir);
 }
 
 TEST(TempFile, RoundTripsBytes) {
