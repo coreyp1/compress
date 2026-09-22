@@ -305,37 +305,84 @@ typedef struct {
 // begins are where the next match is most likely to source from; the ones
 // deep inside it are largely redundant with the copy the match already found.
 // So the fill is dense for `fill_dense` positions and then strides by
-// `fill_sparse`.  Measured on six corpus files against indexing every
-// position:
+// `fill_sparse`.  Measured on six corpus files at level 1, against indexing
+// every position and with everything else held as it was:
 //
-//   shape      level 1 size   level 1 instructions
-//   dense 32 stride 8  +0.08%   -7.5%
-//   dense 16 stride 4  +0.16%  -10.3%
-//   dense  6 stride 8  +0.73%  -19.4%
-//   dense  4 stride 16 +1.34%  -23.9%
-//   stride 2 flat      +2.68%  -19.2%
+//   shape              size     instructions
+//   dense 32 stride 8  +0.08%     -7.5%
+//   dense 16 stride 4  +0.16%    -10.3%
+//   dense  6 stride 8  +0.73%    -19.4%
+//   dense  4 stride 16 +1.34%    -23.9%
+//   flat stride 2      +2.68%    -19.2%
 //
-// The last row is the one that says the shape matters rather than the count:
-// a flat stride of 2 costs twice the ratio of dense-4-then-16 for less of the
-// saving.  Every dense-then-sparse point measured dominates every flat one.
+// The last row says this is a shape and not a count: a flat stride of two
+// costs twice the ratio of dense-4-then-16 and saves less.  Every
+// dense-then-sparse point measured dominates every flat one.
 //
-// The levels are graded because the trade is: at level 8 the same shape costs
-// more ratio and saves less (+1.56% and -12.8% where level 1 gets +0.73% and
-// -19.3%).  Levels 1 and 2 are where a caller has asked for speed, and take
-// the aggressive shape; the rest take one that is nearly free.
+// WHY THE REST OF THE TABLE MOVED WITH IT
+// =======================================
 //
-// The tree levels ignore both fields.  They sample by nice_length instead,
-// for a different reason -- see the fill loop.
+// Every number above is a ratio given up for speed, and that framing was
+// wrong -- an artefact of changing the fill while holding search_depth and
+// hash_log where a DENSE fill had put them.  With all three free there is no
+// trade to make.  At level 1, dense-4-then-16 plus a deeper chain and a
+// bigger table is 1.91% SMALLER than indexing every position was, and still
+// 28.4% cheaper:
+//
+//   depth  hash_log   size vs dense fill   instructions
+//     4      14          +1.34%              -31.0%
+//     6      17          -0.42%              -32.2%
+//     8      17          -1.10%              -31.0%
+//    12      17          -1.91%              -28.4%
+//    16      17          -2.39%              -25.8%
+//
+// hash_log is the free half: a bigger table means fewer collisions, so a
+// chain walk of a given depth crosses off fewer positions that were never
+// going to match.  It improves BOTH axes wherever it was below the window.
+// The depth is what the fill pays for -- the saved insertions buy candidates,
+// which are worth more.
+//
+// The ladder against the same corpus, against indexing every position:
+//
+//   level   size     instructions
+//     1    -1.91%      -28.4%
+//     2    -0.58%      -13.9%
+//     3    -0.94%       -5.3%
+//     4    -0.65%       -3.2%
+//     5    -0.07%       -6.7%
+//     6    -0.05%       -4.0%
+//     7    +0.07%       -1.1%
+//     8    +0.08%       -9.3%
+//
+// Six of the eight are better on both axes.  Levels 7 and 8 give up under a
+// tenth of a percent: they are the deep end of the chain, where the extra
+// candidates the fill pays for run into what the chain can do at all, and
+// buying the last of the ratio back cost 18% at level 8 for 0.19%.
+//
+// The tree levels ignore fill_dense and fill_sparse entirely and their output
+// is byte for byte what it was.  They sample too, but by nice_length and for
+// an unrelated reason -- see zstd_mf_fill_match().
+//
+// TWO THINGS THAT DID NOT WORK
+//
+// Searching fewer candidates is worse on both axes.  Level 1 at depth 1 came
+// out 7.8% larger AND 1.8% more instructions than at 4: fewer candidates
+// means fewer matches, and the parse then crawls forward a byte at a time.
+//
+// Accelerating past runs of misses -- libzstd's step of 1 + (run >> 8) --
+// moved instructions 0.1% the wrong way.  The miss branch is barely taken
+// here, because at level 1 a match is found at most positions; the cost is
+// what happens after one is found, not what happens when none is.
 static const zstd_effort_t k_zstd_effort[23] = {
     {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, // 0: unused
-    {4, 0, 128, 14, 0, 0, 0, 0, 0, 4, 16}, // 1: greedy, and fast because of it
-    {8, 1, 128, 14, 0, 0, 0, 0, 0, 4, 16}, // 2
-    {16, 1, 128, 15, 0, 0, 0, 0, 0, 16, 4}, // 3
-    {24, 1, 128, 16, 0, 0, 0, 0, 0, 16, 4}, // 4
-    {48, 1, 128, 16, 0, 0, 0, 0, 0, 16, 4}, // 5
-    {64, 1, 128, 16, 0, 0, 0, 0, 0, 16, 4}, // 6: the window steps to 2 MB next
-    {80, 1, 128, 17, 0, 0, 0, 0, 0, 16, 4}, // 7
-    {112, 2, 192, 17, 0, 0, 0, 0, 0, 16, 4}, // 8: last of the chain levels
+    {12, 0, 128, 17, 0, 0, 0, 0, 0, 4, 16}, // 1: greedy, and fast because of it
+    {20, 1, 128, 17, 0, 0, 0, 0, 0, 4, 16}, // 2
+    {32, 1, 128, 18, 0, 0, 0, 0, 0, 16, 4}, // 3
+    {40, 1, 128, 18, 0, 0, 0, 0, 0, 16, 4}, // 4
+    {64, 1, 128, 18, 0, 0, 0, 0, 0, 16, 4}, // 5
+    {88, 1, 128, 18, 0, 0, 0, 0, 0, 16, 4}, // 6: the window steps to 2 MB next
+    {104, 1, 128, 18, 0, 0, 0, 0, 0, 16, 4}, // 7
+    {112, 2, 192, 18, 0, 0, 0, 0, 0, 64, 4}, // 8: last of the chain levels
     {24, 2, 256, 17, 1, 0, 0, 0, 0, 0, 1}, // 9: first of the tree levels
     {32, 2, 512, 17, 1, 0, 0, 0, 0, 0, 1}, // 10
     {36, 0, 768, 17, 1, 1, 1024, 8, 0, 0, 1}, // 11: first of the optimal levels

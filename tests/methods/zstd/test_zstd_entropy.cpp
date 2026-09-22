@@ -89,12 +89,59 @@ protected:
       return {};
     }
 
-    std::vector<uint8_t> result(len * 100 + 65536);
+    // The buffer GROWS.  It used to be `len * 100 + 65536` -- a guess about
+    // the compression ratio made from the COMPRESSED length, which is the one
+    // quantity that shrinks as the encoder gets better.  When the match
+    // finder was retuned, 100,000 bytes that had compressed to 825 came to
+    // 141, and 141 * 100 + 65536 is 79,636: less than the input.  The decode
+    // then stopped for want of room and this helper returned a short vector,
+    // which reads from the test as the library losing 20% of the data.
+    std::vector<uint8_t> result(len * 4u + 65536u);
     gcomp_buffer_t in_buf = {const_cast<void *>(data), len, 0};
     gcomp_buffer_t out_buf = {result.data(), result.size(), 0};
 
-    while (in_buf.used < in_buf.size) {
-      size_t before = in_buf.used;
+    // Growing in place, so out_buf has to be re-pointed at the new storage
+    // and told how much of it is already written.
+    //
+    // Capped, because the finish loop below spins on GCOMP_ERR_LIMIT until it
+    // is given room: a grow that does not grow is an infinite loop, not a
+    // failure.  That is not hypothetical -- it is what a mutant with
+    // `resize(result.size())` did, and a suite that hangs is far harder to
+    // read than one that fails.  Past the cap this stops growing and the
+    // short result fails whatever assertion the test makes about its size.
+    // The guard is that the buffer actually GREW, not that it has reached
+    // some ceiling.  A ceiling is a proxy: a grow that returns the same size
+    // never reaches one, so the loop spins exactly as before -- which is what
+    // the first version of this guard did, and it is the same mistake as
+    // reading a stalled input as a finished stream.  Both loops below stop on
+    // the real condition, no progress.
+    constexpr size_t kMaxResult = 64u * 1024u * 1024u;
+    bool out_of_room = false;
+    auto grow = [&result, &out_buf, &out_of_room]() {
+      const size_t before = result.size();
+      if (before >= kMaxResult) {
+        out_of_room = true;
+        return;
+      }
+      const size_t used = out_buf.used;
+      result.resize(before * 2u);
+      if (result.size() <= before) {
+        out_of_room = true;
+        return;
+      }
+      out_buf.data = result.data();
+      out_buf.size = result.size();
+      out_buf.used = used;
+    };
+
+    // stream.h: "A call that neither consumes input nor produces output has
+    // nothing left to do with what it holds.  That is the signal to stop, not
+    // input->used reaching input->size."  The old loop stopped on the input
+    // not advancing, which is also what a full output buffer looks like -- so
+    // "no room" was read as "done".
+    for (;;) {
+      const size_t before_in = in_buf.used;
+      const size_t before_out = out_buf.used;
       status = gcomp_decoder_update(decoder, &in_buf, &out_buf);
       if (status != GCOMP_OK) {
         if (status_out)
@@ -102,12 +149,29 @@ protected:
         gcomp_decoder_destroy(decoder);
         return {};
       }
-      if (in_buf.used == before) {
+      if (in_buf.used == before_in && out_buf.used == before_out) {
         break;
+      }
+      if (out_buf.used == out_buf.size) {
+        grow();
+        if (out_of_room) {
+          break;
+        }
       }
     }
 
-    status = gcomp_decoder_finish(decoder, &out_buf);
+    // finish reports GCOMP_ERR_LIMIT for "more to give, nowhere to put it",
+    // which is not an error here, only a request for room.
+    for (;;) {
+      status = gcomp_decoder_finish(decoder, &out_buf);
+      if (status != GCOMP_ERR_LIMIT) {
+        break;
+      }
+      grow();
+      if (out_of_room) {
+        break;
+      }
+    }
     if (status_out)
       *status_out = status;
 
