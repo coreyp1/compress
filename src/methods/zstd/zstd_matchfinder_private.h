@@ -125,8 +125,17 @@ static inline size_t zstd_mf_max_offset(const zstd_match_finder_t * mf) {
   if (max_offset > MF_MAX_DISTANCE) {
     max_offset = MF_MAX_DISTANCE;
   }
-  if (mf->use_bt && max_offset > mf->bt_size - 1u) {
-    max_offset = mf->bt_size - 1u;
+  // Both finders index a ring by position, so neither may reach back as far
+  // as its own size: two positions that far apart share a slot, and the older
+  // one's entry is gone.  One byte short of the ring is the whole of what
+  // either can offer.
+  if (mf->use_bt) {
+    if (max_offset > mf->bt_size - 1u) {
+      max_offset = mf->bt_size - 1u;
+    }
+  }
+  else if (mf->chain_size != 0u && max_offset > mf->chain_size - 1u) {
+    max_offset = mf->chain_size - 1u;
   }
   return max_offset;
 }

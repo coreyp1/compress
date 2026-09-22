@@ -255,8 +255,34 @@ typedef struct {
 //
 
 typedef struct {
-  uint32_t * hash_table;  ///< Hash table: hash -> position
-  uint32_t * chain_table; ///< Chain table: position -> previous position
+  /**
+   * @brief Hash of four bytes -> the latest position with that hash, plus one.
+   *
+   * Zero means "no entry", which is why every position stored here and in
+   * @ref chain_table is one more than itself.
+   *
+   * POSITIONS ARE ABSOLUTE, in both tables and in @ref dict_hash_table: they
+   * count from the start of the stream rather than from the front of the
+   * caller's buffer, exactly as the tree's do.  Sliding the window is then one
+   * addition to @ref base_pos.  Named from the front of the buffer, as they
+   * were, a slide had to walk every entry of both tables and subtract - which
+   * measured 12% of encoding at level 1 and 9.7% at level 3, spent entirely on
+   * bookkeeping.
+   */
+  uint32_t * hash_table;
+
+  /**
+   * @brief Position -> the previous position with the same hash, plus one.
+   *
+   * A ring: the slot for a position is its absolute position masked with
+   * @ref chain_mask, so an entry is overwritten only by one at least
+   * @ref chain_size ahead of it, which is already further back than a
+   * sequence may reach.  An entry that has fallen out of the window is
+   * before @ref base_pos or before the window floor, and the walk stops at
+   * it - which prunes the chain rather than corrupting it: fewer candidates,
+   * never wrong ones.
+   */
+  uint32_t * chain_table;
 
   /**
    * @brief Where the chain enters the dictionary, per hash.  NULL if none.
@@ -276,16 +302,18 @@ typedef struct {
   uint32_t * dict_hash_table;
 
   /**
-   * @brief One past the last dictionary position, in window coordinates.
+   * @brief One past the last dictionary position, absolute.
    *
-   * Zero when there is no dictionary or when sliding has pushed all of it out
-   * of the window - at which point the decoder cannot reach it either, so a
-   * match against it would not be decodable.
+   * Zero when there is no dictionary.  Absolute like everything else here, so
+   * a slide leaves it alone: whether any of the dictionary is still reachable
+   * is decided by the same window floor that bounds the ordinary walk, rather
+   * than by counting this down until it hits zero.
    */
   size_t dict_end;
   unsigned hash_log;      ///< Log2 of hash table size
   size_t hash_size;       ///< Hash table size
-  size_t chain_size;      ///< Chain table size (= window size)
+  size_t chain_size;      ///< Chain ring entries; a power of two.
+  size_t chain_mask;      ///< chain_size - 1.
   unsigned search_depth;  ///< Maximum chain search depth
   unsigned lazy_depth;    ///< Positions a match may be deferred through (0 = greedy)
   uint32_t nice_length;   ///< Length at which a match is taken without looking further
@@ -1344,6 +1372,7 @@ void zstd_mf_slide(zstd_match_finder_t * mf, size_t shift);
  * @param mf Match finder
  * @param alloc Allocator for the one extra table
  * @param dict_end One past the last dictionary position, in window coordinates
+ *   (converted to an absolute position on the way in)
  * @param mem_tracker Optional; charged for the table
  */
 /**

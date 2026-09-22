@@ -176,6 +176,7 @@ struct Parse {
   std::vector<uint8_t> literals;
   std::vector<uint32_t> chain;
   size_t chain_size = 0;
+  size_t base_pos = 0;
   std::vector<uint32_t> bt;
   size_t bt_size = 0;
   unsigned use_bt = 0;
@@ -213,6 +214,7 @@ Parse run_parse(const std::vector<uint8_t> & data, int level,
   // is allocated.
   parse.use_bt = mf.use_bt;
   parse.compared_bytes = mf.compared_bytes;
+  parse.base_pos = mf.base_pos;
   if (mf.chain_table) {
     parse.chain_size = mf.chain_size;
     parse.chain.assign(mf.chain_table, mf.chain_table + mf.chain_size);
@@ -387,6 +389,12 @@ TEST_F(ZstdMatchFinderTest, NoPositionIsChainedToItself) {
     Parse parse = run_parse(data, 6, depth, true);
     ASSERT_EQ(parse.use_bt, 0u) << "this test is about the chain";
     ASSERT_GT(parse.chain_size, 0u);
+    // Entries name absolute positions and the slot for one is its position
+    // masked with chain_size - 1, so "slot i belongs to position i" holds
+    // only while data[0] is still at the start of the stream.  This harness
+    // never slides, so it does; asserting it keeps the reading below honest
+    // if that ever changes.
+    ASSERT_EQ(parse.base_pos, 0u) << "slot i no longer means position i";
     for (size_t i = 0; i < parse.chain_size; i++) {
       // Entries are stored as position+1 so that zero can mean "no entry".
       ASSERT_NE(parse.chain[i], static_cast<uint32_t>(i + 1))
@@ -1124,6 +1132,99 @@ TEST_F(ZstdMatchFinderTest, TheFixedPointLogarithmIsTheRealOne) {
 
 // The deferral is a ratio improvement, and the levels that do it should come
 // out ahead of the level that does not on input built to reward it.
+// History the window has slid past is still matched, and the boundary is where
+// the window says it is.
+//
+// The tables name positions from the start of the stream, so a slide is one
+// addition to base_pos and nothing else moves.  Before, the chain named
+// positions in the buffer and a slide rewrote every entry it held -- 12% of
+// level 1 -- and the two spellings are easy to mix up: an entry left
+// un-rebased points at the wrong bytes, one rebased twice points at bytes no
+// longer there.  Neither shows up as a crash, because every candidate is
+// compared byte by byte before it is used.  They show up as matches quietly
+// not being found.
+//
+// TWO THINGS THIS HAS TO GET RIGHT TO TEST ANYTHING
+//
+// The input must actually slide.  Written first with a 240 KB input and a
+// 256 KB window, this passed against a slide that did not move the base at
+// all and against one that moved it twice: the whole input fitted inside the
+// window, so nothing ever slid.  1 MB against a 256 KB window slides roughly
+// six times.
+//
+// The two inputs must be the same length, with the same number of
+// incompressible bytes.  Only the DISTANCE between the two copies of the
+// payload differs -- inside the window in one, outside it in the other -- so
+// the difference in output is the match and not the input.  Lengthening the
+// gap and letting the input grow with it would hide an 8 KB match inside
+// 32 KB of extra noise.
+TEST_F(ZstdMatchFinderTest, AMatchIsStillFoundAfterTheWindowHasSlid) {
+  constexpr unsigned kWindowLog = 18;                  // 256 KiB
+  constexpr size_t kWindow = (size_t)1 << kWindowLog;
+  constexpr size_t kPayload = 8u * 1024u;
+  constexpr size_t kTotal = 1024u * 1024u;             // four windows
+
+  // lead noise, payload, gap noise, payload -- kTotal bytes whatever the gap,
+  // so the two cases differ only in how far apart the copies are.
+  auto build = [&](size_t gap) {
+    const size_t lead = kTotal - (2u * kPayload + gap);
+    Noise payload_noise(0x5EEDu);
+    Noise filler(0xC0FFEEu);
+    std::vector<uint8_t> payload;
+    payload_noise.append(payload, kPayload);
+    std::vector<uint8_t> data;
+    filler.append(data, lead);
+    data.insert(data.end(), payload.begin(), payload.end());
+    filler.append(data, gap);
+    data.insert(data.end(), payload.begin(), payload.end());
+    EXPECT_EQ(data.size(), size_t{kTotal});
+    return data;
+  };
+
+  auto encoded_size = [](const std::vector<uint8_t> & data) -> size_t {
+    gcomp_options_t * opts = nullptr;
+    EXPECT_EQ(gcomp_options_create(&opts), GCOMP_OK);
+    // A chain level, since this is the chain's invariant.  Level 6 rather
+    // than level 1: level 1 walks four candidates into a 16 K-entry table, so
+    // over a megabyte of noise every bucket is hundreds deep and the four it
+    // looks at are all recent.  It finds about a third of this payload, and
+    // what decides that is the depth of the chain rather than the width of
+    // the window -- a different question from the one here.
+    gcomp_options_set_int64(opts, "zstd.level", 6);
+    gcomp_options_set_uint64(opts, "zstd.window_log", kWindowLog);
+
+    std::vector<uint8_t> out(data.size() + data.size() / 2 + 4096);
+    size_t written = 0;
+    EXPECT_EQ(gcomp_encode_buffer(nullptr, "zstd", opts, data.data(),
+                  data.size(), out.data(), out.size(), &written),
+        GCOMP_OK);
+
+    // The stream has to read back, or its size measures nothing.
+    std::vector<uint8_t> back(data.size() + 64);
+    size_t back_len = 0;
+    EXPECT_EQ(gcomp_decode_buffer(nullptr, "zstd", nullptr, out.data(),
+                  written, back.data(), back.size(), &back_len),
+        GCOMP_OK);
+    EXPECT_EQ(back_len, data.size());
+    if (back_len == data.size()) {
+      EXPECT_EQ(memcmp(back.data(), data.data(), data.size()), 0);
+    }
+    gcomp_options_destroy(opts);
+    return written;
+  };
+
+  // Comfortably inside and comfortably outside.  The exact edge is one byte
+  // wide and is not what this is about -- see zstd_mf_max_offset().
+  const size_t inside = encoded_size(build(kWindow - 2u * kPayload));
+  const size_t outside = encoded_size(build(kWindow + 4u * kPayload));
+
+  // Finding the repeat is worth nearly the whole payload, so half of it is a
+  // bound that noise cannot clear by accident.
+  EXPECT_LT(inside + kPayload / 2u, outside)
+      << "inside " << inside << ", outside " << outside
+      << ": the repeat across the slid window was not matched";
+}
+
 TEST_F(ZstdMatchFinderTest, DeferringDescribesTheInputInFewerSequences) {
   size_t target = 0;
   std::vector<uint8_t> data = build_deferral_case(&target);

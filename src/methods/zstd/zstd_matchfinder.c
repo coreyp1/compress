@@ -416,11 +416,55 @@ static void zstd_mf_plan(const zstd_effort_t * effort, size_t window_size,
   plan->hash_log = hash_log;
   plan->hash_size = (size_t)1 << hash_log;
 
-  // The chain table is indexed by position in the match finder's window, and
-  // that window now holds the history carried across blocks as well as the
-  // block being compressed.  Sizing it to one block, as it was, meant no
-  // position past the first 128 KB could be chained at all.
-  plan->chain_size = (size_t)window_size + ZSTD_BLOCK_SIZE_MAX;
+  // The chain is a ring indexed by absolute position, so its size is a power
+  // of two, and a match may only reach back less far than that: two positions
+  // that far apart share a slot and the older one's entry is gone.
+  //
+  // Sized from the WINDOW, rounded UP, which is not the same as rounding the
+  // window plus a block DOWN.  For a declared window -- itself a power of two
+  // -- the two agree and the ring is exactly the window, costing one byte of
+  // reach (zstd_mf_max_offset()) and slightly less memory than the flat table
+  // it replaces: at level 7, 8 MiB against 8.5.  For a window that is NOT a
+  // power of two they do not agree at all, and rounding down is the wrong one.
+  // mf_window_max is the declared window clamped to the content size when that
+  // is known (zstd_encoder.c), so an 825,336-byte input gets an 825,336-byte
+  // window: rounding 956,408 down gives 524,288 and halves the reach, where
+  // rounding the window up gives 1,048,576 and keeps all of it.
+  //
+  // WHY NOT LARGER STILL
+  //
+  // A ring of window + one block would alias nothing at all: positions that
+  // share a slot are exactly chain_size apart, and the buffer holds a window
+  // plus a block.  Built that way the output is byte for byte what the flat
+  // table produced, on every one of the 96 chain-level cases in the corpus --
+  // which is how the rewrite above was shown to preserve behaviour.  It is
+  // not what is built, because for a power-of-two window it rounds to twice
+  // the window: 16 MiB at level 8 against 8.
+  //
+  // The byte it costs instead is the offset exactly equal to the window.
+  // Nothing closer is lost: zstd_mf_max_offset() stops one short of the ring,
+  // and a candidate within that bound cannot have had its slot overwritten,
+  // because whatever would overwrite it sits chain_size further on and has
+  // not been reached yet.  Across the corpus that byte changed the output in
+  // 5 cases of 132 and made it smaller in all five.
+  //
+  // The cap is the tree's, for the reason the tree has one: a declared window
+  // is a promise to the decoder about how much history it must keep (RFC 8878
+  // section 3.1.1.1.2), not an undertaking to search all of it.  No level that
+  // uses the chain declares a window anywhere near it, but zstd.window_log is
+  // the caller's to set.
+  {
+    size_t n = 1;
+    while (n < window_size && n < MF_BT_MAX_ENTRIES) {
+      n <<= 1;
+    }
+    if (n < ZSTD_BLOCK_SIZE_MAX) {
+      // A window smaller than a block still has a whole block of positions
+      // live at once, and every one of them needs a slot of its own.
+      n = ZSTD_BLOCK_SIZE_MAX;
+    }
+    plan->chain_size = n;
+  }
 
   // How far back the tree can reach, and what it costs.
   //
@@ -524,6 +568,7 @@ gcomp_status_t zstd_mf_init(zstd_match_finder_t * mf,
   mf->lazy_depth = effort->lazy_depth;
   mf->nice_length = effort->nice_length;
   mf->chain_size = plan.chain_size;
+  mf->chain_mask = plan.chain_size - 1u;
 
   mf->use_bt = effort->use_bt;
   mf->use_opt = effort->use_opt;
@@ -750,25 +795,24 @@ static bool zstd_mf_find_match(zstd_match_finder_t * mf, const uint8_t * data,
     return false;
   }
 
-  // Hash the current position
+  // Hash the current position.  Positions are absolute here, as they are in
+  // the tree: see hash_table in zstd_internal.h.  The window position is what
+  // indexes `data`, the absolute one is what the tables hold, and the two
+  // differ by base_pos.
+  const size_t cur_abs = mf->base_pos + pos;
   uint32_t hash = zstd_mf_hash4(data + pos, mf->hash_log);
-  uint32_t chain_pos = mf->hash_table[hash];
+  uint32_t chain_entry = mf->hash_table[hash];
 
   if (insert) {
-    // Update hash table with current position (for future references)
-    mf->hash_table[hash] = (uint32_t)(pos + 1); // +1 so 0 means "no entry"
-
-    // Update chain table
-    if (pos < mf->chain_size) {
-      mf->chain_table[pos] = chain_pos;
-    }
+    mf->hash_table[hash] = (uint32_t)(cur_abs + 1u); // +1 so 0 means "none"
+    mf->chain_table[cur_abs & mf->chain_mask] = chain_entry;
   }
 
   // No previous position at this hash
-  if (chain_pos == 0) {
+  if (chain_entry == 0) {
     return false;
   }
-  chain_pos--; // Convert back from 1-based to 0-based
+  size_t m_abs = (size_t)chain_entry - 1u; // back from 1-based
 
   // Search the chain for best match
   size_t best_len = MF_MIN_MATCH - 1;
@@ -787,14 +831,18 @@ static bool zstd_mf_find_match(zstd_match_finder_t * mf, const uint8_t * data,
   // so rather than measuring each candidate's offset against that limit, the
   // limit becomes the earliest position worth looking at.
   //
-  // The test that the offset does not exceed `pos` is gone with it.  The loop
-  // runs only while chain_pos < pos, so pos - chain_pos is at most pos and
-  // that comparison could never have been true.
-  size_t max_offset = mf->window_size;
-  if (max_offset > MF_MAX_DISTANCE) {
-    max_offset = MF_MAX_DISTANCE;
+  // base_pos is the floor under that: a position before it is not in the
+  // buffer at all, whatever the window would allow.  It is also what retires
+  // the entries a slide left behind - they sit below it, and the walk stops
+  // at them, which prunes the chain rather than corrupting it.
+  //
+  // The test that the offset does not exceed the current position is gone
+  // with it.  The loop runs only while m_abs < cur_abs.
+  const size_t max_offset = zstd_mf_max_offset(mf);
+  size_t min_abs = mf->base_pos;
+  if (cur_abs > max_offset && cur_abs - max_offset > min_abs) {
+    min_abs = cur_abs - max_offset;
   }
-  const size_t min_chain_pos = (pos > max_offset) ? (pos - max_offset) : 0u;
 
   // The first byte of the position being matched never changes.  The byte one
   // past the best match so far, and whether it is inside the buffer at all,
@@ -804,23 +852,22 @@ static bool zstd_mf_find_match(zstd_match_finder_t * mf, const uint8_t * data,
   bool probe_ok = (pos + best_len < data_size);
   uint8_t probe_byte = probe_ok ? data[pos + best_len] : 0u;
 
-  while (depth > 0 && chain_pos < pos) {
-    if (chain_pos < min_chain_pos) {
+  while (depth > 0 && m_abs < cur_abs) {
+    if (m_abs < min_abs) {
       break;
     }
+    const size_t m = m_abs - mf->base_pos; // where it sits in `data`
 
     // Quick check: compare first and last bytes before full comparison.
-    // chain_pos < pos and pos + best_len < data_size together keep the
-    // second read inside the buffer.
-    if (probe_ok && data[chain_pos] == cur_byte &&
-        data[chain_pos + best_len] == probe_byte) {
+    // m < pos and pos + best_len < data_size together keep the second read
+    // inside the buffer.
+    if (probe_ok && data[m] == cur_byte && data[m + best_len] == probe_byte) {
       // Count matching bytes
-      size_t match_len =
-          zstd_mf_count_match(data + pos, data + chain_pos, limit);
+      size_t match_len = zstd_mf_count_match(data + pos, data + m, limit);
 
       if (match_len > best_len) {
         best_len = match_len;
-        best_offset = pos - chain_pos;
+        best_offset = pos - m;
 
         // A match this long is taken as it stands; see nice_length.
         if (match_len >= mf->nice_length) {
@@ -832,16 +879,11 @@ static bool zstd_mf_find_match(zstd_match_finder_t * mf, const uint8_t * data,
     }
 
     // Follow chain
-    if (chain_pos < mf->chain_size) {
-      uint32_t next = mf->chain_table[chain_pos];
-      if (next == 0 || next - 1 >= chain_pos) {
-        break; // End of chain or invalid
-      }
-      chain_pos = next - 1;
+    uint32_t next = mf->chain_table[m_abs & mf->chain_mask];
+    if (next == 0 || next - 1u >= m_abs) {
+      break; // End of chain or invalid
     }
-    else {
-      break;
-    }
+    m_abs = (size_t)next - 1u;
 
     depth--;
   }
@@ -858,11 +900,16 @@ static bool zstd_mf_find_match(zstd_match_finder_t * mf, const uint8_t * data,
   // The links are the same chain_table: every link from a dictionary position
   // points at an earlier dictionary position, because the dictionary was
   // indexed before anything else was.  Walking stops at dict_end for the same
-  // reason it stops at min_chain_pos - beyond it is not this dictionary.
-  if (mf->dict_hash_table && mf->dict_end > 0 && pos >= mf->dict_end) {
+  // reason it stops at min_abs - beyond it is not this dictionary.
+  //
+  // dict_end is absolute too, so a slide neither moves it nor switches it
+  // off.  Once the dictionary has gone off the front of the buffer, min_abs
+  // is above every position in it and the walk below ends on its first test,
+  // which is the same answer the old countdown to zero gave.
+  if (mf->dict_hash_table && mf->dict_end > 0 && cur_abs >= mf->dict_end) {
     uint32_t dict_chain = mf->dict_hash_table[hash];
     if (dict_chain != 0) {
-      size_t dict_pos = dict_chain - 1u;
+      size_t dict_abs = (size_t)dict_chain - 1u;
       // A budget of its own, and a floor under it.  The level's own
       // search_depth is what the stream deserves; the dictionary is not the
       // stream.  A caller who supplied one has said this content matters, and
@@ -877,15 +924,15 @@ static bool zstd_mf_find_match(zstd_match_finder_t * mf, const uint8_t * data,
       unsigned dict_depth = mf->search_depth < ZSTD_MF_DICT_MIN_DEPTH
           ? (unsigned)ZSTD_MF_DICT_MIN_DEPTH
           : mf->search_depth;
-      while (dict_depth > 0 && dict_pos < mf->dict_end &&
-          dict_pos >= min_chain_pos) {
-        if (probe_ok && data[dict_pos] == cur_byte &&
-            data[dict_pos + best_len] == probe_byte) {
-          size_t match_len =
-              zstd_mf_count_match(data + pos, data + dict_pos, limit);
+      while (dict_depth > 0 && dict_abs < mf->dict_end
+          && dict_abs >= min_abs) {
+        const size_t d = dict_abs - mf->base_pos;
+        if (probe_ok && data[d] == cur_byte
+            && data[d + best_len] == probe_byte) {
+          size_t match_len = zstd_mf_count_match(data + pos, data + d, limit);
           if (match_len > best_len) {
             best_len = match_len;
-            best_offset = pos - dict_pos;
+            best_offset = pos - d;
             if (match_len >= mf->nice_length) {
               break;
             }
@@ -893,14 +940,11 @@ static bool zstd_mf_find_match(zstd_match_finder_t * mf, const uint8_t * data,
             probe_byte = probe_ok ? data[pos + best_len] : 0u;
           }
         }
-        if (dict_pos >= mf->chain_size) {
+        uint32_t next = mf->chain_table[dict_abs & mf->chain_mask];
+        if (next == 0 || next - 1u >= dict_abs) {
           break;
         }
-        uint32_t next = mf->chain_table[dict_pos];
-        if (next == 0 || next - 1 >= dict_pos) {
-          break;
-        }
-        dict_pos = next - 1u;
+        dict_abs = (size_t)next - 1u;
         dict_depth--;
       }
     }
@@ -973,8 +1017,12 @@ static bool zstd_mf_find_match(zstd_match_finder_t * mf, const uint8_t * data,
  * the walk stops at them, which prunes the tree rather than corrupting it:
  * fewer candidates, never wrong ones.
  *
- * No two positions that are live at once can share a pair of slots, because
- * that would need them to be bt_size apart and the buffer is not that wide.
+ * Two positions that are live at once CAN share a pair of slots: they need to
+ * be bt_size apart, and bt_size is the window rounded down while the buffer is
+ * the window plus a block.  What makes that harmless is the reach bound, not
+ * the width -- zstd_mf_max_offset() stops one short of bt_size, so whatever
+ * would overwrite a candidate's slot lies further on than the descent has
+ * reached.  The chain is safe for the same reason and says so at its ring.
  */
 static inline size_t zstd_mf_bt_descend(zstd_match_finder_t * mf,
     const uint8_t * data, size_t pos, size_t data_size,
@@ -1184,13 +1232,14 @@ void zstd_mf_insert_one(zstd_match_finder_t * mf, const uint8_t * data,
     return;
   }
 
+  // Absolute, like the tree's; see hash_table in zstd_internal.h.  Every
+  // position has a slot in the ring, where the buffer-relative form chained
+  // nothing past chain_size.
+  const size_t cur_abs = mf->base_pos + pos;
   uint32_t hash = zstd_mf_hash4(data + pos, mf->hash_log);
   uint32_t prev = mf->hash_table[hash];
-  mf->hash_table[hash] = (uint32_t)(pos + 1);
-
-  if (pos < mf->chain_size) {
-    mf->chain_table[pos] = prev;
-  }
+  mf->hash_table[hash] = (uint32_t)(cur_abs + 1u);
+  mf->chain_table[cur_abs & mf->chain_mask] = prev;
 }
 
 void zstd_mf_slide(zstd_match_finder_t * mf, size_t shift) {
@@ -1198,66 +1247,25 @@ void zstd_mf_slide(zstd_match_finder_t * mf, size_t shift) {
     return;
   }
 
-  // The tree names positions from the start of the stream, so moving the
-  // window changes only where data[0] sits in it.  Entries that have fallen
-  // out of the buffer are behind the new base and the walk stops at them;
-  // nothing has to be rewritten, which is the whole reason the tree counts
-  // this way.  The chain below names positions in the buffer instead, and
-  // has to move every entry it holds.
-  // The long-distance index counts absolutely too, for the same reason, and
-  // it must move whether or not this level uses the tree.
+  // Every position either finder holds is counted from the start of the
+  // stream, so moving the window changes only where data[0] sits in it.
+  // Nothing in the tables has to be rewritten: entries that have fallen out
+  // of the buffer are behind the new base and every walk stops at them.
+  //
+  // The chain used to name positions in the buffer instead, and so had to
+  // move every entry it held - a pass over the hash table, a pass over the
+  // chain table, and a third over the dictionary heads, per block once the
+  // window was full. On 4.7 MB of C source that was 12.0% of level 1 and 9.7%
+  // of level 3, none of it spent looking for a match. The ring in
+  // zstd_internal.h is what replaced it.
+  //
+  // The long-distance index counts absolutely too, but holds its own base,
+  // so it is told separately.
   if (mf->ldm) {
     zstd_ldm_slide(mf->ldm, shift);
   }
 
-  if (mf->use_bt) {
-    mf->base_pos += shift;
-    return;
-  }
-
-  // Entries name positions in the window, so moving the window moves every
-  // entry with it.  A position that falls off the front is dropped: the byte
-  // it named is no longer there to match against.  Zero means "no entry", so
-  // it is both the empty value and what a dropped entry becomes.
-  for (size_t i = 0; i < mf->hash_size; i++) {
-    uint32_t v = mf->hash_table[i];
-    mf->hash_table[i] = (v > shift) ? (uint32_t)(v - shift) : 0u;
-  }
-
-  // The dictionary heads name window positions too, so they move with
-  // everything else.  Once the last of the dictionary has gone off the front
-  // the decoder cannot reach it either - a sequence may not point past the
-  // declared window (RFC 8878 section 3.1.1.1.2) - so the shortcut is
-  // switched off rather than left pointing at bytes that are no longer there.
-  if (mf->dict_hash_table) {
-    if (mf->dict_end > shift) {
-      mf->dict_end -= shift;
-      for (size_t i = 0; i < mf->hash_size; i++) {
-        uint32_t v = mf->dict_hash_table[i];
-        mf->dict_hash_table[i] = (v > shift) ? (uint32_t)(v - shift) : 0u;
-      }
-    }
-    else {
-      mf->dict_end = 0;
-    }
-  }
-
-  if (shift >= mf->chain_size) {
-    memset(mf->chain_table, 0, mf->chain_size * sizeof(uint32_t));
-    return;
-  }
-  // Moving the entries down and rebasing them are one pass, not two.  Done
-  // separately -- a memmove and then a loop over what it had just written --
-  // the chain table was read and written twice over, and it is the larger of
-  // the two tables: a window plus a block, four bytes an entry.  Entry i of
-  // the result depends only on entry i + shift of the input and i < i + shift,
-  // so a forward pass reads each entry before anything overwrites it.
-  size_t kept = mf->chain_size - shift;
-  for (size_t i = 0; i < kept; i++) {
-    uint32_t v = mf->chain_table[i + shift];
-    mf->chain_table[i] = (v > shift) ? (uint32_t)(v - shift) : 0u;
-  }
-  memset(mf->chain_table + kept, 0, shift * sizeof(uint32_t));
+  mf->base_pos += shift;
 }
 
 void zstd_mf_note_dictionary(zstd_match_finder_t * mf,
@@ -1287,7 +1295,12 @@ void zstd_mf_note_dictionary(zstd_match_finder_t * mf,
   }
   memcpy(mf->dict_hash_table, mf->hash_table,
       mf->hash_size * sizeof(uint32_t));
-  mf->dict_end = dict_end;
+  // The caller counts from the front of the buffer; everything stored here
+  // counts from the start of the stream.  They agree only while base_pos is
+  // zero, which is when a dictionary is normally indexed - so converting is
+  // a no-op today and stops being one the moment a caller indexes one after
+  // a slide.
+  mf->dict_end = mf->base_pos + dict_end;
 }
 
 void zstd_mf_index_range(zstd_match_finder_t * mf, const uint8_t * data,
