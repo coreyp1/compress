@@ -15,7 +15,6 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -96,8 +95,13 @@ static int write_file(const char * path, const uint8_t * data, size_t size) {
   // GCU_FILE_SYNC_NONE is the right end of file.h's trade: the rename is
   // still atomic, so a re-run interrupted halfway cannot leave a fuzzer
   // reading a half-written seed.
-  GCU_File_Result r =
-      gcu_file_write_atomic(path, data, size, GCU_FILE_SYNC_NONE, NULL);
+  //
+  // GCU_FILE_PERMS_DEFAULT because a seed is read by people and committed:
+  // it should look like every other file in the tree, not like the temporary
+  // it was renamed from.  The owner-only default this parameter replaced is
+  // still visible in a few of fuzz/regression's working-tree modes.
+  GCU_File_Result r = gcu_file_write_atomic(
+      path, data, size, GCU_FILE_SYNC_NONE, GCU_FILE_PERMS_DEFAULT, NULL);
   if (r != GCU_FILE_OK) {
     fprintf(stderr, "Error: cannot write %s: %s\n", path,
         gcu_file_result_string(r));

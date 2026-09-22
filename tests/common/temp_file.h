@@ -64,7 +64,8 @@ public:
     // abort path here.  SYNC_NONE because this is scratch that every run
     // regenerates; file.h reserves the durable default for bytes that cannot
     // be remade.
-    if (gcu_file_temp_commit(&temp, dest.c_str(), GCU_FILE_SYNC_NONE)
+    if (gcu_file_temp_commit(
+            &temp, dest.c_str(), GCU_FILE_SYNC_NONE, GCU_FILE_PERMS_PRIVATE)
         != GCU_FILE_OK) {
       return;
     }
@@ -94,8 +95,8 @@ public:
     if (path_.empty()) {
       return false;
     }
-    return gcu_file_write_atomic(
-               path_.c_str(), data, len, GCU_FILE_SYNC_NONE, nullptr)
+    return gcu_file_write_atomic(path_.c_str(), data, len,
+               GCU_FILE_SYNC_NONE, GCU_FILE_PERMS_PRIVATE, nullptr)
         == GCU_FILE_OK;
   }
 
@@ -179,7 +180,8 @@ inline std::string uniqueTempPath(
     return {};
   }
   std::string dest = std::string(gcu_file_temp_path(&temp)) + suffix;
-  if (gcu_file_temp_commit(&temp, dest.c_str(), GCU_FILE_SYNC_NONE)
+  if (gcu_file_temp_commit(
+          &temp, dest.c_str(), GCU_FILE_SYNC_NONE, GCU_FILE_PERMS_PRIVATE)
       != GCU_FILE_OK) {
     return {};
   }
@@ -190,7 +192,7 @@ inline std::string uniqueTempPath(
 inline bool writeWholeFile(
     const std::string & path, const std::vector<uint8_t> & data) {
   return gcu_file_write_atomic(path.c_str(), data.data(), data.size(),
-             GCU_FILE_SYNC_NONE, nullptr)
+             GCU_FILE_SYNC_NONE, GCU_FILE_PERMS_PRIVATE, nullptr)
       == GCU_FILE_OK;
 }
 
