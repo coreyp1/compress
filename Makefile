@@ -157,6 +157,42 @@ CFLAGS := -pedantic-errors -Wall -Wextra -Werror -Wno-error=unused-function -Wfa
 # nothing else. Tests reach the internals by linking the static archive, which
 # a static link can do even for hidden symbols.
 LIB_CFLAGS := $(CFLAGS) -fvisibility=hidden -DGCOMP_BUILD $(EXTRA_CFLAGS)
+# ---------------------------------------------------------------------------
+# Goals that need no dependency
+#
+# The pkg-config check below is an $(error), and make evaluates that while it
+# reads this file - before it has decided which target to build. So it fires
+# for `make clean` too, and a tree whose prefix has since moved cannot be
+# cleaned: clean exits 2 having removed nothing, and the message tells you to
+# run bootstrap.sh, which is confusing when bootstrap.sh is what invoked it.
+# Removing nothing is the harmful part - `clean` is least able to run in
+# exactly the situation that makes someone type it.
+#
+# These goals read no header and link no library, so the check is skipped when
+# every goal named is one of them.
+#
+# uninstall is here because it finds what it removes through PREFIX and asks
+# pkg-config nothing, so needing cutil in order to REMOVE this library is the
+# same defect as needing it to clean - and worse, because something is already
+# broken by the time anyone types it. uninstall-debug has to be listed beside
+# it: the recipe is `make uninstall BUILD=debug`, so the outer invocation is
+# the one that parses this file first, and it would fail before the inner ran.
+#
+# Deliberately not here: check-symbols and coverage, which build the library
+# before they can say anything.
+#
+# `$(or $(MAKECMDGOALS),all)` is load-bearing. A bare `make` names no goal, so
+# MAKECMDGOALS is empty, and $(filter-out ...) of an empty list is empty -
+# which would skip the check in the one case it exists for. Substituting the
+# default goal gives filter-out something that is not in the list.
+#
+# check-clean-guard tests both directions; it is in TEST_GATES.
+# ---------------------------------------------------------------------------
+DEPLESS_GOALS := clean cloc docs docs-pdf help fuzz-help sanitizer-help uninstall uninstall-debug
+ifeq ($(filter-out $(DEPLESS_GOALS),$(or $(MAKECMDGOALS),all)),)
+SKIP_DEP_CHECK := 1
+endif
+
 # cutil, found through pkg-config. The name carries the branch, which is how a
 # consumer picks a version; CUTIL_PC is overridable so this library can be
 # built against a cutil on a different branch from its own.
@@ -164,7 +200,9 @@ CUTIL_PC ?= ghoti.io-cutil$(BRANCH)
 CUTIL_CFLAGS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --cflags $(CUTIL_PC) 2>/dev/null)
 CUTIL_LIBS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs $(CUTIL_PC) 2>/dev/null)
 ifeq ($(strip $(CUTIL_CFLAGS)),)
+ifndef SKIP_DEP_CHECK
 $(error ghoti.io-cutil was not found by pkg-config. Run ./bootstrap.sh in the parent folder to build and install the suite into a local prefix, then pass the same PREFIX here - or point PKG_CONFIG_PATH at the directory holding its .pc file. There is deliberately no sibling-checkout fallback: a second resolution path that only in-tree builds exercise is one that silently rots.)
+endif
 endif
 LDFLAGS := -L /usr/lib -lstdc++ -lm $(CUTIL_LIBS) -lpthread $(EXTRA_LDFLAGS)
 ifdef PREFIX
@@ -220,7 +258,7 @@ TESTFLAGS := `PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs --cfla
 # coverage target does, because --coverage links the gcov runtime, whose
 # mangle_path check-symbols is right to reject in a shipping library and
 # wrong to reject in an instrumented one. Spelled as text's TEST_GATES is.
-TEST_GATES ?= check-symbols
+TEST_GATES ?= check-symbols check-clean-guard
 
 
 # Valgrind flags (exclude "still reachable" as it's not a leak)
@@ -594,7 +632,7 @@ FUZZ_DEPFILES := $(patsubst fuzz/%.c,$(APP_DIR)/fuzz/%.d,$(FUZZ_SOURCES))
 ####################################################################
 
 # General commands
-.PHONY: clean cloc docs docs-pdf examples bench bench-deflate coverage check-symbols
+.PHONY: clean cloc docs docs-pdf examples bench bench-deflate coverage check-symbols check-clean-guard
 # Release build commands
 .PHONY: all install test test-quiet test-valgrind test-valgrind-quiet test-watch uninstall watch
 # Debug build commands
@@ -1309,6 +1347,78 @@ ifeq ($(OS_NAME), Linux)
 else
 	@printf "check-symbols: skipped (Linux only)\n"
 endif
+
+####################################################################
+# Dependency-check guard
+####################################################################
+
+check-clean-guard: ## Fail if the pkg-config check gates the wrong goals
+# Both directions, because either one alone passes for the wrong reason.
+#
+# Without SKIP_DEP_CHECK, `clean` inherits the $(error) that make evaluates
+# while reading this file, so it exits 2 having removed nothing - and a clean
+# that removed nothing looks exactly like a clean that had nothing to remove.
+# With SKIP_DEP_CHECK set for every goal, the check never fires at all, and a
+# build against a missing dependency fails later in the compiler, complaining
+# about a header rather than about the prefix. With the suite installed those
+# two states are indistinguishable, which is why "clean works now" is not a
+# test of this.
+#
+# CUTIL_PC names a package that cannot exist, so this asks the question
+# without depending on what happens to be installed: no PKG_CONFIG_PATH to
+# unset, nothing to move out of the way, and the same answer on a machine
+# where the real cutil sits in /usr/lib. -n throughout, so the goals that
+# delete things evaluate this file without acting on it.
+#
+# The exempt half drives itself from DEPLESS_GOALS rather than a second copy
+# of the list, so a goal added there cannot go untested.
+#
+# Three of the checked goals are chosen rather than obvious:
+#
+#   _none_      names NO goal. This is what proves $(or $(MAKECMDGOALS),all)
+#               is live: written $(filter-out $(DEPLESS_GOALS),$(MAKECMDGOALS))
+#               an empty goal list filters to empty and skips the check - and
+#               every other spelling here passes anyway, because each names a
+#               goal, which is exactly what that broken form handles.
+#   clean+all   a mixed goal line. filter-out leaves `all`, so the check must
+#               still fire even though `clean` alone is exempt.
+#   fuzz-corpus links generate_corpus outside LDFLAGS, so it reaches cutil by
+#               a route the rest of this file does not describe. It must not
+#               become reachable from a listed goal.
+	@absent=ghoti.io-no-such-package-0; \
+		refused=""; \
+		for goal in $(DEPLESS_GOALS); do \
+			$(MAKE) -n -f $(firstword $(MAKEFILE_LIST)) $$goal CUTIL_PC=$$absent \
+				>/dev/null 2>&1 || refused="$$refused $$goal"; \
+		done; \
+		if [ -n "$$refused" ]; then \
+			printf "\033[0;31m\n### goals in DEPLESS_GOALS that need a dependency ###\033[0m\n" >&2; \
+			printf "%s\n" "$$refused" >&2; \
+			printf "\nThese failed with no cutil present, so the \$$(error) still\n" >&2; \
+			printf "reaches them - and each exits having done nothing, which reads\n" >&2; \
+			printf "as success. Check the ifndef SKIP_DEP_CHECK wrapper.\n" >&2; \
+			exit 1; \
+		fi; \
+		unchecked=""; \
+		for goal in _none_ all test install fuzz-build fuzz-corpus clean+all; do \
+			case $$goal in \
+				_none_) named="" ;; \
+				clean+all) named="clean all" ;; \
+				*) named=$$goal ;; \
+			esac; \
+			if $(MAKE) -n -f $(firstword $(MAKEFILE_LIST)) $$named CUTIL_PC=$$absent \
+				>/dev/null 2>&1; then unchecked="$$unchecked $$goal"; fi; \
+		done; \
+		if [ -n "$$unchecked" ]; then \
+			printf "\033[0;31m\n### goals that parsed with no dependency ###\033[0m\n" >&2; \
+			printf "%s\n" "$$unchecked" >&2; \
+			printf "\nThese succeeded with no cutil present. DEPLESS_GOALS is too\n" >&2; \
+			printf "wide, or \$$(or \$$(MAKECMDGOALS),all) lost its default - an empty\n" >&2; \
+			printf "goal list filters to empty and skips the check. _none_ alone\n" >&2; \
+			printf "catches that one; the named goals cannot see it.\n" >&2; \
+			exit 1; \
+		fi
+	@printf "\033[0;32mEvery dependency-free goal runs without one; every other goal is refused.\033[0m\n"
 
 test: ## Make and run the Unit tests
 test: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES) $(TEST_GATES)
