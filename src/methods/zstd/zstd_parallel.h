@@ -104,7 +104,7 @@ typedef struct {
   uint32_t max_in_flight;              ///< Max in-flight jobs (0 = default)
   uint64_t job_size;                   ///< Job size in bytes (0 = auto)
   bool checksum_enabled;               ///< Compute content checksums
-  int compression_level;               ///< Compression level (1-22)
+  int compression_level;               ///< Compression level (0-22)
   uint8_t window_log;                  ///< Window log (10-31)
   uint64_t max_memory_bytes;           ///< Memory limit
   const gcomp_allocator_t * allocator; ///< Allocator (NULL = default)

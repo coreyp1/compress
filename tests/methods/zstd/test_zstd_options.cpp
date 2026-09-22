@@ -196,14 +196,18 @@ TEST_F(ZstdOptionsTest, ValidLevelMax) {
   gcomp_options_destroy(opts);
 }
 
-TEST_F(ZstdOptionsTest, InvalidLevelZero) {
+// Zero was refused until it meant something.  It is the fast strategy now, so
+// this says so rather than being deleted: a level that the schema accepts and
+// that produces a stream which reads back.  InvalidLevelNegative below still
+// covers the bound, one further down.
+TEST_F(ZstdOptionsTest, LevelZeroIsAccepted) {
   gcomp_options_t * opts = nullptr;
   ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
   gcomp_options_set_int64(opts, "zstd.level", 0);
 
   gcomp_encoder_t * enc = nullptr;
-  EXPECT_EQ(gcomp_encoder_create(registry_, "zstd", opts, &enc),
-      GCOMP_ERR_INVALID_ARG);
+  EXPECT_EQ(gcomp_encoder_create(registry_, "zstd", opts, &enc), GCOMP_OK);
+  gcomp_encoder_destroy(enc);
   gcomp_options_destroy(opts);
 }
 

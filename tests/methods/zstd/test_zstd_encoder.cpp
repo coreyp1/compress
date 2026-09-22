@@ -85,10 +85,14 @@ TEST_F(ZstdEncoderTest, EncodeEmpty) {
   EXPECT_EQ(gcomp_encoder_finish(enc, &ob), GCOMP_OK);
 }
 
+// Zero used to be the example of an invalid level here.  It is the fast
+// strategy now (ZSTD_LEVEL_MIN), so the case moved to the other end of the
+// range rather than being deleted -- the schema still has two bounds and both
+// are worth a test.
 TEST_F(ZstdEncoderTest, CreateWithInvalidLevel) {
   gcomp_options_t * opts = nullptr;
   ASSERT_EQ(gcomp_options_create(&opts), GCOMP_OK);
-  gcomp_options_set_int64(opts, "zstd.level", 0);
+  gcomp_options_set_int64(opts, "zstd.level", ZSTD_LEVEL_MAX + 1);
   gcomp_encoder_t * enc = nullptr;
   EncoderGuard enc_guard(enc);
   EXPECT_EQ(gcomp_encoder_create(registry_, "zstd", opts, &enc),

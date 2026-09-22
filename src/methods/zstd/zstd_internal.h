@@ -136,7 +136,19 @@ extern "C" {
 #define ZSTD_DECODE_SLACK GCOMP_FASTCOPY_SLACK
 
 // Compression level constraints
-#define ZSTD_LEVEL_MIN 1     ///< Minimum compression level
+/**
+ * @brief Lowest compression level.
+ *
+ * Zero is the fast strategy: one hash probe, no chain, and positions skipped
+ * on a miss.  It was refused by the option schema until it meant something,
+ * so nothing that used to work now means something else.
+ *
+ * libzstd spells this differently -- there level 0 means "use the default"
+ * and the fast modes are negative.  This library has no use for a spelling
+ * of "default" (the option carries its own, applied when it is absent), so
+ * zero is spent on the strategy instead.
+ */
+#define ZSTD_LEVEL_MIN 0
 #define ZSTD_LEVEL_MAX 22    ///< Maximum compression level
 #define ZSTD_LEVEL_DEFAULT 3 ///< Default compression level
 
@@ -327,6 +339,16 @@ typedef struct {
    */
   unsigned fill_dense;
   unsigned fill_sparse;
+
+  /**
+   * @brief One hash probe and no chain: the level 0 strategy.
+   *
+   * The chain levels keep two structures -- a head per hash and a link per
+   * position -- and walk the links.  This keeps only the heads, so an
+   * insertion is one store rather than two and a search is one probe rather
+   * than a walk, and @ref chain_table is not allocated at all.
+   */
+  unsigned use_fast;
   size_t window_size;     ///< Window size for match offsets
 
   // Binary tree match finder, used instead of the chain at the levels whose
@@ -867,7 +889,7 @@ uint32_t zstd_window_log_to_size(uint8_t window_log);
 /**
  * @brief Get window log from compression level.
  *
- * @param level Compression level (1-22)
+ * @param level Compression level (0-22)
  * @return Appropriate window log
  */
 uint8_t zstd_level_to_window_log(int level);

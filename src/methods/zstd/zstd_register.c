@@ -40,7 +40,7 @@
  * ## Options
  *
  * Zstd-specific options use the `zstd.*` prefix:
- * - `zstd.level`: Compression level (1-22)
+ * - `zstd.level`: Compression level (0-22; 0 is the fast strategy)
  * - `zstd.checksum`: Enable content checksum
  * - `zstd.window_log`: Window log (10-31, or 0 for auto)
  * - `zstd.content_size`: Content size for header (optional)
@@ -74,7 +74,7 @@
 //
 
 static const gcomp_option_schema_t g_zstd_option_schemas[] = {
-    // zstd.level - Compression level (1-22)
+    // zstd.level - Compression level (0-22; 0 is the fast strategy)
     {
         "zstd.level",                // key
         GCOMP_OPT_INT64,             // type
@@ -86,7 +86,7 @@ static const gcomp_option_schema_t g_zstd_option_schemas[] = {
         ZSTD_LEVEL_MAX,              // max_int
         0,                           // min_uint
         0,                           // max_uint
-        "Compression level (1-22, higher = better compression)", // help
+        "Compression level (0-22; 0 favours speed, higher = better compression)", // help
         NULL, // allowed
     },
     // zstd.checksum - Enable content checksum

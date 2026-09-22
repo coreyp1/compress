@@ -132,6 +132,9 @@
 
 /// Most positions the binary tree will hold: two slots of four bytes each,
 /// so this is a 64 MiB ceiling on the tree.  See zstd_mf_init().
+/// How fast the fast strategy gives up on a run of misses; see the parse.
+#define ZSTD_MF_FAST_STEP_LOG 6u
+
 #define MF_BT_MAX_ENTRIES (8u * 1024u * 1024u)
 
 //
@@ -205,6 +208,7 @@ typedef struct {
   unsigned two_pass;     ///< Parse each sweep twice; see zstd_optimal.c.
   unsigned fill_dense;   ///< Positions after a match indexed one by one.
   unsigned fill_sparse;  ///< Stride for the rest of them.
+  unsigned use_fast;     ///< One hash probe and no chain; see level 0.
 } zstd_effort_t;
 
 /**
@@ -374,33 +378,34 @@ typedef struct {
 // here, because at level 1 a match is found at most positions; the cost is
 // what happens after one is found, not what happens when none is.
 static const zstd_effort_t k_zstd_effort[23] = {
-    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, // 0: unused
-    {12, 0, 128, 17, 0, 0, 0, 0, 0, 4, 16}, // 1: greedy, and fast because of it
-    {20, 1, 128, 17, 0, 0, 0, 0, 0, 4, 16}, // 2
-    {32, 1, 128, 18, 0, 0, 0, 0, 0, 16, 4}, // 3
-    {40, 1, 128, 18, 0, 0, 0, 0, 0, 16, 4}, // 4
-    {64, 1, 128, 18, 0, 0, 0, 0, 0, 16, 4}, // 5
-    {88, 1, 128, 18, 0, 0, 0, 0, 0, 16, 4}, // 6: the window steps to 2 MB next
-    {104, 1, 128, 18, 0, 0, 0, 0, 0, 16, 4}, // 7
-    {112, 2, 192, 18, 0, 0, 0, 0, 0, 64, 4}, // 8: last of the chain levels
-    {24, 2, 256, 17, 1, 0, 0, 0, 0, 0, 1}, // 9: first of the tree levels
-    {32, 2, 512, 17, 1, 0, 0, 0, 0, 0, 1}, // 10
-    {36, 0, 768, 17, 1, 1, 1024, 8, 0, 0, 1}, // 11: first of the optimal levels
-    {40, 0, 1024, 17, 1, 1, 1280, 12, 0, 0, 1}, // 12
-    {44, 0, 1280, 18, 1, 1, 1536, 16, 0, 0, 1}, // 13
-    {48, 0, 1536, 18, 1, 1, 2048, 24, 0, 0, 1}, // 14
-    {52, 0, 2048, 18, 1, 1, 2560, 32, 0, 0, 1}, // 15
-    {56, 0, 2560, 18, 1, 1, 3072, 48, 0, 0, 1}, // 16
-    {60, 0, 3072, 18, 1, 1, 4096, 64, 0, 0, 1}, // 17
-    {64, 0, 3584, 18, 1, 1, 5120, 96, 0, 0, 1}, // 18
-    {72, 0, 4096, 18, 1, 1, 6144, 128, 0, 0, 1}, // 19
-    {80, 0, 5120, 18, 1, 1, 8192, 192, 1, 0, 1}, // 20: parsed twice
-    {96, 0, 8192, 18, 1, 1, 12288, 320, 1, 0, 1}, // 21
-    {128, 0, 12288, 18, 1, 1, 16384, 512, 1, 0, 1} // 22
+    {1, 0, 64, 17, 0, 0, 0, 0, 0, 2, 4096, 1}, // 0: one probe, no chain -- see THE FAST STRATEGY
+    {12, 0, 128, 17, 0, 0, 0, 0, 0, 4, 16, 0}, // 1: greedy, and fast because of it
+    {20, 1, 128, 17, 0, 0, 0, 0, 0, 4, 16, 0}, // 2
+    {32, 1, 128, 18, 0, 0, 0, 0, 0, 16, 4, 0}, // 3
+    {40, 1, 128, 18, 0, 0, 0, 0, 0, 16, 4, 0}, // 4
+    {64, 1, 128, 18, 0, 0, 0, 0, 0, 16, 4, 0}, // 5
+    {88, 1, 128, 18, 0, 0, 0, 0, 0, 16, 4, 0}, // 6: the window steps to 2 MB next
+    {104, 1, 128, 18, 0, 0, 0, 0, 0, 16, 4, 0}, // 7
+    {112, 2, 192, 18, 0, 0, 0, 0, 0, 64, 4, 0}, // 8: last of the chain levels
+    {24, 2, 256, 17, 1, 0, 0, 0, 0, 0, 1, 0}, // 9: first of the tree levels
+    {32, 2, 512, 17, 1, 0, 0, 0, 0, 0, 1, 0}, // 10
+    {36, 0, 768, 17, 1, 1, 1024, 8, 0, 0, 1, 0}, // 11: first of the optimal levels
+    {40, 0, 1024, 17, 1, 1, 1280, 12, 0, 0, 1, 0}, // 12
+    {44, 0, 1280, 18, 1, 1, 1536, 16, 0, 0, 1, 0}, // 13
+    {48, 0, 1536, 18, 1, 1, 2048, 24, 0, 0, 1, 0}, // 14
+    {52, 0, 2048, 18, 1, 1, 2560, 32, 0, 0, 1, 0}, // 15
+    {56, 0, 2560, 18, 1, 1, 3072, 48, 0, 0, 1, 0}, // 16
+    {60, 0, 3072, 18, 1, 1, 4096, 64, 0, 0, 1, 0}, // 17
+    {64, 0, 3584, 18, 1, 1, 5120, 96, 0, 0, 1, 0}, // 18
+    {72, 0, 4096, 18, 1, 1, 6144, 128, 0, 0, 1, 0}, // 19
+    {80, 0, 5120, 18, 1, 1, 8192, 192, 1, 0, 1, 0}, // 20: parsed twice
+    {96, 0, 8192, 18, 1, 1, 12288, 320, 1, 0, 1, 0}, // 21
+    {128, 0, 12288, 18, 1, 1, 16384, 512, 1, 0, 1, 0} // 22
 };
 
 /// The sizes zstd_mf_plan() computes; see zstd_mf_memory_estimate().
 typedef struct {
+  unsigned use_fast;  ///< One hash probe and no chain.
   unsigned hash_log; ///< Log2 of the hash table size, clamped to the window.
   size_t hash_size;  ///< Hash table entries.
   size_t chain_size; ///< Chain table entries, when the level uses a chain.
@@ -412,8 +417,12 @@ typedef struct {
  * @brief The effort settings for @p level, clamped to the table.
  */
 static const zstd_effort_t * zstd_mf_effort(int level) {
-  if (level < 1) {
-    level = 3;
+  // Level 0 used to mean "the default", because the option schema refused it
+  // and nothing could ask for it.  It is the fast strategy now.  Anything
+  // below it is still a caller that bypassed validation, and still gets the
+  // default rather than an out-of-range read.
+  if (level < 0) {
+    level = ZSTD_LEVEL_DEFAULT;
   }
   if (level > 22) {
     level = 22;
@@ -571,6 +580,10 @@ static void zstd_mf_plan(const zstd_effort_t * effort, size_t window_size,
   // what fits in its budget and the frame stays exactly as valid.  Without
   // it the top levels, which declare a 32 MB window, asked for 536 MB
   // against a 256 MiB budget and simply failed to encode.
+  plan->use_fast = effort->use_fast;
+  if (plan->use_fast) {
+    plan->chain_size = 0;   // heads only; there are no links to hold
+  }
   plan->use_bt = effort->use_bt;
   plan->bt_size = 0;
   if (plan->use_bt) {
@@ -623,7 +636,7 @@ size_t zstd_mf_memory_estimate(int level, size_t window_size) {
       total += zstd_opt_memory_estimate(effort->opt_segment, effort->two_pass);
     }
   }
-  else {
+  else if (!plan.use_fast) {
     total += plan.chain_size * sizeof(uint32_t);
   }
   return total;
@@ -653,6 +666,7 @@ gcomp_status_t zstd_mf_init(zstd_match_finder_t * mf,
   mf->nice_length = effort->nice_length;
   mf->fill_dense = effort->fill_dense;
   mf->fill_sparse = effort->fill_sparse;
+  mf->use_fast = effort->use_fast;
   mf->chain_size = plan.chain_size;
   mf->chain_mask = plan.chain_size - 1u;
 
@@ -699,6 +713,12 @@ gcomp_status_t zstd_mf_init(zstd_match_finder_t * mf,
         return status;
       }
     }
+    return GCOMP_OK;
+  }
+
+  // The fast strategy keeps heads only, so there is no chain to allocate and
+  // the largest of the match finder's tables simply is not there.
+  if (mf->use_fast) {
     return GCOMP_OK;
   }
 
@@ -891,7 +911,9 @@ static bool zstd_mf_find_match(zstd_match_finder_t * mf, const uint8_t * data,
 
   if (insert) {
     mf->hash_table[hash] = (uint32_t)(cur_abs + 1u); // +1 so 0 means "none"
-    mf->chain_table[cur_abs & mf->chain_mask] = chain_entry;
+    if (!mf->use_fast) {
+      mf->chain_table[cur_abs & mf->chain_mask] = chain_entry;
+    }
   }
 
   // No previous position at this hash
@@ -964,7 +986,11 @@ static bool zstd_mf_find_match(zstd_match_finder_t * mf, const uint8_t * data,
       }
     }
 
-    // Follow chain
+    // Follow chain.  There is none for the fast strategy: the one candidate
+    // the head named is the whole of its search.
+    if (mf->use_fast) {
+      break;
+    }
     uint32_t next = mf->chain_table[m_abs & mf->chain_mask];
     if (next == 0 || next - 1u >= m_abs) {
       break; // End of chain or invalid
@@ -1325,7 +1351,9 @@ void zstd_mf_insert_one(zstd_match_finder_t * mf, const uint8_t * data,
   uint32_t hash = zstd_mf_hash4(data + pos, mf->hash_log);
   uint32_t prev = mf->hash_table[hash];
   mf->hash_table[hash] = (uint32_t)(cur_abs + 1u);
-  mf->chain_table[cur_abs & mf->chain_mask] = prev;
+  if (!mf->use_fast) {
+    mf->chain_table[cur_abs & mf->chain_mask] = prev;
+  }
 }
 
 void zstd_mf_slide(zstd_match_finder_t * mf, size_t shift) {
@@ -1615,7 +1643,12 @@ gcomp_status_t zstd_mf_generate_sequences(zstd_match_finder_t * mf,
         rep_try[2] = (rep[0] > 1u) ? (rep[0] - 1u) : 0u;
       }
 
-      if (match.length < mf->nice_length) {
+      // The repeat-offset probe costs three zstd_mf_count_match() calls at
+      // every match, and the fast strategy does not pay for it: on the corpus
+      // it is 10.5% of level 0's instructions for 0.42% of its size.  The
+      // levels that are competing on ratio keep it -- there it is worth far
+      // more than that, and the reasoning below is about them.
+      if (match.length < mf->nice_length && !mf->use_fast) {
         for (unsigned r = 0; r < 3u; r++) {
           const uint32_t roff = rep_try[r];
           if (roff == 0u || (size_t)roff > pos) {
@@ -1684,8 +1717,20 @@ gcomp_status_t zstd_mf_generate_sequences(zstd_match_finder_t * mf,
       lit_start = pos;
     }
     else {
-      // No match found, advance by one
-      pos++;
+      // No match found.  The chain levels advance by one: a match is found at
+      // most positions there, so the miss branch is cold and stepping over it
+      // measured 0.1% the WRONG way when it was tried at level 1.
+      //
+      // One probe misses far more often, and a miss costs a hash and a
+      // compare that bought nothing, so the fast strategy steps further the
+      // longer it has been failing.  The shift is over the literal run rather
+      // than a separate counter because that run IS how long it has been
+      // since a match: a step of 1 + (run >> 6) is one position per 64 bytes
+      // of literals, which costs nothing on matchable input and skips most of
+      // an incompressible stretch.
+      pos += mf->use_fast
+          ? (1u + ((pos - lit_start) >> ZSTD_MF_FAST_STEP_LOG))
+          : 1u;
     }
   }
 

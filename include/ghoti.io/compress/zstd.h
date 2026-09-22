@@ -32,7 +32,7 @@
  * - Full Zstandard frame format support (header + blocks + trailer)
  * - Content checksum support (xxHash64, low 32 bits)
  * - Content size field support
- * - Multiple compression levels (1-22)
+ * - Multiple compression levels (0-22; 0 is the fast strategy)
  * - Configurable window size
  * - Concatenated frame support
  * - Streaming with arbitrary input/output buffer sizes
@@ -71,7 +71,8 @@
  * ## Options
  *
  * Zstd-specific:
- * - `zstd.level` (int64, default 3): Compression level (1-22)
+ * - `zstd.level` (int64, default 3): Compression level (0-22). 0 is the fast
+ *   strategy: one hash probe and no chain, for throughput over ratio.
  * - `zstd.checksum` (bool, default false): Enable content checksum (xxHash64)
  * - `zstd.window_log` (uint64, default 0/auto): Window log (10-31, 0=auto)
  * - `zstd.dictionary` (bytes, optional): Raw or formatted dictionary (RFC 8878

@@ -1005,7 +1005,10 @@ TEST_F(ZstdMatchFinderTest, HigherLevelsDoNotProduceLargerOutput) {
 
   for (const std::vector<uint8_t> * in : {&small, &large}) {
     size_t previous = SIZE_MAX;
-    for (int level = 1; level <= 12; level++) {
+    // From 0, which is the fast strategy and the bottom of the ladder: it
+    // is allowed to be the largest, and not allowed to be smaller than a
+    // level that is supposed to try harder.
+    for (int level = 0; level <= 12; level++) {
       size_t size = EncodeAtLevel(*in, level).size();
       EXPECT_LE(size, previous)
           << "over " << in->size() << " bytes, level " << level
