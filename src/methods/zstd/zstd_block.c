@@ -137,9 +137,11 @@ gcomp_status_t zstd_block_decompress_compressed(zstd_decoder_state_t * state,
     return GCOMP_OK;
   }
 
-  // Allocate temporary buffer for literals
-  // Maximum literals size is the block size (128KB)
-  uint8_t * literals_buf = gcomp_malloc(state->allocator, ZSTD_BLOCK_SIZE_MAX);
+  // Allocate temporary buffer for literals.  Maximum literals size is the
+  // block size (128KB); the spare bytes past it are what the sequence loop
+  // reads when it overshoots the end of a literal run (fastcopy.h).
+  uint8_t * literals_buf =
+      gcomp_malloc(state->allocator, ZSTD_BLOCK_SIZE_MAX + ZSTD_DECODE_SLACK);
   if (!literals_buf) {
     return GCOMP_ERR_MEMORY;
   }

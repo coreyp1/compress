@@ -54,6 +54,7 @@
 
 #include "../../core/alloc_internal.h"
 #include "../../core/endian.h"
+#include "../../core/fastcopy.h"
 #include "../../core/registry_internal.h"
 #include <ghoti.io/cutil/safemath.h>
 #include "../../core/stream_internal.h"
@@ -118,6 +119,21 @@ extern "C" {
 
 // Block size constraints
 #define ZSTD_BLOCK_SIZE_MAX 131072 ///< Maximum block size (128 KB)
+
+/**
+ * @brief Spare bytes past the end of a decode buffer, for overshooting into.
+ *
+ * The sequence loop copies literals and matches with fixed-width moves and
+ * lets the excess fall past the length it was asked for; see fastcopy.h.  A
+ * buffer it writes to, and a buffer it reads from, is allocated this much
+ * larger than its capacity says, and the capacity itself does not count it -
+ * so every bound the decoder checks is the real one and the slack is only
+ * ever reached by an overshoot.
+ *
+ * The two buffers this applies to are zstd_decoder_state_t::output_buffer and
+ * the literals buffer in zstd_block_decompress_compressed().
+ */
+#define ZSTD_DECODE_SLACK GCOMP_FASTCOPY_SLACK
 
 // Compression level constraints
 #define ZSTD_LEVEL_MIN 1     ///< Minimum compression level
@@ -824,6 +840,12 @@ gcomp_status_t zstd_block_decompress_rle(const uint8_t * input,
 
 /**
  * @brief Decompress a compressed block.
+ *
+ * @p output must own @ref ZSTD_DECODE_SLACK writable bytes past
+ * @p output_cap, which the sequence loop overshoots its copies into; nothing
+ * that lands there is part of the result.  zstd_decoder_state_t::output_buffer
+ * is allocated that way.  The raw and RLE forms above have no such
+ * requirement.
  */
 gcomp_status_t zstd_block_decompress_compressed(zstd_decoder_state_t * state,
     const uint8_t * input, size_t input_len, uint8_t * output,
@@ -1184,11 +1206,16 @@ size_t zstd_literals_header_size(const uint8_t * src, size_t src_size);
  * @param src_size Source size
  * @param literals Decoded literals from literals section
  * @param literals_size Size of literals buffer
- * @param dst Destination buffer for output
- * @param dst_capacity Destination capacity
+ * @param dst Destination buffer for output, owning @ref ZSTD_DECODE_SLACK
+ *            writable bytes past @p dst_capacity for copies to overshoot into
+ * @param dst_capacity Destination capacity, not counting that slack
  * @param output_size_out Output: actual output size
  * @param bytes_read_out Output: bytes consumed from source
  * @return GCOMP_OK on success
+ *
+ * @p literals likewise owns @ref ZSTD_DECODE_SLACK readable bytes past
+ * @p literals_size, because a literal copy reads the same fixed width it
+ * writes.  See fastcopy.h for why the copies are shaped that way.
  */
 gcomp_status_t zstd_sequences_decode(zstd_decoder_state_t * state,
     const uint8_t * src, size_t src_size, const uint8_t * literals,

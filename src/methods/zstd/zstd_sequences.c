@@ -852,14 +852,16 @@ static gcomp_status_t zstd_sequences_execute(zstd_decoder_state_t * state,
       }
     }
 
-    // Copy literals
+    // Copy literals.  Both buffers carry ZSTD_DECODE_SLACK spare bytes past
+    // the capacities checked here, which is what lets this overshoot rather
+    // than pick a width by length; see fastcopy.h.
     if (lit_pos + literal_length > literals_size) {
       return GCOMP_ERR_CORRUPT;
     }
     if (out_pos + literal_length > dst_capacity) {
       return GCOMP_ERR_LIMIT;
     }
-    gcomp_copy_short(dst + out_pos, literals + lit_pos, literal_length);
+    gcomp_copy_slack(dst + out_pos, literals + lit_pos, literal_length);
     out_pos += literal_length;
     lit_pos += literal_length;
 
@@ -887,6 +889,10 @@ static gcomp_status_t zstd_sequences_execute(zstd_decoder_state_t * state,
     // as this used to, along with a circular index computation for every byte
     // that came from the window -- was the largest single cost in a
     // Zstandard decode.
+    //
+    // Only the first of those runs is the window's, and only a match near the
+    // start of a block has one at all.  The rest is the common case and is
+    // one call with no loop around it.
     size_t remaining_match = match_length;
 
     // The part that predates this block, taken from the circular window.
@@ -920,22 +926,19 @@ static gcomp_status_t zstd_sequences_execute(zstd_decoder_state_t * state,
     }
 
     // The rest comes from what this block has already written.  Source and
-    // destination are the same buffer, so a run stops at the distance between
-    // them; past that the copy would have to repeat what it just wrote.
-    while (remaining_match > 0u) {
-      if (actual_offset > out_pos) {
-        return GCOMP_ERR_CORRUPT; // Reaches back further than anything held.
-      }
-      size_t run = (actual_offset < remaining_match) ? (size_t)actual_offset
-                                                     : remaining_match;
-      if (actual_offset == 1u) {
-        memset(dst + out_pos, dst[out_pos - 1u], run);
-      }
-      else {
-        gcomp_copy_short(dst + out_pos, dst + out_pos - actual_offset, run);
-      }
-      out_pos += run;
-      remaining_match -= run;
+    // destination are the same buffer and the source may be the nearer of the
+    // two, so this is a repeat of a period rather than a copy, and
+    // gcomp_copy_repeat_slack() is the one that knows how to do that without
+    // splitting the length into runs of `actual_offset` bytes.
+    //
+    // The loop above leaves `actual_offset <= out_pos` whenever it leaves
+    // anything to do, which is the precondition that function asks for: it
+    // exits only when its own condition fails, and out_pos never shrinks.
+    // A match length is at least three (zstd_seq_ml_baseline), so there is
+    // never a zero-length repeat.
+    if (remaining_match > 0u) {
+      gcomp_copy_repeat_slack(dst + out_pos, actual_offset, remaining_match);
+      out_pos += remaining_match;
     }
   }
 

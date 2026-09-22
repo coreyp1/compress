@@ -211,15 +211,20 @@ gcomp_status_t zstd_decoder_init(gcomp_registry_t * registry,
   state->block_buffer_capacity = block_buffer_size;
   gcomp_memory_track_alloc(&state->mem_tracker, block_buffer_size);
 
-  // Allocate output buffer
+  // Allocate output buffer.  The sequence loop overshoots its copies, so the
+  // allocation carries ZSTD_DECODE_SLACK spare bytes that the capacity does
+  // not name; every bound the decoder checks is against the capacity, and
+  // the slack is only ever reached by an overshoot.
   size_t output_buffer_size = ZSTD_BLOCK_SIZE_MAX;
-  state->output_buffer = gcomp_malloc(alloc, output_buffer_size);
+  state->output_buffer =
+      gcomp_malloc(alloc, output_buffer_size + ZSTD_DECODE_SLACK);
   if (!state->output_buffer) {
     status = GCOMP_ERR_MEMORY;
     goto cleanup;
   }
   state->output_buffer_capacity = output_buffer_size;
-  gcomp_memory_track_alloc(&state->mem_tracker, output_buffer_size);
+  gcomp_memory_track_alloc(
+      &state->mem_tracker, output_buffer_size + ZSTD_DECODE_SLACK);
 
   // Check memory limits through the core helper; see zstd_encoder.c.
   if (gcomp_memory_check_limit(&state->mem_tracker, max_memory) != GCOMP_OK) {

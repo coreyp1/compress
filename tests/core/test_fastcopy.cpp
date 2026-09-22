@@ -15,6 +15,13 @@
  * memcpy over a buffer with poisoned margins on both sides, at several source
  * and destination alignments, and the margins are checked too.
  *
+ * The slack variants make the opposite promise: the bytes below `n` are what
+ * memcpy would have moved, and everything they write past that is within
+ * GCOMP_FASTCOPY_SLACK of it.  Both halves of that are checked here too --
+ * the second is what the zstd decoder's buffers are sized from, so a helper
+ * that overshoots further than it says would run off the end of an
+ * allocation rather than producing wrong output.
+ *
  * Copyright 2026 by Corey Pennycuff
  */
 
@@ -104,6 +111,129 @@ TEST(FastCopyTest, HandsLongCopiesOverUnchanged) {
       ASSERT_EQ(dst[i], kPoison) << "length " << len << " overran";
     }
   }
+}
+
+//
+// The slack variants
+//
+
+namespace {
+
+// What gcomp_copy_repeat_slack() has to reproduce: an LZ match copy, one
+// byte at a time, which is the definition rather than an implementation of
+// it.  A byte may read one this loop has just written, which is the whole
+// difficulty.
+std::vector<uint8_t> RepeatReference(
+    const std::vector<uint8_t> & history, size_t offset, size_t n) {
+  std::vector<uint8_t> out = history;
+  const size_t start = out.size();
+  out.resize(start + n);
+  for (size_t i = 0; i < n; i++) {
+    out[start + i] = out[start + i - offset];
+  }
+  return out;
+}
+
+} // namespace
+
+TEST(FastCopySlackTest, CopiesExactlyWhatMemcpyWouldForEveryLength) {
+  const size_t max_len = 4u * GCOMP_FASTCOPY_SLACK;
+  std::vector<uint8_t> src = SourceBytes(max_len + 2u * kMargin);
+
+  for (size_t len = 0; len <= max_len; len++) {
+    for (size_t src_align = 0; src_align < 8u; src_align++) {
+      for (size_t dst_align = 0; dst_align < 8u; dst_align++) {
+        std::vector<uint8_t> dst(max_len + 2u * kMargin, kPoison);
+
+        gcomp_copy_slack(dst.data() + kMargin + dst_align,
+            src.data() + src_align, len);
+
+        ASSERT_EQ(memcmp(dst.data() + kMargin + dst_align,
+                      src.data() + src_align, len),
+            0)
+            << "length " << len << ", source alignment " << src_align
+            << ", destination alignment " << dst_align;
+      }
+    }
+  }
+}
+
+TEST(FastCopySlackTest, WritesNoFurtherPastTheEndThanTheSlackAllows) {
+  const size_t max_len = 4u * GCOMP_FASTCOPY_SLACK;
+  std::vector<uint8_t> src = SourceBytes(max_len + 2u * kMargin);
+
+  for (size_t len = 0; len <= max_len; len++) {
+    std::vector<uint8_t> buf(max_len + 2u * kMargin, kPoison);
+    gcomp_copy_slack(buf.data() + kMargin, src.data(), len);
+
+    for (size_t i = 0; i < kMargin; i++) {
+      ASSERT_EQ(buf[i], kPoison)
+          << "length " << len << " wrote " << (kMargin - i)
+          << " bytes before the destination";
+    }
+    for (size_t i = kMargin + len + GCOMP_FASTCOPY_SLACK; i < buf.size(); i++) {
+      ASSERT_EQ(buf[i], kPoison)
+          << "length " << len << " wrote "
+          << (i - kMargin - len - GCOMP_FASTCOPY_SLACK + 1u)
+          << " bytes past the slack it is allowed";
+    }
+  }
+}
+
+// Every offset the widening table covers, every offset just above it, and
+// lengths either side of a move width.  An offset below the move width is
+// the case the table exists for: the copy reads bytes it has just written,
+// and a wrong entry produces a plausible-looking repetition of the wrong
+// period rather than a crash.
+TEST(FastCopySlackTest, RepeatsThePeriodForEveryOffsetAndLength) {
+  const size_t max_len = 4u * GCOMP_FASTCOPY_SLACK;
+  const size_t max_offset = 3u * GCOMP_FASTCOPY_MOVE;
+  std::vector<uint8_t> history = SourceBytes(max_offset + kMargin);
+
+  for (size_t offset = 1u; offset <= max_offset; offset++) {
+    for (size_t len = 1u; len <= max_len; len++) {
+      std::vector<uint8_t> want = RepeatReference(history, offset, len);
+
+      std::vector<uint8_t> buf(
+          history.size() + max_len + kMargin + GCOMP_FASTCOPY_SLACK, kPoison);
+      memcpy(buf.data(), history.data(), history.size());
+
+      gcomp_copy_repeat_slack(buf.data() + history.size(), offset, len);
+
+      ASSERT_EQ(memcmp(buf.data(), want.data(), want.size()), 0)
+          << "offset " << offset << ", length " << len;
+    }
+  }
+}
+
+TEST(FastCopySlackTest, RepeatWritesNoFurtherPastTheEndThanTheSlackAllows) {
+  const size_t max_len = 4u * GCOMP_FASTCOPY_SLACK;
+  const size_t max_offset = 3u * GCOMP_FASTCOPY_MOVE;
+  std::vector<uint8_t> history = SourceBytes(max_offset + kMargin);
+
+  for (size_t offset = 1u; offset <= max_offset; offset++) {
+    for (size_t len = 1u; len <= max_len; len++) {
+      std::vector<uint8_t> buf(
+          history.size() + max_len + kMargin + GCOMP_FASTCOPY_SLACK, kPoison);
+      memcpy(buf.data(), history.data(), history.size());
+
+      gcomp_copy_repeat_slack(buf.data() + history.size(), offset, len);
+
+      const size_t limit = history.size() + len + GCOMP_FASTCOPY_SLACK;
+      for (size_t i = limit; i < buf.size(); i++) {
+        ASSERT_EQ(buf[i], kPoison)
+            << "offset " << offset << ", length " << len << " wrote "
+            << (i - limit + 1u) << " bytes past the slack it is allowed";
+      }
+    }
+  }
+}
+
+// The two are used together on the same buffer, so the slack one asks for has
+// to cover the other.  This is the number zstd_decoder.c sizes its buffers
+// from; if it ever stops covering a move it has to be raised there too.
+TEST(FastCopySlackTest, TheSlackCoversAMoveOnEitherSideOfIt) {
+  EXPECT_GE(GCOMP_FASTCOPY_SLACK, 2u * GCOMP_FASTCOPY_MOVE);
 }
 
 int main(int argc, char ** argv) {

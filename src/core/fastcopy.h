@@ -48,14 +48,32 @@
  * compile-time constants, `memcpy` of one is an instruction rather than a
  * call.
  *
- * Nothing here writes past `n` bytes.  That matters: this library decodes
- * into the caller's buffer, which has no slack to overshoot into, so the
- * wildcopy trick other implementations use -- rounding the length up to a
- * vector width and writing the excess -- is not available.
+ * Nothing in gcomp_copy_short() writes past `n` bytes.  That matters
+ * wherever this library copies into the caller's buffer, which has no slack
+ * to overshoot into.
  *
  * **Caller contract:** the regions must not overlap, exactly as for memcpy.
- * The zstd match loops clamp each run to the match offset, which is what
- * makes that true there.
+ *
+ * THE SLACK VARIANTS
+ * ==================
+ *
+ * Choosing a size class costs a branch per class, and the lengths are the
+ * lengths a compressor chose -- so the branch is unpredictable by
+ * construction.  On 3 MB of manuals at zstd level 1 the ladder was 8% of the
+ * decode's instructions and 73% of its branch mispredictions.
+ *
+ * The way out is the one every other implementation takes: write a fixed
+ * width regardless of the length and let the excess land somewhere it does
+ * not matter.  That needs a destination with room past the bytes asked for,
+ * which the caller's buffer does not have -- but the zstd decoder does not
+ * decode into the caller's buffer.  It decodes a block into
+ * `zstd_decoder_state_t::output_buffer` and copies out of that, so the slack
+ * can be allocated there and the API promise is untouched.
+ *
+ * gcomp_copy_slack() and gcomp_copy_repeat_slack() may write up to
+ * @ref GCOMP_FASTCOPY_SLACK bytes past the end of what was asked for, and
+ * read that far past the end of their source.  **Both ends must own that
+ * many spare bytes.**  Use gcomp_copy_short() where they do not.
  */
 
 #ifndef GHOTI_IO_GCOMP_SRC_CORE_FASTCOPY_H
@@ -123,6 +141,96 @@ static inline void gcomp_copy_short(
       dst[1] = src[1];
       dst[n - 1u] = src[n - 1u];
     }
+  }
+}
+
+/// Bytes a slack copy may write past its destination and read past its source.
+#define GCOMP_FASTCOPY_SLACK 32u
+
+/// Width of one move in a slack copy; the slack is two of these.
+#define GCOMP_FASTCOPY_MOVE 16u
+
+/**
+ * @brief Copy @p n bytes from @p src to @p dst, overshooting both.
+ *
+ * Writes up to @ref GCOMP_FASTCOPY_SLACK bytes past `dst + n` and reads that
+ * far past `src + n`; both buffers must own that much room beyond the bytes
+ * named here.  The bytes below `n` are exactly what memcpy would have moved.
+ *
+ * @param dst Destination, with @ref GCOMP_FASTCOPY_SLACK bytes to spare
+ * @param src Source, with @ref GCOMP_FASTCOPY_SLACK bytes to spare, not
+ *            overlapping @p dst
+ * @param n Number of bytes that matter; may be zero
+ */
+static inline void gcomp_copy_slack(
+    uint8_t * dst, const uint8_t * src, size_t n) {
+  // Two fixed-width moves cover everything up to the slack, which is where
+  // nearly all of these lengths are; past that libc's vectorised loop is
+  // better than anything written here.  Both tests are on the length rather
+  // than on a size class, so neither has to be right to a byte.
+  if (n > GCOMP_FASTCOPY_SLACK) {
+    memcpy(dst, src, n);
+    return;
+  }
+  memcpy(dst, src, GCOMP_FASTCOPY_MOVE);
+  memcpy(dst + GCOMP_FASTCOPY_MOVE, src + GCOMP_FASTCOPY_MOVE,
+      GCOMP_FASTCOPY_MOVE);
+}
+
+/**
+ * @brief Write @p n bytes at @p dst that repeat the @p offset bytes before it.
+ *
+ * This is an LZ match copy: `dst[i] == dst[i - offset]` for every byte, which
+ * for an offset below the length means the copy reads what it has just
+ * written.  Doing that with memcpy means splitting the length into runs of
+ * `offset` bytes, and a short offset makes that a loop with a call in it.
+ *
+ * Instead the period is widened first -- a multiple of a period is a period,
+ * so a short one is turned into one at least a move wide by materialising
+ * sixteen bytes a byte at a time and then stepping back by that wider
+ * period -- and the rest is fixed-width moves that cannot overlap.
+ *
+ * Writes up to @ref GCOMP_FASTCOPY_SLACK bytes past `dst + n` and reads no
+ * further than that.
+ *
+ * @param dst Destination, with @ref GCOMP_FASTCOPY_SLACK bytes to spare
+ * @param offset Distance back to the source; at least 1, and at most the
+ *               number of bytes already written before @p dst
+ * @param n Number of bytes that matter; at least 1
+ */
+static inline void gcomp_copy_repeat_slack(
+    uint8_t * dst, size_t offset, size_t n) {
+  uint8_t * op = dst;
+  uint8_t * const end = dst + n;
+  const uint8_t * mp;
+
+  if (offset >= GCOMP_FASTCOPY_MOVE) {
+    mp = dst - offset;
+  }
+  else {
+    // The smallest multiple of the offset that is at least a move wide: any
+    // multiple of a period is also a period, and that is the width source
+    // and destination have to be apart for a move not to overlap.  Index 0
+    // is unused; the rest is `offset * ceil(16 / offset)`, at most
+    // `offset + 15`, so stepping back by it never reaches past
+    // `dst - offset`.
+    static const uint8_t period_16[GCOMP_FASTCOPY_MOVE] = {
+        0, 16, 16, 18, 16, 20, 18, 21, 16, 18, 20, 22, 24, 26, 28, 30};
+
+    // Sixteen fixed iterations with no branch in them.  The serial
+    // dependency between them is what a period this short costs, and it is
+    // paid once rather than per run.
+    for (size_t i = 0; i < GCOMP_FASTCOPY_MOVE; i++) {
+      op[i] = *(op + (ptrdiff_t)i - (ptrdiff_t)offset);
+    }
+    op += GCOMP_FASTCOPY_MOVE;
+    mp = op - period_16[offset];
+  }
+
+  while (op < end) {
+    memcpy(op, mp, GCOMP_FASTCOPY_MOVE);
+    op += GCOMP_FASTCOPY_MOVE;
+    mp += GCOMP_FASTCOPY_MOVE;
   }
 }
 
