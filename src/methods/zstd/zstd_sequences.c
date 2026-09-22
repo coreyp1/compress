@@ -218,9 +218,45 @@ typedef struct {
   unsigned used;          ///< Bits of the container taken, from bit 63 down.
   unsigned bit_offset;    ///< Padding bits in front of a short stream.
   unsigned total_bits;    ///< Data bits in the stream, below the marker.
-  unsigned bits_consumed; ///< Data bits read so far; bounds the stream.
-  uint8_t pad[8];         ///< A stream shorter than eight bytes, right-aligned.
+  /// Data bits read so far; at the end it must be @ref total_bits exactly.
+  unsigned bits_consumed;
+  /**
+   * The largest `used + nb_bits` a read may reach; see the note below.
+   *
+   * `64 - bit_offset`, fixed for the life of the reader.
+   */
+  unsigned limit;
+  uint8_t pad[8]; ///< A stream shorter than eight bytes, right-aligned.
 } zstd_seq_bit_reader_t;
+
+//
+// ONE BOUND, NOT TWO
+// ==================
+//
+// A read has two ways to fail: the stream may not hold that many bits, and
+// the container may not.  Those were two tests, and they are the same test.
+//
+// The invariant above says
+//
+//   byte_pos * 8 + 64 - used  ==  total_bits - bits_consumed + bit_offset
+//
+// so "the stream holds nb_bits more", which is
+// `bits_consumed + nb_bits <= total_bits`, rearranges to
+//
+//   used + nb_bits  <=  byte_pos * 8 + 64 - bit_offset
+//
+// and "the container holds them" is `used + nb_bits <= 64`.  The right-hand
+// sides differ by `byte_pos * 8`, and `bit_offset` is non-zero only for a
+// stream shorter than eight bytes -- which is copied into `pad` and read
+// from there, so its `byte_pos` is zero and never moves.  Whenever
+// `byte_pos` is positive, therefore, `bit_offset` is zero and the stream
+// bound is the looser of the two by at least eight bits; whenever
+// `byte_pos` is zero the two coincide.
+//
+// So `64 - bit_offset` bounds both, for the whole life of the reader, and a
+// read tests `used + nb_bits` against that one number.  Exceeding it means
+// either "slide the window" or "the stream is out", and which of those it
+// was is exactly whether the slide moved: refill, and test again.
 
 /**
  * @brief Slide the container down over the bits that come next.
@@ -286,6 +322,7 @@ static gcomp_status_t zstd_seq_bit_reader_init(
     br->bit_offset = (unsigned)((8u - src_size) * 8u);
   }
 
+  br->limit = 64u - br->bit_offset;
   br->byte_pos = br->base_size - 8u;
   br->container = gcomp_read_le64(br->base + br->byte_pos);
   // Satisfies the invariant in the comment above; works out to 8 minus the
@@ -308,18 +345,12 @@ static gcomp_status_t zstd_seq_bit_reader_init(
  * Returns zero when the stream does not hold that many bits, which is how the
  * callers detect the end.
  *
- * `used + nb_bits` cannot exceed 64.  Once the window has reached the start of
- * the stream and can slide no further, the bounds check below is what holds
- * that: it refuses any read reaching past the first bit of the stream, and
- * that bit sits at container bit `bit_offset`.  Everywhere else it is the
- * refill budget.
+ * `used + nb_bits` cannot exceed 64, and no read reaches past the first bit
+ * of the stream.  One test holds both; see the note above the reader.
  */
 static inline uint32_t zstd_seq_bit_reader_take(
     zstd_seq_bit_reader_t * br, unsigned nb_bits) {
   if (nb_bits == 0) {
-    return 0;
-  }
-  if (br->bits_consumed + nb_bits > br->total_bits) {
     return 0;
   }
   // The refill budget the caller works to is an argument about the widths the
@@ -327,19 +358,18 @@ static inline uint32_t zstd_seq_bit_reader_take(
   // arrive from outside, so it is not what correctness rests on.  If the bits
   // are not in the container, fetch them.
   //
-  // On ordinary data this never fires -- the refill at the top of the sequence
-  // loop keeps it from firing, which is what that refill is for -- so it costs
-  // one predictable comparison.  Were it removed and the loop's budget wrong,
-  // the shift below would move by more than sixty-three, which is undefined
-  // rather than merely wrong; were it a bare rejection instead of a refill, a
-  // stream with a far offset, a long literal run and a long match in one
-  // sequence would decode to the wrong bytes and report success.
-  if (br->used + nb_bits > 64u) {
+  // On ordinary data the first test fails -- the refill at the top of the
+  // sequence loop keeps it failing, which is what that refill is for -- so it
+  // costs one predictable comparison.  Were it removed and the loop's budget
+  // wrong, the shift below would move by more than sixty-three, which is
+  // undefined rather than merely wrong; were it a bare rejection instead of a
+  // refill, a stream with a far offset, a long literal run and a long match
+  // in one sequence would decode to the wrong bytes and report success.
+  if (br->used + nb_bits > br->limit) {
     zstd_seq_bit_reader_refill(br);
-    if (br->used + nb_bits > 64u) {
-      // Unreachable: a refill leaves `used` below eight unless the window is
-      // already at the start of the stream, and there the bounds check above
-      // has already refused anything reaching past the first bit.
+    if (br->used + nb_bits > br->limit) {
+      // The slide could not move, so this read reaches past the first bit of
+      // the stream: the stream is out.
       return 0;
     }
   }
@@ -940,6 +970,23 @@ static gcomp_status_t zstd_sequences_execute(zstd_decoder_state_t * state,
       gcomp_copy_repeat_slack(dst + out_pos, actual_offset, remaining_match);
       out_pos += remaining_match;
     }
+  }
+
+  // RFC 8878 section 3.1.1.3.2.1: the bitstream holds exactly the sequences
+  // the header counted, and the marker bit says where its data ends.  A
+  // decoder that has read the number it was told and is not standing on that
+  // boundary has been reading something other than what was written: the
+  // count is wrong, or the stream is short of what the count needs, or the
+  // tables it decoded with are not the tables it was encoded with.
+  //
+  // Without this those are silent.  zstd_seq_bit_reader_take() answers zero
+  // past the end of the stream, so the sequences after that point are
+  // invented rather than refused, and every bound below is still satisfied
+  // because invented sequences are small -- a block that had lost bits
+  // decoded to plausible bytes and reported success.  libzstd makes the same
+  // check (BIT_endOfDStream) and calls the failure corruption_detected.
+  if (br.bits_consumed != br.total_bits) {
+    return GCOMP_ERR_CORRUPT;
   }
 
   // Copy remaining literals

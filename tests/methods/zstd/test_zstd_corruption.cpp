@@ -20,22 +20,23 @@
 
 #include "../common/test_helpers.h"
 #include <cstring>
+#include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
 #include <ghoti.io/compress/stream.h>
+#include "../../../src/methods/zstd/zstd_internal.h"
 #include <ghoti.io/compress/zstd.h>
 #include <gtest/gtest.h>
 #include <string>
 #include <vector>
 
 //
-// Zstd Frame Format Constants (from spec)
+// The frame format constants these tests reach for are the decoder's own,
+// out of zstd_internal.h above; they were spelled out a second time here
+// until a test needed something else from that header and the two
+// definitions of ZSTD_MAGIC met.
 //
-static const uint32_t ZSTD_MAGIC = 0xFD2FB528U;
-static const uint8_t ZSTD_FHD_RESERVED_BIT = 0x08;
-static const uint8_t ZSTD_FHD_UNUSED_BIT = 0x10;
-static const uint8_t ZSTD_BLOCK_TYPE_RESERVED = 3;
 
 //
 // Test fixture
@@ -688,4 +689,111 @@ TEST_F(ZstdCorruptionTest, LiteralsCompressedSizeInconsistentWithBlockIsRefused)
     EXPECT_EQ(tryDecode(c.frame.data(), c.frame.size()), GCOMP_ERR_CORRUPT)
         << c.name;
   }
+}
+
+/**
+ * A sequences section whose bitstream holds more than its count admits.
+ *
+ * RFC 8878 section 3.1.1.3.2: Number_Of_Sequences says how many sequences the
+ * bitstream carries, and the marker bit in its last byte says where its data
+ * ends.  The two have to agree -- a decoder that has read the number it was
+ * told and is not standing on that boundary has been reading something other
+ * than what was written.
+ *
+ * Nothing checked that.  A decoder reading past the end of the bitstream is
+ * answered with zeroes, so the sequences after the truncation point are
+ * invented rather than refused, and every bound they are put through is
+ * satisfied because invented sequences are small.  A block that had lost bits
+ * decoded to plausible bytes and reported success.
+ *
+ * The frame here is built rather than compressed, because our encoder never
+ * writes a count that disagrees with its own bitstream.  Both versions are
+ * built the same way and differ in one byte, so the only thing the second can
+ * be failing on is the disagreement: the first is decoded and its bytes
+ * checked, which is what says the construction is a valid frame and not an
+ * accident.
+ */
+TEST_F(ZstdCorruptionTest, ASequenceCountBelowWhatTheBitstreamHoldsIsRefused) {
+  // Literals every sequence draws from.  Two more than the sequences use, so
+  // the run copied after the last one is exercised too.
+  const std::vector<uint8_t> literals = {'a', 'b', 'c', 'd', 'e', 'f', 'g',
+      'h', 'i', 'j', 'k', 'l', 'm', 'n'};
+
+  // Four sequences, each three literals then a four byte match three back.
+  // Three literals is the least the first one can carry and still have
+  // something three bytes back to match.  match_offset is the encoded
+  // Offset_Value, so a real distance of three is written as six.
+  const uint32_t kLiteralRun = 3u;
+  const uint32_t kMatchDistance = 3u;
+  const uint32_t kMatchRun = 4u;
+  std::vector<zstd_sequence_t> sequences;
+  for (int i = 0; i < 4; i++) {
+    zstd_sequence_t seq;
+    seq.lit_length = kLiteralRun;
+    seq.match_offset = kMatchDistance + 3u;
+    seq.match_length = kMatchRun;
+    sequences.push_back(seq);
+  }
+
+  uint8_t section[512];
+  size_t section_len = 0;
+  ASSERT_EQ(zstd_sequences_encode(sequences.data(), sequences.size(), section,
+                sizeof(section), &section_len),
+      GCOMP_OK);
+  // Number_Of_Sequences below 128 is a single byte, which is the byte the
+  // second frame below changes.
+  ASSERT_LT(sequences.size(), 128u);
+  ASSERT_EQ(section[0], sequences.size());
+
+  auto build = [&](uint8_t declared_sequences) {
+    // Raw_Literals_Block, Size_Format 00: one header byte carrying a five bit
+    // Regenerated_Size, then the literals themselves.
+    std::vector<uint8_t> block = {
+        (uint8_t)(0u | (0u << 2) | ((uint32_t)literals.size() << 3))};
+    block.insert(block.end(), literals.begin(), literals.end());
+
+    const size_t count_at = block.size();
+    block.insert(block.end(), section, section + section_len);
+    block[count_at] = declared_sequences;
+
+    uint32_t bh = 1u // Last_Block
+        | (2u << 1)  // Compressed_Block
+        | ((uint32_t)block.size() << 3);
+
+    std::vector<uint8_t> frame = {0x28, 0xb5, 0x2f, 0xfd,
+        0x00, // Frame_Header_Descriptor: no content size, not single segment
+        0x00, // Window_Descriptor: Window_Log 10
+        (uint8_t)(bh & 0xFF), (uint8_t)((bh >> 8) & 0xFF),
+        (uint8_t)((bh >> 16) & 0xFF)};
+    frame.insert(frame.end(), block.begin(), block.end());
+    return frame;
+  };
+
+  // What the four sequences reconstruct, written out the way the format
+  // defines it rather than the way the decoder does it.
+  std::vector<uint8_t> want;
+  size_t lit_pos = 0;
+  for (size_t i = 0; i < sequences.size(); i++) {
+    for (uint32_t j = 0; j < kLiteralRun; j++) {
+      want.push_back(literals[lit_pos++]);
+    }
+    for (uint32_t j = 0; j < kMatchRun; j++) {
+      want.push_back(want[want.size() - kMatchDistance]);
+    }
+  }
+  want.insert(want.end(), literals.begin() + (long)lit_pos, literals.end());
+
+  const std::vector<uint8_t> good = build((uint8_t)sequences.size());
+  std::vector<uint8_t> got(256);
+  size_t got_len = 0;
+  ASSERT_EQ(gcomp_decode_buffer(registry_, "zstd", nullptr, good.data(),
+                good.size(), got.data(), got.size(), &got_len),
+      GCOMP_OK);
+  got.resize(got_len);
+  ASSERT_EQ(got, want);
+
+  const std::vector<uint8_t> short_count =
+      build((uint8_t)(sequences.size() - 1u));
+  EXPECT_EQ(tryDecode(short_count.data(), short_count.size()),
+      GCOMP_ERR_CORRUPT);
 }
