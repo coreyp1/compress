@@ -126,8 +126,11 @@ static int lz4_decode_job_run(void * job_ctx) {
   // No history: that a block needs none is the property B.Indep promises, and
   // passing NULL here is what holds the encoder to it.
   size_t produced = 0;
+  // LZ4_DECODE_SLACK on the output, which is this job's own buffer, and none
+  // on the input: `payload` points into the caller's input, which is not ours
+  // to read past.
   const gcomp_status_t s = lz4_block_decompress(job->payload, job->payload_size,
-      job->out, job->out_capacity, &produced, NULL, 0);
+      job->out, job->out_capacity, LZ4_DECODE_SLACK, &produced, NULL, 0);
   job->out_size = (s == GCOMP_OK) ? produced : 0;
   job->status = s;
   return (int)s;
@@ -429,7 +432,9 @@ gcomp_status_t lz4_decode_parallel(gcomp_registry_t * registry,
           result = GCOMP_ERR_MEMORY;
           break;
         }
-        job->out = gcomp_malloc(alloc, job_capacity);
+        // LZ4_DECODE_SLACK past the capacity, for the block decoder's copies
+        // to overshoot into; `out_capacity` below does not count it.
+        job->out = gcomp_malloc(alloc, job_capacity + LZ4_DECODE_SLACK);
         if (!job->out) {
           gcomp_free(alloc, job);
           result = GCOMP_ERR_MEMORY;

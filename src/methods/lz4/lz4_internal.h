@@ -56,6 +56,7 @@
 
 #include "../../core/alloc_internal.h"
 #include "../../core/endian.h"
+#include "../../core/fastcopy.h"
 #include "../../core/registry_internal.h"
 #include "../../core/stream_internal.h"
 #include <ghoti.io/compress/errors.h>
@@ -157,11 +158,31 @@ extern "C" {
  * Bytes a wide copy may write past the last one actually wanted.
  *
  * The decoder keeps this much room between its write cursor and the end of
- * the caller's buffer while it uses the wide path, and finishes the block
- * with exact copies, so the slack never leaves the buffer.  Two groups,
- * because the longest match the wide path takes is two groups.
+ * what it is allowed to write while it uses the wide path, and finishes with
+ * exact copies, so the slack never leaves the buffer.
+ *
+ * This is fastcopy.h's figure because the wide copies are fastcopy.h's:
+ * gcomp_copy_slack() and gcomp_copy_repeat_slack() promise to overshoot by no
+ * more than @ref GCOMP_FASTCOPY_SLACK, and the decoder's room has to be the
+ * same number or the promise means nothing here.
  */
-#define LZ4_WIDE_SLACK 32u
+#define LZ4_WIDE_SLACK GCOMP_FASTCOPY_SLACK
+
+/**
+ * @brief Spare bytes past the end of a decode buffer, for overshooting into.
+ *
+ * A buffer the block decoder owns is allocated this much larger than the
+ * capacity it is given, and the capacity does not count it - so every bound
+ * the decoder checks is the real one, and the slack is only ever reached by
+ * an overshoot.  With it the wide path runs to the last byte of a block
+ * instead of stopping @ref LZ4_WIDE_SLACK short of it; without it the
+ * decoder is exactly what it was.
+ *
+ * It is a parameter of lz4_block_decompress() and not an assumption, because
+ * one of its callers has no slack to offer: the parallel decoder decodes
+ * straight out of the caller's input buffer.
+ */
+#define LZ4_DECODE_SLACK GCOMP_FASTCOPY_SLACK
 #define LZ4_LAST_LITERALS 5    ///< Minimum literals in last sequence
 
 /**
@@ -668,19 +689,6 @@ gcomp_status_t lz4_block_compress_linked(const uint8_t * window,
     size_t * output_len_out, uint32_t * hash_table, size_t hash_table_size);
 
 /**
- * @brief Decompress a block using LZ4 block format.
- *
- * @param input Compressed block data
- * @param input_len Compressed data length
- * @param output Output buffer for decompressed data
- * @param output_cap Output buffer capacity
- * @param output_len_out Output: actual decompressed length
- * @param history History buffer for back-references (NULL for independent
- * blocks)
- * @param history_len History length
- * @return GCOMP_OK on success, error code on failure
- */
-/**
  * @brief Decode a whole LZ4 stream with several threads, or decline.
  *
  * The ::gcomp_method_s::decode_parallel hook. See lz4_decode_parallel.c for
@@ -690,9 +698,29 @@ gcomp_status_t lz4_decode_parallel(gcomp_registry_t * registry,
     gcomp_options_t * options, const void * input, size_t input_size,
     void * output, size_t output_capacity, size_t * output_size_out);
 
+/**
+ * @brief Decompress a block using LZ4 block format.
+ *
+ * @param input Compressed block data
+ * @param input_len Compressed data length
+ * @param output Output buffer for decompressed data
+ * @param output_cap Output buffer capacity, not counting @p output_slack
+ * @param output_slack Bytes writable past @p output_cap that no caller reads
+ *        and nothing written to them means anything.  The copies below run in
+ *        whole groups and overshoot the length they were asked for, so this is
+ *        how far the wide path may run: given @ref LZ4_DECODE_SLACK it covers
+ *        every byte of the block, and given zero it stops
+ *        @ref LZ4_WIDE_SLACK short of the end and exact copies finish.  Pass
+ *        zero for a buffer that is not yours to overshoot.
+ * @param output_len_out Output: actual decompressed length
+ * @param history History buffer for back-references (NULL for independent
+ * blocks)
+ * @param history_len History length
+ * @return GCOMP_OK on success, error code on failure
+ */
 gcomp_status_t lz4_block_decompress(const uint8_t * input, size_t input_len,
-    uint8_t * output, size_t output_cap, size_t * output_len_out,
-    const uint8_t * history, size_t history_len);
+    uint8_t * output, size_t output_cap, size_t output_slack,
+    size_t * output_len_out, const uint8_t * history, size_t history_len);
 
 
 /**

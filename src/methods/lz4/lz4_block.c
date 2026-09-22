@@ -432,8 +432,8 @@ gcomp_status_t lz4_block_compress_linked(const uint8_t * window,
 //
 
 gcomp_status_t lz4_block_decompress(const uint8_t * input, size_t input_len,
-    uint8_t * output, size_t output_cap, size_t * output_len_out,
-    const uint8_t * history, size_t history_len) {
+    uint8_t * output, size_t output_cap, size_t output_slack,
+    size_t * output_len_out, const uint8_t * history, size_t history_len) {
   if (!input || !output || !output_len_out) {
     return GCOMP_ERR_INVALID_ARG;
   }
@@ -455,13 +455,19 @@ gcomp_status_t lz4_block_decompress(const uint8_t * input, size_t input_len,
   // instructions.
   //
   // A group may write up to LZ4_WIDE_SLACK bytes past the last byte actually
-  // wanted, so the wide path is used only while that much room is left inside
-  // the caller's buffer, and the end of a block goes through the exact path
-  // below it.  Nothing is ever written at or past `dst_end`, so the API
-  // promises no slack it did not promise before -- which is what
-  // `DECODER-PERFORMANCE.md` item 2 said stood in the way.
-  uint8_t * const dst_wide_end =
-      (output_cap > LZ4_WIDE_SLACK) ? dst_end - LZ4_WIDE_SLACK : output;
+  // wanted, so the wide path runs only while that much room is left, and what
+  // is left of a block after that goes through the exact copies below it.
+  // `output_slack` is what says where that room ends: given
+  // LZ4_DECODE_SLACK the wide path covers the whole block, and given zero it
+  // stops short of `dst_end` and nothing is written at or past it.
+  //
+  // `DECODER-PERFORMANCE.md` item 2 read the API's promise -- no slack past
+  // the caller's buffer -- as ruling the whole thing out.  It rules out
+  // assuming slack, not having it: this decoder stages a block in a buffer of
+  // its own and copies out afterwards, so the slack goes there, and the one
+  // caller with nothing to offer (the parallel decoder, which decodes
+  // straight out of the caller's input) passes zero and gets what it had.
+  uint8_t * const dst_slack_end = dst_end + output_slack;
 
   while (src < src_end) {
     // Read token
@@ -493,7 +499,9 @@ gcomp_status_t lz4_block_decompress(const uint8_t * input, size_t input_len,
     // Copy literals.  A whole group where both buffers have room for one --
     // the read needs the room too, since a group reads sixteen bytes whatever
     // `lit_len` says, and the last literals of a block sit against `src_end`.
-    if (lit_len <= LZ4_WIDE_GROUP && dst < dst_wide_end
+    // The input is never ours to overshoot: on the parallel path it is the
+    // caller's buffer, so that half stays a bound and not a slack.
+    if (lit_len <= LZ4_WIDE_GROUP && dst + LZ4_WIDE_GROUP <= dst_slack_end
         && src + LZ4_WIDE_GROUP <= src_end) {
       memcpy(dst, src, LZ4_WIDE_GROUP);
     }
@@ -611,14 +619,41 @@ gcomp_status_t lz4_block_decompress(const uint8_t * input, size_t input_len,
     // one wrote, and those are exactly the bytes a byte-at-a-time copy would
     // have read there.  Neither group's source overlaps its own destination,
     // so neither is the overlapping `memcpy` that C leaves undefined.
-    //
-    // Below one group the two do overlap, and LZ4 gives a match nearer than
-    // its own length the meaning that the pattern repeats: that is the loop
-    // underneath, and it stays the only implementation of it.
-    if (remaining <= LZ4_WIDE_SLACK && dst < dst_wide_end
+    if (remaining <= LZ4_WIDE_SLACK
+        && dst + LZ4_WIDE_SLACK <= dst_slack_end
         && (size_t)(dst - match_src) >= LZ4_WIDE_GROUP) {
       memcpy(dst, match_src, LZ4_WIDE_GROUP);
       memcpy(dst + LZ4_WIDE_GROUP, match_src + LZ4_WIDE_GROUP, LZ4_WIDE_GROUP);
+      dst += remaining;
+      remaining = 0u;
+    }
+
+    // A match nearer than the run it is filling: LZ4 means the pattern
+    // repeats, and the loop below does that a period at a time -- which is a
+    // call to libc per period, for periods of a few bytes.
+    //
+    // One byte repeated is memset, which splats.  Handing it to
+    // gcomp_copy_repeat_slack() instead costs 3% of the instructions and
+    // two and a half times the wall clock on a stream made of short-period
+    // repeats: that function widens a period of one with sixteen byte-wide
+    // stores and then moves sixteen bytes at a time out of the bytes
+    // immediately behind them, and every one of those loads waits on the
+    // store before it.  The instruction count cannot see a dependency chain
+    // through the store buffer, and here it is nearly all of the cost.  The
+    // case belongs here and not in the helper: zstd's matches are longer and
+    // rarely a single byte, and it measured 2% slower carrying the test.
+    //
+    // Anything else goes to the helper, which widens the period first -- a
+    // multiple of a period is also a period -- and then moves whole groups,
+    // so it is one call whatever the period is.
+    if (remaining > 0u && (size_t)(dst - match_src) == 1u) {
+      memset(dst, *match_src, remaining);
+      dst += remaining;
+      remaining = 0u;
+    }
+    else if (remaining > 0u && (size_t)(dst - match_src) < remaining
+        && dst + remaining + LZ4_WIDE_SLACK <= dst_slack_end) {
+      gcomp_copy_repeat_slack(dst, (size_t)(dst - match_src), remaining);
       dst += remaining;
       remaining = 0u;
     }

@@ -192,8 +192,10 @@ void check_blocks_decode_alone(const std::vector<uint8_t> & s,
     size_t produced = 0;
     // No history: an independent block must not need any, which is the
     // property being checked.
+    // No slack: this buffer is the test's, and nothing may be written past
+    // the capacity it names.
     ASSERT_EQ(lz4_block_decompress(s.data() + off, payload, out.data(),
-                  out.size(), &produced, nullptr, 0),
+                  out.size(), 0, &produced, nullptr, 0),
         GCOMP_OK)
         << "block " << i << " did not decode on its own";
     rebuilt.insert(rebuilt.end(), out.begin(), out.begin() + produced);
@@ -463,7 +465,7 @@ TEST(Lz4Walk, DescriptorVariationsMoveTheFirstBlock) {
       std::vector<uint8_t> out(65536 + 1024);
       size_t produced = 0;
       ASSERT_EQ(lz4_block_decompress(s.data() + off, payload, out.data(),
-                    out.size(), &produced, nullptr, 0),
+                    out.size(), 0, &produced, nullptr, 0),
           GCOMP_OK)
           << v.name << ": block " << i;
       rebuilt.insert(rebuilt.end(), out.begin(), out.begin() + produced);

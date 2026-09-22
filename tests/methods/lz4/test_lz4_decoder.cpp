@@ -24,6 +24,7 @@
 #include <ghoti.io/compress/lz4.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
+#include "../../../src/methods/lz4/lz4_internal.h"
 #include <ghoti.io/compress/stream.h>
 #include <gtest/gtest.h>
 #include <vector>
@@ -847,6 +848,72 @@ TEST_F(Lz4DecoderTest, MatchCopy_SurvivesAnyOutputBufferSize) {
     }
     gcomp_decoder_destroy(dec);
     EXPECT_EQ(decoded, input) << "chunk " << chunk;
+  }
+}
+
+//
+// The overshoot bound
+//
+
+/**
+ * The block decoder copies in whole groups and overshoots the length it was
+ * asked for, so where it may stop doing that is a bound, and `output_slack`
+ * is the caller's statement of where that is.  Two callers depend on the two
+ * answers: the streaming decoder stages a block in a buffer of its own and
+ * hands over LZ4_DECODE_SLACK, and the parallel decoder decodes into a job
+ * buffer but out of the caller's input, so it hands over what it has.
+ *
+ * Getting this wrong writes past an allocation rather than producing wrong
+ * output, which a comparison of the decoded bytes alone would not see.  So
+ * the destination is poisoned past the capacity and the poison is checked --
+ * at `output_cap` when the slack is zero, and at `output_cap + slack` when it
+ * is not.
+ *
+ * Every length in a range rather than one, because which path finishes a
+ * block depends on where the block's last bytes fall relative to the group
+ * width, and the data repeats at short periods so that the pattern fill runs
+ * as well as the plain copies.
+ */
+TEST_F(Lz4DecoderTest, MatchCopy_WritesNoFurtherPastTheEndThanTheSlackAllows) {
+  constexpr uint8_t kPoison = 0xA5u;
+  constexpr size_t kMargin = 64u;
+
+  std::vector<uint32_t> hash_table(65536u, 0u);
+
+  for (size_t period : {size_t(1), size_t(3), size_t(4), size_t(8), size_t(16),
+           size_t(17), size_t(40)}) {
+    for (size_t n = 64u; n <= 320u; n++) {
+      const std::vector<uint8_t> src = OverlappingMatchBytes(n, period);
+
+      std::vector<uint8_t> block(n * 2u + 256u);
+      size_t block_len = 0;
+      std::fill(hash_table.begin(), hash_table.end(), 0u);
+      const gcomp_status_t packed = lz4_block_compress(src.data(), src.size(),
+          block.data(), block.size(), &block_len, hash_table.data(),
+          hash_table.size());
+      if (packed != GCOMP_OK) {
+        continue; // Incompressible at this length; nothing to decode.
+      }
+
+      for (size_t slack : {size_t(0), size_t(LZ4_DECODE_SLACK)}) {
+        std::vector<uint8_t> out(n + LZ4_DECODE_SLACK + kMargin, kPoison);
+        size_t produced = 0;
+        ASSERT_EQ(lz4_block_decompress(block.data(), block_len, out.data(), n,
+                      slack, &produced, nullptr, 0),
+            GCOMP_OK)
+            << "period " << period << ", length " << n << ", slack " << slack;
+        ASSERT_EQ(produced, n) << "period " << period << ", length " << n;
+        ASSERT_EQ(memcmp(out.data(), src.data(), n), 0)
+            << "period " << period << ", length " << n << ", slack " << slack;
+
+        for (size_t i = n + slack; i < out.size(); i++) {
+          ASSERT_EQ(out[i], kPoison)
+              << "period " << period << ", length " << n << ", slack " << slack
+              << " wrote " << (i - n - slack + 1u)
+              << " bytes past the slack it was given";
+        }
+      }
+    }
   }
 }
 

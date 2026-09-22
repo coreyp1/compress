@@ -575,10 +575,15 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
               gcomp_memory_track_free(
                   &state->mem_tracker, state->output_buffer_size);
             }
-            state->output_buffer = (uint8_t *)gcomp_malloc(alloc, block_size);
+            // LZ4_DECODE_SLACK spare bytes past the capacity, for the block
+            // decoder's copies to overshoot into; the capacity does not count
+            // them, so every bound it checks is the real one.
+            state->output_buffer =
+                (uint8_t *)gcomp_malloc(alloc, block_size + LZ4_DECODE_SLACK);
             state->output_buffer_size = block_size;
             if (state->output_buffer) {
-              gcomp_memory_track_alloc(&state->mem_tracker, block_size);
+              gcomp_memory_track_alloc(
+                  &state->mem_tracker, block_size + LZ4_DECODE_SLACK);
             }
           }
 
@@ -772,7 +777,7 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
           // Decompress block
           gcomp_status_t status = lz4_block_decompress(state->block_buffer,
               state->block_buffer_pos, state->output_buffer,
-              state->output_buffer_size, &decompressed_len,
+              state->output_buffer_size, LZ4_DECODE_SLACK, &decompressed_len,
               state->history_buffer, state->history_size);
           if (status != GCOMP_OK) {
             state->stage = LZ4_DEC_STAGE_ERROR;
