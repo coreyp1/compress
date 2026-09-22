@@ -106,12 +106,15 @@
  *    c. Copy match bytes from (output - offset) to output
  * 5. Repeat until input exhausted
  *
- * ## History Buffer Support
+ * ## History
  *
  * For dependent blocks (block independence = false), matches can reference
- * data from previous blocks. The `history` and `history_len` parameters
- * provide this context. When a match offset exceeds the current output
- * position, the decompressor looks in the history buffer.
+ * data from previous blocks.  Those bytes sit immediately before `output` in
+ * the same allocation and `history_len` says how many of them there are, so
+ * a match source is `output_position - offset` whether or not it reaches
+ * past the start of this block.  The decoder that put them in a buffer of
+ * their own had to ask which, once per match, and could not predict the
+ * answer.
  *
  * ## Error Cases
  *
@@ -433,7 +436,7 @@ gcomp_status_t lz4_block_compress_linked(const uint8_t * window,
 
 gcomp_status_t lz4_block_decompress(const uint8_t * input, size_t input_len,
     uint8_t * output, size_t output_cap, size_t output_slack,
-    size_t * output_len_out, const uint8_t * history, size_t history_len) {
+    size_t * output_len_out, size_t history_len) {
   if (!input || !output || !output_len_out) {
     return GCOMP_ERR_INVALID_ARG;
   }
@@ -542,33 +545,26 @@ gcomp_status_t lz4_block_decompress(const uint8_t * input, size_t input_len,
 
     // Find match source.
     //
-    // This branch is the bounds check, and the only untrusted value in it is
-    // `offset`.  In the first case 1 <= offset <= dst_offset, so `dst -
-    // offset` lands in [output, dst); in the second 1 <= offset - dst_offset
-    // <= history_len, so the pointer lands inside the history.  Anything else
-    // is refused here.  Which of the two it was is then carried rather than
-    // asked again: the code below used to re-derive it by comparing pointers,
-    // at thirteen instructions per sequence, and comparing pointers into
-    // different allocations is also a question C does not actually define an
-    // answer to.
-    const uint8_t * match_src;
-    size_t dst_offset = dst - output;
-    bool match_in_history;
+    // A match reaches back into this block's own output, or past its start
+    // into what earlier blocks decoded.  Those used to be two buffers, and
+    // this used to be the branch that said which -- 54% of a linked decode's
+    // branch mispredictions, because 39% of matches took the second side and
+    // nothing can predict a coin toss.  A match that was both was then copied
+    // in two pieces, with a flag carried from here to say so.
+    //
+    // The history now sits immediately before `output` in the same
+    // allocation, `history_len` bytes of it, so the source is `dst - offset`
+    // whichever side of the boundary it falls on and there is nothing to ask.
+    // What is left is the bounds check, and `offset` is the only untrusted
+    // value in it: 1 <= offset <= dst_offset + history_len puts
+    // `dst - offset` inside [output - history_len, dst), and anything else
+    // is refused here.
+    const size_t dst_offset = (size_t)(dst - output);
 
-    if (offset <= dst_offset) {
-      // Match is within output buffer
-      match_src = dst - offset;
-      match_in_history = false;
-    }
-    else if (history && offset <= dst_offset + history_len) {
-      // Match is in history buffer
-      size_t history_offset = offset - dst_offset;
-      match_src = history + history_len - history_offset;
-      match_in_history = true;
-    }
-    else {
+    if (offset > dst_offset + history_len) {
       return GCOMP_ERR_CORRUPT; // Invalid back-reference
     }
+    const uint8_t * match_src = dst - offset;
 
     // Check output bounds
     if (dst + match_len > dst_end) {
@@ -579,37 +575,18 @@ gcomp_status_t lz4_block_decompress(const uint8_t * input, size_t input_len,
     //
     // This used to ask, for every single byte, whether the source was still
     // inside the history buffer and whether it had reached the write cursor.
-    // Neither question changes more than once in a whole match: a match begins
-    // in one buffer or the other and crosses between them at most once.  Asked
-    // once instead of per byte, the copies become memcpy, and LZ4 decoding
-    // spends its time moving bytes rather than deciding where they are.
-    size_t remaining = match_len;
-
-    // The part that comes from the previous block's tail, if any.  It is a
-    // flat run, so it goes in one piece, and what follows continues at the
-    // start of this block's output.
-    if (match_in_history) {
-      size_t from_history = (size_t)((history + history_len) - match_src);
-      if (from_history > remaining) {
-        from_history = remaining;
-      }
-      memcpy(dst, match_src, from_history);
-      dst += from_history;
-      remaining -= from_history;
-      match_src = output;
-    }
-
-    // The rest comes from what this block has already written.  Source and
-    // destination are the same buffer and the source may be very close
-    // behind, so a run stops at the distance between them; up to that point
-    // the two ranges cannot overlap and memcpy is exact.  A distance of one
-    // is a single byte repeated.
+    // Neither question changes more than once in a whole match, so they were
+    // asked once and the copies became memcpy.  With the history in front of
+    // the output rather than beside it there is nothing left to ask: one run
+    // covers a match wherever it starts, and a match that spans the boundary
+    // is no longer a special case at all.
     //
-    // `match_src` is inside [output, dst) here and stays there: the branch
-    // that chose it put it there, and the history case above leaves it at the
-    // start of the output with at least one byte already written, since it
-    // copies at least one.  Each pass moves source and destination together
-    // by the same amount, so the distance between them never shrinks.
+    // `match_src` is inside [output - history_len, dst) and stays there --
+    // the bound above put it there, and each pass moves source and
+    // destination together by the same amount, so the distance between them
+    // never shrinks.  A run stops at that distance; up to it the two ranges
+    // cannot overlap and memcpy is exact.
+    size_t remaining = match_len;
 
     // A short match far enough behind is two groups and no loop at all.
     //

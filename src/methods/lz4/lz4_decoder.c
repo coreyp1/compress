@@ -165,14 +165,17 @@
  */
 static void lz4_decoder_seed_history(lz4_decoder_state_t * state) {
   state->history_size = 0;
-  if (state->dictionary_size == 0 || !state->history_buffer) {
+  if (state->dictionary_size == 0 || !state->output_buffer
+      || state->output_prefix == 0) {
     return;
   }
   size_t take = state->dictionary_size;
-  if (take > state->history_capacity) {
-    take = state->history_capacity;
+  if (take > state->output_prefix) {
+    take = state->output_prefix;
   }
-  memcpy(state->history_buffer,
+  // The history ends where the block begins, so the dictionary's tail is
+  // written to the bytes immediately in front of it.
+  memcpy(state->output_buffer - take,
       state->dictionary + state->dictionary_size - take, take);
   state->history_size = take;
 }
@@ -302,10 +305,10 @@ gcomp_status_t lz4_decoder_init(gcomp_registry_t * registry,
   state->block_buffer = NULL;
   state->block_buffer_size = 0;
   state->output_buffer = NULL;
+  state->output_alloc = NULL;
+  state->output_prefix = 0;
   state->output_buffer_size = 0;
-  state->history_buffer = NULL;
   state->history_size = 0;
-  state->history_capacity = 0;
   // Not state->dictionary: lz4_decoder_read_options() has already run and
   // copied it, and zeroing it here would leak the copy and lose the option.
 
@@ -344,11 +347,8 @@ void lz4_decoder_destroy(gcomp_decoder_t * decoder) {
     state->dictionary = NULL;
     state->dictionary_size = 0;
   }
-  if (state->history_buffer) {
-    gcomp_free(alloc, state->history_buffer);
-  }
-  if (state->output_buffer) {
-    gcomp_free(alloc, state->output_buffer);
+  if (state->output_alloc) {
+    gcomp_free(alloc, state->output_alloc);
   }
   if (state->block_buffer) {
     gcomp_free(alloc, state->block_buffer);
@@ -569,21 +569,40 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
               gcomp_memory_track_alloc(&state->mem_tracker, block_size);
             }
           }
-          if (!state->output_buffer || state->output_buffer_size < block_size) {
-            if (state->output_buffer) {
-              gcomp_free(alloc, state->output_buffer);
-              gcomp_memory_track_free(
-                  &state->mem_tracker, state->output_buffer_size);
+          // A frame whose blocks are linked, or one read against a
+          // dictionary, needs history in front of the block; one with
+          // neither does not, and does not pay for it.  It is a prefix of the
+          // same allocation rather than a buffer of its own, so that a match
+          // reaching past the start of a block is the same arithmetic as one
+          // that does not -- see lz4_block_decompress().
+          const size_t want_prefix = (!state->header.block_independence
+                                         || state->dictionary_size > 0)
+              ? (size_t)LZ4_HISTORY_SIZE
+              : 0u;
+          if (!state->output_alloc || state->output_buffer_size < block_size
+              || state->output_prefix != want_prefix) {
+            if (state->output_alloc) {
+              gcomp_free(alloc, state->output_alloc);
+              gcomp_memory_track_free(&state->mem_tracker,
+                  state->output_prefix + state->output_buffer_size
+                      + LZ4_DECODE_SLACK);
+              state->output_alloc = NULL;
+              state->output_buffer = NULL;
+              state->output_buffer_size = 0;
+              state->output_prefix = 0;
+              state->history_size = 0;
             }
             // LZ4_DECODE_SLACK spare bytes past the capacity, for the block
-            // decoder's copies to overshoot into; the capacity does not count
-            // them, so every bound it checks is the real one.
-            state->output_buffer =
-                (uint8_t *)gcomp_malloc(alloc, block_size + LZ4_DECODE_SLACK);
-            state->output_buffer_size = block_size;
-            if (state->output_buffer) {
-              gcomp_memory_track_alloc(
-                  &state->mem_tracker, block_size + LZ4_DECODE_SLACK);
+            // decoder's copies to overshoot into; the capacity counts neither
+            // them nor the prefix, so every bound it checks is the real one.
+            const size_t alloc_size =
+                want_prefix + block_size + LZ4_DECODE_SLACK;
+            state->output_alloc = (uint8_t *)gcomp_malloc(alloc, alloc_size);
+            if (state->output_alloc) {
+              state->output_prefix = want_prefix;
+              state->output_buffer = state->output_alloc + want_prefix;
+              state->output_buffer_size = block_size;
+              gcomp_memory_track_alloc(&state->mem_tracker, alloc_size);
             }
           }
 
@@ -596,60 +615,25 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
               state->block_buffer = NULL;
               state->block_buffer_size = 0;
             }
-            if (state->output_buffer) {
-              gcomp_free(alloc, state->output_buffer);
-              gcomp_memory_track_free(
-                  &state->mem_tracker, state->output_buffer_size);
+            if (state->output_alloc) {
+              gcomp_free(alloc, state->output_alloc);
+              gcomp_memory_track_free(&state->mem_tracker,
+                  state->output_prefix + state->output_buffer_size
+                      + LZ4_DECODE_SLACK);
+              state->output_alloc = NULL;
               state->output_buffer = NULL;
               state->output_buffer_size = 0;
+              state->output_prefix = 0;
             }
             state->stage = LZ4_DEC_STAGE_ERROR;
             return gcomp_decoder_set_error(decoder, GCOMP_ERR_MEMORY,
                 "failed to allocate lz4 block buffers (%u bytes)", block_size);
           }
 
-          // Allocate the history buffer for dependent blocks, and for any
-          // frame decoded against a dictionary -- an independent block reads
-          // the dictionary out of the same buffer.
-          if (!state->header.block_independence ||
-              state->dictionary_size > 0) {
-            if (!state->history_buffer ||
-                state->history_capacity < LZ4_HISTORY_SIZE) {
-              if (state->history_buffer) {
-                gcomp_free(alloc, state->history_buffer);
-                gcomp_memory_track_free(
-                    &state->mem_tracker, state->history_capacity);
-              }
-              state->history_capacity = LZ4_HISTORY_SIZE;
-              state->history_buffer =
-                  (uint8_t *)gcomp_malloc(alloc, state->history_capacity);
-              if (!state->history_buffer) {
-                // Clean up block and output buffers before returning error
-                if (state->block_buffer) {
-                  gcomp_free(alloc, state->block_buffer);
-                  gcomp_memory_track_free(
-                      &state->mem_tracker, state->block_buffer_size);
-                  state->block_buffer = NULL;
-                  state->block_buffer_size = 0;
-                }
-                if (state->output_buffer) {
-                  gcomp_free(alloc, state->output_buffer);
-                  gcomp_memory_track_free(
-                      &state->mem_tracker, state->output_buffer_size);
-                  state->output_buffer = NULL;
-                  state->output_buffer_size = 0;
-                }
-                state->history_capacity = 0;
-                state->stage = LZ4_DEC_STAGE_ERROR;
-                return gcomp_decoder_set_error(decoder, GCOMP_ERR_MEMORY,
-                    "failed to allocate lz4 history buffer (%zu bytes)",
-                    LZ4_HISTORY_SIZE);
-              }
-              gcomp_memory_track_alloc(
-                  &state->mem_tracker, state->history_capacity);
-            }
-            lz4_decoder_seed_history(state);
-          }
+          // Whatever is in front of a block at the start of a frame comes
+          // from the dictionary, if there is one; the frame's own output
+          // takes over from there.
+          lz4_decoder_seed_history(state);
 
           // Check memory limit through the core helper: see the note in
           // lz4_encoder.c about where "0 means unlimited" lives.
@@ -778,7 +762,7 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
           gcomp_status_t status = lz4_block_decompress(state->block_buffer,
               state->block_buffer_pos, state->output_buffer,
               state->output_buffer_size, LZ4_DECODE_SLACK, &decompressed_len,
-              state->history_buffer, state->history_size);
+              state->history_size);
           if (status != GCOMP_OK) {
             state->stage = LZ4_DEC_STAGE_ERROR;
             if (status == GCOMP_ERR_CORRUPT) {
@@ -832,23 +816,22 @@ gcomp_status_t lz4_decoder_update(gcomp_decoder_t * decoder,
               &state->content_hash, state->output_buffer, decompressed_len);
         }
 
-        // Update history for dependent blocks
-        if (!state->header.block_independence && state->history_buffer) {
-          size_t to_keep = decompressed_len;
-          if (to_keep > state->history_capacity) {
-            to_keep = state->history_capacity;
+        // Update history for dependent blocks.
+        //
+        // The history is the bytes immediately before output_buffer, so this
+        // slides the tail of what has been decoded -- the block just written
+        // and as much of the old history as still fits -- back so that it
+        // ends where the next block will begin.  One move, and the ranges
+        // overlap whenever the history is not full, which is what memmove is
+        // for.
+        if (!state->header.block_independence && state->output_prefix > 0) {
+          size_t keep = state->history_size + decompressed_len;
+          if (keep > state->output_prefix) {
+            keep = state->output_prefix;
           }
-          // Shift history and add new data
-          if (state->history_size + to_keep > state->history_capacity) {
-            size_t shift =
-                state->history_size + to_keep - state->history_capacity;
-            memmove(state->history_buffer, state->history_buffer + shift,
-                state->history_size - shift);
-            state->history_size -= shift;
-          }
-          memcpy(state->history_buffer + state->history_size,
-              state->output_buffer + decompressed_len - to_keep, to_keep);
-          state->history_size += to_keep;
+          memmove(state->output_buffer - keep,
+              state->output_buffer + decompressed_len - keep, keep);
+          state->history_size = keep;
         }
 
         if (state->header.block_checksum) {
@@ -1112,11 +1095,9 @@ gcomp_status_t lz4_decoder_reset(gcomp_decoder_t * decoder) {
   if (state->block_buffer) {
     state->mem_tracker.current_bytes += state->block_buffer_size;
   }
-  if (state->output_buffer) {
-    state->mem_tracker.current_bytes += state->output_buffer_size;
-  }
-  if (state->history_buffer) {
-    state->mem_tracker.current_bytes += state->history_capacity;
+  if (state->output_alloc) {
+    state->mem_tracker.current_bytes +=
+        state->output_prefix + state->output_buffer_size + LZ4_DECODE_SLACK;
   }
 
   // Reset parsing state

@@ -130,7 +130,7 @@ static int lz4_decode_job_run(void * job_ctx) {
   // on the input: `payload` points into the caller's input, which is not ours
   // to read past.
   const gcomp_status_t s = lz4_block_decompress(job->payload, job->payload_size,
-      job->out, job->out_capacity, LZ4_DECODE_SLACK, &produced, NULL, 0);
+      job->out, job->out_capacity, LZ4_DECODE_SLACK, &produced, 0);
   job->out_size = (s == GCOMP_OK) ? produced : 0;
   job->status = s;
   return (int)s;

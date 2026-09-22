@@ -20,12 +20,15 @@
 
 #include "test_helpers.h"
 #include <cstring>
+#include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/lz4.h>
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
 #include "../../../src/methods/lz4/lz4_internal.h"
 #include <ghoti.io/compress/stream.h>
+#include <ghoti.io/compress/xxhash32.h>
+#include <string>
 #include <gtest/gtest.h>
 #include <vector>
 
@@ -899,7 +902,7 @@ TEST_F(Lz4DecoderTest, MatchCopy_WritesNoFurtherPastTheEndThanTheSlackAllows) {
         std::vector<uint8_t> out(n + LZ4_DECODE_SLACK + kMargin, kPoison);
         size_t produced = 0;
         ASSERT_EQ(lz4_block_decompress(block.data(), block_len, out.data(), n,
-                      slack, &produced, nullptr, 0),
+                      slack, &produced, 0),
             GCOMP_OK)
             << "period " << period << ", length " << n << ", slack " << slack;
         ASSERT_EQ(produced, n) << "period " << period << ", length " << n;
@@ -912,6 +915,131 @@ TEST_F(Lz4DecoderTest, MatchCopy_WritesNoFurtherPastTheEndThanTheSlackAllows) {
               << " wrote " << (i - n - slack + 1u)
               << " bytes past the slack it was given";
         }
+      }
+    }
+  }
+}
+
+//
+// The far edge of the match window
+//
+
+namespace {
+
+void Put32(std::vector<uint8_t> & v, uint32_t x) {
+  v.push_back(static_cast<uint8_t>(x));
+  v.push_back(static_cast<uint8_t>(x >> 8));
+  v.push_back(static_cast<uint8_t>(x >> 16));
+  v.push_back(static_cast<uint8_t>(x >> 24));
+}
+
+/// A linked-block frame: one stored block of `history`, then one compressed
+/// block that is a single match at distance `offset` followed by five
+/// literals.  Built rather than compressed because no encoder emits an
+/// offset it is not allowed to, and the offsets either side of the limit are
+/// the whole point.
+std::vector<uint8_t> LinkedFrameWithOneMatch(const std::vector<uint8_t> & history,
+    uint16_t offset, uint8_t match_len, const std::vector<uint8_t> & literals) {
+  std::vector<uint8_t> frame;
+  Put32(frame, LZ4_MAGIC);
+
+  const uint8_t flg = LZ4_FLG_VERSION_VALUE; // B.Indep clear: linked blocks
+  const uint8_t bd = 0x40u;                  // block max size 4: 64 KB
+  frame.push_back(flg);
+  frame.push_back(bd);
+  gcomp_xxhash32_state_t h;
+  gcomp_xxhash32_reset(&h, 0);
+  gcomp_xxhash32_update(&h, &frame[4], 2u);
+  frame.push_back(static_cast<uint8_t>((gcomp_xxhash32_finalize(&h) >> 8) & 0xFFu));
+
+  Put32(frame, static_cast<uint32_t>(history.size()) | LZ4_BLOCK_UNCOMPRESSED_FLAG);
+  frame.insert(frame.end(), history.begin(), history.end());
+
+  std::vector<uint8_t> block;
+  block.push_back(static_cast<uint8_t>(match_len - LZ4_MIN_MATCH)); // 0 literals
+  block.push_back(static_cast<uint8_t>(offset & 0xFFu));
+  block.push_back(static_cast<uint8_t>(offset >> 8));
+  block.push_back(static_cast<uint8_t>(literals.size() << 4)); // last sequence
+  block.insert(block.end(), literals.begin(), literals.end());
+  Put32(frame, static_cast<uint32_t>(block.size()));
+  frame.insert(frame.end(), block.begin(), block.end());
+
+  Put32(frame, 0u); // EndMark
+  return frame;
+}
+
+} // namespace
+
+/**
+ * Offsets either side of how far back a match may legally reach.
+ *
+ * The history is the bytes immediately before the block being decoded, and
+ * how many of them there are decides one bound: an offset up to
+ * `output_position + history_size` names a byte that has been decoded, and
+ * anything beyond it names one that has not.  Getting that wrong by a single
+ * byte either refuses a legal stream or reads a byte nothing ever wrote --
+ * and the second is inside the allocation, so no sanitizer sees it and the
+ * output is merely wrong.
+ *
+ * So both sides are checked at every history size, with the bytes compared
+ * against the format's own definition rather than against a round trip.
+ * Three mutations of the arithmetic survived the whole lz4 suite before this
+ * existed: a slide keeping one byte too few, one keeping one too many, and a
+ * bound off by one.
+ *
+ * A match longer than the offset is included because it is the case that
+ * used to be copied in two pieces, once from the history buffer and once
+ * from the output: it now spans a boundary inside one allocation and is one
+ * run, so nothing should notice it at all.
+ */
+TEST_F(Lz4DecoderTest, MatchCopy_OffsetsEitherSideOfTheHistoryEdge) {
+  const std::vector<uint8_t> literals = {0xE0, 0xE1, 0xE2, 0xE3, 0xE4};
+
+  for (size_t h : {size_t(1), size_t(2), size_t(15), size_t(16), size_t(17),
+           size_t(500), size_t(1000)}) {
+    std::vector<uint8_t> history(h);
+    for (size_t i = 0; i < h; i++) {
+      history[i] = static_cast<uint8_t>(i * 7u + 13u);
+    }
+
+    for (size_t d = 1; d <= h + 1u; d++) {
+      // Only a few offsets matter, but the two either side of the edge
+      // always do.
+      if (d > 3u && d + 3u < h) {
+        continue;
+      }
+      // Both nibbles stay below 15, so neither length carries an extension
+      // byte and the block is exactly the four bytes built below.
+      for (uint8_t match_len : {uint8_t(4), uint8_t(18)}) {
+        const std::vector<uint8_t> frame = LinkedFrameWithOneMatch(
+            history, static_cast<uint16_t>(d), match_len, literals);
+
+        std::vector<uint8_t> out(h + 64u);
+        size_t produced = 0;
+        const gcomp_status_t status = gcomp_decode_buffer(registry_, "lz4",
+            nullptr, frame.data(), frame.size(), out.data(), out.size(),
+            &produced);
+
+        const std::string where = "history " + std::to_string(h) + ", offset "
+            + std::to_string(d) + ", match " + std::to_string(match_len);
+
+        if (d > h) {
+          EXPECT_EQ(status, GCOMP_ERR_CORRUPT)
+              << where << ": reaches back further than anything decoded";
+          continue;
+        }
+
+        ASSERT_EQ(status, GCOMP_OK) << where;
+
+        // The format's definition, a byte at a time.
+        std::vector<uint8_t> want = history;
+        for (uint8_t i = 0; i < match_len; i++) {
+          want.push_back(want[want.size() - d]);
+        }
+        want.insert(want.end(), literals.begin(), literals.end());
+
+        out.resize(produced);
+        EXPECT_EQ(out, want) << where;
       }
     }
   }

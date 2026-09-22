@@ -414,8 +414,17 @@ typedef struct {
   size_t block_buffer_pos;  ///< Bytes accumulated
 
   // Decompressed block output buffer
-  uint8_t * output_buffer;   ///< Decompressed output buffer
-  size_t output_buffer_size; ///< Capacity
+  /**
+   * @brief Where a block decodes to.
+   *
+   * Points @ref output_prefix bytes into @ref output_alloc, which is the
+   * allocation and the thing to free.  The gap in front is the match
+   * history: see @ref history_size.
+   */
+  uint8_t * output_buffer;
+  uint8_t * output_alloc;    ///< The allocation @ref output_buffer sits in
+  size_t output_prefix;      ///< Bytes of @ref output_alloc before the block
+  size_t output_buffer_size; ///< Capacity, not counting prefix or slack
   size_t output_buffer_pos;  ///< Read position for output
   size_t output_buffer_len;  ///< Valid bytes in output buffer
 
@@ -428,10 +437,18 @@ typedef struct {
   uint8_t content_checksum_buf[4];
   size_t content_checksum_buf_pos;
 
-  // History buffer for dependent blocks
-  uint8_t * history_buffer; ///< History for back-references
-  size_t history_size;      ///< Current history size
-  size_t history_capacity;  ///< History buffer capacity
+  /**
+   * @brief How far back a match may reach before this block's own output.
+   *
+   * Those bytes are the ones immediately before @ref output_buffer, inside
+   * the same allocation -- not a buffer of their own.  A match source is
+   * then `dst - offset` whichever side of the boundary it falls, which is
+   * the whole point: asking which side it was cost a branch per match that
+   * nothing could predict, and a copy split in two when it was both.
+   *
+   * At most LZ4_HISTORY_SIZE, and zero when @ref output_prefix is.
+   */
+  size_t history_size;
 
   // Skippable frames
   uint32_t skippable_remaining; ///< Payload bytes left to discard
@@ -713,14 +730,16 @@ gcomp_status_t lz4_decode_parallel(gcomp_registry_t * registry,
  *        @ref LZ4_WIDE_SLACK short of the end and exact copies finish.  Pass
  *        zero for a buffer that is not yours to overshoot.
  * @param output_len_out Output: actual decompressed length
- * @param history History buffer for back-references (NULL for independent
- * blocks)
- * @param history_len History length
+ * @param history_len How far back a match may reach before @p output, in
+ *        bytes that are already decoded and sit immediately before it in the
+ *        same allocation.  Zero for an independent block, which is why a
+ *        caller with nothing in front of @p output passes zero rather than
+ *        a null pointer.
  * @return GCOMP_OK on success, error code on failure
  */
 gcomp_status_t lz4_block_decompress(const uint8_t * input, size_t input_len,
     uint8_t * output, size_t output_cap, size_t output_slack,
-    size_t * output_len_out, const uint8_t * history, size_t history_len);
+    size_t * output_len_out, size_t history_len);
 
 
 /**
