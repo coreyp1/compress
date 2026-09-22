@@ -1569,8 +1569,22 @@ endif
 # Sanitizer flags
 ASAN_FLAGS := -fsanitize=address -fno-omit-frame-pointer -g
 UBSAN_FLAGS := -fsanitize=undefined -fno-omit-frame-pointer -g
-# Combined sanitizer flags (ASan + UBSan work well together)
-ASAN_UBSAN_FLAGS := $(ASAN_FLAGS) -fsanitize=undefined
+# Combined sanitizer flags (ASan + UBSan work well together).
+#
+# UBSan recovers by default: without -fno-sanitize-recover it prints the
+# diagnostic, continues, and the process still exits 0 - so every UBSan finding
+# this target has ever made was reported and then passed.  The checks are named
+# in one variable because -fsanitize= and -fno-sanitize-recover= have to agree;
+# spelling them twice is how they drifted apart.  float-cast-overflow is in
+# clang's `undefined` group but not gcc's, and converting a float that does not
+# fit the destination integer is undefined behaviour, so it is named here.
+#
+# Deliberately absent: float-divide-by-zero, which IEEE 754 defines and which
+# fires on correct code that records an infinity.  bounds-strict and
+# pointer-overflow are already inside gcc 14's `undefined` and add nothing.
+UBSAN_CHECKS := undefined,float-cast-overflow
+ASAN_UBSAN_FLAGS := $(ASAN_FLAGS) -fsanitize=$(UBSAN_CHECKS) \
+                    -fno-sanitize-recover=$(UBSAN_CHECKS)
 
 # Sanitizer-specific build directories
 ASAN_BUILD_DIR := ./build/$(BUILD)-asan
