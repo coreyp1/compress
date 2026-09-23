@@ -157,9 +157,24 @@ CC := cc
 # build nobody can read in a debugger is a release build nobody can diagnose,
 # and the symbols cost only file size.
 #
-# -O3 is retained for release rather than chosen here; it predates this block.
-# It is also unmeasured for this library: there is no -O3-versus-O2 figure for
-# compress anywhere, so it is convention, not a result.
+# -O3 is retained for release, and as of 2026-09-23 it is measured rather than
+# inherited. One encode per case over a fixed 256 KB input, deterministic
+# counters because the machine was far too loaded for a clock (a 12-round
+# alternating wall-clock sweep put the reference library's own rate 8.3% apart
+# between runs, which is more than the effect being looked for):
+#
+#   instructions, -O3 vs -O2   deflate-9 -9.80%   zstd-9 -10.80%
+#                              zstd-16   -4.37%   median over 9 cases -1.35%
+#                              cheap cases within 0.1% either way
+#   data refs                  deflate-9 -9.80%   zstd-9 -16.94%  zstd-16 -7.61%
+#   D1 misses                  -0.06% .. +0.01%   LLd misses +0.00% .. +0.01%
+#   incompressible input       deflate-9 -1.92%   zstd-9 -11.31% (instructions)
+#
+# So -O3 is not buying instructions with cache misses, which is the way this
+# question usually goes wrong: it does strictly less work on every axis. The
+# miss counts are flat because the working set belongs to the algorithm and the
+# tables, which the optimizer does not change; what it removes is loads and
+# stores. Compressed output is byte-identical at both levels.
 #
 # What appends its own -O after this one, all relying on the last -O winning:
 # `make coverage` passes EXTRA_CFLAGS="--coverage -O0", which lands at the end
@@ -178,13 +193,24 @@ CC := cc
 # shared-library link line is g++ as linker driver carrying CXXFLAGS, and an
 # -O on a link line is inert without LTO.
 #
-# Leaving the inheritance alone, with the argument written down rather than
-# settled here: -Wmaybe-uninitialized, -Warray-bounds and the aliasing and
-# signed-overflow assumptions UBSan exists to catch are all optimizer-
-# dependent, so a gate pinned below the shipping level is testing code nobody
-# installs. chron pins its sanitizer to -O1 and gets cleaner stack traces for
-# it, which is an honest argument the other way. Whether the suite should
-# standardise, and on which, is not this Makefile's call.
+# Leaving the inheritance alone, but NOT because inheriting is better. An
+# earlier version of this comment argued that a gate pinned below the shipping
+# level tests code nobody installs, naming the aliasing and signed-overflow
+# assumptions UBSan exists to catch. Measured, that argument does not hold:
+#
+#   UBSan signed overflow   reported identically at -O0, -O1, -O2 and -O3
+#   strict aliasing         not reported at ANY level, by any sanitizer; the
+#                           only instrument is -Wstrict-aliasing=1 at compile
+#                           time, which also fires at -O0
+#   -Warray-bounds          -O0 silent, -O2 warns
+#
+# The level-dependent diagnostics are compiler *warnings*, and those already
+# come from the release build, which compiles every TU at -O3 with -Werror. A
+# sanitizer's own -O buys essentially nothing in detection, so on this evidence
+# chron's choice - pin -O1 and get readable stack traces for free - is the
+# better one. It is not changed here because the suite-wide question is not
+# this Makefile's to settle; the measurement is recorded so whoever settles it
+# is not relying on the argument above, which was wrong.
 ifeq ($(BUILD),debug)
 OPT_CFLAGS := -O0
 else
