@@ -507,7 +507,7 @@ $(APP_DIR)/$(STATIC_TARGET): \
 ####################################################################
 
 # Test helper object (compiled once, linked into all tests)
-$(TEST_HELPER_OBJ): tests/common/test_helpers.cpp | $(LIBVER_GEN)
+$(TEST_HELPER_OBJ): tests/common/test_helpers.cpp $(FLAGS_STAMP) | $(LIBVER_GEN)
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(TEST_INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
 
@@ -1746,7 +1746,7 @@ $(ASAN_APP_DIR)/$(ASAN_TARGET): $(ASAN_LIBOBJECTS)
 	$(CXX) $(ASAN_CXXFLAGS) -shared -o $@ $^ $(ASAN_LDFLAGS)
 
 # ASan test helper object
-$(ASAN_OBJ_DIR)/tests/common/test_helpers.o: tests/common/test_helpers.cpp | $(LIBVER_GEN)
+$(ASAN_OBJ_DIR)/tests/common/test_helpers.o: tests/common/test_helpers.cpp $(ASAN_FLAGS_STAMP) | $(LIBVER_GEN)
 	@mkdir -p $(@D)
 	$(CXX) $(ASAN_CXXFLAGS) $(TEST_INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
 
@@ -1935,7 +1935,7 @@ $(TSAN_APP_DIR)/$(TSAN_TARGET): $(TSAN_LIBOBJECTS)
 	@mkdir -p $(@D)
 	$(CXX) $(TSAN_CXXFLAGS) -shared -o $@ $^ $(TSAN_LDFLAGS)
 
-$(TSAN_OBJ_DIR)/tests/common/test_helpers.o: tests/common/test_helpers.cpp | $(LIBVER_GEN)
+$(TSAN_OBJ_DIR)/tests/common/test_helpers.o: tests/common/test_helpers.cpp $(TSAN_FLAGS_STAMP) | $(LIBVER_GEN)
 	@mkdir -p $(@D)
 	$(CXX) $(TSAN_CXXFLAGS) $(TEST_INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
 
@@ -2278,7 +2278,24 @@ help: ## Display this help
 # Each build tree carries the flag string it was built with. The stamp is
 # rewritten only when that string differs -- written to a scratch file,
 # compared, moved into place only on a difference -- so its mtime moves on a
-# flag change and on nothing else. The object rules above depend on it.
+# flag change and on nothing else. EVERY object rule above depends on the stamp
+# for its own build tree, and that has to stay true of any rule added later,
+# because a stamp is only worth its coverage.
+#
+# Three rules were left out when these were introduced: the release, ASan and
+# TSan test_helpers.o rules, each an explicit rule sitting apart from the
+# pattern rules that did get the stamp. So `make EXTRA_CXXFLAGS=-O2`
+# recompiled every object except those three and linked the result, and
+# nothing said so -- an object records nowhere make can see what flags built
+# it, and a mixed build links and runs like any other.
+#
+# The witness has to be a paired test with a control, because "it rebuilt" and
+# "make found nothing to do" are the same empty output: build two objects,
+# change a flag on the command line, then compare mtimes and the -O tokens gcc
+# records in .debug_str. The stamped object moved and its recorded command line
+# gained the new flag; the unstamped one did neither. Read the tokens as
+# occurrences, not decisions -- both -O3 and -O2 appear on a command line where
+# EXTRA_CFLAGS appends, and the last one is what the compiler used.
 #
 # This replaces listing `Makefile` as a prerequisite, which was too broad (a
 # comment-only edit recompiled everything) and too narrow (a command-line
