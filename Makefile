@@ -324,6 +324,14 @@ CFLAGS := -pedantic-errors -Wall -Wextra -Werror -Wfatal-errors -std=c17 $(OPT_C
 # No -DGCOMP_TEST_BUILD here: the shipped library exports its public API and
 # nothing else. Tests reach the internals by linking the static archive, which
 # a static link can do even for hidden symbols.
+ifeq ($(OS_NAME), Windows)
+# Everything built here but the library itself links the static archive, so
+# the headers must not say dllimport to it: an archive has no __imp_ thunks.
+# The library's own objects also get GCOMP_BUILD, which the header tests first.
+# See GCOMP_API in macros.h.
+CFLAGS += -DGCOMP_STATIC
+CXXFLAGS += -DGCOMP_STATIC
+endif
 LIB_CFLAGS := $(CFLAGS) -fvisibility=hidden -DGCOMP_BUILD $(EXTRA_CFLAGS)
 # ---------------------------------------------------------------------------
 # Goals that need no dependency

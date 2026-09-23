@@ -97,6 +97,11 @@ extern "C" {
  * shared library. Automatically handles Windows DLL export/import
  * and Unix symbol visibility.
  *
+ * On Windows, code that links the static archive rather than the DLL must
+ * define GCOMP_STATIC: dllimport makes the compiler reference __imp_ thunks,
+ * which only a DLL's import library provides. The test suite links the
+ * archive, so the Makefile defines it there.
+ *
  * Example:
  * @code
  * GCOMP_API void public_function(void);
@@ -111,6 +116,8 @@ extern "C" {
 #if defined(_WIN32) || defined(__CYGWIN__)
 #ifdef GCOMP_BUILD
 #define GCOMP_API GCOMP_EXTERN __declspec(dllexport)
+#elif defined(GCOMP_STATIC)
+#define GCOMP_API GCOMP_EXTERN
 #else
 #define GCOMP_API GCOMP_EXTERN __declspec(dllimport)
 #endif
@@ -130,6 +137,8 @@ extern "C" {
 #if defined(_WIN32) || defined(__CYGWIN__)
 #ifdef GCOMP_BUILD
 #define GCOMP_API_DATA __declspec(dllexport)
+#elif defined(GCOMP_STATIC)
+#define GCOMP_API_DATA
 #else
 #define GCOMP_API_DATA __declspec(dllimport)
 #endif
