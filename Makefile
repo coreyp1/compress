@@ -409,6 +409,31 @@ LIBVER_GEN := $(GEN_DIR)/ghoti.io/$(PROJECT)/libver_gen.h
 # make BRANCH=-dev - takes effect. Keying the rule on the Makefile's timestamp
 # alone left the previous token and version baked into the build, and nothing
 # said so.
+
+# EVERY rule that compiles a translation unit lists this header as an
+# order-only prerequisite, and they have to stay that way. namespace.h
+# includes libver.h, which includes libver_gen.h, so any source that reaches a
+# public header needs it to exist before the compiler runs. Only the two
+# release library rules had it. The result was that `make test-asan`,
+# `make test-tsan` and `make fuzz-build` could not build a clean checkout at
+# all: each stopped on
+#
+#     libver.h:45:10: fatal error: ghoti.io/compress/libver_gen.h
+#
+# after eleven lines of output, exit 2. Nobody hit it because nobody runs a
+# sanitizer target as the first command in a fresh tree - a plain `make` first
+# generates the header as a side effect of the release build, and from then on
+# the file is simply there, so the missing prerequisite is invisible for the
+# life of the checkout. It surfaced only in a scratch clone.
+#
+# The release paths were not affected and are worth distinguishing from the
+# broken ones, so this is not read as a wider outage than it was: test
+# executables take the static archive as a normal prerequisite, and
+# test_helpers.cpp includes no compress header (the libver.h in its .d file is
+# cutil's). The helper and release test rules are listed for uniformity, so
+# that the rule set stops encoding a guess about which sources include what -
+# adding one include to test_helpers.h would otherwise reintroduce this.
+
 .PHONY: force-libver
 force-libver:
 
@@ -482,14 +507,14 @@ $(APP_DIR)/$(STATIC_TARGET): \
 ####################################################################
 
 # Test helper object (compiled once, linked into all tests)
-$(TEST_HELPER_OBJ): tests/common/test_helpers.cpp
+$(TEST_HELPER_OBJ): tests/common/test_helpers.cpp | $(LIBVER_GEN)
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(TEST_INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
 
 # Pattern rule for compiling test source files to object files
 # This allows tests to be compiled separately from linking
 # Only test_helpers is built as .o (shared by all tests). Individual test .cpp files compile directly to exe.
-$(OBJ_DIR)/tests/%.o: tests/%.cpp $(FLAGS_STAMP)
+$(OBJ_DIR)/tests/%.o: tests/%.cpp $(FLAGS_STAMP) | $(LIBVER_GEN)
 	@printf "\n### Compiling Test Object: $* ###\n"
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(TEST_INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
@@ -642,7 +667,7 @@ AFL_STATIC_TARGET := $(BASE_NAME_PREFIX)-afl.a
 # misaligned-pointer report from UBSan, in a build where one translation unit
 # still had the old struct layout.  The regular and ASan builds already do
 # this; this rule was the one that did not.
-$(AFL_OBJ_DIR)/%.o: src/%.c $(AFL_FLAGS_STAMP)
+$(AFL_OBJ_DIR)/%.o: src/%.c $(AFL_FLAGS_STAMP) | $(LIBVER_GEN)
 	@printf "\n### Compiling (AFL instrumented): $< ###\n"
 	@mkdir -p $(@D)
 	$(AFL_CC) $(AFL_CFLAGS) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
@@ -1702,7 +1727,7 @@ endif
 # heap-buffer-overflow in code that was correct.  A sanitizer build that can be
 # assembled from mismatched objects is worse than no sanitizer build: it can
 # invent a failure, and it can just as easily hide a real one.
-$(ASAN_OBJ_DIR)/%.o: src/%.c $(ASAN_FLAGS_STAMP)
+$(ASAN_OBJ_DIR)/%.o: src/%.c $(ASAN_FLAGS_STAMP) | $(LIBVER_GEN)
 	@printf "\n### Compiling (ASan+UBSan instrumented): $< ###\n"
 	@mkdir -p $(@D)
 	$(CC) $(ASAN_CFLAGS) $(INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
@@ -1721,12 +1746,12 @@ $(ASAN_APP_DIR)/$(ASAN_TARGET): $(ASAN_LIBOBJECTS)
 	$(CXX) $(ASAN_CXXFLAGS) -shared -o $@ $^ $(ASAN_LDFLAGS)
 
 # ASan test helper object
-$(ASAN_OBJ_DIR)/tests/common/test_helpers.o: tests/common/test_helpers.cpp
+$(ASAN_OBJ_DIR)/tests/common/test_helpers.o: tests/common/test_helpers.cpp | $(LIBVER_GEN)
 	@mkdir -p $(@D)
 	$(CXX) $(ASAN_CXXFLAGS) $(TEST_INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
 
 # Pattern rule for ASan test object files
-$(ASAN_OBJ_DIR)/tests/%.o: tests/%.cpp $(ASAN_FLAGS_STAMP)
+$(ASAN_OBJ_DIR)/tests/%.o: tests/%.cpp $(ASAN_FLAGS_STAMP) | $(LIBVER_GEN)
 	@printf "\n### Compiling ASan+UBSan Test Object: $* ###\n"
 	@mkdir -p $(@D)
 	$(CXX) $(ASAN_CXXFLAGS) $(TEST_INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
@@ -1900,7 +1925,7 @@ endif
 # reason spelled out above the first ASan compile rule: a sanitizer build
 # assembled from objects that disagree about a struct can invent a failure and
 # can hide a real one.
-$(TSAN_OBJ_DIR)/%.o: src/%.c $(TSAN_FLAGS_STAMP)
+$(TSAN_OBJ_DIR)/%.o: src/%.c $(TSAN_FLAGS_STAMP) | $(LIBVER_GEN)
 	@printf "\n### Compiling (TSan instrumented): $< ###\n"
 	@mkdir -p $(@D)
 	$(CC) $(TSAN_CFLAGS) $(INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
@@ -1910,11 +1935,11 @@ $(TSAN_APP_DIR)/$(TSAN_TARGET): $(TSAN_LIBOBJECTS)
 	@mkdir -p $(@D)
 	$(CXX) $(TSAN_CXXFLAGS) -shared -o $@ $^ $(TSAN_LDFLAGS)
 
-$(TSAN_OBJ_DIR)/tests/common/test_helpers.o: tests/common/test_helpers.cpp
+$(TSAN_OBJ_DIR)/tests/common/test_helpers.o: tests/common/test_helpers.cpp | $(LIBVER_GEN)
 	@mkdir -p $(@D)
 	$(CXX) $(TSAN_CXXFLAGS) $(TEST_INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
 
-$(TSAN_OBJ_DIR)/tests/%.o: tests/%.cpp $(TSAN_FLAGS_STAMP)
+$(TSAN_OBJ_DIR)/tests/%.o: tests/%.cpp $(TSAN_FLAGS_STAMP) | $(LIBVER_GEN)
 	@printf "\n### Compiling TSan Test Object: $* ###\n"
 	@mkdir -p $(@D)
 	$(CXX) $(TSAN_CXXFLAGS) $(TEST_INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
