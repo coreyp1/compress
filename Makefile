@@ -205,9 +205,18 @@ CC := cc
 # assumptions UBSan exists to catch. Measured, that argument does not hold:
 #
 #   UBSan signed overflow   reported identically at -O0, -O1, -O2 and -O3
-#   strict aliasing         not reported at ANY level, by any sanitizer; the
-#                           only instrument is -Wstrict-aliasing=1 at compile
-#                           time, which also fires at -O0
+#   strict aliasing         not reported at ANY level, by any sanitizer. The
+#                           only instrument is -Wstrict-aliasing at compile
+#                           time, and the line below used to claim it "also
+#                           fires at -O0". It does not. What arms the warning
+#                           is -fstrict-aliasing, the optimisation, which gcc
+#                           enables at -O2 and above and DISABLES at -O0 and
+#                           -O1. Measured on both shapes, at every level from
+#                           1 to 3: silent at -O0 and -O1, fires from -O2 up,
+#                           and armed at -O0 by naming -fstrict-aliasing
+#                           explicitly. So the claim was right about the
+#                           release build and wrong about the debug one, which
+#                           is the build it was written to describe.
 #   -Warray-bounds          -O0 silent, -O2 warns
 #
 # The level-dependent diagnostics are compiler *warnings*, and those already
@@ -223,7 +232,54 @@ else
 OPT_CFLAGS := -O3
 endif
 
-CFLAGS := -pedantic-errors -Wall -Wextra -Werror -Wno-error=unused-function -Wfatal-errors -std=c17 $(OPT_CFLAGS) -g $(EXTRA_CFLAGS)
+# Strict aliasing, named rather than inherited. Two flags doing two jobs:
+#
+#   -fstrict-aliasing     licenses the optimisation AND is what arms the
+#                         warning. Already on at -O2/-O3, off at -O0/-O1.
+#   -Wstrict-aliasing=2   chooses what the warning diagnoses.
+#
+# Both were previously implicit, and each was implicit in a way that hid
+# something.
+#
+# The LEVEL was 3, because -Wall implies 3 - it does not leave the level
+# unset, which is what reading the flag list suggests. 3 is gcc's least
+# aggressive setting. Measured here across five shapes at -O2, varying one
+# thing at a time:
+#
+#                                              L0  L1  L2  L3
+#   &visible object, direct deref               0   1   1   1
+#   &visible object, via pointer variable       0   1   1   0
+#   parameter, direct deref                     0   1   0   0
+#   parameter, via pointer variable             0   1   0   0
+#   local via void * -> int *                   0   0   0   0
+#
+# Two independent axes: taking the address of an object the compiler can see
+# is what level 2 needs, and routing the cast through a separate pointer
+# variable is what defeats level 3. So level 2 adds the second row over the 3
+# that was in force, and costs nothing: all 76 library TUs compile clean at 2
+# under -Werror, in both the release and debug configurations and with
+# -DGCOMP_TEST_BUILD. Level 1 was measured too and is not adoptable - 7
+# diagnostics in 5 files, every one a construct C17 sanctions (six are
+# initial-member conversions, one is a trailing-array carve), and no true
+# positive among them.
+#
+# The last row is the standing limit and bounds what this can claim: no level
+# catches punning through a void *, which is the shape real code reaches for.
+# This covers three of the five known shapes and is not aliasing coverage in
+# general.
+#
+# The OPTIMISATION was on only by virtue of -O3, so `BUILD=debug` compiled at
+# -O0 with the warning silent at every level - the debug build had no aliasing
+# diagnostic at all, and looked identical to one that did. Naming the flag
+# arms it in both.
+#
+# EXTRA_CFLAGS comes last and so can still displace the level: an explicit
+# level beats -Wall's implicit 3 from either side, but a later explicit level
+# displaces an earlier one, which makes EXTRA_CFLAGS=-Wstrict-aliasing=3 a
+# silent disarming. check-aliasing is the reason that is not a silent one.
+ALIASING_CFLAGS := -fstrict-aliasing -Wstrict-aliasing=2
+
+CFLAGS := -pedantic-errors -Wall -Wextra -Werror -Wno-error=unused-function -Wfatal-errors -std=c17 $(OPT_CFLAGS) -g $(ALIASING_CFLAGS) $(EXTRA_CFLAGS)
 # Library-specific compile flags (export symbols on Windows, PIC on Linux)
 # GCOMP_BUILD enables DLL export on Windows (checked by GCOMP_API macro)
 # GCOMP_TEST_BUILD enables export of internal functions for testing (checked by GCOMP_INTERNAL_API macro)
@@ -344,7 +400,7 @@ TESTFLAGS_PC := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --l
 # coverage target does, because --coverage links the gcov runtime, whose
 # mangle_path check-symbols is right to reject in a shipping library and
 # wrong to reject in an instrumented one. Spelled as text's TEST_GATES is.
-TEST_GATES ?= check-symbols check-clean-guard
+TEST_GATES ?= check-symbols check-clean-guard check-aliasing
 
 
 # Valgrind flags (exclude "still reachable" as it's not a leak)
@@ -739,7 +795,7 @@ FUZZ_DEPFILES := $(patsubst fuzz/%.c,$(APP_DIR)/fuzz/%.d,$(FUZZ_SOURCES))
 ####################################################################
 
 # General commands
-.PHONY: clean cloc docs docs-pdf examples bench bench-deflate coverage check-symbols check-clean-guard
+.PHONY: clean cloc docs docs-pdf examples bench bench-deflate coverage check-symbols check-clean-guard check-aliasing
 # Release build commands
 .PHONY: all install test test-quiet test-valgrind test-valgrind-quiet test-watch uninstall watch
 # Debug build commands
@@ -1526,6 +1582,138 @@ check-clean-guard: ## Fail if the pkg-config check gates the wrong goals
 			exit 1; \
 		fi
 	@printf "\033[0;32mEvery dependency-free goal runs without one; every other goal is refused.\033[0m\n"
+
+####################################################################
+# Strict-aliasing gate
+####################################################################
+
+check-aliasing: ## Fail if the strict-aliasing warning is no longer armed
+# $(ALIASING_CFLAGS) is what detects these violations, and it lives in CFLAGS
+# under -Werror - so a real violation fails the build and no sweep is needed.
+# A disarmed warning fails nothing and looks exactly like a clean library.
+# This compiles a planted violation with the library's OWN flags and fails if
+# it is accepted.
+#
+# Deliberately $(CFLAGS) and not a copy: a control compiled with flags written
+# out beside it proves those flags work, which is not the question.
+#
+# THE SHAPE OF THE CONTROL IS LOAD-BEARING, and the requirement is that a
+# control for a gate at level N must be caught at N and MISSED at N+1. The
+# grid is in the comment on ALIASING_CFLAGS. This control is the address of a
+# visible object cast through a pointer variable - caught at 1 and 2, missed
+# at 3 - so it certifies "2 or stricter" and fails if the level falls back to
+# the 3 that -Wall implies, or to 0. The natural way to write a type pun,
+# *(int32_t *)&obj, is diagnosed from level 1 up including 3, so a control
+# spelled that way would pass with the gate switched off. Do not simplify it.
+#
+# The second compile is what stops this gate going vacuous on its own. It
+# repeats the control with -Wstrict-aliasing=3 appended, which displaces the
+# level (a later explicit level beats an earlier one - that is the same
+# mechanism as the EXTRA_CFLAGS hazard, used here as an instrument), and
+# requires it to be ACCEPTED. If a future gcc starts diagnosing this shape at
+# 3, the control stops separating the levels and this gate would keep passing
+# while asserting nothing about the level in force. Then it says so instead.
+#
+# Two failure causes this library has that chron's copy does not, both
+# reported separately because they want different fixes:
+#
+#   -fstrict-aliasing [disabled]   the OPTIMISATION is off, so nothing arms
+#                                  the warning at any level. That is what
+#                                  -O0 and -O1 do, and why ALIASING_CFLAGS
+#                                  names the flag.
+#   level absent, query exit 0     the flag string is malformed. Not "unset"
+#                                  and not clang - an empty -Q result has
+#                                  three causes and exit status separates
+#                                  them.
+#
+# clang accepts -Wstrict-aliasing=1 and =2 and implements neither, and rejects
+# =3 outright, so `make CC=clang` reaches this gate with the aliasing flags on
+# every compile line and no aliasing coverage behind them. That is a true
+# failure and the gate reports it, naming the compiler rather than the flags.
+check-aliasing: $(LIBVER_GEN)
+	@mkdir -p $(BUILD_DIR)
+	@printf '%s\n' \
+		'#include <stdint.h>' \
+		'static double gcomp_alias_object;' \
+		'int32_t gcomp_alias_control(void);' \
+		'int32_t gcomp_alias_control(void) {' \
+		'  int32_t * p = (int32_t *)&gcomp_alias_object;' \
+		'  gcomp_alias_object = 1.0;' \
+		'  return *p;' \
+		'}' > $(BUILD_DIR)/alias_control.c
+# qrc below is read on the same line the compiler runs on and must stay there.
+# Any $(...) evaluated in between - including one building the message that
+# reports the status - replaces $? with the subshell's, and the clang branch
+# stops being selected. Adding a substitution to the lines above it looks like
+# editing prose.
+	@if $(CC) $(CFLAGS) $(INCLUDE) -fsyntax-only \
+			$(BUILD_DIR)/alias_control.c 2> $(BUILD_DIR)/alias_control.log; then \
+		qout=$$($(CC) -Q --help=warnings $(CFLAGS) 2>/dev/null); qrc=$$?; \
+		oout=$$($(CC) -Q --help=optimizers $(CFLAGS) 2>/dev/null); \
+		lvl=$$(printf '%s\n' "$$qout" \
+			| awk '/-Wstrict-aliasing=<0,3>/ { print $$2 }'); \
+		opt=$$(printf '%s\n' "$$oout" \
+			| awk '$$1 == "-fstrict-aliasing" { print $$2 }'); \
+		printf "\033[0;31mcheck-aliasing: %s accepted a planted type-punning violation, so this build has no aliasing coverage.\033[0m\n" "$$($(CC) --version 2>/dev/null | head -1)" >&2; \
+		if [ "$$opt" = "[disabled]" ]; then \
+			printf '%s\n' \
+				'  -fstrict-aliasing is DISABLED, which silences this warning at every level - the' \
+				'  level below is beside the point. gcc disables it at -O0 and -O1, so this is what a' \
+				'  build carrying -O0 or -O1 after ALIASING_CFLAGS looks like, and what removing' \
+				'  -fstrict-aliasing from ALIASING_CFLAGS looks like. Restore the flag rather than' \
+				'  raising the level; no level fires without it.' >&2; \
+		elif [ -z "$$lvl" ] && [ "$$qrc" = "0" ]; then \
+			printf '%s\n' \
+				'  -Q --help=warnings succeeded and named no -Wstrict-aliasing level at all, which is' \
+				'  neither compiler behaviour seen here. Do NOT read this as the clang case: check what' \
+				'  CFLAGS was actually passed before concluding anything about the warning.' >&2; \
+		elif [ -z "$$lvl" ]; then \
+			printf '%s\n' \
+				'  This compiler would not report an effective -Wstrict-aliasing level, which gcc gives' \
+				'  through -Q --help=warnings. Expect clang: it accepts -fstrict-aliasing' \
+				'  -Wstrict-aliasing=2 in silence and implements no such diagnostic, so the flags ride' \
+				'  every compile line of a clang build while detecting nothing. compress aliasing' \
+				'  coverage is gcc-only, and a clang run does not have it.' >&2; \
+		elif [ "$$lvl" = "1" ] || [ "$$lvl" = "2" ]; then \
+			printf '  The effective -Wstrict-aliasing level is %s, which is a level that DOES diagnose this control.\n' "$$lvl" >&2; \
+			printf '%s\n' \
+				'  So the flags are right and the compiler is not implementing them - that is clang,' \
+				'  which accepts these flags in silence. compress aliasing coverage is gcc-only.' >&2; \
+		else \
+			printf '  The effective -Wstrict-aliasing level is %s, and this control is diagnosed only at 1 and 2.\n' "$$lvl" >&2; \
+			printf '%s\n' \
+				'  So the warning is at the WRONG LEVEL rather than missing, and ALIASING_CFLAGS is' \
+				'  likely untouched. What displaces it is a later EXPLICIT level, since an explicit' \
+				'  level beats the 3 that -Wall implies from either side. CFLAGS ends with' \
+				'  EXTRA_CFLAGS, so EXTRA_CFLAGS=-Wstrict-aliasing=3 does exactly this. Note that 3 is' \
+				'  also what -Wall implies on its own, so a level of 3 is equally what removing' \
+				'  -Wstrict-aliasing=2 from ALIASING_CFLAGS looks like; 0 can only have been asked' \
+				'  for.' >&2; \
+		fi; \
+		exit 1; \
+	fi
+	@if ! grep -q 'strict-aliasing' $(BUILD_DIR)/alias_control.log; then \
+		printf "\033[0;31mcheck-aliasing: the control failed to compile, but not for aliasing - so this says nothing about whether the warning is armed:\033[0m\n" >&2; \
+		cat $(BUILD_DIR)/alias_control.log >&2; \
+		exit 1; \
+	fi
+	@if ! $(CC) $(CFLAGS) -Wstrict-aliasing=3 $(INCLUDE) -fsyntax-only \
+			$(BUILD_DIR)/alias_control.c 2> $(BUILD_DIR)/alias_control3.log; then \
+		if grep -q 'strict-aliasing' $(BUILD_DIR)/alias_control3.log; then \
+			printf "\033[0;31mcheck-aliasing: the control is now diagnosed at -Wstrict-aliasing=3 as well, so it no longer certifies the level in force.\033[0m\n" >&2; \
+			printf '%s\n' \
+				'  It was chosen because level 3 accepts it: that is what makes its rejection evidence' \
+				'  that the level is 2 or stricter rather than the 3 -Wall implies. Now it would be' \
+				'  rejected either way, and this gate would pass with the level silently back at 3.' \
+				'  Respell the control to a shape this compiler accepts at 3 and rejects at 2, and' \
+				'  re-measure the grid on ALIASING_CFLAGS; do not simply delete this check.' >&2; \
+		else \
+			printf "\033[0;31mcheck-aliasing: the vacuity control failed to compile, but not for aliasing:\033[0m\n" >&2; \
+			cat $(BUILD_DIR)/alias_control3.log >&2; \
+		fi; \
+		exit 1; \
+	fi
+	@printf "\033[0;32mA planted type-punning violation is refused by the library's own flags, and accepted at -Wstrict-aliasing=3 - so the level in force is doing work the default would not.\033[0m\n"
 
 test: ## Make and run the Unit tests
 test: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES) $(TEST_GATES)
