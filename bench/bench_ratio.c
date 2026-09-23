@@ -172,30 +172,46 @@ static void * bench_dlopen(const char * name) {
   return dlopen(name, RTLD_NOW);
 }
 
+/**
+ * @brief Store a dlsym result into a function pointer without type-punning.
+ *
+ * C gives no conversion between a void pointer and a function pointer, and the
+ * usual workaround takes the address of the function pointer, casts it to a
+ * pointer-to-void-pointer and writes through that. POSIX blesses it for dlsym,
+ * but it is a type-punned store as far as the compiler is concerned, and
+ * -Wstrict-aliasing=2 diagnosed all thirteen of the ones that used to be here -
+ * at level 2 and not at the 3 that -Wall implies, so they compiled silently
+ * until the level was named. Copying the bytes says the same thing with no
+ * aliasing violation to forgive, and compiles to the same load and store.
+ */
+static void bench_bind(void * fn_slot, void * sym) {
+  memcpy(fn_slot, &sym, sizeof sym);
+}
+
 static void bench_load_references(void) {
   void * z = bench_dlopen("libz.so.1");
   if (z) {
-    *(void **)&zlib_compress2 = dlsym(z, "compress2");
-    *(void **)&zlib_compressBound = dlsym(z, "compressBound");
-    *(void **)&zlib_uncompress = dlsym(z, "uncompress");
+    bench_bind(&zlib_compress2, dlsym(z, "compress2"));
+    bench_bind(&zlib_compressBound, dlsym(z, "compressBound"));
+    bench_bind(&zlib_uncompress, dlsym(z, "uncompress"));
   }
   void * zs = bench_dlopen("libzstd.so.1");
   if (zs) {
-    *(void **)&zstd_compress = dlsym(zs, "ZSTD_compress");
-    *(void **)&zstd_compressBound = dlsym(zs, "ZSTD_compressBound");
-    *(void **)&zstd_isError = dlsym(zs, "ZSTD_isError");
-    *(void **)&zstd_decompress = dlsym(zs, "ZSTD_decompress");
+    bench_bind(&zstd_compress, dlsym(zs, "ZSTD_compress"));
+    bench_bind(&zstd_compressBound, dlsym(zs, "ZSTD_compressBound"));
+    bench_bind(&zstd_isError, dlsym(zs, "ZSTD_isError"));
+    bench_bind(&zstd_decompress, dlsym(zs, "ZSTD_decompress"));
   }
   void * l4 = bench_dlopen("liblz4.so.1");
   if (l4) {
-    *(void **)&lz4_compressFrame = dlsym(l4, "LZ4F_compressFrame");
-    *(void **)&lz4_compressFrameBound = dlsym(l4, "LZ4F_compressFrameBound");
-    *(void **)&lz4_isError = dlsym(l4, "LZ4F_isError");
-    *(void **)&lz4_createDecompressionContext =
-        dlsym(l4, "LZ4F_createDecompressionContext");
-    *(void **)&lz4_freeDecompressionContext =
-        dlsym(l4, "LZ4F_freeDecompressionContext");
-    *(void **)&lz4_decompress = dlsym(l4, "LZ4F_decompress");
+    bench_bind(&lz4_compressFrame, dlsym(l4, "LZ4F_compressFrame"));
+    bench_bind(&lz4_compressFrameBound, dlsym(l4, "LZ4F_compressFrameBound"));
+    bench_bind(&lz4_isError, dlsym(l4, "LZ4F_isError"));
+    bench_bind(&lz4_createDecompressionContext,
+        dlsym(l4, "LZ4F_createDecompressionContext"));
+    bench_bind(&lz4_freeDecompressionContext,
+        dlsym(l4, "LZ4F_freeDecompressionContext"));
+    bench_bind(&lz4_decompress, dlsym(l4, "LZ4F_decompress"));
   }
 }
 
