@@ -293,6 +293,7 @@ LIBVER_SYMBOL := $(shell echo "ghotiio_$(PROJECT)$(BRANCH)" | sed 's/[.-]/_/g')
 BUILD_DIR := ./build/$(BUILD)
 OBJ_DIR := $(BUILD_DIR)/objects
 FLAGS_STAMP := $(OBJ_DIR)/.flags
+LINK_STAMP := $(OBJ_DIR)/.linkflags
 GEN_DIR := $(BUILD_DIR)/generated
 APP_DIR := $(BUILD_DIR)/apps
 
@@ -327,6 +328,16 @@ LIBOBJECTS := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(SOURCES))
 
 
 TESTFLAGS := `PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs --cflags gtest`
+
+# The same query as a make variable, for the link stamps to record. TESTFLAGS is
+# a BACKTICK string, expanded by the shell when a recipe runs, so its characters
+# are the same however far gtest moves -- a stamp recording $(TESTFLAGS) alone
+# would be present, correct-looking and permanently equal. It is still worth
+# recording, because a command-line `make TESTFLAGS=...` replaces the whole
+# value and so does change those characters; the two spellings catch different
+# halves and a stamp needs both. Checked non-empty: an empty $(shell) result
+# would be the same permanently-equal trap wearing the other hat.
+TESTFLAGS_PC := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs --cflags gtest 2>/dev/null)
 
 # The checks `make test` runs besides the tests themselves. Named in a
 # variable so that a build which cannot satisfy them can clear it: the
@@ -532,6 +543,7 @@ $(APP_DIR)/$2$(EXE_EXTENSION): \
 		$1 \
 		$(TEST_HELPER_OBJ) \
 		$(APP_DIR)/$(STATIC_TARGET) \
+		$(LINK_STAMP) \
 		| $(APP_DIR)/$(TARGET)
 	@printf "\n### Compiling and linking %s Test ###\n" "$2"
 	@mkdir -p $$(@D)
@@ -1685,6 +1697,7 @@ ASAN_UBSAN_FLAGS := $(ASAN_FLAGS) -fsanitize=$(UBSAN_CHECKS) \
 ASAN_BUILD_DIR := ./build/$(BUILD)-asan
 ASAN_OBJ_DIR := $(ASAN_BUILD_DIR)/objects
 ASAN_FLAGS_STAMP := $(ASAN_OBJ_DIR)/.flags
+ASAN_LINK_STAMP := $(ASAN_OBJ_DIR)/.linkflags
 ASAN_APP_DIR := $(ASAN_BUILD_DIR)/apps
 
 # ASan-instrumented object files
@@ -1771,7 +1784,8 @@ ASAN_TEST_OBJ_$1 := $(ASAN_OBJ_DIR)/tests/$(patsubst tests/%.cpp,%.o,$1)
 $(ASAN_APP_DIR)/$2$(EXE_EXTENSION): \
 		$$(ASAN_TEST_OBJ_$1) \
 		$(ASAN_TEST_HELPER_OBJ) \
-		$(ASAN_APP_DIR)/$(ASAN_TARGET)
+		$(ASAN_APP_DIR)/$(ASAN_TARGET) \
+		$(ASAN_LINK_STAMP)
 	@printf "\n### Linking ASan+UBSan %s Test ###\n" "$2"
 	@mkdir -p $$(@D)
 	$$(CXX) $$(ASAN_CXXFLAGS) -o $$@ $$(ASAN_TEST_OBJ_$1) $$(ASAN_TEST_HELPER_OBJ) $$(ASAN_LDFLAGS) $$(TESTFLAGS) $$(ASAN_COMPRESSLIBRARY)
@@ -1880,6 +1894,7 @@ TSAN_FLAGS := -fsanitize=thread -fno-omit-frame-pointer -g
 TSAN_BUILD_DIR := ./build/$(BUILD)-tsan
 TSAN_OBJ_DIR := $(TSAN_BUILD_DIR)/objects
 TSAN_FLAGS_STAMP := $(TSAN_OBJ_DIR)/.flags
+TSAN_LINK_STAMP := $(TSAN_OBJ_DIR)/.linkflags
 TSAN_APP_DIR := $(TSAN_BUILD_DIR)/apps
 
 TSAN_LIBOBJECTS := $(patsubst src/%.c,$(TSAN_OBJ_DIR)/%.o,$(SOURCES))
@@ -1955,7 +1970,8 @@ TSAN_TEST_OBJ_$1 := $(TSAN_OBJ_DIR)/tests/$(patsubst tests/%.cpp,%.o,$1)
 $(TSAN_APP_DIR)/$2$(EXE_EXTENSION): \
 		$$(TSAN_TEST_OBJ_$1) \
 		$(TSAN_TEST_HELPER_OBJ) \
-		$(TSAN_APP_DIR)/$(TSAN_TARGET)
+		$(TSAN_APP_DIR)/$(TSAN_TARGET) \
+		$(TSAN_LINK_STAMP)
 	@printf "\n### Linking TSan %s Test ###\n" "$2"
 	@mkdir -p $$(@D)
 	$$(CXX) $$(TSAN_CXXFLAGS) -o $$@ $$(TSAN_TEST_OBJ_$1) $$(TSAN_TEST_HELPER_OBJ) $$(TSAN_LDFLAGS) $$(TESTFLAGS) $$(TSAN_COMPRESSLIBRARY)
@@ -2346,4 +2362,27 @@ $(ASAN_FLAGS_STAMP): force-flags
 $(TSAN_FLAGS_STAMP): force-flags
 	@mkdir -p $(@D)
 	@printf '%s\n' '$(CC) $(CXX) $(TSAN_CFLAGS) $(TSAN_CXXFLAGS) $(TSAN_LDFLAGS) $(INCLUDE) $(TEST_INCLUDE)' > $@.new
+	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@
+
+# Link stamps, one per tree, kept separate from the flag stamps above so that a
+# gtest move relinks the test binaries without recompiling 189 library objects.
+# The test executables were the population no flag stamp covered: they compile
+# and link in one step, so they are not object rules, and $(TESTFLAGS) appears
+# nowhere else. Measured before this existed: changing TESTFLAGS relinked 0 of
+# the test binaries and ran 0 compiler invocations, while an EXTRA_LDFLAGS
+# change relinked them (transitively, through LDFLAGS -> flag stamp -> objects
+# -> archive) and touching a test source relinked one, so the probe could move.
+$(LINK_STAMP): force-flags
+	@mkdir -p $(@D)
+	@printf '%s\n' '$(CXX) $(LDFLAGS) $(TESTFLAGS) $(TESTFLAGS_PC)' > $@.new
+	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@
+
+$(ASAN_LINK_STAMP): force-flags
+	@mkdir -p $(@D)
+	@printf '%s\n' '$(CXX) $(ASAN_LDFLAGS) $(TESTFLAGS) $(TESTFLAGS_PC)' > $@.new
+	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@
+
+$(TSAN_LINK_STAMP): force-flags
+	@mkdir -p $(@D)
+	@printf '%s\n' '$(CXX) $(TSAN_LDFLAGS) $(TESTFLAGS) $(TESTFLAGS_PC)' > $@.new
 	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@
