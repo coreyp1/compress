@@ -450,12 +450,6 @@ $(OBJ_DIR)/%.o: src/%.cpp $(FLAGS_STAMP) | $(LIBVER_GEN)
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
 
-# Pattern rule for test helper C++ files:
-$(OBJ_DIR)/tests/%.o: tests/%.cpp $(FLAGS_STAMP)
-	@printf "\n### Compiling $@ ###\n"
-	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
-
 
 ####################################################################
 # Shared Library
