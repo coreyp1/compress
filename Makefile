@@ -400,7 +400,8 @@ TESTFLAGS_PC := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --l
 # coverage target does, because --coverage links the gcov runtime, whose
 # mangle_path check-symbols is right to reject in a shipping library and
 # wrong to reject in an instrumented one. Spelled as text's TEST_GATES is.
-TEST_GATES ?= check-symbols check-clean-guard check-aliasing check-test-build check-stamps
+TEST_GATES ?= check-symbols check-clean-guard check-aliasing check-test-build check-stamps \
+	check-san-report
 
 
 # Valgrind flags (exclude "still reachable" as it's not a leak)
@@ -796,7 +797,7 @@ FUZZ_DEPFILES := $(patsubst fuzz/%.c,$(APP_DIR)/fuzz/%.d,$(FUZZ_SOURCES))
 ####################################################################
 
 # General commands
-.PHONY: clean cloc docs docs-pdf examples bench bench-deflate coverage check-symbols check-clean-guard check-aliasing check-test-build check-stamps
+.PHONY: clean cloc docs docs-pdf examples bench bench-deflate coverage check-symbols check-clean-guard check-aliasing check-test-build check-stamps check-san-report
 # Release build commands
 .PHONY: all install test test-quiet test-valgrind test-valgrind-quiet test-watch uninstall watch
 # Debug build commands
@@ -2102,7 +2103,16 @@ check-stamps: ## Fail if a compile or link rule has no flags stamp, or the wrong
 			$(BUILD_DIR)/stamp_control.mk | tail -1 \
 			| sed 's/ PREREQ [0-9]*$$//'); \
 	if [ "$$ctl" != "$(STAMP_CONTROL_EXPECTED)" ]; then \
-		printf "\033[0;31mcheck-stamps: the control says '%s', not '%s' - the sweep is not reading rules the way it thinks, so a clean result from it means nothing.\033[0m\n" "$$ctl" "$(STAMP_CONTROL_EXPECTED)" >&2; \
+		printf "\033[0;31mcheck-stamps: the control says '%s', not '%s', so a clean result from this sweep means nothing.\033[0m\n" "$$ctl" "$(STAMP_CONTROL_EXPECTED)" >&2; \
+		printf '%s\n' \
+			'  TWO causes produce this, they need opposite fixes, and the fingerprint cannot tell' \
+			'  them apart: the sweep has stopped reading rules the way it thinks, OR the planted' \
+			'  control no longer contains the shape that figure counts. Removing the `!` strip from' \
+			'  the awk and removing the negated arm from the control both print PROBES one short.' \
+			'  The control it actually wrote is left at:' >&2; \
+		printf '    %s\n' '$(BUILD_DIR)/stamp_control.mk' >&2; \
+		printf '%s\n' \
+			'  Read it first. If the shape is there, the sweep is what changed.' >&2; \
 		exit 1; \
 	fi
 # Two counts of the same population, and they are NOT independent - both key on
@@ -2158,6 +2168,75 @@ check-stamps: ## Fail if a compile or link rule has no flags stamp, or the wrong
 		exit 1; \
 	fi; \
 	printf "\033[0;32mAll %s compile rules carry the flags stamp for their own tree and %s link rules carry a link stamp, every variable either recorded or a file prerequisite; %s invocations outside the model and %s syntax-only probes, as pinned.\033[0m\n" "$$got" "$$linked" "$$unmodelled" "$$probes"
+
+####################################################################
+# Sanitizer-report gate
+####################################################################
+
+# How many recipes consult $(SAN_REPORT_RE): the ASan and TSan quiet runners.
+# Pinned because the check lives inside a shell branch, and simplifying that
+# branch back to "exit status decides" is a one-line edit that no test would
+# notice - the runners would go green on a reporting binary again.
+SAN_SCAN_EXPECTED := 2
+
+check-san-report: ## Fail if the quiet runners could not recognise a sanitizer report
+# The quiet runners capture each binary's output and print it only when the run
+# is judged a failure, so whatever the judgement misses is deleted rather than
+# shown. That is not hypothetical here: a planted signed overflow once ran
+# under test-asan-quiet, printed its diagnostic into the captured string, exited
+# 0, and produced a green PASS row with the diagnostic discarded - the report
+# existed and nothing kept it.
+#
+# Exit status alone cannot carry that judgement. -fno-sanitize-recover covers
+# the checks it names and nothing else, a report from a child process does not
+# set the parent's status, and the runtimes take their options from the
+# environment, where a caller can turn halting off. So the runners also scan the
+# output they already hold, which costs one grep per suite.
+#
+# That makes $(SAN_REPORT_RE) load-bearing, and a regex that matches nothing is
+# indistinguishable from a clean run - the exact failure this gate exists to
+# prevent, one level up. So: five report shapes must each be recognised, and two
+# gtest summary lines must not be. The negatives are the two that come closest
+# to the positives, since those are what a careless widening would catch.
+#
+# Counting matches rather than testing for non-empty output: a regex that
+# matched every line would pass a "does it find anything" check.
+check-san-report:
+	@mkdir -p $(BUILD_DIR)
+	@printf '%s\n' \
+		'src/foo.c:12:5: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type int' \
+		'==1234==ERROR: AddressSanitizer: heap-use-after-free on address 0x602000000010' \
+		'WARNING: ThreadSanitizer: data race (pid=999)' \
+		'==999==ERROR: LeakSanitizer: detected memory leaks' \
+		'SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior src/foo.c:12:5 in' \
+		> $(BUILD_DIR)/san_report_control.txt
+	@printf '%s\n' \
+		'[  PASSED  ] 21 tests.' \
+		'[==========] 21 tests from 3 test suites ran. (4 ms total)' \
+		'[ RUN      ] TestDeflate.RoundTripsAnEmptyInput' \
+		'Note: Google Test filter = *Zstd*' \
+		> $(BUILD_DIR)/san_clean_control.txt
+	@hits=$$(grep -cE '$(SAN_REPORT_RE)' $(BUILD_DIR)/san_report_control.txt || true); \
+	want=$$(wc -l < $(BUILD_DIR)/san_report_control.txt); \
+	if [ "$$hits" != "$$want" ]; then \
+		printf "\033[0;31mcheck-san-report: %s of %s sanitizer report shapes are recognised, so a quiet runner would delete the ones that are not.\033[0m\n" "$$hits" "$$want" >&2; \
+		printf '%s\n' 'Unmatched:' >&2; \
+		grep -vE '$(SAN_REPORT_RE)' $(BUILD_DIR)/san_report_control.txt >&2; \
+		exit 1; \
+	fi
+	@false=$$(grep -cE '$(SAN_REPORT_RE)' $(BUILD_DIR)/san_clean_control.txt || true); \
+	if [ "$$false" != "0" ]; then \
+		printf "\033[0;31mcheck-san-report: %s lines of ordinary gtest output match the report pattern, so every passing suite would be reported as failing.\033[0m\n" "$$false" >&2; \
+		grep -E '$(SAN_REPORT_RE)' $(BUILD_DIR)/san_clean_control.txt >&2; \
+		exit 1; \
+	fi
+	@scans=$$(grep -c "^[[:space:]]*reports=.*grep -cE '.(SAN_REPORT_RE)'" $(STAMP_CHECK_MAKEFILE) || true); \
+	if [ "$$scans" != "$(SAN_SCAN_EXPECTED)" ]; then \
+		printf "\033[0;31mcheck-san-report: %s recipes scan their captured output for a sanitizer report, not the %s pinned. A quiet runner that judges on exit status alone discards a report from a binary that still exits 0.\033[0m\n" \
+			"$$scans" "$(SAN_SCAN_EXPECTED)" >&2; \
+		exit 1; \
+	fi
+	@printf "\033[0;32mAll %s sanitizer report shapes are recognised, no ordinary gtest line is, and both quiet runners scan for them.\033[0m\n" "$$(wc -l < $(BUILD_DIR)/san_report_control.txt)"
 
 test: ## Make and run the Unit tests
 test: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES) $(TEST_GATES)
@@ -2357,6 +2436,30 @@ ASAN_COMPRESSLIBRARY := -L $(ASAN_APP_DIR) -l$(SUITE)-$(PROJECT)$(BRANCH)-asan
 # inherited and puts it first, which is the remedy the runtime itself names.
 ASAN_RUNTIME := $(shell $(CC) -print-file-name=libasan.so)
 
+# One environment for both ASan runners, the way TSAN_RUN_ENV already is. It
+# was written out twice and the two copies drifted: the quiet runner carried
+# neither halt_on_error, so it kept going after the first report while the loud
+# one stopped. Two spellings of one setting is the defect, not the setting.
+ASAN_RUN_ENV := LD_LIBRARY_PATH="$(ASAN_APP_DIR)" LD_PRELOAD="$(ASAN_RUNTIME)" \
+	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
+	UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
+
+# What a sanitizer report looks like, for the quiet runners, which capture a
+# binary's output and print it only when the run is judged a failure. Judging
+# that on exit status alone throws the report away whenever the process still
+# exits 0 - and several things make it do so: a check outside
+# -fno-sanitize-recover's set, a report from a child process, a runtime whose
+# options were overridden from the environment. The valgrind quiet runner
+# already scans its output for leak lines rather than trusting its exit code;
+# this is the same check for the sanitizers, and check-san-report is what keeps
+# it able to see.
+#
+# Calibrated against 3,343 lines of real output from 336 suite runs: zero
+# matches. The two gtest summary lines that look closest - the [ PASSED ] line
+# and the "N tests from M test suites ran" line - are in the control as
+# negatives.
+SAN_REPORT_RE := (ERROR|WARNING): (AddressSanitizer|LeakSanitizer|ThreadSanitizer|MemorySanitizer)|SUMMARY: (AddressSanitizer|UndefinedBehaviorSanitizer|ThreadSanitizer|LeakSanitizer)|runtime error:
+
 # Add PIC on Linux
 ifeq ($(UNAME_S), Linux)
 	ASAN_CFLAGS += -fPIC
@@ -2441,7 +2544,7 @@ ifeq ($(OS_NAME), Linux)
 		printf "### Running %s tests (ASan+UBSan) ###\n" "$$test_name"; \
 		printf "############################"; \
 		printf "\033[0m\n\n"; \
-		LD_LIBRARY_PATH="$(ASAN_APP_DIR)" LD_PRELOAD="$(ASAN_RUNTIME)" ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 $$test_exe --gtest_brief=1 || exit 1; \
+		$(ASAN_RUN_ENV) $$test_exe --gtest_brief=1 || exit 1; \
 	done
 	@printf "\033[0;32m\n"
 	@printf "###########################################\n"
@@ -2466,7 +2569,7 @@ ifeq ($(OS_NAME), Linux)
 	printf "\033[1;33m%-30s %8s %10s %s\033[0m\n" "------------------------------" "--------" "----------" "------"; \
 	for test_exe in $(ASAN_TEST_EXECUTABLES); do \
 		test_name=$$(basename $$test_exe $(EXE_EXTENSION)); \
-		output=$$(LD_LIBRARY_PATH="$(ASAN_APP_DIR)" LD_PRELOAD="$(ASAN_RUNTIME)" ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 $$test_exe --gtest_brief=1 2>&1); \
+		output=$$($(ASAN_RUN_ENV) $$test_exe --gtest_brief=1 2>&1); \
 		exit_code=$$?; \
 		num_tests=$$(echo "$$output" | grep -oP '\[\s*=+\s*\]\s*\K\d+(?=\s+tests?)' | head -1); \
 		time_ms=$$(echo "$$output" | grep -oP '\(\K\d+(?=\s*ms\s*total\))' | head -1); \
@@ -2474,17 +2577,23 @@ ifeq ($(OS_NAME), Linux)
 		[ -z "$$time_ms" ] && time_ms=0; \
 		total_tests=$$((total_tests + num_tests)); \
 		total_time=$$((total_time + time_ms)); \
-		if [ $$exit_code -eq 0 ]; then \
+		reports=$$(printf '%s\n' "$$output" | grep -cE '$(SAN_REPORT_RE)' || true); \
+		if [ $$exit_code -eq 0 ] && [ $$reports -eq 0 ]; then \
 			total_passed=$$((total_passed + num_tests)); \
 			printf "%-30s %8d %8dms \033[0;32mPASS\033[0m\n" "$$test_name" "$$num_tests" "$$time_ms"; \
 		else \
 			failures=$$(echo "$$output" | grep -oP '\[\s*FAILED\s*\]\s*\K\d+' | head -1); \
 			[ -z "$$failures" ] && failures=$$num_tests; \
 			[ "$$failures" -eq 0 ] && failures=1; \
+			reason=""; \
+			if [ $$exit_code -eq 0 ]; then \
+				failures=1; \
+				reason="\n\033[0;31mThe binary exited 0 and gtest reported no failure. What failed is the $$reports sanitizer report line(s) in the output below, which a runner judging on exit status alone would have discarded.\033[0m"; \
+			fi; \
 			total_failed=$$((total_failed + failures)); \
 			total_passed=$$((total_passed + num_tests - failures)); \
 			printf "%-30s %8d %8dms \033[0;31mFAIL\033[0m\n" "$$test_name" "$$num_tests" "$$time_ms"; \
-			failed_suites="$$failed_suites\n\033[0;31m=== $$test_name FAILURES ===\033[0m\n$$output\n"; \
+			failed_suites="$$failed_suites\n\033[0;31m=== $$test_name FAILURES ===\033[0m$$reason\n$$output\n"; \
 		fi; \
 	done; \
 	printf "\033[1;33m%-30s %8s %10s %s\033[0m\n" "------------------------------" "--------" "----------" "------"; \
@@ -2663,17 +2772,23 @@ ifeq ($(OS_NAME), Linux)
 		[ -z "$$time_ms" ] && time_ms=0; \
 		total_tests=$$((total_tests + num_tests)); \
 		total_time=$$((total_time + time_ms)); \
-		if [ $$exit_code -eq 0 ]; then \
+		reports=$$(printf '%s\n' "$$output" | grep -cE '$(SAN_REPORT_RE)' || true); \
+		if [ $$exit_code -eq 0 ] && [ $$reports -eq 0 ]; then \
 			total_passed=$$((total_passed + num_tests)); \
 			printf "%-30s %8d %8dms \033[0;32mPASS\033[0m\n" "$$test_name" "$$num_tests" "$$time_ms"; \
 		else \
 			failures=$$(echo "$$output" | grep -oP '\[\s*FAILED\s*\]\s*\K\d+' | head -1); \
 			[ -z "$$failures" ] && failures=$$num_tests; \
 			[ "$$failures" -eq 0 ] && failures=1; \
+			reason=""; \
+			if [ $$exit_code -eq 0 ]; then \
+				failures=1; \
+				reason="\n\033[0;31mThe binary exited 0 and gtest reported no failure. What failed is the $$reports sanitizer report line(s) in the output below, which a runner judging on exit status alone would have discarded.\033[0m"; \
+			fi; \
 			total_failed=$$((total_failed + failures)); \
 			total_passed=$$((total_passed + num_tests - failures)); \
 			printf "%-30s %8d %8dms \033[0;31mFAIL\033[0m\n" "$$test_name" "$$num_tests" "$$time_ms"; \
-			failed_suites="$$failed_suites\n\033[0;31m=== $$test_name FAILURES ===\033[0m\n$$output\n"; \
+			failed_suites="$$failed_suites\n\033[0;31m=== $$test_name FAILURES ===\033[0m$$reason\n$$output\n"; \
 		fi; \
 	done; \
 	printf "\033[1;33m%-30s %8s %10s %s\033[0m\n" "------------------------------" "--------" "----------" "------"; \
