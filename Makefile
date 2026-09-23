@@ -50,6 +50,12 @@ ENV_VARS :=
 # asked for first, so dependency lookup can still honour it further down.
 PKG_CONFIG_PATH_ENV := $(PKG_CONFIG_PATH)
 
+# `override` on each of those: BUILD may arrive on the command line, and a
+# command-line variable beats a plain makefile assignment, so without it
+# `make BUILD=debug` skips the rewrite and builds into ./build/debug --
+# outside the platform tree, and a different tree from the one plain `make`
+# uses. The platform segment exists to keep linux/mac/win builds apart.
+
 # Detect OS
 UNAME_S := $(shell uname -s)
 
@@ -64,7 +70,7 @@ ifeq ($(UNAME_S), Linux)
 	PKG_CONFIG_PATH := /usr/local/share/pkgconfig
 	INCLUDE_INSTALL_PATH := /usr/local/include
 	LIB_INSTALL_PATH := /usr/local/lib
-	BUILD := linux/$(BUILD)
+	override BUILD := linux/$(BUILD)
 
 else ifeq ($(UNAME_S), Darwin)
 	OS_NAME := Mac
@@ -74,7 +80,7 @@ else ifeq ($(UNAME_S), Darwin)
 	TARGET := $(BASE_NAME_PREFIX).dylib
 	EXE_EXTENSION :=
 	# Additional macOS-specific variables
-	BUILD := mac/$(BUILD)
+	override BUILD := mac/$(BUILD)
 
 else ifeq ($(findstring MINGW32_NT,$(UNAME_S)),MINGW32_NT)  # 32-bit Windows
 	OS_NAME := Windows
@@ -89,7 +95,7 @@ else ifeq ($(findstring MINGW32_NT,$(UNAME_S)),MINGW32_NT)  # 32-bit Windows
 	INCLUDE_INSTALL_PATH := /mingw32/include
 	LIB_INSTALL_PATH := /mingw32/lib
 	BIN_INSTALL_PATH := /mingw32/bin
-	BUILD := win32/$(BUILD)
+	override BUILD := win32/$(BUILD)
 
 else ifeq ($(findstring MINGW64_NT,$(UNAME_S)),MINGW64_NT)  # 64-bit Windows
 	OS_NAME := Windows
@@ -104,7 +110,7 @@ else ifeq ($(findstring MINGW64_NT,$(UNAME_S)),MINGW64_NT)  # 64-bit Windows
 	INCLUDE_INSTALL_PATH := /mingw64/include
 	LIB_INSTALL_PATH := /mingw64/lib
 	BIN_INSTALL_PATH := /mingw64/bin
-	BUILD := win64/$(BUILD)
+	override BUILD := win64/$(BUILD)
 
 else
     $(error Unsupported OS: $(UNAME_S))
