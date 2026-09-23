@@ -1762,20 +1762,43 @@ check-test-build: ## Fail if the GCOMP_TEST_BUILD arms do not compile
 # sanitizer run. This is the same defect class as an unbuilt preprocessor
 # branch anywhere else, and the fix is to compile the branch.
 #
-# -fsyntax-only, so this parses and type-checks without generating code: all
-# 76 TUs in about a second. It is not a substitute for building the sanitizer
-# trees, and does not try to be - it answers "does this still compile", which
-# is the question that was being answered five minutes too late.
+# A real compile to /dev/null, not -fsyntax-only, and that distinction was
+# measured after -fsyntax-only gave a wrong answer elsewhere in this library.
+# Warnings that need the middle end are simply absent under -fsyntax-only:
 #
-# THE CONTROL IS A PAIR, and the second half is the one that earns its keep.
-# A planted sign-compare inside a GCOMP_TEST_BUILD arm - the same shape as the
-# defect above - must be REJECTED with the macro and ACCEPTED without it. The
-# first half proves the sweep's flags can see this class of error. The second
-# proves the premise: that the release build really is blind to these lines,
-# so this gate is testing something `make test` does not already cover. If
-# both compiles start failing, the sweep is not reading the macro; if both
-# start passing, -Wsign-compare has left -Wextra and the control needs
-# respelling rather than deleting.
+#                        -fsyntax-only   -c -o /dev/null
+#   -Wsign-compare             1               1
+#   -Wstrict-aliasing          1               1
+#   -Wunused-function          0               1
+#   -Warray-bounds             0               1
+#
+# -Warray-bounds is not in the -Wno-error= list, so it IS an error under
+# -Werror - which means a syntax-only sweep could pass while the sanitizer
+# build failed on exactly the kind of defect this gate exists to catch early.
+# The cost of closing that is 11s against 1.4s for all 76 TUs, on a `make test`
+# that takes minutes.
+#
+# It is still not a substitute for building the sanitizer trees and does not try
+# to be. It answers "does this compile", which is now true rather than
+# approximately true.
+#
+# TWO CONTROLS, EACH A PAIR. Both plant a defect inside a GCOMP_TEST_BUILD arm
+# and require it REJECTED with the macro and ACCEPTED without it. The rejection
+# proves the sweep's flags can see that class; the acceptance proves the
+# premise, that the release build really is blind to these lines, so this gate
+# covers something `make test` does not.
+#
+#   A  a sign-compare      the defect that prompted this gate. Visible to
+#                          -fsyntax-only as well, so it says nothing about how
+#                          the sweep compiles.
+#   B  an array-bounds     invisible to -fsyntax-only, measured. This is the
+#                          arm that certifies the sweep is a REAL compile: if
+#                          anyone trades the 11s back for 1.4s by returning to
+#                          -fsyntax-only, B stops firing and the gate says so.
+#
+# If a pair's two halves both fail, the sweep is not reading the macro. If both
+# pass, that warning has left -Wextra and the control wants respelling rather
+# than deleting.
 #
 # Scored by exit status per TU, not by grepping for "warning". A broken
 # include path produces ERRORS, so a text search for warnings finds nothing
@@ -1794,28 +1817,48 @@ check-test-build: $(LIBVER_GEN)
 		'  return 0;' \
 		'#endif' \
 		'}' > $(BUILD_DIR)/test_build_control.c
-	@if $(CC) $(LIB_CFLAGS) -DGCOMP_TEST_BUILD $(INCLUDE) -fsyntax-only \
-			$(BUILD_DIR)/test_build_control.c \
-			2> $(BUILD_DIR)/test_build_control.log; then \
-		printf "\033[0;31mcheck-test-build: a planted sign-compare inside a GCOMP_TEST_BUILD arm was accepted, so this sweep would not see the defect it exists for.\033[0m\n" >&2; \
-		exit 1; \
-	fi
-	@if ! grep -q 'sign-compare' $(BUILD_DIR)/test_build_control.log; then \
-		printf "\033[0;31mcheck-test-build: the control was refused, but not for the planted sign-compare - so this says nothing about what the sweep can see:\033[0m\n" >&2; \
-		cat $(BUILD_DIR)/test_build_control.log >&2; \
-		exit 1; \
-	fi
-	@if ! $(CC) $(LIB_CFLAGS) $(INCLUDE) -fsyntax-only \
-			$(BUILD_DIR)/test_build_control.c \
-			2> $(BUILD_DIR)/test_build_control_off.log; then \
-		printf "\033[0;31mcheck-test-build: the control is refused WITHOUT -DGCOMP_TEST_BUILD too, so the release build was never blind to it and this gate's premise is wrong:\033[0m\n" >&2; \
-		cat $(BUILD_DIR)/test_build_control_off.log >&2; \
-		exit 1; \
-	fi
+	@printf '%s\n' \
+		'#include <stdint.h>' \
+		'#include <string.h>' \
+		'int32_t gcomp_test_build_codegen_control(void);' \
+		'int32_t gcomp_test_build_codegen_control(void) {' \
+		'#ifdef GCOMP_TEST_BUILD' \
+		'  int32_t a[4];' \
+		'  memset(a, 0, sizeof a);' \
+		'  return a[7];' \
+		'#else' \
+		'  return 0;' \
+		'#endif' \
+		'}' > $(BUILD_DIR)/test_build_codegen_control.c
+	@for pair in 'test_build_control sign-compare' 'test_build_codegen_control array-bounds'; do \
+		set -- $$pair; ctl=$$1; want=$$2; \
+		if $(CC) $(LIB_CFLAGS) -DGCOMP_TEST_BUILD $(INCLUDE) -c -o /dev/null \
+				$(BUILD_DIR)/$$ctl.c 2> $(BUILD_DIR)/$$ctl.log; then \
+			printf "\033[0;31mcheck-test-build: a planted %s inside a GCOMP_TEST_BUILD arm was accepted, so this sweep would not see the defect it exists for.\033[0m\n" "$$want" >&2; \
+			if [ "$$want" = "array-bounds" ]; then \
+				printf '%s\n' \
+					'  This is the arm that certifies the sweep is a real compile. -fsyntax-only does not' \
+					'  report -Warray-bounds at all, so it passing while the sign-compare arm still fails' \
+					'  is what returning this sweep to -fsyntax-only looks like.' >&2; \
+			fi; \
+			exit 1; \
+		fi; \
+		if ! grep -q "$$want" $(BUILD_DIR)/$$ctl.log; then \
+			printf "\033[0;31mcheck-test-build: the %s control was refused, but not for the planted %s - so this says nothing about what the sweep can see:\033[0m\n" "$$ctl" "$$want" >&2; \
+			cat $(BUILD_DIR)/$$ctl.log >&2; \
+			exit 1; \
+		fi; \
+		if ! $(CC) $(LIB_CFLAGS) $(INCLUDE) -c -o /dev/null \
+				$(BUILD_DIR)/$$ctl.c 2> $(BUILD_DIR)/$$ctl-off.log; then \
+			printf "\033[0;31mcheck-test-build: the %s control is refused WITHOUT -DGCOMP_TEST_BUILD too, so the release build was never blind to it and this gate's premise is wrong:\033[0m\n" "$$ctl" >&2; \
+			cat $(BUILD_DIR)/$$ctl-off.log >&2; \
+			exit 1; \
+		fi; \
+	done
 	@broken=""; n=0; \
 	for src in $(SOURCES); do \
 		n=$$((n + 1)); \
-		if ! $(CC) $(LIB_CFLAGS) -DGCOMP_TEST_BUILD $(INCLUDE) -fsyntax-only \
+		if ! $(CC) $(LIB_CFLAGS) -DGCOMP_TEST_BUILD $(INCLUDE) -c -o /dev/null \
 				$$src > $(BUILD_DIR)/test_build_sweep.log 2>&1; then \
 			broken="$$broken $$src"; \
 			printf "\033[0;31m\n### %s ###\033[0m\n" "$$src" >&2; \
@@ -1830,7 +1873,7 @@ check-test-build: $(LIBVER_GEN)
 		printf "\`make test-asan\` fails at the compile step.\n" >&2; \
 		exit 1; \
 	fi; \
-	printf "\033[0;32mAll %s library TUs compile with -DGCOMP_TEST_BUILD, which no build in \`make test\` defines.\033[0m\n" "$$n"
+	printf "\033[0;32mAll %s library TUs compile with -DGCOMP_TEST_BUILD, which no build in \`make test\` defines - a real compile, so the codegen-stage warnings are included.\033[0m\n" "$$n"
 
 ####################################################################
 # Flags-stamp gate
@@ -1918,27 +1961,38 @@ STAMP_UNMODELLED_EXPECTED := 7
 # wrong cause.
 STAMP_PREREQ_EXPECTED := 9
 
-# -fsyntax-only invocations: check-aliasing's two controls and
-# check-test-build's two. Pinned separately from the number above so that
+# -fsyntax-only invocations at the head of a recipe: check-aliasing's control
+# and its vacuity compile. Pinned separately from the number above so that
 # adding a gate and weakening the build cannot hide behind one figure.
 #
-# Three of those four are spelled `@if ! $(CC) ...`, and the sweep could not
-# see any of them until the head normalisation learned to strip a leading `!`.
-# That mattered beyond the count: a LINK rule spelled that way was skipped by
-# both arms, appearing in neither LINKED nor UNMODELLED, which is the shape of
-# blindness that reads as a clean result. The control carries a negated probe
-# so it cannot come back.
+# It read 4 until check-test-build's sweep became a real compile to /dev/null
+# rather than -fsyntax-only, which moved its control compiles into a shell loop.
+# The pin caught that, which is what it is for: a change in how a gate compiles
+# should require someone to look. The two it lost are not unchecked - they are
+# outside this model for the shell-loop reason below.
 #
-# The fifth -fsyntax-only in this file is check-test-build's own sweep, and it
-# is deliberately not counted: it sits inside a shell for-loop, so the recipe's
-# command is a script rather than a compiler and this model does not look past
-# the head of a recipe. That is a real limit - a build step could hide in a
-# shell loop the same way - so it was measured rather than assumed: of the
-# eleven compiler names this file mentions away from a recipe head, every one
-# is either that sweep, a printf writing check-stamps' own planted control, or
-# a stamp recipe recording its flag string. No build rule hides a compiler
-# inside a shell recipe.
-STAMP_PROBES_EXPECTED := 4
+# Both of these are spelled `@if [!] $(CC) ...`, and the sweep could not see the
+# negated form until the head normalisation learned to strip a leading `!`. That
+# mattered beyond the count: a LINK rule spelled that way was skipped by both
+# arms, appearing in neither LINKED nor UNMODELLED, which is the shape of
+# blindness that reads as a clean result. The control carries a negated probe so
+# it cannot come back.
+#
+# NOT counted, and why that is a limit rather than a rule: this model does not
+# look past the head of a recipe, so the compiler invocations inside
+# check-test-build's two shell loops - its four control compiles and its 76-TU
+# sweep - are invisible to it. They are gate probes that write to /dev/null and
+# produce nothing that can go stale, so nothing is lost here; the limit is that
+# a real build step could hide the same way. Measured rather than assumed: every
+# compiler name this file mentions away from a recipe head is a gate's own
+# probe, a printf writing check-stamps' planted control, or a stamp recipe
+# recording its flag string. No build rule hides a compiler in a shell recipe.
+#
+# Deliberately NOT done: teaching the probe test to recognise `-o /dev/null` as
+# well as -fsyntax-only. No recipe in this file is spelled that way at a head
+# position, so the branch would be unexercised, and an untested branch in a
+# sweep is worse than a limit that is written down.
+STAMP_PROBES_EXPECTED := 2
 
 # What the planted control must produce. Four compile recipes, one of them
 # wrapped; one with no stamp; four variables no stamp records, two of them past
