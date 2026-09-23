@@ -1955,6 +1955,7 @@ STAMP_PROBES_EXPECTED := 4
 STAMP_CONTROL_EXPECTED := TOTAL 4 BAD 1 UNMODELLED 2 UNRECORDED 4 LINKED 3 PROBES 3
 
 STAMP_CHECK_MAKEFILE := $(firstword $(MAKEFILE_LIST))
+STAMP_CHECK_AWK := $(BUILD_DIR)/stamp_check.awk
 
 define stamp-check-awk
 { L[NR] = $$0 }
@@ -2071,9 +2072,26 @@ END {
 }
 endef
 
+# $(file ...) is expanded when make expands this recipe, which happens before
+# ANY line of it runs - so an @mkdir on the line above cannot have created the
+# directory yet, and the write fails with "No such file or directory". It never
+# showed in a warm tree, because one earlier build makes $(BUILD_DIR) and it
+# then persists for the life of the checkout. Found by running this gate as the
+# FIRST command in a fresh clone, which is the only state that can see it.
+#
+# So the awk goes in its own rule, whose recipe make expands only when it
+# decides to run it - after the order-only directory prerequisite exists. The
+# makefile is a normal prerequisite because the program lives inside it: without
+# that the file would be written once and never refreshed, so an edit to the awk
+# would leave the gate running the previous version.
+$(STAMP_CHECK_AWK): $(STAMP_CHECK_MAKEFILE) | $(BUILD_DIR)
+	$(file >$@,$(stamp-check-awk))
+
+$(BUILD_DIR):
+	@mkdir -p $@
+
 check-stamps: ## Fail if a compile or link rule has no flags stamp, or the wrong one
-	@mkdir -p $(BUILD_DIR)
-	$(file >$(BUILD_DIR)/stamp_check.awk,$(stamp-check-awk))
+check-stamps: $(STAMP_CHECK_AWK)
 # The control comes first, and is a planted set rather than a single bad rule:
 # stamped and unstamped, recorded and unrecorded, wrapped and unwrapped, one
 # probe and one link spelled with a bare compiler name. A sweep that has
@@ -2125,7 +2143,7 @@ check-stamps: ## Fail if a compile or link rule has no flags stamp, or the wrong
 		'@if ! $$(CC) $$(CFLAGS) -fsyntax-only probe3.c; then exit 1; fi' \
 		>> $(BUILD_DIR)/stamp_control.mk
 	@ctl=$$(awk -v PREREQ_NAMES='$(STAMP_PREREQ_NAMES)' \
-			-f $(BUILD_DIR)/stamp_check.awk \
+			-f $(STAMP_CHECK_AWK) \
 			$(BUILD_DIR)/stamp_control.mk | tail -1 \
 			| sed 's/ PREREQ [0-9]*$$//'); \
 	if [ "$$ctl" != "$(STAMP_CONTROL_EXPECTED)" ]; then \
@@ -2150,7 +2168,7 @@ check-stamps: ## Fail if a compile or link rule has no flags stamp, or the wrong
 	@want=$$(grep -v '^#' $(STAMP_CHECK_MAKEFILE) \
 		| grep -cF -- '-c $$<'); \
 	out=$$(awk -v PREREQ_NAMES='$(STAMP_PREREQ_NAMES)' \
-		-f $(BUILD_DIR)/stamp_check.awk $(STAMP_CHECK_MAKEFILE)); \
+		-f $(STAMP_CHECK_AWK) $(STAMP_CHECK_MAKEFILE)); \
 	got=$$(printf '%s\n' "$$out" | sed -n 's/^TOTAL \([0-9]*\) .*/\1/p'); \
 	bad=$$(printf '%s\n' "$$out" | sed -n 's/^TOTAL [0-9]* BAD \([0-9]*\) .*/\1/p'); \
 	unmodelled=$$(printf '%s\n' "$$out" | sed -n 's/.* UNMODELLED \([0-9]*\) .*/\1/p'); \
