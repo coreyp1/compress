@@ -228,8 +228,31 @@ CC := cc
 # is not relying on the argument above, which was wrong.
 ifeq ($(BUILD),debug)
 OPT_CFLAGS := -O0
+# -fstrict-aliasing is named ONLY here, and only because it was measured here.
+# It is what arms -Wstrict-aliasing, gcc disables it below -O2, and naming it
+# also turns the ASSUMPTION on - a codegen change, not only a warning. So it
+# belongs wherever it is codegen-neutral and nowhere else. Measured on all 76
+# library TUs, comparing `objdump -d` text rather than object bytes, since
+# debug info records the command line and makes every .o differ:
+#
+#   -O0, flag off vs on     0 of 76 objects differ
+#   -O1, flag off vs on    30 of 76 differ
+#   -O2, -fno- vs -f       44 of 76 differ   (positive control: the
+#                                             comparison can see a change)
+#
+# So -O0 is free and -O1 is not, which is why this sits in the debug branch
+# rather than in ALIASING_CFLAGS where every configuration would inherit it.
+# A sibling library measured 0 of 9 at BOTH -O0 and -O1; that zero does not
+# transfer, and the 30 above is what inheriting it would have bought.
+#
+# No C compilation in this file uses -O1 today, so the 30 is a hazard rather
+# than a live change - but `EXTRA_CFLAGS=-O1` would have taken it silently.
+ALIASING_FFLAGS := -fstrict-aliasing
 else
 OPT_CFLAGS := -O3
+# Nothing to name: -O3 enables -fstrict-aliasing already, so the warning is
+# armed and the assumption is one this build has always made.
+ALIASING_FFLAGS :=
 endif
 
 # Strict aliasing, named rather than inherited. Two flags doing two jobs:
@@ -270,14 +293,16 @@ endif
 #
 # The OPTIMISATION was on only by virtue of -O3, so `BUILD=debug` compiled at
 # -O0 with the warning silent at every level - the debug build had no aliasing
-# diagnostic at all, and looked identical to one that did. Naming the flag
-# arms it in both.
+# diagnostic at all, and looked identical to one that did. $(ALIASING_FFLAGS)
+# names -fstrict-aliasing in the debug branch, and ONLY there, because naming it
+# arms the assumption as well as the warning: measured codegen-neutral at -O0 and
+# not at -O1. The note by OPT_CFLAGS has the figures.
 #
 # EXTRA_CFLAGS comes last and so can still displace the level: an explicit
 # level beats -Wall's implicit 3 from either side, but a later explicit level
 # displaces an earlier one, which makes EXTRA_CFLAGS=-Wstrict-aliasing=3 a
 # silent disarming. check-aliasing is the reason that is not a silent one.
-ALIASING_CFLAGS := -fstrict-aliasing -Wstrict-aliasing=2
+ALIASING_CFLAGS := $(ALIASING_FFLAGS) -Wstrict-aliasing=2
 
 CFLAGS := -pedantic-errors -Wall -Wextra -Werror -Wno-error=unused-function -Wfatal-errors -std=c17 $(OPT_CFLAGS) -g $(ALIASING_CFLAGS) $(EXTRA_CFLAGS)
 # Library-specific compile flags (export symbols on Windows, PIC on Linux)
@@ -1660,10 +1685,11 @@ check-aliasing: $(LIBVER_GEN)
 		if [ "$$opt" = "[disabled]" ]; then \
 			printf '%s\n' \
 				'  -fstrict-aliasing is DISABLED, which silences this warning at every level - the' \
-				'  level below is beside the point. gcc disables it at -O0 and -O1, so this is what a' \
-				'  build carrying -O0 or -O1 after ALIASING_CFLAGS looks like, and what removing' \
-				'  -fstrict-aliasing from ALIASING_CFLAGS looks like. Restore the flag rather than' \
-				'  raising the level; no level fires without it.' >&2; \
+				'  level below is beside the point. gcc disables it below -O2, and this file names it' \
+				'  explicitly only in the debug branch, where it was measured to change no code. So a' \
+				'  release build forced to -O0 or -O1 reaches here, and the fix is NOT simply to name' \
+				'  the flag: at -O1 naming it changes 30 of 76 objects. Measure that configuration' \
+				'  before arming it, or build at the -O this library ships.' >&2; \
 		elif [ -z "$$lvl" ] && [ "$$qrc" = "0" ]; then \
 			printf '%s\n' \
 				'  -Q --help=warnings succeeded and named no -Wstrict-aliasing level at all, which is' \
