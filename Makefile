@@ -400,7 +400,7 @@ TESTFLAGS_PC := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --l
 # coverage target does, because --coverage links the gcov runtime, whose
 # mangle_path check-symbols is right to reject in a shipping library and
 # wrong to reject in an instrumented one. Spelled as text's TEST_GATES is.
-TEST_GATES ?= check-symbols check-clean-guard check-aliasing
+TEST_GATES ?= check-symbols check-clean-guard check-aliasing check-test-build
 
 
 # Valgrind flags (exclude "still reachable" as it's not a leak)
@@ -795,7 +795,7 @@ FUZZ_DEPFILES := $(patsubst fuzz/%.c,$(APP_DIR)/fuzz/%.d,$(FUZZ_SOURCES))
 ####################################################################
 
 # General commands
-.PHONY: clean cloc docs docs-pdf examples bench bench-deflate coverage check-symbols check-clean-guard check-aliasing
+.PHONY: clean cloc docs docs-pdf examples bench bench-deflate coverage check-symbols check-clean-guard check-aliasing check-test-build
 # Release build commands
 .PHONY: all install test test-quiet test-valgrind test-valgrind-quiet test-watch uninstall watch
 # Debug build commands
@@ -1714,6 +1714,95 @@ check-aliasing: $(LIBVER_GEN)
 		exit 1; \
 	fi
 	@printf "\033[0;32mA planted type-punning violation is refused by the library's own flags, and accepted at -Wstrict-aliasing=3 - so the level in force is doing work the default would not.\033[0m\n"
+
+####################################################################
+# GCOMP_TEST_BUILD gate
+####################################################################
+
+check-test-build: ## Fail if the GCOMP_TEST_BUILD arms do not compile
+# -DGCOMP_TEST_BUILD appears only in ASAN_CFLAGS and TSAN_CFLAGS, so `make
+# test` never preprocesses the arms it selects: four files carry an
+# `#ifdef GCOMP_TEST_BUILD` block, and thirteen more expand
+# GCOMP_INTERNAL_API differently under it. Code inside an arm the
+# preprocessor discards is not compiled, so -Werror has nothing to say about
+# it - the release build is not lenient about those lines, it cannot see them.
+#
+# That is not hypothetical. A sign-compare added to an assertion inside one of
+# these arms compiled clean under `make test` and failed `make test-asan`
+# immediately, which is a slow and confusing way to find a one-line mistake:
+# the sanitizer tree has to build first, and the failure arrives labelled as a
+# sanitizer run. This is the same defect class as an unbuilt preprocessor
+# branch anywhere else, and the fix is to compile the branch.
+#
+# -fsyntax-only, so this parses and type-checks without generating code: all
+# 76 TUs in about a second. It is not a substitute for building the sanitizer
+# trees, and does not try to be - it answers "does this still compile", which
+# is the question that was being answered five minutes too late.
+#
+# THE CONTROL IS A PAIR, and the second half is the one that earns its keep.
+# A planted sign-compare inside a GCOMP_TEST_BUILD arm - the same shape as the
+# defect above - must be REJECTED with the macro and ACCEPTED without it. The
+# first half proves the sweep's flags can see this class of error. The second
+# proves the premise: that the release build really is blind to these lines,
+# so this gate is testing something `make test` does not already cover. If
+# both compiles start failing, the sweep is not reading the macro; if both
+# start passing, -Wsign-compare has left -Wextra and the control needs
+# respelling rather than deleting.
+#
+# Scored by exit status per TU, not by grepping for "warning". A broken
+# include path produces ERRORS, so a text search for warnings finds nothing
+# and a sweep scored that way reports a clean library.
+check-test-build: $(LIBVER_GEN)
+	@mkdir -p $(BUILD_DIR)
+	@printf '%s\n' \
+		'#include <stdint.h>' \
+		'int32_t gcomp_test_build_control(void);' \
+		'int32_t gcomp_test_build_control(void) {' \
+		'#ifdef GCOMP_TEST_BUILD' \
+		'  int32_t i = -1;' \
+		'  uint32_t u = 1u;' \
+		'  return (i < u) ? 1 : 0;' \
+		'#else' \
+		'  return 0;' \
+		'#endif' \
+		'}' > $(BUILD_DIR)/test_build_control.c
+	@if $(CC) $(LIB_CFLAGS) -DGCOMP_TEST_BUILD $(INCLUDE) -fsyntax-only \
+			$(BUILD_DIR)/test_build_control.c \
+			2> $(BUILD_DIR)/test_build_control.log; then \
+		printf "\033[0;31mcheck-test-build: a planted sign-compare inside a GCOMP_TEST_BUILD arm was accepted, so this sweep would not see the defect it exists for.\033[0m\n" >&2; \
+		exit 1; \
+	fi
+	@if ! grep -q 'sign-compare' $(BUILD_DIR)/test_build_control.log; then \
+		printf "\033[0;31mcheck-test-build: the control was refused, but not for the planted sign-compare - so this says nothing about what the sweep can see:\033[0m\n" >&2; \
+		cat $(BUILD_DIR)/test_build_control.log >&2; \
+		exit 1; \
+	fi
+	@if ! $(CC) $(LIB_CFLAGS) $(INCLUDE) -fsyntax-only \
+			$(BUILD_DIR)/test_build_control.c \
+			2> $(BUILD_DIR)/test_build_control_off.log; then \
+		printf "\033[0;31mcheck-test-build: the control is refused WITHOUT -DGCOMP_TEST_BUILD too, so the release build was never blind to it and this gate's premise is wrong:\033[0m\n" >&2; \
+		cat $(BUILD_DIR)/test_build_control_off.log >&2; \
+		exit 1; \
+	fi
+	@broken=""; n=0; \
+	for src in $(SOURCES); do \
+		n=$$((n + 1)); \
+		if ! $(CC) $(LIB_CFLAGS) -DGCOMP_TEST_BUILD $(INCLUDE) -fsyntax-only \
+				$$src > $(BUILD_DIR)/test_build_sweep.log 2>&1; then \
+			broken="$$broken $$src"; \
+			printf "\033[0;31m\n### %s ###\033[0m\n" "$$src" >&2; \
+			cat $(BUILD_DIR)/test_build_sweep.log >&2; \
+		fi; \
+	done; \
+	if [ -n "$$broken" ]; then \
+		printf "\033[0;31m\n### GCOMP_TEST_BUILD arms that do not compile ###\033[0m\n" >&2; \
+		printf "%s\n" "$$broken" >&2; \
+		printf "\nThese compile in the sanitizer trees, which define\n" >&2; \
+		printf "GCOMP_TEST_BUILD, and nowhere else - so \`make test\` passes and\n" >&2; \
+		printf "\`make test-asan\` fails at the compile step.\n" >&2; \
+		exit 1; \
+	fi; \
+	printf "\033[0;32mAll %s library TUs compile with -DGCOMP_TEST_BUILD, which no build in \`make test\` defines.\033[0m\n" "$$n"
 
 test: ## Make and run the Unit tests
 test: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES) $(TEST_GATES)
