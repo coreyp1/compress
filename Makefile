@@ -292,6 +292,7 @@ LIBVER_SYMBOL := $(shell echo "ghotiio_$(PROJECT)$(BRANCH)" | sed 's/[.-]/_/g')
 
 BUILD_DIR := ./build/$(BUILD)
 OBJ_DIR := $(BUILD_DIR)/objects
+FLAGS_STAMP := $(OBJ_DIR)/.flags
 GEN_DIR := $(BUILD_DIR)/generated
 APP_DIR := $(BUILD_DIR)/apps
 
@@ -438,19 +439,19 @@ $(LIBVER_GEN): force-libver
 		'#endif // GHOTI_IO_GCOMP_LIBVER_GEN_H' > $@.tmp
 	@if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv $@.tmp $@; fi
 
-$(OBJ_DIR)/%.o: src/%.c | $(LIBVER_GEN)
+$(OBJ_DIR)/%.o: src/%.c $(FLAGS_STAMP) | $(LIBVER_GEN)
 	@printf "\n### Compiling $@ ###\n"
 	@mkdir -p $(@D)
 	$(CC) $(LIB_CFLAGS) $(INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
 
 # Pattern rule for C++ source files (if any):
-$(OBJ_DIR)/%.o: src/%.cpp | $(LIBVER_GEN)
+$(OBJ_DIR)/%.o: src/%.cpp $(FLAGS_STAMP) | $(LIBVER_GEN)
 	@printf "\n### Compiling $@ ###\n"
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
 
 # Pattern rule for test helper C++ files:
-$(OBJ_DIR)/tests/%.o: tests/%.cpp
+$(OBJ_DIR)/tests/%.o: tests/%.cpp $(FLAGS_STAMP)
 	@printf "\n### Compiling $@ ###\n"
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
@@ -494,7 +495,7 @@ $(TEST_HELPER_OBJ): tests/common/test_helpers.cpp
 # Pattern rule for compiling test source files to object files
 # This allows tests to be compiled separately from linking
 # Only test_helpers is built as .o (shared by all tests). Individual test .cpp files compile directly to exe.
-$(OBJ_DIR)/tests/%.o: tests/%.cpp
+$(OBJ_DIR)/tests/%.o: tests/%.cpp $(FLAGS_STAMP)
 	@printf "\n### Compiling Test Object: $* ###\n"
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(TEST_INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
@@ -631,6 +632,7 @@ AFL_RUN_ENV = LD_LIBRARY_PATH="$(TEST_LD_PATH)" $(AFL_SAN_ENV) $(AFL_ENV)
 
 # AFL-instrumented object files and library (separate from regular build)
 AFL_OBJ_DIR := $(BUILD_DIR)/afl-objects
+AFL_FLAGS_STAMP := $(AFL_OBJ_DIR)/.flags
 AFL_LIBOBJECTS := $(patsubst src/%.c,$(AFL_OBJ_DIR)/%.o,$(SOURCES))
 AFL_STATIC_TARGET := $(BASE_NAME_PREFIX)-afl.a
 
@@ -646,7 +648,7 @@ AFL_STATIC_TARGET := $(BASE_NAME_PREFIX)-afl.a
 # misaligned-pointer report from UBSan, in a build where one translation unit
 # still had the old struct layout.  The regular and ASan builds already do
 # this; this rule was the one that did not.
-$(AFL_OBJ_DIR)/%.o: src/%.c
+$(AFL_OBJ_DIR)/%.o: src/%.c $(AFL_FLAGS_STAMP)
 	@printf "\n### Compiling (AFL instrumented): $< ###\n"
 	@mkdir -p $(@D)
 	$(AFL_CC) $(AFL_CFLAGS) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
@@ -1663,6 +1665,7 @@ ASAN_UBSAN_FLAGS := $(ASAN_FLAGS) -fsanitize=$(UBSAN_CHECKS) \
 # Sanitizer-specific build directories
 ASAN_BUILD_DIR := ./build/$(BUILD)-asan
 ASAN_OBJ_DIR := $(ASAN_BUILD_DIR)/objects
+ASAN_FLAGS_STAMP := $(ASAN_OBJ_DIR)/.flags
 ASAN_APP_DIR := $(ASAN_BUILD_DIR)/apps
 
 # ASan-instrumented object files
@@ -1705,7 +1708,7 @@ endif
 # heap-buffer-overflow in code that was correct.  A sanitizer build that can be
 # assembled from mismatched objects is worse than no sanitizer build: it can
 # invent a failure, and it can just as easily hide a real one.
-$(ASAN_OBJ_DIR)/%.o: src/%.c
+$(ASAN_OBJ_DIR)/%.o: src/%.c $(ASAN_FLAGS_STAMP)
 	@printf "\n### Compiling (ASan+UBSan instrumented): $< ###\n"
 	@mkdir -p $(@D)
 	$(CC) $(ASAN_CFLAGS) $(INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
@@ -1729,7 +1732,7 @@ $(ASAN_OBJ_DIR)/tests/common/test_helpers.o: tests/common/test_helpers.cpp
 	$(CXX) $(ASAN_CXXFLAGS) $(TEST_INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
 
 # Pattern rule for ASan test object files
-$(ASAN_OBJ_DIR)/tests/%.o: tests/%.cpp
+$(ASAN_OBJ_DIR)/tests/%.o: tests/%.cpp $(ASAN_FLAGS_STAMP)
 	@printf "\n### Compiling ASan+UBSan Test Object: $* ###\n"
 	@mkdir -p $(@D)
 	$(CXX) $(ASAN_CXXFLAGS) $(TEST_INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
@@ -1857,6 +1860,7 @@ TSAN_FLAGS := -fsanitize=thread -fno-omit-frame-pointer -g
 
 TSAN_BUILD_DIR := ./build/$(BUILD)-tsan
 TSAN_OBJ_DIR := $(TSAN_BUILD_DIR)/objects
+TSAN_FLAGS_STAMP := $(TSAN_OBJ_DIR)/.flags
 TSAN_APP_DIR := $(TSAN_BUILD_DIR)/apps
 
 TSAN_LIBOBJECTS := $(patsubst src/%.c,$(TSAN_OBJ_DIR)/%.o,$(SOURCES))
@@ -1902,7 +1906,7 @@ endif
 # reason spelled out above the first ASan compile rule: a sanitizer build
 # assembled from objects that disagree about a struct can invent a failure and
 # can hide a real one.
-$(TSAN_OBJ_DIR)/%.o: src/%.c
+$(TSAN_OBJ_DIR)/%.o: src/%.c $(TSAN_FLAGS_STAMP)
 	@printf "\n### Compiling (TSan instrumented): $< ###\n"
 	@mkdir -p $(@D)
 	$(CC) $(TSAN_CFLAGS) $(INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
@@ -1916,7 +1920,7 @@ $(TSAN_OBJ_DIR)/tests/common/test_helpers.o: tests/common/test_helpers.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(TSAN_CXXFLAGS) $(TEST_INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
 
-$(TSAN_OBJ_DIR)/tests/%.o: tests/%.cpp
+$(TSAN_OBJ_DIR)/tests/%.o: tests/%.cpp $(TSAN_FLAGS_STAMP)
 	@printf "\n### Compiling TSan Test Object: $* ###\n"
 	@mkdir -p $(@D)
 	$(CXX) $(TSAN_CXXFLAGS) $(TEST_INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
@@ -2247,3 +2251,44 @@ coverage: ## Build instrumented, run the tests, and report line coverage
 
 help: ## Display this help
 	@grep -E '^[ a-zA-Z0-9_-]+:.*?## .*$$' Makefile | sort | sed 's/\([^:]*\):.*## \(.*\)/\1:\2/' | awk -F: '{printf "%-15s %s\n", $$1, $$2}' | sed "s/(SUITE)/$(SUITE)/g; s/(PROJECT)/$(PROJECT)/g; s/(BRANCH)/$(BRANCH)/g"
+
+
+####################################################################
+# Flag stamps
+####################################################################
+# Each build tree carries the flag string it was built with. The stamp is
+# rewritten only when that string differs -- written to a scratch file,
+# compared, moved into place only on a difference -- so its mtime moves on a
+# flag change and on nothing else. The object rules above depend on it.
+#
+# This replaces listing `Makefile` as a prerequisite, which was too broad (a
+# comment-only edit recompiled everything) and too narrow (a command-line
+# override such as `make EXTRA_CFLAGS=-O2` changes no file's mtime and so was
+# invisible).
+#
+# These rules sit at the end of the file for two reasons. A rule's target
+# expands when make reads the line, so a stamp rule above its own OBJ_DIR
+# definition has an empty target: not an error, just a rule that silently does
+# not exist. And the first target in a makefile is the default goal, so a stamp
+# rule above `all:` makes a bare `make` build the stamp and nothing else.
+.PHONY: force-flags
+
+$(FLAGS_STAMP): force-flags
+	@mkdir -p $(@D)
+	@printf '%s\n' '$(CFLAGS) $(CXXFLAGS) $(LDFLAGS) $(INCLUDE)' > $@.new
+	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@
+
+$(AFL_FLAGS_STAMP): force-flags
+	@mkdir -p $(@D)
+	@printf '%s\n' '$(AFL_CFLAGS) $(AFL_LDFLAGS) $(INCLUDE)' > $@.new
+	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@
+
+$(ASAN_FLAGS_STAMP): force-flags
+	@mkdir -p $(@D)
+	@printf '%s\n' '$(ASAN_CFLAGS) $(ASAN_CXXFLAGS) $(ASAN_LDFLAGS) $(INCLUDE)' > $@.new
+	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@
+
+$(TSAN_FLAGS_STAMP): force-flags
+	@mkdir -p $(@D)
+	@printf '%s\n' '$(TSAN_CFLAGS) $(TSAN_CXXFLAGS) $(TSAN_LDFLAGS) $(INCLUDE)' > $@.new
+	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@
