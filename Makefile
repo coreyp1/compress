@@ -2289,6 +2289,25 @@ help: ## Display this help
 # nothing said so -- an object records nowhere make can see what flags built
 # it, and a mixed build links and runs like any other.
 #
+# **A stamp must record the variables the recipes EXPAND, not the ones those
+# derive from.** This is a separate failure from missing the prerequisite, it is
+# invisible to a check that only asks whether a rule names a stamp, and it was
+# live here in eleven distinct (stamp, variable) pairs. The library objects
+# compile with $(LIB_CFLAGS) while this stamp recorded $(CFLAGS); every test
+# object compiles with $(TEST_INCLUDE) while all three stamps recorded
+# $(INCLUDE); and no stamp recorded $(CC), $(CXX) or $(AFL_CC) at all. Each of
+# those is $(PARENT) plus literal text, so editing the literal -- changing
+# -fvisibility=hidden, adding an -I -- leaves the recorded parent byte for byte
+# identical and rebuilds nothing.
+#
+# Measured, with the control in the same run: changing -fvisibility=hidden to
+# -fvisibility=default and adding an -I to TEST_INCLUDE, both as plain Makefile
+# edits, recompiled 0 objects and moved no mtime, while a command-line
+# EXTRA_CFLAGS change moved both in the same tree. `make CC=clang` recompiled 0
+# objects and left DW_AT_producer reading "GNU C17 14.2.0" -- so a clang
+# cross-check was comparing gcc against gcc, which matters because clang's UBSan
+# reports what gcc's does not.
+#
 # The witness has to be a paired test with a control, because "it rebuilt" and
 # "make found nothing to do" are the same empty output: build two objects,
 # change a flag on the command line, then compare mtimes and the -O tokens gcc
@@ -2311,20 +2330,20 @@ help: ## Display this help
 
 $(FLAGS_STAMP): force-flags
 	@mkdir -p $(@D)
-	@printf '%s\n' '$(CFLAGS) $(CXXFLAGS) $(LDFLAGS) $(INCLUDE)' > $@.new
+	@printf '%s\n' '$(CC) $(CXX) $(LIB_CFLAGS) $(CXXFLAGS) $(LDFLAGS) $(INCLUDE) $(TEST_INCLUDE)' > $@.new
 	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@
 
 $(AFL_FLAGS_STAMP): force-flags
 	@mkdir -p $(@D)
-	@printf '%s\n' '$(AFL_CFLAGS) $(AFL_LDFLAGS) $(INCLUDE)' > $@.new
+	@printf '%s\n' '$(AFL_CC) $(AFL_CFLAGS) $(AFL_LDFLAGS) $(INCLUDE)' > $@.new
 	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@
 
 $(ASAN_FLAGS_STAMP): force-flags
 	@mkdir -p $(@D)
-	@printf '%s\n' '$(ASAN_CFLAGS) $(ASAN_CXXFLAGS) $(ASAN_LDFLAGS) $(INCLUDE)' > $@.new
+	@printf '%s\n' '$(CC) $(CXX) $(ASAN_CFLAGS) $(ASAN_CXXFLAGS) $(ASAN_LDFLAGS) $(INCLUDE) $(TEST_INCLUDE)' > $@.new
 	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@
 
 $(TSAN_FLAGS_STAMP): force-flags
 	@mkdir -p $(@D)
-	@printf '%s\n' '$(TSAN_CFLAGS) $(TSAN_CXXFLAGS) $(TSAN_LDFLAGS) $(INCLUDE)' > $@.new
+	@printf '%s\n' '$(CC) $(CXX) $(TSAN_CFLAGS) $(TSAN_CXXFLAGS) $(TSAN_LDFLAGS) $(INCLUDE) $(TEST_INCLUDE)' > $@.new
 	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@
