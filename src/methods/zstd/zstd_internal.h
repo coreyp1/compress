@@ -244,16 +244,6 @@ typedef struct {
 } zstd_fse_entry_t;
 
 //
-// FSE Decoder State
-//
-
-typedef struct {
-  uint16_t state;                 ///< Current FSE state
-  const zstd_fse_entry_t * table; ///< Pointer to decoding table
-  unsigned table_log;             ///< Log2 of table size
-} zstd_fse_state_t;
-
-//
 // Huffman Decoding Table Entry
 //
 

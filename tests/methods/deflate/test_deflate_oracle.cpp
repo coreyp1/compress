@@ -61,25 +61,6 @@ const char * pythonCommand() {
 #endif
 }
 
-std::vector<uint8_t> runCapture(const std::string & cmd) {
-#ifdef _WIN32
-  FILE * pipe = popen(cmd.c_str(), "rb");
-#else
-  FILE * pipe = popen(cmd.c_str(), "r");
-#endif
-  if (!pipe) {
-    return {};
-  }
-  std::vector<uint8_t> out;
-  char buf[8192];
-  size_t n;
-  while ((n = fread(buf, 1, sizeof(buf), pipe)) > 0) {
-    out.insert(out.end(), buf, buf + n);
-  }
-  pclose(pipe);
-  return out;
-}
-
 std::string tempPath(const std::string & suffix) {
   // cutil creates the file as it names it, so nothing can occupy the
   // name in between, and it puts it where gcu_path_temp_dir() says.

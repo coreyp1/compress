@@ -153,7 +153,7 @@ PKG_CONFIG_LOOKUP_PATH := $(if $(PKG_CONFIG_PATH_ENV),$(PKG_CONFIG_PATH_ENV):)$(
 
 
 CXX := g++
-CXXFLAGS := -pedantic-errors -Wall -Wextra -Werror -Wno-error=unused-function -Wfatal-errors -std=c++20 -O1 -g $(EXTRA_CXXFLAGS)
+CXXFLAGS := -pedantic-errors -Wall -Wextra -Werror -Wfatal-errors -std=c++20 -O1 -g $(EXTRA_CXXFLAGS)
 CC := cc
 # The optimization level is the one thing that should distinguish the two
 # builds' compile flags, and until now it did not: the BUILD=debug block above
@@ -304,7 +304,20 @@ endif
 # silent disarming. check-aliasing is the reason that is not a silent one.
 ALIASING_CFLAGS := $(ALIASING_FFLAGS) -Wstrict-aliasing=2
 
-CFLAGS := -pedantic-errors -Wall -Wextra -Werror -Wno-error=unused-function -Wfatal-errors -std=c17 $(OPT_CFLAGS) -g $(ALIASING_CFLAGS) $(EXTRA_CFLAGS)
+# -Wno-error=unused-function is deliberately NOT here, and its absence is a
+# compress choice rather than the suite convention it was copied from. It was the
+# reason seventeen dead functions in two files could sit behind eleven warnings
+# indefinitely: nothing in the build said anything, because the warnings were
+# demoted and `make test` prints thousands of lines. With them deleted the whole
+# library, the examples, the benchmarks and the 112 test binaries compile clean,
+# measured before removing it - so the escape now costs nothing and an unused
+# static becomes an error at the moment it appears rather than a line nobody
+# reads.
+#
+# If a legitimately-unused static ever needs to land, say so at the site with
+# __attribute__((unused)) rather than restoring this: the attribute names the one
+# function, and the flag names all of them forever.
+CFLAGS := -pedantic-errors -Wall -Wextra -Werror -Wfatal-errors -std=c17 $(OPT_CFLAGS) -g $(ALIASING_CFLAGS) $(EXTRA_CFLAGS)
 # Library-specific compile flags (export symbols on Windows, PIC on Linux)
 # GCOMP_BUILD enables DLL export on Windows (checked by GCOMP_API macro)
 # GCOMP_TEST_BUILD enables export of internal functions for testing (checked by GCOMP_INTERNAL_API macro)

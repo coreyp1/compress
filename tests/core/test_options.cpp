@@ -512,9 +512,6 @@ void setZeroOutputAndRatio(gcomp_options_t * o) {
   gcomp_options_set_uint64(o, "limits.max_output_bytes", 0);
   gcomp_options_set_uint64(o, "limits.max_expansion_ratio", 0);
 }
-void setZeroMemory(gcomp_options_t * o) {
-  gcomp_options_set_uint64(o, "limits.max_memory_bytes", 0);
-}
 void setDeflateLevel(gcomp_options_t * o) {
   gcomp_options_set_int64(o, "deflate.level", 6); // int64, not uint64
 }
