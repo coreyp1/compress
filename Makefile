@@ -149,7 +149,49 @@ PKG_CONFIG_LOOKUP_PATH := $(if $(PKG_CONFIG_PATH_ENV),$(PKG_CONFIG_PATH_ENV):)$(
 CXX := g++
 CXXFLAGS := -pedantic-errors -Wall -Wextra -Werror -Wno-error=unused-function -Wfatal-errors -std=c++20 -O1 -g $(EXTRA_CXXFLAGS)
 CC := cc
-CFLAGS := -pedantic-errors -Wall -Wextra -Werror -Wno-error=unused-function -Wfatal-errors -std=c17 -O3 -g $(EXTRA_CFLAGS)
+# The optimization level is the one thing that should distinguish the two
+# builds' compile flags, and until now it did not: the BUILD=debug block above
+# renamed the artifact and changed nothing about how the code was compiled, so
+# `make BUILD=debug` produced -O3 objects carrying a -debug filename - a debug
+# build that cannot be stepped through. -g stays in both, because a release
+# build nobody can read in a debugger is a release build nobody can diagnose,
+# and the symbols cost only file size.
+#
+# -O3 is retained for release rather than chosen here; it predates this block.
+# It is also unmeasured for this library: there is no -O3-versus-O2 figure for
+# compress anywhere, so it is convention, not a result.
+#
+# What appends its own -O after this one, all relying on the last -O winning:
+# `make coverage` passes EXTRA_CFLAGS="--coverage -O0", which lands at the end
+# of CFLAGS below. What does NOT: AFL_CFLAGS is built standalone with its own
+# -O2 and never sees CFLAGS.
+#
+# ASAN_UBSAN_FLAGS carries no -O at all, so the sanitizer build inherits
+# whatever this says. That was not a decision anyone recorded - it is what
+# happens when the flag set omits an -O - so measure it rather than assume:
+#
+#   make -n test-asan PREFIX=... | grep -e ' -c ' | grep -oE -e '-O[0-3s]' \
+#     | sort | uniq -c
+#
+# gives 76 C library TUs at -O3 and 113 C++ test TUs at -O1 (a literal in
+# CXXFLAGS). Filter on ` -c `: without it the count says 226 -O1, because the
+# shared-library link line is g++ as linker driver carrying CXXFLAGS, and an
+# -O on a link line is inert without LTO.
+#
+# Leaving the inheritance alone, with the argument written down rather than
+# settled here: -Wmaybe-uninitialized, -Warray-bounds and the aliasing and
+# signed-overflow assumptions UBSan exists to catch are all optimizer-
+# dependent, so a gate pinned below the shipping level is testing code nobody
+# installs. chron pins its sanitizer to -O1 and gets cleaner stack traces for
+# it, which is an honest argument the other way. Whether the suite should
+# standardise, and on which, is not this Makefile's call.
+ifeq ($(BUILD),debug)
+OPT_CFLAGS := -O0
+else
+OPT_CFLAGS := -O3
+endif
+
+CFLAGS := -pedantic-errors -Wall -Wextra -Werror -Wno-error=unused-function -Wfatal-errors -std=c17 $(OPT_CFLAGS) -g $(EXTRA_CFLAGS)
 # Library-specific compile flags (export symbols on Windows, PIC on Linux)
 # GCOMP_BUILD enables DLL export on Windows (checked by GCOMP_API macro)
 # GCOMP_TEST_BUILD enables export of internal functions for testing (checked by GCOMP_INTERNAL_API macro)
