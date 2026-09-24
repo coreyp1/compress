@@ -73,13 +73,43 @@ typedef struct {
   uint64_t decompressed_size;
 } gcomp_seek_entry_t;
 
+/**
+ * @brief Where a seekable stream's compressed bytes come from.
+ *
+ * Two cases behind one type, so the indexer and the frame loader are written
+ * once. `data` non-NULL is a caller's buffer, addressable throughout and
+ * copied from nowhere; `data` NULL is a gcomp_seek_cb that has to be asked.
+ *
+ * `total` is authoritative in both cases and is what every bound is checked
+ * against. For the buffer case it is `size`; for the callback case the caller
+ * supplied it, because a callback cannot be asked how long the file is.
+ */
+typedef struct {
+  const uint8_t * data; ///< The whole file, or NULL for a callback source.
+  size_t size;          ///< Its length, when `data` is set.
+  gcomp_seek_cb read;   ///< The source, when `data` is NULL.
+  void * ctx;           ///< Handed to `read` unchanged.
+  uint64_t total;       ///< File length; set either way.
+} gcomp_seek_source_t;
+
 struct gcomp_seekable_s {
   const gcomp_allocator_t * allocator;
   gcomp_registry_t * registry;
   gcomp_options_t * options; ///< Cloned, so the caller may change theirs
 
-  const uint8_t * data;
-  size_t size;
+  gcomp_seek_source_t source;
+
+  /**
+   * @brief One frame's compressed bytes, for a callback source only.
+   *
+   * A buffer source decodes straight out of the caller's memory and never
+   * allocates this. A callback source has to have the frame in hand before it
+   * can be decoded, so it is fetched here and the buffer is kept and regrown,
+   * because consecutive reads are usually in the same or a neighbouring frame
+   * and those are of similar size.
+   */
+  uint8_t * raw_frame;
+  size_t raw_frame_size;
 
   gcomp_seek_entry_t * entries;
   size_t count;
@@ -100,6 +130,81 @@ struct gcomp_seekable_s {
 };
 
 /**
+ * @brief Read exactly @p len bytes at @p offset, or fail.
+ *
+ * Every structure this file reads - the footer, the seek table, a frame - is
+ * only meaningful whole, so a short read is a corrupt file rather than
+ * something to carry on from with less. The one caller that does want a short
+ * read (the walker, at end of file) asks through
+ * gcomp_seek_source_read_upto() instead.
+ *
+ * @return ::GCOMP_OK; ::GCOMP_ERR_CORRUPT when the range runs past the end or
+ *         the source supplied less than asked; or the source's own error
+ */
+static gcomp_status_t gcomp_seek_source_read_exact(
+    const gcomp_seek_source_t * src, uint64_t offset, void * dst, size_t len) {
+  if (len == 0) {
+    return GCOMP_OK;
+  }
+  uint64_t end = 0;
+  if (!gcu_safe_add_u64(offset, (uint64_t)len, &end) || end > src->total) {
+    return GCOMP_ERR_CORRUPT;
+  }
+  if (src->data) {
+    memcpy(dst, src->data + (size_t)offset, len);
+    return GCOMP_OK;
+  }
+  // A source is allowed to answer in pieces, the way read(2) may, so this
+  // loops rather than demanding the whole range in one call.
+  uint8_t * out = (uint8_t *)dst;
+  size_t done = 0;
+  while (done < len) {
+    size_t got = 0;
+    const gcomp_status_t s =
+        src->read(src->ctx, offset + (uint64_t)done, out + done, len - done,
+            &got);
+    if (s != GCOMP_OK) {
+      return s;
+    }
+    if (got == 0) {
+      return GCOMP_ERR_CORRUPT; // Short where a whole structure was needed.
+    }
+    if (got > len - done) {
+      // A source that claims more than it was offered has scribbled past the
+      // end of the buffer. Nothing can be trusted after that.
+      return GCOMP_ERR_CORRUPT;
+    }
+    done += got;
+  }
+  return GCOMP_OK;
+}
+
+/**
+ * @brief Read up to @p len bytes at @p offset, stopping short at end of file.
+ *
+ * For the walker, which asks for a window at a time and is entitled to get
+ * less at the end.
+ */
+static gcomp_status_t gcomp_seek_source_read_upto(
+    const gcomp_seek_source_t * src, uint64_t offset, void * dst, size_t len,
+    size_t * got_out) {
+  *got_out = 0;
+  if (offset >= src->total) {
+    return GCOMP_OK;
+  }
+  const uint64_t left = src->total - offset;
+  if ((uint64_t)len > left) {
+    len = (size_t)left;
+  }
+  const gcomp_status_t s = gcomp_seek_source_read_exact(src, offset, dst, len);
+  if (s != GCOMP_OK) {
+    return s;
+  }
+  *got_out = len;
+  return GCOMP_OK;
+}
+
+/**
  * @brief Find and validate a seek table at the end of the file.
  *
  * @return ::GCOMP_OK with @p entries_out filled; ::GCOMP_ERR_UNSUPPORTED when
@@ -107,16 +212,29 @@ struct gcomp_seekable_s {
  *         there is one that does not describe this file
  */
 static gcomp_status_t gcomp_seek_read_table(const gcomp_allocator_t * alloc,
-    const uint8_t * data, size_t size, gcomp_seek_entry_t ** entries_out,
+    const gcomp_seek_source_t * src, gcomp_seek_entry_t ** entries_out,
     size_t * count_out, uint64_t * total_out) {
-  if (size < GCOMP_SEEK_FOOTER_SIZE + 8u) {
-    return GCOMP_ERR_UNSUPPORTED;
-  }
-  if (gcomp_read_le32(data + size - 4u) != GCOMP_SEEK_FOOTER_MAGIC) {
+  const uint64_t size = src->total;
+  if (size < (uint64_t)GCOMP_SEEK_FOOTER_SIZE + 8u) {
     return GCOMP_ERR_UNSUPPORTED;
   }
 
-  const uint8_t descriptor = data[size - 5u];
+  // The footer first, because it says how big the table is and therefore how
+  // much to ask a callback source for. Nine bytes, at the very end.
+  uint8_t footer[GCOMP_SEEK_FOOTER_SIZE];
+  {
+    const gcomp_status_t fs = gcomp_seek_source_read_exact(
+        src, size - GCOMP_SEEK_FOOTER_SIZE, footer, sizeof(footer));
+    if (fs != GCOMP_OK) {
+      return fs;
+    }
+  }
+  if (gcomp_read_le32(footer + GCOMP_SEEK_FOOTER_SIZE - 4u) !=
+      GCOMP_SEEK_FOOTER_MAGIC) {
+    return GCOMP_ERR_UNSUPPORTED;
+  }
+
+  const uint8_t descriptor = footer[GCOMP_SEEK_FOOTER_SIZE - 5u];
   if (descriptor & GCOMP_SEEK_DESC_RESERVED) {
     // The spec reserves these and says a reader must reject them; a table
     // whose shape this build does not know is one whose entries it would
@@ -126,7 +244,7 @@ static gcomp_status_t gcomp_seek_read_table(const gcomp_allocator_t * alloc,
   const int has_checksums = (descriptor & GCOMP_SEEK_DESC_CHECKSUM) != 0;
   const uint64_t entry_size = has_checksums ? 12u : 8u;
 
-  const uint32_t frames = gcomp_read_le32(data + size - GCOMP_SEEK_FOOTER_SIZE);
+  const uint32_t frames = gcomp_read_le32(footer);
   uint64_t entries_bytes = 0;
   if (!gcu_safe_mul_u64((uint64_t)frames, entry_size, &entries_bytes)) {
     return GCOMP_ERR_CORRUPT;
@@ -135,19 +253,28 @@ static gcomp_status_t gcomp_seek_read_table(const gcomp_allocator_t * alloc,
   uint64_t table_bytes = 0;
   if (!gcu_safe_add_u64(entries_bytes, 8u + GCOMP_SEEK_FOOTER_SIZE,
           &table_bytes) ||
-      table_bytes > (uint64_t)size) {
+      table_bytes > size) {
     return GCOMP_ERR_CORRUPT;
   }
 
-  const size_t table_start = size - (size_t)table_bytes;
-  if (gcomp_read_le32(data + table_start) != GCOMP_SEEK_TABLE_MAGIC) {
+  const uint64_t table_start = size - table_bytes;
+
+  // The skippable frame's own eight-byte header.
+  uint8_t skip_header[8];
+  {
+    const gcomp_status_t hs =
+        gcomp_seek_source_read_exact(src, table_start, skip_header, 8u);
+    if (hs != GCOMP_OK) {
+      return hs;
+    }
+  }
+  if (gcomp_read_le32(skip_header) != GCOMP_SEEK_TABLE_MAGIC) {
     // The footer magic can occur by chance in compressed bytes, so failing to
     // find the skippable frame it implies means there was no table, not that
     // the file is broken.
     return GCOMP_ERR_UNSUPPORTED;
   }
-  if (gcomp_read_le32(data + table_start + 4u) !=
-      (uint32_t)(table_bytes - 8u)) {
+  if (gcomp_read_le32(skip_header + 4u) != (uint32_t)(table_bytes - 8u)) {
     return GCOMP_ERR_CORRUPT;
   }
 
@@ -164,7 +291,29 @@ static gcomp_status_t gcomp_seek_read_table(const gcomp_allocator_t * alloc,
     return GCOMP_ERR_MEMORY;
   }
 
-  const uint8_t * p = data + table_start + 8u;
+  // The entries themselves. A buffer source could be read in place, but the
+  // entries are at most twelve bytes each and reading them the same way for
+  // both sources is what keeps one code path below rather than two.
+  if (entries_bytes > (uint64_t)SIZE_MAX) {
+    gcomp_free(alloc, entries);
+    return GCOMP_ERR_LIMIT;
+  }
+  uint8_t * raw = gcomp_malloc(alloc, (size_t)entries_bytes);
+  if (!raw) {
+    gcomp_free(alloc, entries);
+    return GCOMP_ERR_MEMORY;
+  }
+  {
+    const gcomp_status_t es = gcomp_seek_source_read_exact(
+        src, table_start + 8u, raw, (size_t)entries_bytes);
+    if (es != GCOMP_OK) {
+      gcomp_free(alloc, raw);
+      gcomp_free(alloc, entries);
+      return es;
+    }
+  }
+
+  const uint8_t * p = raw;
   uint64_t c_off = 0;
   uint64_t d_off = 0;
   for (uint32_t i = 0; i < frames; i++) {
@@ -179,15 +328,18 @@ static gcomp_status_t gcomp_seek_read_table(const gcomp_allocator_t * alloc,
 
     if (!gcu_safe_add_u64(c_off, c, &c_off) ||
         !gcu_safe_add_u64(d_off, d, &d_off)) {
+      gcomp_free(alloc, raw);
       gcomp_free(alloc, entries);
       return GCOMP_ERR_CORRUPT;
     }
   }
 
+  gcomp_free(alloc, raw);
+
   // The frames the table describes must be exactly the bytes in front of it.
   // Checking here is what turns a truncated file into an error at open rather
   // than a decode failure part way through somebody's read.
-  if (c_off != (uint64_t)table_start) {
+  if (c_off != table_start) {
     gcomp_free(alloc, entries);
     return GCOMP_ERR_CORRUPT;
   }
@@ -207,7 +359,7 @@ static gcomp_status_t gcomp_seek_read_table(const gcomp_allocator_t * alloc,
  * rather than opened into something that decodes it all on every read.
  */
 static gcomp_status_t gcomp_seek_index_by_walking(
-    const gcomp_allocator_t * alloc, const uint8_t * data, size_t size,
+    const gcomp_allocator_t * alloc, const gcomp_seek_source_t * src,
     gcomp_seek_entry_t ** entries_out, size_t * count_out,
     uint64_t * total_out) {
   zstd_walk_t w;
@@ -220,18 +372,81 @@ static gcomp_status_t gcomp_seek_index_by_walking(
     return GCOMP_ERR_MEMORY;
   }
 
+  // A buffer source is walked where it lies. A callback source is walked
+  // through a window, which is what keeps this O(1) in memory for a file
+  // larger than memory.
+  //
+  // The window has to be able to hold one whole header, because
+  // zstd_walk_update() consumes nothing across a header that is not all
+  // present and would otherwise make no progress. A zstd frame header is at
+  // most 18 bytes and a block header 3, so 64 KiB is four orders of magnitude
+  // of margin; the loop still checks for no progress rather than assuming it,
+  // because a walker change is not a thing this function would otherwise
+  // notice.
+  const size_t window = 64u * 1024u;
+  uint8_t * buf = NULL;
+  size_t held = 0; ///< Bytes in `buf` not yet consumed by the walker.
+  if (!src->data) {
+    buf = gcomp_malloc(alloc, window);
+    if (!buf) {
+      gcomp_free(alloc, entries);
+      return GCOMP_ERR_MEMORY;
+    }
+  }
+
   uint64_t d_off = 0;
-  size_t used_total = 0;
+  uint64_t used_total = 0; ///< File offset the walker has reached.
   for (;;) {
     gcomp_walk_event_t batch[64];
     size_t used = 0, n = 0;
-    const gcomp_status_t s = zstd_walk_update(&w, data + used_total,
-        size - used_total, &used, batch, 64, &n);
+    gcomp_status_t s;
+
+    if (src->data) {
+      s = zstd_walk_update(&w, src->data + (size_t)used_total,
+          src->size - (size_t)used_total, &used, batch, 64, &n);
+    }
+    else {
+      // Top the window up from where the walker has got to, keeping whatever
+      // it declined to consume last time at the front.
+      size_t got = 0;
+      const gcomp_status_t rs = gcomp_seek_source_read_upto(src,
+          used_total + (uint64_t)held, buf + held, window - held, &got);
+      if (rs != GCOMP_OK) {
+        gcomp_free(alloc, buf);
+        gcomp_free(alloc, entries);
+        return rs;
+      }
+      held += got;
+      if (held == 0) {
+        break; // End of file, and nothing left over.
+      }
+      s = zstd_walk_update(&w, buf, held, &used, batch, 64, &n);
+      if (s == GCOMP_OK) {
+        if (used == 0 && n == 0 && got == 0) {
+          // The walker wants more and there is no more: a unit's header runs
+          // past the end of the file.
+          gcomp_free(alloc, buf);
+          gcomp_free(alloc, entries);
+          return GCOMP_ERR_UNSUPPORTED;
+        }
+        if (used == 0 && held == window) {
+          // A full window it will not consume any of. Cannot happen with
+          // headers this small, and would be an infinite loop if it did.
+          gcomp_free(alloc, buf);
+          gcomp_free(alloc, entries);
+          return GCOMP_ERR_UNSUPPORTED;
+        }
+        memmove(buf, buf + used, held - used);
+        held -= used;
+      }
+    }
+
     if (s != GCOMP_OK) {
+      gcomp_free(alloc, buf);
       gcomp_free(alloc, entries);
       return GCOMP_ERR_UNSUPPORTED;
     }
-    used_total += used;
+    used_total += (uint64_t)used;
 
     for (size_t i = 0; i < n; i++) {
       if (batch[i].kind != GCOMP_WALK_FRAME) {
@@ -239,18 +454,21 @@ static gcomp_status_t gcomp_seek_index_by_walking(
                   // no data.
       }
       if (batch[i].content_size == 0) {
+        gcomp_free(alloc, buf);
         gcomp_free(alloc, entries);
         return GCOMP_ERR_UNSUPPORTED;
       }
       if (count == cap) {
         size_t next = 0;
         if (!gcu_safe_mul_size(cap, 2u, &next)) {
+          gcomp_free(alloc, buf);
           gcomp_free(alloc, entries);
           return GCOMP_ERR_LIMIT;
         }
         gcomp_seek_entry_t * grown =
             gcomp_realloc(alloc, entries, next * sizeof(*entries));
         if (!grown) {
+          gcomp_free(alloc, buf);
           gcomp_free(alloc, entries);
           return GCOMP_ERR_MEMORY;
         }
@@ -262,6 +480,7 @@ static gcomp_status_t gcomp_seek_index_by_walking(
       entries[count].decompressed_offset = d_off;
       entries[count].decompressed_size = batch[i].content_size;
       if (!gcu_safe_add_u64(d_off, batch[i].content_size, &d_off)) {
+        gcomp_free(alloc, buf);
         gcomp_free(alloc, entries);
         return GCOMP_ERR_LIMIT;
       }
@@ -272,7 +491,9 @@ static gcomp_status_t gcomp_seek_index_by_walking(
     }
   }
 
-  if (used_total != size || count == 0) {
+  gcomp_free(alloc, buf);
+
+  if (used_total != src->total || count == 0) {
     gcomp_free(alloc, entries);
     return GCOMP_ERR_UNSUPPORTED;
   }
@@ -283,14 +504,17 @@ static gcomp_status_t gcomp_seek_index_by_walking(
   return GCOMP_OK;
 }
 
-gcomp_status_t gcomp_seekable_open_buffer(gcomp_registry_t * registry,
-    const char * method_name, gcomp_options_t * options, const void * data,
-    size_t size, gcomp_seekable_t ** out) {
-  if (!method_name || !data || size == 0 || !out) {
-    return GCOMP_ERR_INVALID_ARG;
-  }
-  *out = NULL;
-
+/**
+ * @brief Index a source and wrap it in a gcomp_seekable_t.
+ *
+ * The whole of both open functions except for validating their own arguments,
+ * so a buffer source and a callback source cannot come to different
+ * conclusions about one file - which is the property
+ * test_seekable.cpp's cross-checks assert.
+ */
+static gcomp_status_t gcomp_seekable_open_source(gcomp_registry_t * registry,
+    const char * method_name, gcomp_options_t * options,
+    const gcomp_seek_source_t * src, gcomp_seekable_t ** out) {
   // Only Zstandard for now, and deliberately. LZ4 blocks that are independent
   // can be decoded alone, but a compressed block's header does not say what it
   // expands to, so an index for one cannot be built without decoding the file
@@ -306,7 +530,6 @@ gcomp_status_t gcomp_seekable_open_buffer(gcomp_registry_t * registry,
     }
   }
   const gcomp_allocator_t * alloc = gcomp_registry_get_allocator(registry);
-  const uint8_t * bytes = (const uint8_t *)data;
 
   gcomp_seek_entry_t * entries = NULL;
   size_t count = 0;
@@ -314,13 +537,12 @@ gcomp_status_t gcomp_seekable_open_buffer(gcomp_registry_t * registry,
   int has_table = 0;
 
   gcomp_status_t s =
-      gcomp_seek_read_table(alloc, bytes, size, &entries, &count, &total);
+      gcomp_seek_read_table(alloc, src, &entries, &count, &total);
   if (s == GCOMP_OK) {
     has_table = 1;
   }
   else if (s == GCOMP_ERR_UNSUPPORTED) {
-    s = gcomp_seek_index_by_walking(alloc, bytes, size, &entries, &count,
-        &total);
+    s = gcomp_seek_index_by_walking(alloc, src, &entries, &count, &total);
     if (s != GCOMP_OK) {
       return s;
     }
@@ -347,8 +569,7 @@ gcomp_status_t gcomp_seekable_open_buffer(gcomp_registry_t * registry,
 
   sk->allocator = alloc;
   sk->registry = registry;
-  sk->data = bytes;
-  sk->size = size;
+  sk->source = *src;
   sk->entries = entries;
   sk->count = count;
   sk->total_decompressed = total;
@@ -357,6 +578,40 @@ gcomp_status_t gcomp_seekable_open_buffer(gcomp_registry_t * registry,
 
   *out = sk;
   return GCOMP_OK;
+}
+
+gcomp_status_t gcomp_seekable_open_buffer(gcomp_registry_t * registry,
+    const char * method_name, gcomp_options_t * options, const void * data,
+    size_t size, gcomp_seekable_t ** out) {
+  if (!method_name || !data || size == 0 || !out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  *out = NULL;
+
+  gcomp_seek_source_t src;
+  memset(&src, 0, sizeof(src));
+  src.data = (const uint8_t *)data;
+  src.size = size;
+  src.total = (uint64_t)size;
+
+  return gcomp_seekable_open_source(registry, method_name, options, &src, out);
+}
+
+gcomp_status_t gcomp_seekable_open_cb(gcomp_registry_t * registry,
+    const char * method_name, gcomp_options_t * options, gcomp_seek_cb read,
+    void * ctx, uint64_t total_size, gcomp_seekable_t ** out) {
+  if (!method_name || !read || total_size == 0 || !out) {
+    return GCOMP_ERR_INVALID_ARG;
+  }
+  *out = NULL;
+
+  gcomp_seek_source_t src;
+  memset(&src, 0, sizeof(src));
+  src.read = read;
+  src.ctx = ctx;
+  src.total = total_size;
+
+  return gcomp_seekable_open_source(registry, method_name, options, &src, out);
 }
 
 uint64_t gcomp_seekable_size(const gcomp_seekable_t * s) {
@@ -377,6 +632,7 @@ void gcomp_seekable_close(gcomp_seekable_t * s) {
   }
   const gcomp_allocator_t * alloc = s->allocator;
   gcomp_free(alloc, s->cached);
+  gcomp_free(alloc, s->raw_frame);
   gcomp_free(alloc, s->entries);
   if (s->options) {
     gcomp_options_destroy(s->options);
@@ -430,9 +686,38 @@ static gcomp_status_t gcomp_seek_load_frame(
     s->cached_size = want;
   }
 
+  // Where the frame's compressed bytes are. A buffer source has them already;
+  // a callback source has to be asked, into a buffer kept across reads.
+  const uint8_t * compressed = NULL;
+  if (s->source.data) {
+    compressed = s->source.data + (size_t)e->compressed_offset;
+  }
+  else {
+    if (e->compressed_size > (uint64_t)SIZE_MAX) {
+      return GCOMP_ERR_LIMIT;
+    }
+    const size_t need = (size_t)e->compressed_size;
+    if (s->raw_frame_size < need) {
+      uint8_t * grown =
+          gcomp_realloc(s->allocator, s->raw_frame, need ? need : 1u);
+      if (!grown) {
+        return GCOMP_ERR_MEMORY;
+      }
+      s->raw_frame = grown;
+      s->raw_frame_size = need;
+    }
+    const gcomp_status_t rs = gcomp_seek_source_read_exact(
+        &s->source, e->compressed_offset, s->raw_frame, need);
+    if (rs != GCOMP_OK) {
+      s->cached_frame = s->count;
+      return rs;
+    }
+    compressed = s->raw_frame;
+  }
+
   size_t produced = 0;
   const gcomp_status_t st = gcomp_decode_buffer(s->registry, "zstd",
-      s->options, s->data + e->compressed_offset, (size_t)e->compressed_size,
+      s->options, compressed, (size_t)e->compressed_size,
       s->cached, s->cached_size ? s->cached_size : 1u, &produced);
   if (st != GCOMP_OK) {
     s->cached_frame = s->count;

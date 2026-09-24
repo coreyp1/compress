@@ -108,6 +108,82 @@ GCOMP_API gcomp_status_t gcomp_seekable_open_buffer(gcomp_registry_t * registry,
     size_t size, gcomp_seekable_t ** out);
 
 /**
+ * @brief Hands over bytes at an offset, for gcomp_seekable_open_cb().
+ *
+ * The one thing a seekable reader needs from a byte source: give me @p len
+ * bytes starting at @p offset. A file, an object store, an mmap of something
+ * larger than memory, a decrypting layer - anything that can answer that.
+ *
+ * Reads are not sequential and will jump backwards: opening reads the footer
+ * at the very end before anything else, and every subsequent read goes
+ * straight to a frame. A source that can only move forwards cannot back this.
+ *
+ * @param ctx The pointer handed to gcomp_seekable_open_cb()
+ * @param offset Byte offset in the compressed file to start at
+ * @param dst Where to put them
+ * @param len How many are wanted
+ * @param read_out Receives how many were supplied; fewer than @p len means
+ *        end of file, and the caller treats a short read where it needed a
+ *        whole structure as ::GCOMP_ERR_CORRUPT
+ * @return ::GCOMP_OK, or any error, which is returned to the caller unchanged
+ *         - ::GCOMP_ERR_IO is the one to use for a failed read
+ */
+typedef gcomp_status_t (*gcomp_seek_cb)(
+    void * ctx, uint64_t offset, void * dst, size_t len, size_t * read_out);
+
+/**
+ * @brief Open a seekable stream whose bytes come from a callback.
+ *
+ * The counterpart to gcomp_seekable_open_buffer() for a file that is not in
+ * memory, and need not fit: nothing larger than one frame plus the seek table
+ * is ever held at once. The format and the index are identical - only where
+ * the bytes come from differs - so a file written by
+ * gcomp_seekable_write_buffer() is read either way, and the answers from
+ * gcomp_seekable_size(), gcomp_seekable_frame_count() and
+ * gcomp_seekable_read() are the same to the byte.
+ *
+ * ## What it costs
+ *
+ * Opening a file that carries a seek table costs two reads and memory for the
+ * table: nine bytes for the footer, then the table itself. The frames are
+ * never touched.
+ *
+ * Opening one without a table costs a walk of the frame headers, which reads
+ * the whole file through a fixed-size window - no block payload is decoded,
+ * but every byte is fetched, so this is the expensive case on a remote source.
+ * gcomp_seekable_has_table() says afterwards which happened.
+ *
+ * A read then costs one fetch of the frame's compressed bytes and one decode
+ * of it. The decoded frame is cached, as with a buffer source, so reads
+ * within one frame fetch nothing further.
+ *
+ * ## Lifetime
+ *
+ * @p ctx must stay valid until gcomp_seekable_close(), which does not touch
+ * it - there is no close callback, because a source this borrows is one the
+ * caller already knows how to shut down. Close the stream first, then the
+ * source.
+ *
+ * @param registry Registry to find the method in (NULL for the default)
+ * @param method_name Method name; only `"zstd"` supports this today
+ * @param options Configuration options for the decodes (may be NULL)
+ * @param read The source; may not be NULL
+ * @param ctx Passed to @p read unchanged, and may be NULL if it needs none
+ * @param total_size The compressed file's length in bytes, which the caller
+ *        knows and this cannot ask for; a wrong value is reported as
+ *        ::GCOMP_ERR_CORRUPT rather than read past
+ * @param out Receives the opened stream
+ * @return ::GCOMP_OK; ::GCOMP_ERR_INVALID_ARG for a NULL @p read or a zero
+ *         @p total_size; ::GCOMP_ERR_UNSUPPORTED when the file cannot be
+ *         indexed - a method without seek support, or a frame that declares no
+ *         decompressed size; ::GCOMP_ERR_CORRUPT when a seek table is present
+ *         but does not describe this file; or whatever @p read returned
+ */
+GCOMP_API gcomp_status_t gcomp_seekable_open_cb(gcomp_registry_t * registry,
+    const char * method_name, gcomp_options_t * options, gcomp_seek_cb read,
+    void * ctx, uint64_t total_size, gcomp_seekable_t ** out);
+
+/**
  * @brief Total decompressed size of the stream.
  */
 GCOMP_API uint64_t gcomp_seekable_size(const gcomp_seekable_t * s);
@@ -147,9 +223,11 @@ GCOMP_API gcomp_status_t gcomp_seekable_read(gcomp_seekable_t * s,
     uint64_t offset, void * dst, size_t len, size_t * read_out);
 
 /**
- * @brief Close a stream opened by gcomp_seekable_open_buffer().
+ * @brief Close a stream opened by gcomp_seekable_open_buffer() or
+ *        gcomp_seekable_open_cb().
  *
- * Safe on NULL.
+ * Safe on NULL. A stream opened from a callback does not have its @p ctx
+ * touched here; close that afterwards.
  */
 GCOMP_API void gcomp_seekable_close(gcomp_seekable_t * s);
 

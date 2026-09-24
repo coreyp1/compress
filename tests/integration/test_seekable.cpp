@@ -144,6 +144,111 @@ void check_reads_against(
   }
 }
 
+/**
+ * @brief A gcomp_seek_cb over a std::vector, with instrumentation.
+ *
+ * Counts calls and bytes, so a test can assert what a read actually fetched
+ * rather than only that it returned the right answer. `chunk` caps what one
+ * call will hand over, which is how the short-read path gets walked: a source
+ * is allowed to answer in pieces the way read(2) is.
+ */
+struct MemorySource {
+  const std::vector<uint8_t> * file = nullptr;
+  size_t chunk = 0; ///< 0 means "as much as asked for".
+  size_t calls = 0;
+  uint64_t bytes = 0;
+  gcomp_status_t fail_with = GCOMP_OK; ///< Returned once `fail_after` is hit.
+  size_t fail_after = SIZE_MAX;        ///< Calls before failing.
+
+  static gcomp_status_t read(
+      void * ctx, uint64_t offset, void * dst, size_t len, size_t * read_out) {
+    MemorySource * self = static_cast<MemorySource *>(ctx);
+    *read_out = 0;
+    if (self->calls >= self->fail_after) {
+      return self->fail_with;
+    }
+    self->calls++;
+    if (offset >= self->file->size()) {
+      return GCOMP_OK; // End of file: a legitimate zero-length answer.
+    }
+    size_t avail = self->file->size() - (size_t)offset;
+    if (avail > len) {
+      avail = len;
+    }
+    if (self->chunk && avail > self->chunk) {
+      avail = self->chunk;
+    }
+    std::memcpy(dst, self->file->data() + (size_t)offset, avail);
+    *read_out = avail;
+    self->bytes += avail;
+    return GCOMP_OK;
+  }
+};
+
+/// A gcomp_seek_cb over a real file on disk, which is the point of the API.
+struct FileSource {
+  std::FILE * fp = nullptr;
+  uint64_t bytes = 0;
+
+  static gcomp_status_t read(
+      void * ctx, uint64_t offset, void * dst, size_t len, size_t * read_out) {
+    FileSource * self = static_cast<FileSource *>(ctx);
+    *read_out = 0;
+    if (std::fseek(self->fp, (long)offset, SEEK_SET) != 0) {
+      return GCOMP_ERR_IO;
+    }
+    const size_t got = std::fread(dst, 1, len, self->fp);
+    if (got == 0 && std::ferror(self->fp)) {
+      return GCOMP_ERR_IO;
+    }
+    *read_out = got;
+    self->bytes += got;
+    return GCOMP_OK;
+  }
+};
+
+/**
+ * @brief Data that does not compress, so the file is about as big as the input.
+ *
+ * make_data() is a cheap arithmetic pattern and compresses roughly 40:1, which
+ * makes a 4 MB input into a 100 KB file - fine for correctness, useless for
+ * measuring whether a read fetched a frame or the file, because at that size
+ * the two are not far apart.
+ */
+std::vector<uint8_t> make_incompressible(size_t len) {
+  std::vector<uint8_t> v(len);
+  uint64_t x = 0x9E3779B97F4A7C15ull;
+  for (size_t i = 0; i < len; i++) {
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    v[i] = (uint8_t)((x * 0x2545F4914F6CDD1Dull) >> 56);
+  }
+  return v;
+}
+
+/// Write `in` as a seekable file and return the bytes.
+std::vector<uint8_t> write_seekable(
+    const std::vector<uint8_t> & in, uint64_t frame_size, int checksum) {
+  gcomp_options_t * o = nullptr;
+  EXPECT_EQ(gcomp_options_create(&o), GCOMP_OK);
+  EXPECT_EQ(gcomp_options_set_uint64(o, "zstd.seekable_frame_size", frame_size),
+      GCOMP_OK);
+  EXPECT_EQ(
+      gcomp_options_set_bool(o, "zstd.seekable_checksum", checksum), GCOMP_OK);
+  size_t bound = 0;
+  EXPECT_EQ(gcomp_seekable_write_bound(nullptr, "zstd", o, in.size(), &bound),
+      GCOMP_OK);
+  std::vector<uint8_t> file(bound ? bound : 1);
+  size_t written = 0;
+  EXPECT_EQ(gcomp_seekable_write_buffer(nullptr, "zstd", o, in.data(),
+                in.size(), file.data(), file.size(), &written),
+      GCOMP_OK);
+  gcomp_options_destroy(o);
+  file.resize(written);
+  return file;
+}
+
 } // namespace
 
 /**
@@ -532,6 +637,380 @@ TEST(Seekable, OracleIsActuallyAvailable) {
          "our seek-table reader against the format as the reference writes "
          "it. Install it (apt install python3-pyzstd), or set "
          "GCOMP_SKIP_ORACLE_TESTS=1 to say the gap is intentional.";
+}
+
+/**
+ * @brief A callback source and a buffer source must agree exactly.
+ *
+ * The format and the index do not change with the source - only where the
+ * bytes come from - so every answer has to be identical, not merely
+ * plausible. Checked across frame sizes, with and without a seek table, and
+ * with a source that answers in one-byte pieces so the read loop that
+ * tolerates a short answer is actually walked.
+ */
+TEST(Seekable, ACallbackSourceAnswersLikeABuffer) {
+  const std::vector<uint8_t> in = make_data(500000);
+
+  for (uint64_t frame_size : {(uint64_t)1024, (uint64_t)65536,
+           (uint64_t)200000, (uint64_t)1000000}) {
+    const std::vector<uint8_t> file = write_seekable(in, frame_size, 1);
+
+    // The buffer source is the reference.
+    gcomp_seekable_t * b = nullptr;
+    ASSERT_EQ(gcomp_seekable_open_buffer(
+                  nullptr, "zstd", nullptr, file.data(), file.size(), &b),
+        GCOMP_OK)
+        << "frame " << frame_size;
+
+    // Whole answers, and one-byte answers, which are the same source with a
+    // different granularity.
+    for (size_t chunk : {(size_t)0, (size_t)1, (size_t)7}) {
+      MemorySource src;
+      src.file = &file;
+      src.chunk = chunk;
+
+      gcomp_seekable_t * c = nullptr;
+      ASSERT_EQ(gcomp_seekable_open_cb(nullptr, "zstd", nullptr,
+                    &MemorySource::read, &src, (uint64_t)file.size(), &c),
+          GCOMP_OK)
+          << "frame " << frame_size << " chunk " << chunk;
+
+      EXPECT_EQ(gcomp_seekable_size(c), gcomp_seekable_size(b))
+          << "frame " << frame_size << " chunk " << chunk;
+      EXPECT_EQ(gcomp_seekable_frame_count(c), gcomp_seekable_frame_count(b))
+          << "frame " << frame_size << " chunk " << chunk;
+      EXPECT_EQ(gcomp_seekable_has_table(c), gcomp_seekable_has_table(b))
+          << "frame " << frame_size << " chunk " << chunk;
+
+      // The same battery of windows the buffer path is held to.
+      check_reads_against(c, in);
+      gcomp_seekable_close(c);
+      if (::testing::Test::HasFatalFailure()) {
+        gcomp_seekable_close(b);
+        return;
+      }
+    }
+    gcomp_seekable_close(b);
+  }
+}
+
+/**
+ * @brief A file with no seek table is indexed through a callback too.
+ *
+ * This is the path that walks every byte of the file through a fixed window
+ * rather than reading a table, so it is the one where the window's retention
+ * of bytes the walker declined matters. Concatenated frames of deliberately
+ * uneven sizes, so frame and block headers land at assorted offsets relative
+ * to the window rather than all at multiples of it.
+ */
+TEST(Seekable, IndexesATablelessFileThroughACallback) {
+  std::vector<uint8_t> file;
+  std::vector<uint8_t> expect;
+  for (size_t len : {size_t{1}, size_t{5}, size_t{999}, size_t{65536},
+           size_t{100000}, size_t{7}, size_t{250000}}) {
+    const std::vector<uint8_t> part = make_data(len);
+    const std::vector<uint8_t> frame = encode_frame(part, 3);
+    file.insert(file.end(), frame.begin(), frame.end());
+    expect.insert(expect.end(), part.begin(), part.end());
+  }
+
+  gcomp_seekable_t * b = nullptr;
+  ASSERT_EQ(gcomp_seekable_open_buffer(
+                nullptr, "zstd", nullptr, file.data(), file.size(), &b),
+      GCOMP_OK);
+  ASSERT_FALSE(gcomp_seekable_has_table(b));
+
+  for (size_t chunk : {(size_t)0, (size_t)1, (size_t)13}) {
+    MemorySource src;
+    src.file = &file;
+    src.chunk = chunk;
+    gcomp_seekable_t * c = nullptr;
+    ASSERT_EQ(gcomp_seekable_open_cb(nullptr, "zstd", nullptr,
+                  &MemorySource::read, &src, (uint64_t)file.size(), &c),
+        GCOMP_OK)
+        << "chunk " << chunk;
+    EXPECT_EQ(gcomp_seekable_has_table(c), 0) << "chunk " << chunk;
+    EXPECT_EQ(gcomp_seekable_frame_count(c), gcomp_seekable_frame_count(b))
+        << "chunk " << chunk;
+    EXPECT_EQ(gcomp_seekable_size(c), gcomp_seekable_size(b))
+        << "chunk " << chunk;
+    check_reads_against(c, expect);
+    gcomp_seekable_close(c);
+    if (::testing::Test::HasFatalFailure()) {
+      gcomp_seekable_close(b);
+      return;
+    }
+  }
+  gcomp_seekable_close(b);
+}
+
+/**
+ * @brief The whole point: a read fetches a frame, not the file.
+ *
+ * Every other test here would pass an implementation that read the entire file
+ * into memory and then answered out of it - correct, and useless for the case
+ * this API exists for. So this one measures what the source was actually asked
+ * for.
+ *
+ * Opening a file that carries a table must not touch the frames at all, and
+ * reading one byte must fetch about one frame rather than the file.
+ */
+TEST(Seekable, ACallbackSourceFetchesOnlyWhatItNeeds) {
+  // Incompressible on purpose. make_data() compresses about 40:1, which would
+  // make the file small enough that "a frame" and "the file" are the same
+  // order of magnitude and the measurement below would prove nothing.
+  const std::vector<uint8_t> in = make_incompressible(4u * 1024u * 1024u);
+  const uint64_t frame_size = 64u * 1024u;
+  const std::vector<uint8_t> file = write_seekable(in, frame_size, 1);
+  ASSERT_GT(file.size(), size_t{1024u * 1024u})
+      << "the file needs to be big enough for 'a frame' and 'the file' to "
+         "differ by a lot; it is " << file.size();
+
+  MemorySource src;
+  src.file = &file;
+
+  gcomp_seekable_t * s = nullptr;
+  ASSERT_EQ(gcomp_seekable_open_cb(nullptr, "zstd", nullptr,
+                &MemorySource::read, &src, (uint64_t)file.size(), &s),
+      GCOMP_OK);
+  ASSERT_TRUE(gcomp_seekable_has_table(s));
+
+  // Opening read the footer, the skippable frame's header, and the entries.
+  // Nothing else: the frames were not touched.
+  const uint64_t open_bytes = src.bytes;
+  const uint64_t frames = gcomp_seekable_frame_count(s);
+  const uint64_t table_max = 9u + 8u + frames * 12u;
+  EXPECT_LE(open_bytes, table_max)
+      << "opening fetched " << open_bytes << " bytes; the footer, the "
+      << "skippable header and " << frames << " entries are at most "
+      << table_max;
+  EXPECT_LT(open_bytes, file.size() / 4u)
+      << "opening fetched " << open_bytes << " of " << file.size()
+      << " bytes, which is not an index - it is reading the file";
+
+  // One byte from the middle.
+  const uint64_t before = src.bytes;
+  uint8_t one = 0;
+  size_t got = 0;
+  ASSERT_EQ(gcomp_seekable_read(s, in.size() / 2u, &one, 1u, &got), GCOMP_OK);
+  ASSERT_EQ(got, size_t{1});
+  EXPECT_EQ(one, in[in.size() / 2u]);
+  const uint64_t one_byte_cost = src.bytes - before;
+
+  // A frame's compressed size, generously: the content is compressible, so a
+  // frame's worth of bytes is well under frame_size. Being under a quarter of
+  // the file is the claim that matters - it did not read the file to answer.
+  EXPECT_LE(one_byte_cost, frame_size + 1024u)
+      << "one byte cost " << one_byte_cost << " fetched bytes; a frame holds "
+      << frame_size << " decompressed";
+  EXPECT_LT(one_byte_cost, file.size() / 4u)
+      << "one byte cost " << one_byte_cost << " of " << file.size();
+
+  // A second read inside the same frame must fetch nothing at all: the decoded
+  // frame is cached.
+  const uint64_t cached_before = src.bytes;
+  ASSERT_EQ(gcomp_seekable_read(s, in.size() / 2u + 10u, &one, 1u, &got),
+      GCOMP_OK);
+  ASSERT_EQ(got, size_t{1});
+  EXPECT_EQ(src.bytes, cached_before)
+      << "a second read in the same frame fetched "
+      << (src.bytes - cached_before) << " bytes; the frame was already decoded";
+
+  gcomp_seekable_close(s);
+}
+
+/**
+ * @brief A real file on disk, which is what the API is for.
+ *
+ * MemorySource proves the logic; this proves the thing a caller will actually
+ * write compiles and works, through fseek and fread, with the file never held
+ * in memory.
+ */
+TEST(Seekable, ReadsFromARealFileThroughACallback) {
+  const std::vector<uint8_t> in = make_data(300000);
+  const std::vector<uint8_t> file = write_seekable(in, 32768, 1);
+
+  const std::string path = temp_path("cbfile");
+  {
+    std::FILE * w = std::fopen(path.c_str(), "wb");
+    ASSERT_NE(w, nullptr);
+    ASSERT_EQ(std::fwrite(file.data(), 1, file.size(), w), file.size());
+    ASSERT_EQ(std::fclose(w), 0);
+  }
+
+  FileSource src;
+  src.fp = std::fopen(path.c_str(), "rb");
+  ASSERT_NE(src.fp, nullptr);
+
+  gcomp_seekable_t * s = nullptr;
+  ASSERT_EQ(gcomp_seekable_open_cb(nullptr, "zstd", nullptr, &FileSource::read,
+                &src, (uint64_t)file.size(), &s),
+      GCOMP_OK);
+  check_reads_against(s, in);
+
+  // Closing the stream must not have touched the caller's source, which the
+  // header promises: it is still usable here.
+  gcomp_seekable_close(s);
+  EXPECT_EQ(std::fseek(src.fp, 0, SEEK_SET), 0)
+      << "gcomp_seekable_close() should not have closed the caller's file";
+  std::fclose(src.fp);
+  std::remove(path.c_str());
+}
+
+/**
+ * @brief What a failing or lying source gets told.
+ *
+ * A source's own error comes back unchanged rather than being flattened into
+ * something generic, because the caller is the only one who knows what
+ * GCOMP_ERR_IO meant. A wrong total_size is a corrupt file, not a read past
+ * the end of anything.
+ */
+TEST(Seekable, RefusesABadCallbackSource) {
+  const std::vector<uint8_t> in = make_data(200000);
+  const std::vector<uint8_t> file = write_seekable(in, 16384, 1);
+
+  // NULL callback, and a zero length.
+  gcomp_seekable_t * s = nullptr;
+  EXPECT_EQ(gcomp_seekable_open_cb(nullptr, "zstd", nullptr, nullptr, nullptr,
+                (uint64_t)file.size(), &s),
+      GCOMP_ERR_INVALID_ARG);
+  MemorySource ok;
+  ok.file = &file;
+  EXPECT_EQ(gcomp_seekable_open_cb(
+                nullptr, "zstd", nullptr, &MemorySource::read, &ok, 0u, &s),
+      GCOMP_ERR_INVALID_ARG);
+
+  // A source that fails on its first call. The error is the source's own.
+  {
+    MemorySource bad;
+    bad.file = &file;
+    bad.fail_after = 0;
+    bad.fail_with = GCOMP_ERR_IO;
+    gcomp_seekable_t * c = nullptr;
+    EXPECT_EQ(gcomp_seekable_open_cb(nullptr, "zstd", nullptr,
+                  &MemorySource::read, &bad, (uint64_t)file.size(), &c),
+        GCOMP_ERR_IO);
+    EXPECT_EQ(c, nullptr);
+  }
+
+  // A source that opens but fails when a frame is fetched: the failure has to
+  // surface from the read rather than be reported as a decode problem.
+  {
+    MemorySource late;
+    late.file = &file;
+    late.fail_with = GCOMP_ERR_IO;
+    gcomp_seekable_t * c = nullptr;
+    ASSERT_EQ(gcomp_seekable_open_cb(nullptr, "zstd", nullptr,
+                  &MemorySource::read, &late, (uint64_t)file.size(), &c),
+        GCOMP_OK);
+    late.fail_after = late.calls; // Fail from the next call on.
+    uint8_t byte = 0;
+    size_t got = 0;
+    EXPECT_EQ(gcomp_seekable_read(c, 0, &byte, 1u, &got), GCOMP_ERR_IO);
+    gcomp_seekable_close(c);
+  }
+
+  // A total_size larger than the file. The footer is then read from bytes that
+  // are not there, and the source reports a short read, which is corrupt.
+  {
+    MemorySource lying;
+    lying.file = &file;
+    gcomp_seekable_t * c = nullptr;
+    EXPECT_EQ(gcomp_seekable_open_cb(nullptr, "zstd", nullptr,
+                  &MemorySource::read, &lying, (uint64_t)file.size() + 4096u,
+                  &c),
+        GCOMP_ERR_CORRUPT);
+    EXPECT_EQ(c, nullptr);
+  }
+
+  // A total_size *smaller* than the file is not an error, and it took a
+  // measurement to establish that rather than a guess. Cutting the end off
+  // removes the footer, so no table is found and the file is indexed by
+  // walking instead; what the cut destroyed is part of the skippable frame the
+  // table lives in, which carries no data, so the index that comes back is
+  // complete and correct. A cut deep enough to reach a real frame drops that
+  // frame and reports the shorter length, which is the documented behaviour
+  // for a tableless file - it indexes the frames that are wholly there.
+  //
+  // What must hold is that the two sources say the same thing, and that is
+  // asserted exhaustively in TruncationsAgreeBetweenSources below rather than
+  // at one arbitrary offset here.
+  {
+    MemorySource cut;
+    cut.file = &file;
+    gcomp_seekable_t * c = nullptr;
+    ASSERT_EQ(gcomp_seekable_open_cb(nullptr, "zstd", nullptr,
+                  &MemorySource::read, &cut, (uint64_t)file.size() - 32u, &c),
+        GCOMP_OK);
+    EXPECT_EQ(gcomp_seekable_has_table(c), 0)
+        << "the footer was cut off, so there is no table to have found";
+    EXPECT_EQ(gcomp_seekable_size(c), (uint64_t)in.size())
+        << "the cut only reached the skippable table frame, which holds no "
+           "data, so every byte is still indexed";
+    gcomp_seekable_close(c);
+  }
+}
+
+/**
+ * @brief Both sources agree on every possible truncation of one file.
+ *
+ * The property the callback path has to have is not "it works on a good file"
+ * but "it is the same reader". A truncated file is where two implementations of
+ * the same format drift: one runs off the end, the other stops early, and both
+ * look fine on input that is not damaged.
+ *
+ * So this opens every prefix of one seekable file through both sources and
+ * requires the status, the frame count, the decompressed size and the
+ * has-table answer to match. Exhaustive rather than sampled, because which
+ * offsets matter is decided by where the frame and block headers happen to
+ * land, and that is not something to guess at.
+ */
+TEST(Seekable, TruncationsAgreeBetweenSources) {
+  const std::vector<uint8_t> in = make_data(200000);
+  const std::vector<uint8_t> file = write_seekable(in, 16384, 1);
+  ASSERT_GT(file.size(), size_t{500});
+
+  size_t opened = 0;
+  for (size_t len = 1; len < file.size(); len++) {
+    MemorySource src;
+    src.file = &file;
+
+    gcomp_seekable_t * c = nullptr;
+    const gcomp_status_t sc = gcomp_seekable_open_cb(nullptr, "zstd", nullptr,
+        &MemorySource::read, &src, (uint64_t)len, &c);
+
+    gcomp_seekable_t * b = nullptr;
+    const gcomp_status_t sb = gcomp_seekable_open_buffer(
+        nullptr, "zstd", nullptr, file.data(), len, &b);
+
+    ASSERT_EQ(sc, sb) << "at length " << len << ": callback said "
+                      << gcomp_status_to_string(sc) << ", buffer said "
+                      << gcomp_status_to_string(sb);
+    if (sc == GCOMP_OK) {
+      opened++;
+      ASSERT_NE(c, nullptr);
+      ASSERT_NE(b, nullptr);
+      EXPECT_EQ(gcomp_seekable_frame_count(c), gcomp_seekable_frame_count(b))
+          << "at length " << len;
+      EXPECT_EQ(gcomp_seekable_size(c), gcomp_seekable_size(b))
+          << "at length " << len;
+      EXPECT_EQ(gcomp_seekable_has_table(c), gcomp_seekable_has_table(b))
+          << "at length " << len;
+    }
+    gcomp_seekable_close(c);
+    gcomp_seekable_close(b);
+    if (::testing::Test::HasFatalFailure()) {
+      return;
+    }
+  }
+
+  // Both arms have to be reachable for the comparison to mean anything: a
+  // sweep where every length was refused would agree perfectly and check
+  // nothing.
+  EXPECT_GT(opened, size_t{0})
+      << "no truncation opened successfully, so the agreement is vacuous";
+  EXPECT_LT(opened, file.size() - 1u)
+      << "every truncation opened, so no rejection path was compared";
 }
 
 int main(int argc, char ** argv) {

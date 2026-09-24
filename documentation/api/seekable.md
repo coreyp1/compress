@@ -34,11 +34,55 @@ was.
 | Function | |
 |----------|-|
 | `gcomp_seekable_open_buffer()` | Index a file that is already in memory |
+| `gcomp_seekable_open_cb()` | Index a file through a read callback |
 | `gcomp_seekable_size()` | Total decompressed size |
 | `gcomp_seekable_frame_count()` | How many frames — the granularity of a seek |
 | `gcomp_seekable_has_table()` | Did the file carry a seek table, or was one built by walking it? |
 | `gcomp_seekable_read()` | Read a window at a decompressed offset |
 | `gcomp_seekable_close()` | Done |
+
+### From a file, or anything else
+
+A file that is not in memory — and need not fit in it — is opened by handing
+over a callback instead of a buffer. Nothing larger than one frame plus the
+seek table is ever held.
+
+```c
+static gcomp_status_t file_read(void *ctx, uint64_t offset,
+                                void *dst, size_t len, size_t *read_out) {
+  FILE *fp = ctx;
+  *read_out = 0;
+  if (fseek(fp, (long)offset, SEEK_SET) != 0) return GCOMP_ERR_IO;
+  size_t got = fread(dst, 1, len, fp);
+  if (got == 0 && ferror(fp)) return GCOMP_ERR_IO;
+  *read_out = got;              /* short is fine; it will ask again */
+  return GCOMP_OK;
+}
+
+gcomp_seekable_t *s = NULL;
+gcomp_seekable_open_cb(NULL, "zstd", NULL, file_read, fp, file_size, &s);
+```
+
+Reads are **not** sequential, so the source has to be able to go backwards:
+opening reads the footer at the very end before anything else. `total_size` is
+a parameter because a callback cannot be asked how long the file is.
+
+The handle does not own `ctx` and `gcomp_seekable_close()` does not touch it.
+Close the stream, then close the source.
+
+What it costs, measured by `examples/seekable_file.c` on 8 MB of structured
+data written with 256 KB frames — a 12,305-byte file in 32 frames:
+
+| | fetched |
+|-|---------|
+| opening (file has a seek table) | 401 bytes in 3 calls |
+| reading 64 bytes from the middle | 372 bytes, 3.0% of the file |
+| a second read inside that frame | 0 bytes |
+
+Opening a file *without* a table is the expensive case on a remote source: the
+index is built by walking every frame header, which fetches the whole file
+through a fixed window even though nothing is decoded.
+`gcomp_seekable_has_table()` says afterwards which happened.
 
 ## Writing
 
@@ -116,12 +160,15 @@ decode failure part way through somebody's read:
 
 ## Not yet
 
-Opening through read and seek callbacks rather than a buffer, so a file larger
-than memory can be indexed. The format and the index do not change; only where
-the bytes come from.
+Writing a seekable file from the streaming encoder. `gcomp_seekable_write_buffer()`
+needs the whole input at once; a `zstd.seekable` encoder option, with `flush`
+ending a frame, would let one be produced from a stream. The reading side is
+complete either way — a file this writes is read from a buffer or a callback.
 
 ## See also
 
 - [Threading](../threading.md) — `threads.count` on decode, which uses the same
   frame boundaries
-- [`examples/seekable_read.c`](../../examples/seekable_read.c)
+- [`examples/seekable_read.c`](../../examples/seekable_read.c) — from a buffer
+- [`examples/seekable_file.c`](../../examples/seekable_file.c) — from a file,
+  through a callback, with the fetch counts printed
