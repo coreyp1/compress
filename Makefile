@@ -868,7 +868,7 @@ FUZZ_DEPFILES := $(patsubst fuzz/%.c,$(APP_DIR)/fuzz/%.d,$(FUZZ_SOURCES))
 .PHONY: fuzz-rle-decoder fuzz-rle-encoder fuzz-rle-roundtrip
 .PHONY: fuzz-lzw-decoder fuzz-lzw-encoder fuzz-lzw-roundtrip
 .PHONY: fuzz-zstd-decoder fuzz-zstd-encoder fuzz-zstd-roundtrip
-.PHONY: fuzz-zlib-decoder fuzz-zlib-roundtrip
+.PHONY: fuzz-zlib-decoder fuzz-zlib-encoder fuzz-zlib-roundtrip
 # Sanitizer commands
 .PHONY: test-asan test-asan-quiet test-ubsan sanitizer-help
 .PHONY: test-tsan test-tsan-quiet test-tsan-threads
@@ -1006,6 +1006,11 @@ fuzz-help: ## Show fuzzing help and instructions
 	@printf "    make fuzz-zstd-decoder  - Run Zstd decoder fuzzer\n"
 	@printf "    make fuzz-zstd-encoder  - Run Zstd encoder fuzzer\n"
 	@printf "    make fuzz-zstd-roundtrip- Run Zstd roundtrip fuzzer\n"
+	@printf "\n"
+	@printf "  Zlib fuzzers:\n"
+	@printf "    make fuzz-zlib-decoder  - Run zlib decoder fuzzer\n"
+	@printf "    make fuzz-zlib-encoder  - Run zlib encoder fuzzer\n"
+	@printf "    make fuzz-zlib-roundtrip- Run zlib roundtrip fuzzer\n"
 	@printf "\n"
 	@printf "Workflow:\n"
 	@printf "  1. make fuzz-corpus        # Generate seed inputs\n"
@@ -1410,11 +1415,18 @@ fuzz-zstd-roundtrip: $(APP_DIR)/fuzz/fuzz_zstd_roundtrip$(EXE_EXTENSION)
 	fi
 	$(AFL_RUN_ENV) afl-fuzz -m $(AFL_MEM_LIMIT) $(AFL_TIME_FLAG) -i fuzz/corpus/zstd_roundtrip -o fuzz/findings/zstd_roundtrip -- $(APP_DIR)/fuzz/fuzz_zstd_roundtrip$(EXE_EXTENSION)
 
-# The zlib harnesses have existed since the container was added and had no way
-# to be run: fuzz-replay fed them, because it feeds every harness it finds, but
-# there was no campaign target for either. There is no zlib encoder harness to
-# match - fuzz_zlib_roundtrip covers that direction, the way the other
-# roundtrip harnesses do.
+# The zlib harnesses existed for a while with no way to be run: fuzz-replay fed
+# them, because it feeds every harness it finds, but there was no campaign
+# target for any of them and fuzz-help did not mention zlib at all.
+#
+# There is a zlib encoder harness now. The note that used to stand here said
+# fuzz_zlib_roundtrip covered that direction "the way the other roundtrip
+# harnesses do", and that was wrong twice over: deflate, gzip, lz4, lzw, rle
+# and zstd each have an encoder harness *and* a roundtrip one, so zlib was the
+# only format missing one; and fuzz_zlib_roundtrip calls gcomp_encode_buffer
+# only, with an output buffer sized for the whole stream and no zlib option
+# set, so it never drove the streaming encoder, never drove flush, and never
+# once set zlib.dictionary - the FDICT/DICTID encode path had never been fuzzed.
 fuzz-zlib-decoder: ## Run zlib decoder fuzzer (Ctrl+C to stop)
 fuzz-zlib-decoder: $(APP_DIR)/fuzz/fuzz_zlib_decoder$(EXE_EXTENSION)
 	@printf "\033[0;32m\n"
@@ -1429,6 +1441,21 @@ fuzz-zlib-decoder: $(APP_DIR)/fuzz/fuzz_zlib_decoder$(EXE_EXTENSION)
 		printf '\x78\x9c\x03\x00\x00\x00\x00\x01' > fuzz/corpus/zlib_decoder/empty.zz; \
 	fi
 	$(AFL_RUN_ENV) afl-fuzz -m $(AFL_MEM_LIMIT) $(AFL_TIME_FLAG) -i fuzz/corpus/zlib_decoder -o fuzz/findings/zlib_decoder -- $(APP_DIR)/fuzz/fuzz_zlib_decoder$(EXE_EXTENSION)
+
+fuzz-zlib-encoder: ## Run zlib encoder fuzzer (Ctrl+C to stop)
+fuzz-zlib-encoder: $(APP_DIR)/fuzz/fuzz_zlib_encoder$(EXE_EXTENSION)
+	@printf "\033[0;32m\n"
+	@printf "########################################\n"
+	@printf "### Running zlib Encoder Fuzzer     ###\n"
+	@printf "########################################\n"
+	@printf "\033[0m\n"
+	@mkdir -p fuzz/findings/zlib_encoder
+	@if [ ! -d fuzz/corpus/zlib_encoder ] || [ -z "$$(ls -A fuzz/corpus/zlib_encoder 2>/dev/null)" ]; then \
+		printf "\033[0;33mWarning: No seed corpus found. Creating minimal seed...\033[0m\n"; \
+		mkdir -p fuzz/corpus/zlib_encoder; \
+		printf 'Hello, world!' > fuzz/corpus/zlib_encoder/hello.txt; \
+	fi
+	$(AFL_RUN_ENV) afl-fuzz -m $(AFL_MEM_LIMIT) $(AFL_TIME_FLAG) -i fuzz/corpus/zlib_encoder -o fuzz/findings/zlib_encoder -- $(APP_DIR)/fuzz/fuzz_zlib_encoder$(EXE_EXTENSION)
 
 fuzz-zlib-roundtrip: ## Run zlib roundtrip fuzzer (Ctrl+C to stop)
 fuzz-zlib-roundtrip: $(APP_DIR)/fuzz/fuzz_zlib_roundtrip$(EXE_EXTENSION)
