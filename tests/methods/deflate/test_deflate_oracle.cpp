@@ -98,16 +98,33 @@ protected:
   }
 
   // Run a short Python program with `in_path` and `out_path` bound.
+  //
+  // The program goes in a file rather than after -c.  The batch bodies run to
+  // several lines, and cmd.exe - which system() uses on Windows - ends a
+  // command at the first newline, so python there was handed the first line
+  // of the program and nothing else.  A file also spares the body a round of
+  // shell quoting on every platform.
   bool runPython(const std::string & body, const std::string & in_path,
       const std::string & out_path) {
-    std::string cmd = std::string(pythonCommand()) + " -c \"" + body + "\" \"" +
+    std::string script = tempPath(".py");
+    if (script.empty()) {
+      return false;
+    }
+    const std::vector<uint8_t> text(body.begin(), body.end());
+    if (!writeFile(script, text)) {
+      unlink(script.c_str());
+      return false;
+    }
+    std::string cmd = std::string(pythonCommand()) + " \"" + script + "\" \"" +
         in_path + "\" \"" + out_path + "\"";
 #ifdef _WIN32
     cmd += " >NUL 2>&1";
 #else
     cmd += " >/dev/null 2>&1";
 #endif
-    return system(cmd.c_str()) == 0;
+    bool ok = system(cmd.c_str()) == 0;
+    unlink(script.c_str());
+    return ok;
   }
 
   // One Python process for a whole sweep.
