@@ -33,44 +33,118 @@
 
 #include <ghoti.io/cutil/file.h>
 #include <ghoti.io/cutil/path.h>
+#include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <fcntl.h>
 #include <string>
+#include <sys/stat.h>
 #include <vector>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace gcomp_test {
+
+namespace detail {
+
+/// Create @p path, failing if anything is already there.  On failure,
+/// @p err receives errno.
+inline bool createExclusive(const std::string & path, int * err) {
+#ifdef _WIN32
+  int fd = _open(path.c_str(), _O_CREAT | _O_EXCL | _O_WRONLY | _O_BINARY,
+      _S_IREAD | _S_IWRITE);
+#else
+  int fd = open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
+#endif
+  if (fd < 0) {
+    *err = errno;
+    return false;
+  }
+#ifdef _WIN32
+  _close(fd);
+#else
+  close(fd);
+#endif
+  return true;
+}
+
+/**
+ * Create `<unique name><suffix>` and return its name, or empty on failure.
+ *
+ * cutil makes `<unique name>` unique only among files that exist while it
+ * does.  The suffixed name is a different file, so the base name's
+ * uniqueness does not carry over to it once the base is gone - and this
+ * used to rename the base onto the suffixed name, which is exactly what
+ * frees it.  On POSIX the next call's six random characters made a repeat
+ * improbable; on Windows `_mktemp` names are a letter and the process id,
+ * so the next call chose the same base again and two live TempFiles shared
+ * one path.
+ *
+ * So the suffixed name is itself created exclusively.  If it is taken, the
+ * base that produced it is held open - which makes cutil choose another -
+ * until one is found, and every held base is released afterwards.  This is
+ * correct however cutil chooses its names.
+ */
+inline std::string createUnique(const char * prefix, const std::string & suffix) {
+  if (suffix.empty()) {
+    // The suffixed name would be the base itself, which always exists.
+    return {};
+  }
+  // A counter in the prefix, because on Windows cutil can only ever have 26
+  // files of one prefix in existence per process (the _mktemp letter), and
+  // a sweep holds thousands.  It changes nothing on POSIX but the name.
+  static std::atomic<unsigned long> counter{0};
+  const std::string stem = std::string(prefix ? prefix : "tmp")
+      + std::to_string(counter.fetch_add(1)) + "_";
+  std::vector<GCU_File_Temp> held;
+  std::string result;
+  // Bounded: _mktemp offers 26 names per prefix per process.
+  for (int attempt = 0; attempt < 26; ++attempt) {
+    GCU_File_Temp temp;
+    // dir = NULL means wherever gcu_path_temp_dir() says, which is TMPDIR
+    // when it is set on POSIX.  Half the copies this replaces hardcoded
+    // "/tmp".
+    if (gcu_file_temp_create(&temp, nullptr, stem.c_str(), nullptr)
+        != GCU_FILE_OK) {
+      break;
+    }
+    std::string dest = std::string(gcu_file_temp_path(&temp)) + suffix;
+    int err = 0;
+    if (createExclusive(dest, &err)) {
+      result = dest;
+      gcu_file_temp_abort(&temp);
+      break;
+    }
+    held.push_back(temp);
+    if (err != EEXIST) {
+      break;
+    }
+  }
+  for (GCU_File_Temp & temp : held) {
+    gcu_file_temp_abort(&temp);
+  }
+  return result;
+}
+
+} // namespace detail
 
 /**
  * A temporary file that deletes itself, and any name derived from it.
  *
  * The suffix is not decoration: the external oracles dispatch on the
  * extension, so `gzip` and `zstd` both misread a file that does not carry
- * one.  cutil appends six random characters to the prefix; the suffix is
- * applied by committing the created file to `<unique name><suffix>` in the
- * same directory, which inherits the uniqueness and keeps the rename inside
- * one filesystem, where it is atomic.
+ * one.  cutil chooses a unique name; the file actually used is that name
+ * plus the suffix, created exclusively beside it (see
+ * detail::createUnique()).
  */
 class TempFile {
 public:
-  TempFile(const char * prefix, const std::string & suffix) {
-    GCU_File_Temp temp;
-    // dir = NULL means wherever gcu_path_temp_dir() says, which is TMPDIR
-    // when it is set.  Half the copies this replaces hardcoded "/tmp".
-    if (gcu_file_temp_create(&temp, nullptr, prefix, nullptr) != GCU_FILE_OK) {
-      return;
-    }
-    std::string dest = std::string(gcu_file_temp_path(&temp)) + suffix;
-    // Commit spends the handle whether it succeeds or fails, so there is no
-    // abort path here.  SYNC_NONE because this is scratch that every run
-    // regenerates; file.h reserves the durable default for bytes that cannot
-    // be remade.
-    if (gcu_file_temp_commit(
-            &temp, dest.c_str(), GCU_FILE_SYNC_NONE, GCU_FILE_PERMS_PRIVATE)
-        != GCU_FILE_OK) {
-      return;
-    }
-    path_ = dest;
-  }
+  TempFile(const char * prefix, const std::string & suffix)
+      : path_(detail::createUnique(prefix, suffix)) {}
 
   ~TempFile() {
     for (const auto & name : also_remove_) {
@@ -175,17 +249,7 @@ inline bool readWholeFile(const std::string & path, std::vector<uint8_t> * out) 
  */
 inline std::string uniqueTempPath(
     const char * prefix, const std::string & suffix) {
-  GCU_File_Temp temp;
-  if (gcu_file_temp_create(&temp, nullptr, prefix, nullptr) != GCU_FILE_OK) {
-    return {};
-  }
-  std::string dest = std::string(gcu_file_temp_path(&temp)) + suffix;
-  if (gcu_file_temp_commit(
-          &temp, dest.c_str(), GCU_FILE_SYNC_NONE, GCU_FILE_PERMS_PRIVATE)
-      != GCU_FILE_OK) {
-    return {};
-  }
-  return dest;
+  return detail::createUnique(prefix, suffix);
 }
 
 /// Replace a file's contents.  False on any failure.

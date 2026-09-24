@@ -15,6 +15,8 @@
 #include <sys/stat.h>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <set>
 #include <string>
 #include <ghoti.io/cutil/dir.h>
 #include <temp_file.h>
@@ -52,19 +54,46 @@ TEST(TempFile, TwoFilesDoNotCollide) {
   EXPECT_NE(a.path(), b.path());
 }
 
+TEST(TempFile, ManyLiveFilesAreAllDistinct) {
+  // A sweep holds a file per case.  Windows' _mktemp names are a letter and
+  // the process id, so a helper whose uniqueness lapses when the base name
+  // is freed hands the same name back every time; this is the shape that
+  // exposed it.  More than 26, because _mktemp has only 26 letters for any
+  // one prefix.
+  std::vector<std::unique_ptr<TempFile>> files;
+  std::set<std::string> seen;
+  for (int i = 0; i < 100; ++i) {
+    files.push_back(std::make_unique<TempFile>("gcomp_many", ".bin"));
+    ASSERT_TRUE(files.back()->valid()) << "file " << i;
+    EXPECT_TRUE(seen.insert(files.back()->path()).second)
+        << files.back()->path() << " handed out twice";
+  }
+}
+
 namespace {
 
-/// Set or clear TMPDIR.  A test that changes it has to put it back, and
-/// getenv's pointer does not survive the setenv, so the old value is copied.
+/// The variable gcu_path_temp_dir() consults first: TMPDIR on POSIX, and on
+/// Windows TMP, which is where GetTempPath looks before TEMP.  TMPDIR means
+/// nothing there, so setting it would ask cutil for behaviour it does not
+/// document.
+#ifdef _WIN32
+const char * const kTmpVar = "TMP";
+#else
+const char * const kTmpVar = "TMPDIR";
+#endif
+
+/// Set or clear that variable.  A test that changes it has to put it back,
+/// and getenv's pointer does not survive the setenv, so the old value is
+/// copied.
 void setTmpdir(const char * value) {
 #ifdef _WIN32
-  _putenv_s("TMPDIR", value ? value : "");
+  _putenv_s(kTmpVar, value ? value : "");
 #else
   if (value) {
-    setenv("TMPDIR", value, 1);
+    setenv(kTmpVar, value, 1);
   }
   else {
-    unsetenv("TMPDIR");
+    unsetenv(kTmpVar);
   }
 #endif
 }
@@ -92,7 +121,7 @@ TEST(TempFile, HonoursTmpdir) {
       GCU_FILE_OK);
   ASSERT_NE(dir, nullptr);
 
-  const char * previous = getenv("TMPDIR");
+  const char * previous = getenv(kTmpVar);
   const std::string saved = previous ? std::string(previous) : std::string();
   const bool had_tmpdir = previous != nullptr;
 
