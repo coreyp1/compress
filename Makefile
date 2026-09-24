@@ -45,9 +45,15 @@ SO_NAME := $(BASE_NAME).$(MAJOR_VERSION)
 STATIC_TARGET := $(BASE_NAME_PREFIX).a
 ENV_VARS :=
 
-# PKG_CONFIG_PATH names where this project's own .pc file is installed, and the
-# platform block below overwrites it to say so. Remember what the environment
-# asked for first, so dependency lookup can still honour it further down.
+# PC_INSTALL_PATH names where this project's own .pc file is installed.
+# PKG_CONFIG_PATH is the environment's and is never assigned here: make exports
+# an inherited variable with whatever value the makefile last gave it, so
+# overwriting it handed every sub-make a different PKG_CONFIG_PATH from the
+# parent's. The sub-make then derived different flags, found the flag stamp
+# changed, and rebuilt everything - which check-rebuild reports as a settled
+# tree that will not settle. It showed first under MSYS2, whose login shell
+# exports PKG_CONFIG_PATH, and happens on Linux whenever the exported value is
+# not exactly the install location. cutil made the same change.
 PKG_CONFIG_PATH_ENV := $(PKG_CONFIG_PATH)
 
 # `override` on each of those: BUILD may arrive on the command line, and a
@@ -67,7 +73,7 @@ ifeq ($(UNAME_S), Linux)
 	TARGET := $(SO_NAME).$(MINOR_VERSION)
 	EXE_EXTENSION :=
 	# Additional Linux-specific variables
-	PKG_CONFIG_PATH := /usr/local/share/pkgconfig
+	PC_INSTALL_PATH := /usr/local/share/pkgconfig
 	INCLUDE_INSTALL_PATH := /usr/local/include
 	LIB_INSTALL_PATH := /usr/local/lib
 	override BUILD := linux/$(BUILD)
@@ -91,7 +97,7 @@ else ifeq ($(findstring MINGW32_NT,$(UNAME_S)),MINGW32_NT)  # 32-bit Windows
 	EXE_EXTENSION := .exe
 	# Additional Windows-specific variables
 	# This is the path to the pkg-config files on MSYS2
-	PKG_CONFIG_PATH := /mingw32/lib/pkgconfig
+	PC_INSTALL_PATH := /mingw32/lib/pkgconfig
 	INCLUDE_INSTALL_PATH := /mingw32/include
 	LIB_INSTALL_PATH := /mingw32/lib
 	BIN_INSTALL_PATH := /mingw32/bin
@@ -106,7 +112,7 @@ else ifeq ($(findstring MINGW64_NT,$(UNAME_S)),MINGW64_NT)  # 64-bit Windows
 	EXE_EXTENSION := .exe
 	# Additional Windows-specific variables
 	# This is the path to the pkg-config files on MSYS2
-	PKG_CONFIG_PATH := /mingw64/lib/pkgconfig
+	PC_INSTALL_PATH := /mingw64/lib/pkgconfig
 	INCLUDE_INSTALL_PATH := /mingw64/include
 	LIB_INSTALL_PATH := /mingw64/lib
 	BIN_INSTALL_PATH := /mingw64/bin
@@ -132,7 +138,7 @@ ifdef PREFIX
 INCLUDE_INSTALL_PATH := $(PREFIX)/include
 LIB_INSTALL_PATH := $(PREFIX)/lib
 BIN_INSTALL_PATH := $(PREFIX)/bin
-PKG_CONFIG_PATH := $(PREFIX)/share/pkgconfig
+PC_INSTALL_PATH := $(PREFIX)/share/pkgconfig
 ifeq ($(OS_NAME), Windows)
 PC_INCLUDE_DIR = $(shell cygpath -m $(INCLUDE_INSTALL_PATH)/$(SUITE)/$(PROJECT)$(BRANCH))
 PC_LIB_DIR = $(shell cygpath -m $(LIB_INSTALL_PATH)/$(SUITE))
@@ -149,7 +155,7 @@ endif
 # install location chosen above, so that exporting PKG_CONFIG_PATH works as the
 # errors below say it does. The inherited value comes first: it is an explicit
 # request for this build, where the install location may be only a default.
-PKG_CONFIG_LOOKUP_PATH := $(if $(PKG_CONFIG_PATH_ENV),$(PKG_CONFIG_PATH_ENV):)$(PKG_CONFIG_PATH)
+PKG_CONFIG_LOOKUP_PATH := $(if $(PKG_CONFIG_PATH_ENV),$(PKG_CONFIG_PATH_ENV):)$(PC_INSTALL_PATH)
 
 
 CXX := g++
@@ -3009,7 +3015,7 @@ PC_REQUIRES := $(CUTIL_PC)
 # Where this project's own .pc file is installed. Defaults to the directory
 # pkg-config is already being told to search, but separate from it so a
 # staged install can write somewhere else without also redirecting lookups.
-PKGCONFIG_INSTALL_PATH ?= $(PKG_CONFIG_PATH)
+PKGCONFIG_INSTALL_PATH ?= $(PC_INSTALL_PATH)
 
 # $(LDCONF_INSTALL_PATH)/(SUITE)-(PROJECT)(BRANCH).conf will point to $(LIB_INSTALL_PATH)/(SUITE)
 # /usr/local/include/(SUITE)/(PROJECT)(BRANCH)
