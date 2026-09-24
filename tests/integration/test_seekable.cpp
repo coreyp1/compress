@@ -44,8 +44,11 @@ bool skip_oracle() {
 
 bool has_pyzstd_seekable() {
   return std::system(
-             "python3 -c 'import pyzstd; pyzstd.SeekableZstdFile' "
-             ">/dev/null 2>&1") == 0;
+             // Double quotes: cmd.exe passes single quotes through, and
+             // python then evaluates a string literal and succeeds whether
+             // pyzstd is there or not.
+             "python3 -c \"import pyzstd; pyzstd.SeekableZstdFile\" "
+             ">" GCOMP_TEST_NULL_DEVICE " 2>&1") == 0;
 }
 
 std::string temp_path(const char * tag) {
@@ -53,7 +56,11 @@ std::string temp_path(const char * tag) {
   // same value on every call from the same frame, in a directory named
   // outright rather than asked for.  cutil creates the file as it names
   // it, under gcu_path_temp_dir().
-  return gcomp_test::uniqueTempPath("gcomp_seek", std::string("_") + tag);
+  //
+  // Forward slashes, because these names are pasted into Python string
+  // literals, where a Windows path's backslashes are escape sequences.
+  return gcomp_test::toPosixPath(
+      gcomp_test::uniqueTempPath("gcomp_seek", std::string("_") + tag));
 }
 
 std::vector<uint8_t> read_file(const std::string & p) {
@@ -171,7 +178,8 @@ TEST(Seekable, ReadsATableTheReferenceWrote) {
         "python3 -c \"import pyzstd; "
         "d=open('%s','rb').read(); "
         "f=pyzstd.SeekableZstdFile('%s','w',level_or_option=3,"
-        "max_frame_content_size=%zu); f.write(d); f.close()\" 2>/dev/null",
+        "max_frame_content_size=%zu); f.write(d); f.close()\" "
+        "2>" GCOMP_TEST_NULL_DEVICE,
         raw_path.c_str(), zst_path.c_str(), frame_size);
     ASSERT_EQ(std::system(cmd), 0) << "frame size " << frame_size;
 
@@ -332,7 +340,8 @@ TEST(Seekable, RefusesATableThatDoesNotDescribeItsFile) {
   std::snprintf(cmd, sizeof(cmd),
       "python3 -c \"import pyzstd; d=open('%s','rb').read(); "
       "f=pyzstd.SeekableZstdFile('%s','w',level_or_option=3,"
-      "max_frame_content_size=32768); f.write(d); f.close()\" 2>/dev/null",
+      "max_frame_content_size=32768); f.write(d); f.close()\" "
+      "2>" GCOMP_TEST_NULL_DEVICE,
       raw_path.c_str(), zst_path.c_str());
   ASSERT_EQ(std::system(cmd), 0);
   const std::vector<uint8_t> comp = read_file(zst_path);
@@ -469,7 +478,7 @@ TEST(Seekable, TheReferenceReadsWhatWeWrite) {
           "assert f.read(1000)==d[123456:124456], 'seek'; f.seek(0); "
           "assert f.read()==d, 'whole'; f.close(); "
           "assert pyzstd.decompress(open('%s','rb').read())==d, 'plain'\" "
-          "2>/dev/null",
+          "2>" GCOMP_TEST_NULL_DEVICE,
           zst_path.c_str(), zst_path.c_str());
       EXPECT_EQ(std::system(cmd), 0)
           << "frame " << frame_size << " checksum " << checksum

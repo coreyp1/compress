@@ -49,8 +49,10 @@ bool skip_oracle() {
 }
 
 bool has_pyzstd_train() {
-  return std::system("python3 -c 'import pyzstd; pyzstd.train_dict' "
-                     ">/dev/null 2>&1") == 0;
+  // Double quotes: cmd.exe passes single quotes through, and python then
+  // evaluates a string literal and succeeds whether pyzstd is there or not.
+  return std::system("python3 -c \"import pyzstd; pyzstd.train_dict\" "
+                     ">" GCOMP_TEST_NULL_DEVICE " 2>&1") == 0;
 }
 
 std::string temp_path(const char * tag) {
@@ -58,7 +60,11 @@ std::string temp_path(const char * tag) {
   // same value on every call from the same frame, in a directory named
   // outright rather than asked for.  cutil creates the file as it names
   // it, under gcu_path_temp_dir().
-  return gcomp_test::uniqueTempPath("gcomp_fmtdict", std::string("_") + tag);
+  //
+  // Forward slashes, because these names are pasted into Python string
+  // literals, where a Windows path's backslashes are escape sequences.
+  return gcomp_test::toPosixPath(
+      gcomp_test::uniqueTempPath("gcomp_fmtdict", std::string("_") + tag));
 }
 
 std::vector<uint8_t> read_file(const std::string & p) {

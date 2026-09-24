@@ -470,7 +470,7 @@ bool skip_oracle() {
 }
 
 bool has_zstd_cli() {
-  return std::system("zstd --version >/dev/null 2>&1") == 0;
+  return std::system("zstd --version >" GCOMP_TEST_NULL_DEVICE " 2>&1") == 0;
 }
 
 std::string temp_path(const char * tag) {
@@ -532,7 +532,8 @@ TEST(ZstdWalkOracle, WalksStreamsTheReferenceProduced) {
   for (const char * flags : flag_sets) {
     const std::string out_path = temp_path("out");
     char cmd[512];
-    std::snprintf(cmd, sizeof(cmd), "zstd -q -f %s -o %s %s 2>/dev/null",
+    std::snprintf(cmd, sizeof(cmd),
+        "zstd -q -f %s -o %s %s 2>" GCOMP_TEST_NULL_DEVICE,
         flags, out_path.c_str(), in_path.c_str());
     const int rc = std::system(cmd);
     if (rc != 0) {

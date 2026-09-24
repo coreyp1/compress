@@ -47,6 +47,20 @@
 #include <unistd.h>
 #endif
 
+/**
+ * The null device, spelled for the shell that system() and popen() run.
+ *
+ * That shell is cmd.exe on Windows, which refuses a redirection to
+ * "/dev/null" with "The system cannot find the path specified" and then does
+ * not run the command at all - so an oracle probe written the POSIX way
+ * reports the tool missing on a machine that has it.
+ */
+#ifdef _WIN32
+#define GCOMP_TEST_NULL_DEVICE "NUL"
+#else
+#define GCOMP_TEST_NULL_DEVICE "/dev/null"
+#endif
+
 namespace gcomp_test {
 
 namespace detail {
