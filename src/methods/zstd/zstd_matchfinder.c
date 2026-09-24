@@ -595,6 +595,19 @@ static void zstd_mf_plan(const zstd_effort_t * effort, size_t window_size,
   }
 }
 
+gcomp_status_t zstd_mf_index_ldm_range(zstd_match_finder_t * mf,
+    const uint8_t * data, size_t from, size_t to, size_t data_size) {
+  if (!mf || !mf->ldm) {
+    return GCOMP_OK; // Long-distance matching is off; nothing to index.
+  }
+  // The scan inserts every position it passes, which is the whole point here.
+  // It also collects the matches it finds along the way, and those are
+  // discarded: the next scan - the one over the job's own content - clears the
+  // list before it starts, and a parse only ever asks about the block it is
+  // compressing.
+  return zstd_ldm_scan(mf->ldm, data, from, to, data_size);
+}
+
 gcomp_status_t zstd_mf_enable_ldm(zstd_match_finder_t * mf,
     const gcomp_allocator_t * alloc, size_t window_size, unsigned min_match,
     unsigned hash_log, unsigned hash_rate_log,
@@ -821,6 +834,15 @@ void zstd_mf_reset_positions(zstd_match_finder_t * mf) {
     memset(mf->dict_hash_table, 0, mf->hash_size * sizeof(uint32_t));
   }
   mf->dict_end = 0;
+
+  // The long-distance table names absolute positions too, and its scan
+  // cursor is absolute. Left alone it is not wrong - a candidate is confirmed
+  // against the bytes before it is used - but the cursor sits ahead of the new
+  // buffer and the scan skips past everything, so long-distance matching
+  // becomes silently inert.
+  if (mf->ldm) {
+    zstd_ldm_reset(mf->ldm);
+  }
 
   // Nothing refers to any position any more, so where data[0] sits in the
   // stream stops mattering and counting can start again.

@@ -107,6 +107,16 @@ typedef struct {
   int compression_level;               ///< Compression level (0-22)
   uint8_t window_log;                  ///< Window log (10-31)
   uint64_t max_memory_bytes;           ///< Memory limit
+  /// Long-distance matching, per job.
+  ///
+  /// Each job is seeded with a whole window of the preceding stream (see
+  /// overlap_size in zstd_parallel.c), and a window is as far as a long match
+  /// may reach anyway - RFC 8878 section 3.1.1.1.2 - so a job's own scan finds
+  /// what the single-threaded encoder finds.
+  bool ldm_enabled;
+  unsigned ldm_min_match;     ///< 0 for the default.
+  unsigned ldm_hash_log;      ///< 0 to size it from the window.
+  unsigned ldm_hash_rate_log;
   const gcomp_allocator_t * allocator; ///< Allocator (NULL = default)
   gcomp_memory_tracker_t *
       mem_tracker; ///< Optional: track allocations (NULL = do not track)

@@ -137,6 +137,10 @@ struct zstd_parallel_ctx_s {
   int compression_level;
   uint8_t window_log;
   uint64_t max_memory_bytes;
+  bool ldm_enabled;
+  unsigned ldm_min_match;
+  unsigned ldm_hash_log;
+  unsigned ldm_hash_rate_log;
   gcomp_memory_tracker_t * mem_tracker;
 };
 
@@ -253,6 +257,15 @@ static gcomp_status_t zstd_parallel_compress_blocks(
           input + job->overlap_len - ov, ov);
       temp_state.mf_window_len = ov;
       zstd_mf_index_range(temp_state.match_finder, temp_state.mf_window, 0, ov, ov);
+      // And into the long-distance table, which zstd_mf_index_range() does not
+      // touch. Without this a job's long scan starts from an empty table and
+      // can only match inside the job's own content, so zstd.long with threads
+      // was on and found nothing.
+      status = zstd_mf_index_ldm_range(
+          temp_state.match_finder, temp_state.mf_window, 0, ov, ov);
+      if (status != GCOMP_OK) {
+        return status;
+      }
     }
   }
 
@@ -364,6 +377,10 @@ gcomp_status_t zstd_parallel_create(
   ctx->compression_level =
       config ? config->compression_level : ZSTD_LEVEL_DEFAULT;
   ctx->window_log = config ? config->window_log : 0;
+  ctx->ldm_enabled = config ? config->ldm_enabled : false;
+  ctx->ldm_min_match = config ? config->ldm_min_match : 0u;
+  ctx->ldm_hash_log = config ? config->ldm_hash_log : 0u;
+  ctx->ldm_hash_rate_log = config ? config->ldm_hash_rate_log : 0u;
   ctx->max_memory_bytes = config ? config->max_memory_bytes : 0;
   ctx->mem_tracker = config && config->mem_tracker ? config->mem_tracker : NULL;
 
@@ -508,6 +525,16 @@ gcomp_status_t zstd_parallel_alloc_job(
   uint32_t window_size = zstd_window_log_to_size(ctx->window_log);
   status = zstd_mf_init(mf, ctx->allocator, ctx->compression_level, window_size,
       ctx->mem_tracker);
+  if (status == GCOMP_OK && ctx->ldm_enabled) {
+    // Per job, not shared. A job is seeded with a whole window of the
+    // preceding stream and a long match may not reach past the declared window
+    // anyway, so a job's own scan has the same reach the single-threaded
+    // encoder's does - there is nothing for the jobs to share, and sharing a
+    // table they all scan into would need locking for no gain.
+    status = zstd_mf_enable_ldm(mf, ctx->allocator, window_size,
+        ctx->ldm_min_match, ctx->ldm_hash_log, ctx->ldm_hash_rate_log,
+        ctx->mem_tracker);
+  }
   if (status != GCOMP_OK) {
     if (ctx->mem_tracker) {
       gcomp_memory_track_free(ctx->mem_tracker, output_cap);

@@ -400,9 +400,15 @@ The Zstd encoder implements parallel compression through `parallel_block.c`, and
 
 - **Location**: `src/methods/zstd/zstd_parallel.c`
 - **Options**: `threads.count`, `zstd.job_size`
-- **Output format**: Concatenated independent frames (so, unlike LZ4, not
-  byte-identical to single-threaded output — a zstd frame carries its window
-  and cannot be split)
+- **Output format**: One frame, whose blocks were compressed on several
+  threads. Not byte-identical to single-threaded output, unlike LZ4 — each job
+  starts from an overlap rather than from the whole history, so it makes
+  different choices — but the *shape* is the same and no decoder option is
+  needed.
+
+  This line said "concatenated independent frames" until 2026-09-24, which
+  contradicted the zstd row in the decode table above ("our encoder emits one
+  frame") in the same document. The table was right.
 
 See [Zstd Module Documentation](modules/zstd.md#parallel-compression) for details.
 

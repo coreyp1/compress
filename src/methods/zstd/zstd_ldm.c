@@ -128,7 +128,6 @@ gcomp_status_t zstd_ldm_init(zstd_ldm_t * ldm, const gcomp_allocator_t * alloc,
   ldm->rate_mask = ((size_t)1u << hash_rate_log) - 1u;
   ldm->max_offset = window_size;
   ldm->allocator = alloc;
-  ldm->mem_tracker = mem_tracker;
 
   // P^(min_match - 1): the weight the byte about to leave the window carries.
   // See zstd_ldm_roll().
@@ -164,13 +163,27 @@ void zstd_ldm_destroy(zstd_ldm_t * ldm, const gcomp_allocator_t * alloc,
     gcomp_free(alloc, ldm->table);
   }
   if (ldm->matches) {
-    if (mem_tracker) {
-      gcomp_memory_track_free(
-          mem_tracker, ldm->match_capacity * sizeof(zstd_ldm_match_t));
-    }
+    // Not un-charged, because zstd_ldm_reserve() does not charge it -- see the
+    // comment there. Releasing a charge that was never made would drive the
+    // counter down past what the table costs and quietly raise the effective
+    // memory limit, which is the opposite of what tracking is for.
     gcomp_free(alloc, ldm->matches);
   }
   memset(ldm, 0, sizeof(*ldm));
+}
+
+void zstd_ldm_reset(zstd_ldm_t * ldm) {
+  if (!ldm) {
+    return;
+  }
+  if (ldm->table) {
+    memset(ldm->table, 0, ldm->table_size * sizeof(uint64_t));
+  }
+  // The list is kept; it is about to be refilled by the next scan and its
+  // capacity is worth holding onto.
+  ldm->match_count = 0;
+  ldm->base_pos = 0;
+  ldm->next_scan = 0;
 }
 
 void zstd_ldm_slide(zstd_ldm_t * ldm, size_t shift) {
@@ -194,12 +207,24 @@ static bool zstd_ldm_reserve(zstd_ldm_t * ldm) {
   if (!grown) {
     return false;
   }
-  if (ldm->mem_tracker) {
-    gcomp_memory_track_free(
-        ldm->mem_tracker, ldm->match_capacity * sizeof(zstd_ldm_match_t));
-    gcomp_memory_track_alloc(
-        ldm->mem_tracker, want * sizeof(zstd_ldm_match_t));
-  }
+  // The match list is deliberately NOT charged against the memory tracker, and
+  // this is the only allocation in the encoder that is not.
+  //
+  // gcomp_memory_tracker_t is one size_t with no synchronisation - "Initialize
+  // with zeros before use" is the whole contract - and this function is the one
+  // place a zstd allocation happens on a **worker** thread: in parallel mode the
+  // scan runs inside a job, and the tracker it would report to belongs to the
+  // encoder, which the main thread is writing to as it allocates the next job.
+  // ThreadSanitizer says so precisely, and it was right: limits.c:270 read by a
+  // pool worker against limits.c:255 written by main.
+  //
+  // Charging it would mean either a lock in the scan's inner growth path or a
+  // per-job tracker folded in at job boundaries, for an amount that does not
+  // matter: entries are 12 bytes, a job's list holds the long matches in one
+  // job's content, and the table -- megabytes, and the allocation
+  // limits.max_memory_bytes exists to catch -- is charged where it is made, on
+  // the main thread, at zstd_ldm_init(). ZstdLdm.IsChargedAgainstTheMemoryLimit
+  // is about that table.
   ldm->matches = grown;
   ldm->match_capacity = want;
   return true;

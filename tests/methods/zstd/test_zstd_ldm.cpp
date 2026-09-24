@@ -328,15 +328,92 @@ TEST(ZstdLdm, HonoursAnExplicitHashLog) {
 /**
  * Refused rather than ignored, with more than one thread.
  *
- * A parallel job compresses its block against its own window, so it cannot
- * see tens of megabytes back.  Accepting the option and quietly producing a
- * stream without long matches in it would be the worst of the three possible
- * answers.
+ * This used to be RefusesToRunWithMoreThanOneThread, on the stated grounds that
+ * "a parallel job compresses its block against its own window, so it cannot see
+ * tens of megabytes back". That was a misreading of the encoder. A job is
+ * seeded with a **whole window** of the preceding stream - zstd_parallel.c
+ * sizes the overlap from window_log and deliberately does not cap it at the job
+ * size - and a window is as far as a long match may reach in any case, because
+ * RFC 8878 section 3.1.1.1.2 forbids an offset past the declared window. So a
+ * job's reach is the single-threaded encoder's reach.
+ *
+ * **The ratio is the assertion, not the round trip.** What was actually missing
+ * was that the overlap went into the match finder's hash tables and not into
+ * the long-distance table, so every job's long scan started from an empty table
+ * and could only match inside its own content. That produces a perfectly valid
+ * stream containing no long matches - so a test that encoded, decoded and
+ * compared would have passed throughout, and did: the first version of this
+ * change was measured only by round trip and looked finished.
  */
-TEST(ZstdLdm, RefusesToRunWithMoreThanOneThread) {
-  const std::vector<uint8_t> input = noise(256u * 1024u, 3u);
-  EncodeResult r = encode(input, 9, 24, true, 4);
-  EXPECT_EQ(r.status, GCOMP_ERR_UNSUPPORTED);
+TEST(ZstdLdm, WorksWithMoreThanOneThread) {
+  const size_t block = 256u * 1024u;
+  const std::vector<uint8_t> input = farRepeat(block, kOrdinaryReach + block);
+  ASSERT_GT(repeatDistance(input.size(), block), kOrdinaryReach)
+      << "the repeat must be beyond what the ordinary finder reaches, or "
+         "threading is not what is being measured";
+
+  // The single-threaded figures are the yardstick: one with the long scan and
+  // one without, so "it worked" is bounded on both sides rather than compared
+  // against a number written down here.
+  const EncodeResult serial_off = encode(input, 9, 25, false);
+  const EncodeResult serial_on = encode(input, 9, 25, true);
+  ASSERT_EQ(serial_off.status, GCOMP_OK);
+  ASSERT_EQ(serial_on.status, GCOMP_OK);
+  ASSERT_LT(serial_on.bytes.size() + block / 2u, serial_off.bytes.size())
+      << "the serial control did not find the repeat, so this test cannot "
+         "tell whether the threaded runs did";
+
+  for (uint64_t threads : {(uint64_t)2, (uint64_t)4, (uint64_t)8}) {
+    const EncodeResult off = encode(input, 9, 25, false, threads);
+    const EncodeResult on = encode(input, 9, 25, true, threads);
+    ASSERT_EQ(off.status, GCOMP_OK) << "threads " << threads;
+    ASSERT_EQ(on.status, GCOMP_OK) << "threads " << threads;
+
+    EXPECT_TRUE(decodesTo(on.bytes, input)) << "threads " << threads;
+    EXPECT_TRUE(decodesTo(off.bytes, input)) << "threads " << threads;
+
+    // The long scan found the repeat: most of a 256 KB block, less what a
+    // sequence costs to name it.
+    EXPECT_LT(on.bytes.size() + block / 2u, off.bytes.size())
+        << "threads " << threads << ": with long " << on.bytes.size()
+        << ", without " << off.bytes.size()
+        << " - the long scan found nothing, which is what an empty "
+           "long-distance table looks like";
+
+    // And it found about as much of it as the serial encoder did. Within 1%,
+    // which is slack for the seams between jobs and not for a missed match.
+    const size_t slack = serial_on.bytes.size() / 100u;
+    EXPECT_LT(on.bytes.size(), serial_on.bytes.size() + slack)
+        << "threads " << threads << ": " << on.bytes.size()
+        << " against the serial encoder's " << serial_on.bytes.size();
+  }
+}
+
+/**
+ * @brief The job size must not decide whether the long scan works.
+ *
+ * A job's history is the overlap, which is a whole window and is not capped by
+ * the job size. If that ever changed - if the overlap were trimmed to the job,
+ * say - small jobs would lose their reach while large ones kept it, and nothing
+ * else here would notice.
+ */
+TEST(ZstdLdm, TheJobSizeDoesNotDecideTheReach) {
+  const size_t block = 256u * 1024u;
+  const std::vector<uint8_t> input = farRepeat(block, kOrdinaryReach + block);
+
+  const EncodeResult serial_off = encode(input, 9, 25, false);
+  ASSERT_EQ(serial_off.status, GCOMP_OK);
+
+  for (uint64_t job : {(uint64_t)(1u << 18), (uint64_t)(1u << 20),
+           (uint64_t)(1u << 22)}) {
+    const EncodeResult r =
+        encode(input, 9, 25, true, 4, "zstd.job_size", job);
+    ASSERT_EQ(r.status, GCOMP_OK) << "job_size " << job;
+    EXPECT_TRUE(decodesTo(r.bytes, input)) << "job_size " << job;
+    EXPECT_LT(r.bytes.size() + block / 2u, serial_off.bytes.size())
+        << "job_size " << job << ": " << r.bytes.size()
+        << " against " << serial_off.bytes.size() << " with no long scan";
+  }
 }
 
 /// One thread is the normal case and is not refused.

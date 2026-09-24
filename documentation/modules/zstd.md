@@ -256,15 +256,22 @@ It is worth turning on only for data that actually repeats itself at long
 range — backups, VM images, packfiles, concatenated logs. On data that does
 not, it costs a table and a sweep and finds nothing.
 
-### What it does not do yet
+### With threads
 
-`zstd.long` with `threads.count > 1` is refused with `GCOMP_ERR_UNSUPPORTED`
-rather than quietly ignored. A parallel job compresses its block against its
-own window, so a match reaching tens of megabytes back is not available to it.
-The reference answers this by running the long scan once over the whole input
-in the calling thread and handing the matches to the jobs; that is a larger
-change, and until it exists the combination is an error rather than a stream
-that silently lacks the long matches the caller asked for.
+`zstd.long` works with `threads.count > 1`, and the ratio is within 1% of the
+single-threaded encoder's on the same input.
+
+This was refused until 2026-09-24, on the stated grounds that "a parallel job
+compresses its block against its own window, so a match reaching tens of
+megabytes back is not available to it". That was wrong about this encoder. A job
+is seeded with a **whole window** of the preceding stream — the overlap is sized
+from `zstd.window_log` and is deliberately not capped at the job size — and a
+long match may not reach past the declared window in any case (RFC 8878
+§3.1.1.1.2). A job's reach is therefore the single-threaded encoder's reach, and
+the reference's design of scanning once in the calling thread answers a problem
+this encoder does not have.
+
+`zstd.job_size` does not change the reach, only where the block seams fall.
 
 ## Content checksum
 
@@ -365,9 +372,10 @@ gcomp_encoder_create(registry, "zstd", opts, &enc);
 
 1. Input data is accumulated until `zstd.job_size` bytes are buffered (512 KB when the option is left at 0)
 2. Each full job is submitted to a thread pool for compression
-3. Each job produces a complete, independent Zstd frame
-4. Compressed frames are collected in order and written to the output
-5. The final output is valid concatenated Zstd frames
+3. Each job compresses its slice into a run of **blocks** — not a frame
+4. Those blocks are collected in submission order and written to the output
+5. The encoder writes one frame header and one final block, so **the output is a
+   single Zstd frame**
 
 ```
 ┌───────────────────────────────────────────────────────────────────────┐
@@ -381,9 +389,9 @@ gcomp_encoder_create(registry, "zstd", opts, &enc);
 │                   │   1    │   │   2    │   │   3    │                │
 │                   └────────┘   └────────┘   └────────┘                │
 │                        ↓           ↓           ↓                      │
-│  Output:          [Frame 1]   [Frame 2]   [Frame 3]   [Frame 4]       │
+│  Output:          [blocks 1]  [blocks 2]  [blocks 3]  [blocks 4]      │
 │                   ◄───────────────────────────────────────────────    │
-│                         (concatenated, ordered output)                │
+│                  one frame: header, all blocks in order, final block  │
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -408,19 +416,28 @@ Larger job sizes provide better compression (more context for the match finder) 
 
 ### Output format
 
-Parallel compression produces **concatenated Zstd frames**. Each frame is complete and valid:
+Parallel compression produces **one Zstd frame**, whose blocks were compressed
+on several threads. Nothing about the output says it was made in parallel.
 
-- Standard tools (`zstd`, `unzstd`) can decompress the output directly
-- Decoding all frames is the default; `zstd.concat=false` stops after the first
+- Standard tools (`zstd`, `unzstd`) decompress it directly, and no decoder
+  option is needed
+- `zstd.concat` is irrelevant to it: there is only one frame
+
+> **This section said the opposite until 2026-09-24** — "concatenated Zstd
+> frames. Each frame is complete and valid" — and it mattered, because a reader
+> who believes that might split the output at a frame boundary and decode the
+> pieces. There are no such boundaries to split at. Measured on 8 MB at
+> `threads.count` 4: one frame magic in the output, a plain decode with no
+> concat option returns all 8,388,608 bytes, and `zstd -l` reports
+> `Frames 1  Skips 0`.
+>
+> One frame is also what makes a job able to match back into the job before it,
+> and so what makes `zstd.long` work with threads.
 
 ```c
-// Decoding parallel-compressed output
-gcomp_options_t *dec_opts = NULL;
-gcomp_options_create(&dec_opts);
-// Multi-frame input decodes fully by default; no option needed.
-
+// Decoding parallel-compressed output: exactly like any other zstd stream.
 gcomp_decoder_t *dec = NULL;
-gcomp_decoder_create(registry, "zstd", dec_opts, &dec);
+gcomp_decoder_create(registry, "zstd", NULL, &dec);
 ```
 
 ### Single-threaded fallback
@@ -428,8 +445,10 @@ gcomp_decoder_create(registry, "zstd", dec_opts, &dec);
 When `threads.count` is 0 or 1, the encoder operates in single-threaded mode:
 
 - No threading overhead
-- Produces a single Zstd frame (not concatenated)
 - Standard streaming compression behavior
+- The output is a single frame, as it is in parallel mode — what differs is the
+  ratio (each job starts from an overlap rather than from the whole history),
+  not the shape
 
 ### Memory usage
 
@@ -480,10 +499,15 @@ The content checksum, when enabled, covers each frame's own content.
 
 ### Parallel mode
 
-With `threads.count > 1` a job is already a whole frame, so a flush closes the
-frame in hand — the same concatenated stream parallel mode always produces.
-A flush waits for every block still out with the workers, which is the point:
-nothing the caller handed over is left in flight.
+With `threads.count > 1` a flush submits the job in hand so its bytes go out,
+and the next input starts a new job. The jobs are blocks of one frame, so this
+moves a block seam and not a frame boundary: the output is still a single frame
+and still needs no decoder option. A flush waits for every block still out with
+the workers, which is the point — nothing the caller handed over is left in
+flight.
+
+(This paragraph used to say a job "is already a whole frame", which was the same
+mistake corrected under [Output format](#output-format).)
 
 ## Concatenated frames
 

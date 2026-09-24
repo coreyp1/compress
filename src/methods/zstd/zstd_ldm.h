@@ -114,12 +114,16 @@ typedef struct zstd_ldm_s {
   size_t next_scan; ///< Absolute position the scan has reached.
   size_t max_offset; ///< The declared window; an offset may not exceed it.
 
-  /// Where the match list is allocated from, and what accounts for it.  Kept
-  /// here because zstd_mf_generate_sequences() has neither to hand, and the
-  /// list grows during a scan; zstd_dict_parsed_t carries its allocator the
-  /// same way.
+  /// Where the match list is allocated from.  Kept here because
+  /// zstd_mf_generate_sequences() does not have it to hand and the list grows
+  /// during a scan; zstd_dict_parsed_t carries its allocator the same way.
+  ///
+  /// There is no memory tracker beside it, and that is deliberate: the growth
+  /// happens on a worker thread in parallel mode, and the tracker is an
+  /// unsynchronised size_t belonging to the encoder.  zstd_ldm_reserve() says
+  /// what was measured and what the trade is.  The table is charged at
+  /// zstd_ldm_init(), on whichever thread built the match finder.
   const gcomp_allocator_t * allocator;
-  gcomp_memory_tracker_t * mem_tracker;
 
   zstd_ldm_match_t * matches; ///< Matches from the last scan, in order.
   size_t match_count;         ///< How many are in @ref matches.
@@ -155,6 +159,23 @@ size_t zstd_ldm_memory_estimate(
 /// Release the index.  A zeroed or already-destroyed @p ldm is accepted.
 void zstd_ldm_destroy(zstd_ldm_t * ldm, const gcomp_allocator_t * alloc,
     gcomp_memory_tracker_t * mem_tracker);
+
+/**
+ * @brief Forget everything: a new stream starts here.
+ *
+ * The table holds **absolute** positions, and so do @ref zstd_ldm_t::base_pos
+ * and @ref zstd_ldm_t::next_scan. Carrying them into an unrelated buffer is not
+ * a correctness problem - every candidate is confirmed by comparing bytes
+ * before it is used, so a stale entry simply fails and is dropped - but
+ * `next_scan` is ahead of the new buffer's positions, and the scan skips
+ * everything behind it. The effect is long-distance matching that is silently
+ * **inert** rather than wrong, which is worse than a failure: the option is on,
+ * nothing is broken, and no long match is ever found.
+ *
+ * Called from zstd_mf_reset(), alongside the match finder's own tables and for
+ * the same reason.
+ */
+void zstd_ldm_reset(zstd_ldm_t * ldm);
 
 /**
  * @brief Move the window on by @p shift bytes.

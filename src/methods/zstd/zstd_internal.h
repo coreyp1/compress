@@ -1445,6 +1445,34 @@ void zstd_mf_index_range(zstd_match_finder_t * mf, const uint8_t * data,
     size_t from, size_t to, size_t data_size);
 
 /**
+ * @brief Index `[from, to)` into the long-distance table, for history.
+ *
+ * zstd_mf_index_range() fills the hash, chain and binary-tree tables. The
+ * long-distance table is not one of those and is filled only by the scan that
+ * runs at the head of zstd_mf_generate_sequences(), over the block being
+ * compressed. In a stream that is enough, because every block's scan indexes
+ * its own positions and the history is simply the blocks already done.
+ *
+ * A parallel job is the case where it is not enough: its history arrives
+ * pre-made, as an overlap copied into the window, and was scanned by some other
+ * job's match finder or by none. Without this the long-distance table is empty
+ * for everything before the job's own content, and no long match into the
+ * history can be found - which is not a wrong answer, just never a match, so it
+ * shows up as a ratio and not as a failure.
+ *
+ * Does nothing when long-distance matching is off.
+ *
+ * @param mf The match finder.
+ * @param data The window.
+ * @param from First position to index.
+ * @param to One past the last.
+ * @param data_size Bytes readable in @p data.
+ * @return ::GCOMP_OK, or ::GCOMP_ERR_MEMORY from the scan's match list.
+ */
+gcomp_status_t zstd_mf_index_ldm_range(zstd_match_finder_t * mf,
+    const uint8_t * data, size_t from, size_t to, size_t data_size);
+
+/**
  * @brief Generate sequences from input data.
  *
  * When dict_prefix_size > 0, data = [dict_content][block]; the first

@@ -2883,7 +2883,17 @@ $(foreach pair,$(TEST_PAIRS),$(eval $(call tsan-test-executable-rule,$(word 1,$(
 # every subsequent test, and history_size buys a deeper record of the other
 # thread's accesses - the shallow default frequently reports a race with no
 # stack for one side, which is not enough to act on.
+# GCOMP_UNDER_SLOW_BUILD tells a test to run a reduced sweep. TSan is roughly
+# twenty times slower than the plain build, and the sweeps that take the longest
+# - test_bound's grid of every method against every option shape and size - are
+# measuring format arithmetic, which a race detector has nothing to say about.
+# Running them in full here costs many minutes and buys nothing; the same grid
+# runs whole in the ordinary build and under ASan.
+#
+# The valgrind targets set GCOMP_UNDER_VALGRIND for the same reason, and the
+# tests honour either.
 TSAN_RUN_ENV := LD_LIBRARY_PATH="$(TSAN_APP_DIR)" LD_PRELOAD= \
+	GCOMP_UNDER_SLOW_BUILD=1 \
 	TSAN_OPTIONS="halt_on_error=1:history_size=7:second_deadlock_stack=1"
 
 test-tsan: ## Run all tests with ThreadSanitizer (Linux only)

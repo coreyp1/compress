@@ -663,15 +663,28 @@ The two methods divide work differently, because their formats do:
 | | LZ4 | Zstd |
 |---|---|---|
 | Work unit | one block (`lz4.block_size`) | one job (`zstd.job_size`) |
-| Output | one frame, independent blocks | concatenated independent frames |
+| Output | one frame, independent blocks | one frame, a run of blocks per job |
 | Same bytes as 1 thread? | **Yes** | No |
 | Requires | `lz4.independent_blocks` (default) | — |
 
 LZ4 can promise byte-identical output because the Block Independence flag
 already guarantees a block is compressed knowing nothing about its
 predecessors, so a worker receives exactly the window the serial encoder
-would have built. A zstd frame carries its own window and cannot be split
-that way, so its parallel mode emits a frame per job instead.
+would have built.
+
+Zstd cannot, but not for the reason this paragraph used to give. It said "a
+zstd frame carries its own window and cannot be split that way, so its parallel
+mode emits a frame per job instead" — the conclusion was wrong: zstd's parallel
+mode emits **one** frame, and the jobs are its blocks. What differs from serial
+output is the *history* each job starts from. A job is seeded with a window's
+worth of the preceding stream rather than with everything before it, so it makes
+different (slightly worse) choices, and the offsets it names cannot be predicted
+in advance because the jobs are compressed at the same time — which is why the
+repeat-offset history in `zstd_parallel.c` starts at zero rather than at RFC
+8878's 1, 4, 8.
+
+One frame is also what lets a job match back into the job before it, and so
+what lets `zstd.long` work with `threads.count > 1`.
 
 Both encoders hold back at most one job's output when the caller's buffer
 fills mid-result, and neither may collect another result while one is staged

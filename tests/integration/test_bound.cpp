@@ -142,7 +142,15 @@ struct Config {
  */
 static bool UnderValgrind() {
   const char * vg = std::getenv("GCOMP_UNDER_VALGRIND");
-  return vg && vg[0] == '1';
+  if (vg && vg[0] == '1') {
+    return true;
+  }
+  // ThreadSanitizer sets GCOMP_UNDER_SLOW_BUILD, and for the same reason: this
+  // sweep measures what a bound arithmetic says about a format, and a race
+  // detector has nothing to add to that while making it twenty times slower.
+  // The full grid still runs in the ordinary build and under ASan.
+  const char * slow = std::getenv("GCOMP_UNDER_SLOW_BUILD");
+  return slow && slow[0] == '1';
 }
 
 /// Sizes to try: the boundaries every format counts blocks at, and a spread.
@@ -201,15 +209,19 @@ std::vector<Config> configurations() {
   }
   // A preset dictionary makes the encoder write FDICT and four DICTID bytes,
   // so it changes the bound. No zlib configuration here set one, which is why
-  // the sweep could not see the bound failing to count them. window_bits 8 at
-  // level 1 is the corner where deflate's own bound is tightest.
-  for (size_t dict_len : {size_t{1}, size_t{64}, size_t{4096}}) {
-    c.push_back({"zlib/dict" + std::to_string(dict_len), "zlib",
-        [dict_len](gcomp_options_t * o) {
-          std::vector<uint8_t> dict(dict_len, uint8_t{'Q'});
-          gcomp_options_set_bytes(o, "zlib.dictionary", dict.data(), dict.size());
-        }});
-  }
+  // the sweep could not see the bound failing to count them.
+  //
+  // One length, not three. What varies with the length is the DICTID
+  // arithmetic, and EncodeBound.ZlibCountsTheDictid pins that at 1, 64 and 4096
+  // bytes directly and in microseconds. What the sweep adds is "a buffer of
+  // exactly the bound is enough, with a dictionary in the stream", and that does
+  // not depend on how long the dictionary is - so three lengths here tripled the
+  // most expensive test in the suite for nothing.
+  c.push_back({"zlib/dict", "zlib", [](gcomp_options_t * o) {
+                 std::vector<uint8_t> dict(64, uint8_t{'Q'});
+                 gcomp_options_set_bytes(
+                     o, "zlib.dictionary", dict.data(), dict.size());
+               }});
   c.push_back({"zlib/dict_tight", "zlib", [](gcomp_options_t * o) {
                  std::vector<uint8_t> dict(64, uint8_t{'Q'});
                  gcomp_options_set_bytes(

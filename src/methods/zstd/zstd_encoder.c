@@ -60,15 +60,29 @@
  * │  │ 4. Set stage to DONE                                          │ │
  * │  └───────────────────────────────────────────────────────────────┘ │
  * │                                                                    │
- * │  Output: Concatenated independent zstd frames (one per job)        │
+ * │  Output: ONE zstd frame; the jobs are its blocks                  │
  * └────────────────────────────────────────────────────────────────────┘
  * ```
  *
  * Key design decisions:
- * - Each parallel job produces a complete, independent zstd frame
- * - Frames are collected in submission order (guaranteed ordering)
- * - Output is valid concatenated zstd stream (decode with zstd.concat=true)
- * - Single-threaded mode (threads.count <= 1) produces a single frame
+ * - A job produces a run of BLOCKS, not a frame. The encoder writes one frame
+ *   header and one final block, so the whole output is a single frame and
+ *   decodes without zstd.concat.
+ *
+ *   This text used to say the opposite - "each parallel job produces a
+ *   complete, independent zstd frame", "decode with zstd.concat=true" - and it
+ *   was stale. Measured on 8 MB at threads.count 4: the output holds exactly
+ *   one frame magic, and a plain decode with no concat option returns all
+ *   8,388,608 bytes. zstd_parallel.c's own comment, "Jobs are blocks of one
+ *   shared frame now", is the accurate one, and it is the reason the repeat
+ *   offsets there start at zero rather than at 1, 4, 8.
+ * - Because it is one frame, a job may match back into the job before it. Each
+ *   is seeded with a whole window of the preceding stream, which is also why
+ *   zstd.long works in parallel mode: a long match may not exceed the declared
+ *   window in any case (RFC 8878 section 3.1.1.1.2), so a job's reach is the
+ *   single-threaded encoder's reach.
+ * - Jobs are collected in submission order (guaranteed ordering)
+ * - Single-threaded mode (threads.count <= 1) produces a single frame too
  *
  * ## Memory Management
  *
@@ -986,20 +1000,29 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
     }
   }
 
-  // A parallel job compresses its own block with its own window, so a match
-  // reaching tens of megabytes back is not available to it: the job would
-  // have to hold the whole stream. libzstd answers this by running the long
-  // scan once over the whole input in the calling thread and handing the
-  // matches to the jobs; that is a larger change than this one, and until it
-  // exists the combination is refused rather than quietly ignored.
-  if (ldm_enabled && num_threads > 1u) {
-    status = GCOMP_ERR_UNSUPPORTED;
-    gcomp_encoder_set_error(encoder, status,
-        "zstd.long is not yet supported with threads.count > 1; the long "
-        "scan would have to run over the whole input before the jobs split "
-        "it");
-    goto cleanup;
-  }
+  // zstd.long and threads.count > 1 work together, and the reason the two were
+  // thought incompatible was a misreading of this encoder rather than a fact
+  // about the format.
+  //
+  // The note that stood here said a job "compresses its own block with its own
+  // window, so a match reaching tens of megabytes back is not available to it:
+  // the job would have to hold the whole stream", and pointed at libzstd's
+  // answer of scanning once in the calling thread and handing matches to the
+  // jobs. Two things were wrong with that. A job is already seeded with a
+  // **whole window** of the preceding stream - zstd_parallel.c sizes the
+  // overlap from window_log and deliberately does not cap it at the job size -
+  // and a window is as far as a long match may reach in any case, because RFC
+  // 8878 section 3.1.1.1.2 forbids an offset past the declared window. So a
+  // job's own scan has exactly the reach the single-threaded encoder's does,
+  // and there is nothing to share.
+  //
+  // What did have to change was zstd_ldm_reset(). The long-distance table
+  // holds absolute positions and so does its scan cursor, and jobs reuse
+  // pooled match finders; a carried-over cursor sits ahead of the new buffer
+  // and the scan skips everything behind it. That is not incorrect output -
+  // every candidate is confirmed against the bytes - it is long-distance
+  // matching that quietly finds nothing, which is why it needed a test that
+  // measures the ratio rather than one that checks the stream decodes.
 
   // Seekable streaming mode.
   if (seekable_enabled) {
@@ -1387,6 +1410,10 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
         .compression_level = state->compression_level,
         .window_log = effective_window_log,
         .max_memory_bytes = max_memory,
+        .ldm_enabled = ldm_enabled ? true : false,
+        .ldm_min_match = (unsigned)ldm_min_match,
+        .ldm_hash_log = (unsigned)ldm_hash_log,
+        .ldm_hash_rate_log = (unsigned)ldm_hash_rate_log,
         .allocator = alloc,
         .mem_tracker = &state->mem_tracker,
     };
@@ -1833,8 +1860,10 @@ static gcomp_status_t zstd_encoder_rearm_frame(zstd_encoder_state_t * state) {
  * mid-frame equivalent of Z_FULL_FLUSH.
  *
  * The consequence for callers is that the output becomes more than one frame,
- * and reading it needs `zstd.concat` on the decoder -- the same requirement
- * parallel mode already carries.
+ * and reading it needs `zstd.concat` on the decoder. This is a requirement a
+ * full flush introduces, and not one parallel mode carries: an earlier version
+ * of this sentence said parallel mode "already carries" it, which was the same
+ * stale belief that it writes a frame per job.
  */
 static gcomp_status_t zstd_encoder_flush_end_frame(gcomp_encoder_t * encoder,
     zstd_encoder_state_t * state, gcomp_buffer_t * output) {
@@ -1938,10 +1967,12 @@ gcomp_status_t zstd_encoder_flush(gcomp_encoder_t * encoder,
   }
 
   if (state->parallel_ctx) {
-    // Parallel mode makes a whole frame per job, so a flush ends the frame in
-    // hand and the next input starts another.  That is the same concatenated
-    // stream parallel mode always produces -- a decoder reading it needs
-    // zstd.concat either way -- so a flush changes only where the seams fall.
+    // A flush submits the job in hand so its bytes go out, and the next input
+    // starts a new job. The jobs are blocks of one frame, so this moves a block
+    // boundary and not a frame boundary, and the result still decodes without
+    // zstd.concat. The previous version of this comment said a flush ended a
+    // frame and that a reader "needs zstd.concat either way" -- the same stale
+    // belief corrected in the file header above.
     if (!zstd_encoder_drain_parallel_output(state, output)) {
       return GCOMP_ERR_LIMIT;
     }
