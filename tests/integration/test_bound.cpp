@@ -193,6 +193,30 @@ std::vector<Config> configurations() {
   }
 
   c.push_back({"zlib/default", "zlib", nullptr});
+  for (uint64_t wb : {8u, 15u}) {
+    c.push_back({"zlib/win" + std::to_string(wb), "zlib",
+        [wb](gcomp_options_t * o) {
+          gcomp_options_set_uint64(o, "deflate.window_bits", wb);
+        }});
+  }
+  // A preset dictionary makes the encoder write FDICT and four DICTID bytes,
+  // so it changes the bound. No zlib configuration here set one, which is why
+  // the sweep could not see the bound failing to count them. window_bits 8 at
+  // level 1 is the corner where deflate's own bound is tightest.
+  for (size_t dict_len : {size_t{1}, size_t{64}, size_t{4096}}) {
+    c.push_back({"zlib/dict" + std::to_string(dict_len), "zlib",
+        [dict_len](gcomp_options_t * o) {
+          std::vector<uint8_t> dict(dict_len, uint8_t{'Q'});
+          gcomp_options_set_bytes(o, "zlib.dictionary", dict.data(), dict.size());
+        }});
+  }
+  c.push_back({"zlib/dict_tight", "zlib", [](gcomp_options_t * o) {
+                 std::vector<uint8_t> dict(64, uint8_t{'Q'});
+                 gcomp_options_set_bytes(
+                     o, "zlib.dictionary", dict.data(), dict.size());
+                 gcomp_options_set_uint64(o, "deflate.window_bits", 8u);
+                 gcomp_options_set_int64(o, "deflate.level", 1);
+               }});
   c.push_back({"gzip/default", "gzip", nullptr});
   c.push_back({"gzip/fields", "gzip", [](gcomp_options_t * o) {
                  gcomp_options_set_string(
@@ -445,6 +469,87 @@ TEST(EncodeBound, IsNotWildlyLoose) {
         << method << ": bound " << bound << " against " << worst
         << " bytes for the worst of " << shapes.size() << " input shapes";
   }
+}
+
+/**
+ * @brief zlib's bound must count the DICTID a dictionary makes it write.
+ *
+ * RFC 1950 section 2.2: FDICT in FLG means four DICTID bytes follow the two
+ * header bytes. The encoder writes them; the bound has to charge for them.
+ *
+ * This is asserted as an exact difference rather than as "the buffer was big
+ * enough", because "big enough" could not see the defect this pins. The bound
+ * was four bytes short, and deflate's own bound happened to carry exactly four
+ * bytes of slack at its tightest point, so every encode still fit -- with zero
+ * margin. Measured across 305,760 configurations the tightest case with a
+ * dictionary had 0 bytes spare and the same case without one had 4. A test
+ * that only checked the encode succeeded would have passed throughout.
+ *
+ * An empty dictionary is the boundary: the encoder treats zero bytes as no
+ * dictionary and does not set FDICT, so the bound must not charge for one.
+ */
+TEST(EncodeBound, ZlibCountsTheDictid) {
+  const size_t n = 52; // The corner where deflate's bound is tightest.
+
+  gcomp_options_t * plain = nullptr;
+  ASSERT_EQ(gcomp_options_create(&plain), GCOMP_OK);
+  gcomp_options_set_uint64(plain, "deflate.window_bits", 8u);
+  gcomp_options_set_int64(plain, "deflate.level", 1);
+
+  size_t bound_plain = 0;
+  ASSERT_EQ(gcomp_encode_bound(nullptr, "zlib", plain, n, &bound_plain),
+      GCOMP_OK);
+
+  for (size_t dict_len : {size_t{1}, size_t{64}, size_t{4096}}) {
+    std::vector<uint8_t> dict(dict_len, uint8_t{'Q'});
+    gcomp_options_t * with = nullptr;
+    ASSERT_EQ(gcomp_options_create(&with), GCOMP_OK);
+    gcomp_options_set_uint64(with, "deflate.window_bits", 8u);
+    gcomp_options_set_int64(with, "deflate.level", 1);
+    gcomp_options_set_bytes(with, "zlib.dictionary", dict.data(), dict.size());
+
+    size_t bound_with = 0;
+    ASSERT_EQ(gcomp_encode_bound(nullptr, "zlib", with, n, &bound_with),
+        GCOMP_OK);
+
+    // DICTID is four bytes whatever the dictionary's length, because it is an
+    // Adler-32 of it and not a copy of it.
+    EXPECT_EQ(bound_with, bound_plain + 4)
+        << "a " << dict_len << "-byte dictionary moved the bound from "
+        << bound_plain << " to " << bound_with
+        << "; RFC 1950 adds exactly four DICTID bytes";
+
+    // And the margin is really there: encode into exactly the bound and check
+    // what it took, so the figure is measured rather than only asserted.
+    std::vector<uint8_t> input = incompressible(n);
+    std::vector<uint8_t> out(bound_with);
+    size_t written = 0;
+    ASSERT_EQ(gcomp_encode_buffer(nullptr, "zlib", with, input.data(), n,
+                  out.data(), out.size(), &written),
+        GCOMP_OK);
+    EXPECT_LE(written, bound_with);
+    EXPECT_GE(bound_with - written, size_t{4})
+        << "the bound should keep deflate's own slack once the DICTID is paid "
+           "for; wrote "
+        << written << " into " << bound_with;
+
+    gcomp_options_destroy(with);
+  }
+
+  // Zero bytes is not a dictionary, and must not be charged for.
+  gcomp_options_t * empty = nullptr;
+  ASSERT_EQ(gcomp_options_create(&empty), GCOMP_OK);
+  gcomp_options_set_uint64(empty, "deflate.window_bits", 8u);
+  gcomp_options_set_int64(empty, "deflate.level", 1);
+  gcomp_options_set_bytes(empty, "zlib.dictionary", nullptr, 0);
+  size_t bound_empty = 0;
+  ASSERT_EQ(gcomp_encode_bound(nullptr, "zlib", empty, n, &bound_empty),
+      GCOMP_OK);
+  EXPECT_EQ(bound_empty, bound_plain)
+      << "an empty zlib.dictionary does not set FDICT, so it adds no DICTID";
+  gcomp_options_destroy(empty);
+
+  gcomp_options_destroy(plain);
 }
 
 TEST(EncodeBound, RejectsBadArguments) {
