@@ -95,10 +95,19 @@ static bool hasGzipCli() {
   return result == 0;
 }
 
+// How to run gunzip.  On Windows (MSYS2, Git for Windows) gunzip is a shell
+// script around "gzip -d", which cmd.exe - what system() and popen() use
+// there - cannot run, so the binary it wraps is called directly.
+#ifdef _WIN32
+#define GUNZIP_COMMAND "gzip -d"
+#else
+#define GUNZIP_COMMAND "gunzip"
+#endif
+
 // Check if gunzip CLI is available
 static bool hasGunzipCli() {
 #ifdef _WIN32
-  int result = system("gunzip --version >NUL 2>&1");
+  int result = system(GUNZIP_COMMAND " --version >NUL 2>&1");
 #else
   int result = system("gunzip --version >/dev/null 2>&1");
 #endif
@@ -234,7 +243,7 @@ protected:
     }
 
     std::stringstream cmd;
-    cmd << "gunzip -c \"" << tmp.path() << "\"";
+    cmd << GUNZIP_COMMAND " -c \"" << tmp.path() << "\"";
 
     // No unlink: ~TempFile does it, on every path out of this function.
     return runCommandGetOutput(cmd.str());
