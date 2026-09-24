@@ -29,7 +29,7 @@
 #include <ghoti.io/compress/registry.h>
 #include <ghoti.io/compress/stream.h>
 #include <gtest/gtest.h>
-#include <dlfcn.h>
+#include <ghoti.io/cutil/library.h>
 #include <algorithm>
 #include <string>
 #include <temp_file.h>
@@ -924,7 +924,7 @@ TEST_F(Lz4SpecOracleTest, RoundTripThroughBothImplementations) {
 //
 
 struct RealLz4 {
-  void * handle = nullptr;
+  GCU_Library handle{};
   size_t (*createDctx)(void **, unsigned) = nullptr;
   size_t (*freeDctx)(void *) = nullptr;
   size_t (*decompress)(void *, void *, size_t *, const void *, size_t *,
@@ -957,10 +957,14 @@ struct RealLz4 {
 const RealLz4 & realLz4() {
   static RealLz4 r = [] {
     RealLz4 out;
-    static const char * kNames[] = {"liblz4.so.1", "liblz4.so", "liblz4.1.dylib",
-        "liblz4.dylib"};
+    // liblz4.dll is what MSYS2 and vcpkg install; a bare name is found on
+    // PATH.
+    static const char * kNames[] = {"liblz4.so.1", "liblz4.so", "liblz4.dll",
+        "liblz4.1.dylib", "liblz4.dylib"};
     for (const char * name : kNames) {
-      out.handle = dlopen(name, RTLD_NOW);
+      if (gcu_library_open(&out.handle, name) != 0) {
+        out.handle = GCU_Library{};
+      }
       if (out.handle) {
         break;
       }
@@ -968,7 +972,9 @@ const RealLz4 & realLz4() {
     if (!out.handle) {
       return out;
     }
-    auto sym = [&](const char * n) { return dlsym(out.handle, n); };
+    auto sym = [&](const char * n) {
+      return gcu_library_symbol(out.handle, n);
+    };
     out.createDctx = (size_t (*)(void **, unsigned))sym(
         "LZ4F_createDecompressionContext");
     out.freeDctx = (size_t (*)(void *))sym("LZ4F_freeDecompressionContext");

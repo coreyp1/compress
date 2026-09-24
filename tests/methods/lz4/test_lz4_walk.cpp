@@ -31,7 +31,7 @@ extern "C" {
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <dlfcn.h>
+#include <ghoti.io/cutil/library.h>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -535,7 +535,7 @@ struct RealPreferences {
 };
 
 struct RealLz4F {
-  void * handle = nullptr;
+  GCU_Library handle{};
   unsigned (*isError)(size_t) = nullptr;
   const char * (*errorName)(size_t) = nullptr;
   size_t (*compressFrameBound)(size_t, const RealPreferences *) = nullptr;
@@ -556,10 +556,14 @@ struct RealLz4F {
 const RealLz4F & realLz4f() {
   static RealLz4F r = [] {
     RealLz4F out;
-    static const char * kNames[] = {"liblz4.so.1", "liblz4.so",
+    // liblz4.dll is what MSYS2 and vcpkg install; a bare name is found on
+    // PATH.
+    static const char * kNames[] = {"liblz4.so.1", "liblz4.so", "liblz4.dll",
         "liblz4.1.dylib", "liblz4.dylib"};
     for (const char * name : kNames) {
-      out.handle = dlopen(name, RTLD_NOW);
+      if (gcu_library_open(&out.handle, name) != 0) {
+        out.handle = GCU_Library{};
+      }
       if (out.handle) {
         break;
       }
@@ -567,7 +571,9 @@ const RealLz4F & realLz4f() {
     if (!out.handle) {
       return out;
     }
-    auto sym = [&](const char * n) { return dlsym(out.handle, n); };
+    auto sym = [&](const char * n) {
+      return gcu_library_symbol(out.handle, n);
+    };
     out.isError = (unsigned (*)(size_t))sym("LZ4F_isError");
     out.errorName = (const char * (*)(size_t))sym("LZ4F_getErrorName");
     out.compressFrameBound = (size_t (*)(size_t,
