@@ -391,6 +391,13 @@ ifdef PREFIX
 # So that a library, a test or an example finds its Ghoti.io dependencies in the
 # prefix at run time without LD_LIBRARY_PATH.
 LDFLAGS += -Wl,-rpath,$(LIB_INSTALL_PATH)/$(SUITE)
+ifeq ($(OS_NAME), Windows)
+# Windows has no rpath: a program finds its DLLs through PATH. Putting the
+# prefix's bin/ on it for everything make runs is the equivalent, so that a
+# test or an example finds its dependencies without the caller arranging it.
+# Without this they die before main() with 0xC0000135 and make reports 127.
+export PATH := $(BIN_INSTALL_PATH):$(PATH)
+endif
 endif
 
 # The symbol namespace token. Derived from BRANCH so that the token inside every
