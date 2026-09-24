@@ -224,3 +224,123 @@ jobs:
       - name: Line coverage
         working-directory: compress
         run: make coverage -j"$(nproc)" COVERAGE_MIN=80 PREFIX="$PREFIX"
+
+  # ---------------------------------------------------------------------------
+  # Windows, natively, under MSYS2.
+  #
+  # The port itself was done and verified by hand in September 2026
+  # (../../notes/suite/WINDOWS-NATIVE-BUILD.md): compress builds as a DLL under
+  # MINGW64, installs, is consumed through pkg-config alone, and 110 of its 112
+  # suites passed from a plain shell with nothing arranged by hand - the other
+  # two being the pyzstd oracle-availability tests, correctly reporting that
+  # pyzstd was not installed on that machine.
+  #
+  # This job exists because that was a thing a person confirmed once. Every
+  # other job here is ubuntu-latest, so nothing stopped the next commit from
+  # breaking the port silently; a `_WIN32` branch is exactly the kind of code
+  # that rots unbuilt (CONVENTIONS.md section 1's argument for having no second
+  # resolution path applies to platforms too). The value is the build and the
+  # tests, not the discovery of new portability work.
+  #
+  # Notes on the shape, each of which is a thing that does not work otherwise:
+  #
+  # - `shell: msys2 {0}` on every step. The default shell on a Windows runner
+  #   is PowerShell, and these recipes are POSIX shell.
+  # - MSYS `make` and `diffutils`, not the MinGW ones. The recipes are POSIX
+  #   shell, and every flag stamp uses `cmp`; without diffutils `cmp` is absent
+  #   and the stamps never compare equal, so everything rebuilds every time.
+  # - `pkgconf` from the MINGW64 prefix rather than MSYS's own pkg-config,
+  #   which cannot see MINGW64's .pc files - gtest included.
+  # - PREFIX converted with `cygpath`. github.workspace is a Windows path
+  #   (D:\a\...), and make, pkg-config and the recipes all want a POSIX one, so
+  #   it is converted once here rather than in each recipe.
+  # - pyzstd from pip. There is no MSYS2 package for it, and without it the two
+  #   seekable oracle tests fail rather than skip - deliberately, because a
+  #   skipped oracle test and an absent one look identical in a summary line.
+  # ---------------------------------------------------------------------------
+  windows:
+    name: Windows (MSYS2 MINGW64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: compress
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          # Required set first, then what the oracle tests compare against.
+          # windows-setup.sh in the workspace is the authority on the suite's
+          # full list; this is the subset compress alone needs.
+          install: >-
+            make
+            diffutils
+            gzip
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-gtest
+            mingw-w64-x86_64-python
+            mingw-w64-x86_64-python-pip
+            mingw-w64-x86_64-zstd
+            mingw-w64-x86_64-lz4
+
+      # The zstd seekable oracle. No MSYS2 package exists, so pip it; and fail
+      # the job if it did not arrive, rather than letting the two tests that
+      # need it report the absence further down.
+      - name: Install pyzstd
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyzstd
+          python -c "from pyzstd import SeekableZstdFile; print('pyzstd ok')"
+
+      - name: Resolve the prefix as a POSIX path
+        run: |
+          prefix="$(cygpath -u '${{ github.workspace }}')/.local"
+          echo "PREFIX=$prefix" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$prefix/share/pkgconfig" >> "$GITHUB_ENV"
+
+      # Unpinned, for the same reason the Linux setup action leaves it
+      # unpinned: a library is expected to build against its dependency's tip.
+      - uses: actions/checkout@v4
+        with:
+          repository: Ghoti-io/CUtil
+          path: cutil
+
+      - name: Build and install cutil
+        working-directory: cutil
+        run: |
+          make -j"$(nproc)" PREFIX="$PREFIX"
+          make install PREFIX="$PREFIX"
+
+      - name: Build
+        working-directory: compress
+        run: make -j"$(nproc)" PREFIX="$PREFIX"
+
+      - name: Symbol namespace gate
+        working-directory: compress
+        run: make check-symbols PREFIX="$PREFIX"
+
+      - name: Tests
+        working-directory: compress
+        run: make test -j"$(nproc)" PREFIX="$PREFIX"
+
+      - name: Examples
+        working-directory: compress
+        run: make examples PREFIX="$PREFIX"
+
+      # The same argument as on Linux: the tests reach the library through
+      # include/ and an archive, a consumer reaches it through pkg-config, the
+      # installed headers and the DLL. On Windows the DLL also has to be found
+      # at run time, which is a different mechanism from an rpath and so is
+      # worth exercising here specifically.
+      - name: Install
+        working-directory: compress
+        run: make install PREFIX="$PREFIX"
+
+      - name: A consumer can use what was installed
+        working-directory: compress
+        run: tools/check-install.sh "$PREFIX"
