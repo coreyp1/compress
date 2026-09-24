@@ -110,6 +110,40 @@ slightly worse compression, because each frame starts with no history: on 4 MiB
 of structured text, 256 KiB frames cost about 1.6% of the input against 0.9%
 for 1 MiB frames.
 
+### From a stream
+
+`gcomp_seekable_write_buffer()` needs the whole input at once. `zstd.seekable`
+on an encoder writes the same file from a stream — for a log being appended to,
+a pipe, an upload — and produces **byte-identical** output to the buffer writer
+for the same input and options.
+
+```c
+gcomp_options_set_bool(opts, "zstd.seekable", 1);
+gcomp_options_set_uint64(opts, "zstd.seekable_frame_size", 1u << 20);
+
+gcomp_encoder_t *enc = NULL;
+gcomp_encoder_create(registry, "zstd", opts, &enc);
+/* update() as usual; finish() appends the seek table */
+```
+
+Input is accumulated to `zstd.seekable_frame_size` before anything is encoded,
+because a frame has to declare a size that is not known until the frame is
+complete. So output lags input by up to one frame — that is the cost of the
+header/table redundancy, not an implementation detail to be optimised away.
+
+**`flush` ends the frame**, which is what makes the mode usable for a file
+being appended to: flush after each record and a reader can seek to it. Both
+flush modes do the same thing, because a file of independent frames has no
+history for a sync flush to preserve. A flush with nothing buffered writes
+nothing rather than an empty frame.
+
+`gcomp_encoder_reset()` starts a new file; the previous stream's frames are
+dropped rather than added to the next table.
+
+Note that `gcomp_encoder_create()` requires a real registry — unlike
+`gcomp_encode_buffer()`, it does not fall back to the default one. Pass
+`gcomp_registry_default()` if that is what you want.
+
 ## The format, and what it costs you
 
 The [Zstandard seekable
@@ -160,10 +194,12 @@ decode failure part way through somebody's read:
 
 ## Not yet
 
-Writing a seekable file from the streaming encoder. `gcomp_seekable_write_buffer()`
-needs the whole input at once; a `zstd.seekable` encoder option, with `flush`
-ending a frame, would let one be produced from a stream. The reading side is
-complete either way — a file this writes is read from a buffer or a callback.
+`zstd.seekable` with `threads.count > 1`. Parallel mode already makes an
+independent frame per job, but where the boundaries fall is decided by
+`zstd.job_size`, so the file would not have the frames that were asked for.
+Reconciling the two and building the table from job results in order is a
+change to the parallel result path rather than a flag, so the combination is
+refused rather than quietly producing something else.
 
 ## See also
 

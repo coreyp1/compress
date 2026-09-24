@@ -44,6 +44,7 @@
 #include "alloc_internal.h"
 #include "endian.h"
 #include "registry_internal.h"
+#include "seek_table.h"
 #include "walk_internal.h"
 #include "../methods/zstd/zstd_walk.h"
 #include <ghoti.io/compress/compress.h>
@@ -52,16 +53,10 @@
 #include <ghoti.io/cutil/safemath.h>
 #include <string.h>
 
-/// Skippable frame carrying a seek table.
-#define GCOMP_SEEK_TABLE_MAGIC 0x184D2A5EU
-/// Last four bytes of the file, so the table can be found from the end.
-#define GCOMP_SEEK_FOOTER_MAGIC 0x8F92EAB1U
-/// Number_Of_Frames (4) + Seek_Table_Descriptor (1) + magic (4).
-#define GCOMP_SEEK_FOOTER_SIZE 9u
-/// Bit 7 of Seek_Table_Descriptor: entries carry a checksum.
-#define GCOMP_SEEK_DESC_CHECKSUM 0x80u
-/// Bits 0-6 are reserved and a reader must refuse a table that sets them.
-#define GCOMP_SEEK_DESC_RESERVED 0x7Fu
+// The table's magic numbers, its sizes and its descriptor bits are defined in
+// seek_table.h, which is also the only thing that writes them. Reading them
+// stays here: a reader has the whole table in front of it and shares no code
+// path with either writer.
 
 /**
  * @brief One frame's place in the file and in the decompressed stream.
@@ -902,14 +897,13 @@ gcomp_status_t gcomp_seekable_write_buffer(gcomp_registry_t * registry,
     return GCOMP_ERR_LIMIT; // Number_Of_Frames is four bytes.
   }
 
-  const uint64_t entry_size = checksum ? 12u : 8u;
-  uint32_t * table = NULL;
-  if (frames > 0) {
-    // Three words per frame regardless of the checksum flag; the unused one
-    // simply is not written out.
-    table = gcomp_calloc(alloc, (size_t)frames * 3u, sizeof(uint32_t));
-    if (!table) {
-      return GCOMP_ERR_MEMORY;
+  // The frame count is known here, so the table is sized once and never grown.
+  gcomp_seek_table_t table;
+  {
+    const gcomp_status_t ts = gcomp_seek_table_init(
+        &table, alloc, checksum, frames ? (size_t)frames : 1u);
+    if (ts != GCOMP_OK) {
+      return ts;
     }
   }
 
@@ -919,12 +913,12 @@ gcomp_status_t gcomp_seekable_write_buffer(gcomp_registry_t * registry,
   gcomp_options_t * frame_options = NULL;
   if (options) {
     if (gcomp_options_clone(options, &frame_options) != GCOMP_OK) {
-      gcomp_free(alloc, table);
+      gcomp_seek_table_free(&table);
       return GCOMP_ERR_MEMORY;
     }
   }
   else if (gcomp_options_create(&frame_options) != GCOMP_OK) {
-    gcomp_free(alloc, table);
+    gcomp_seek_table_free(&table);
     return GCOMP_ERR_MEMORY;
   }
 
@@ -952,57 +946,26 @@ gcomp_status_t gcomp_seekable_write_buffer(gcomp_registry_t * registry,
     if (status != GCOMP_OK) {
       break;
     }
-    if (produced > 0xFFFFFFFFu || len > 0xFFFFFFFFu) {
-      status = GCOMP_ERR_LIMIT;
+    // The 32-bit field checks and the checksum both live in the table now.
+    status = gcomp_seek_table_append(
+        &table, (uint64_t)produced, len, in + at, (size_t)len);
+    if (status != GCOMP_OK) {
       break;
-    }
-
-    table[i * 3u + 0u] = (uint32_t)produced;
-    table[i * 3u + 1u] = (uint32_t)len;
-    if (checksum) {
-      // The format records the low 32 bits of the XXH64 of the frame's
-      // decompressed content.
-      gcomp_xxhash64_state_t h;
-      gcomp_xxhash64_reset(&h, 0);
-      gcomp_xxhash64_update(&h, in + at, (size_t)len);
-      table[i * 3u + 2u] = (uint32_t)(gcomp_xxhash64_finalize(&h) & 0xFFFFFFFFu);
     }
     written += produced;
   }
 
   if (status == GCOMP_OK) {
-    uint64_t table_bytes = 0;
-    if (!gcu_safe_mul_u64(frames, entry_size, &table_bytes) ||
-        !gcu_safe_add_u64(table_bytes, 8u + GCOMP_SEEK_FOOTER_SIZE,
-            &table_bytes)) {
-      status = GCOMP_ERR_LIMIT;
-    }
-    else if (table_bytes > (uint64_t)(output_capacity - written)) {
-      status = GCOMP_ERR_LIMIT;
-    }
-    else {
-      uint8_t * p = out + written;
-      gcomp_write_le32(p, GCOMP_SEEK_TABLE_MAGIC);
-      gcomp_write_le32(p + 4u, (uint32_t)(table_bytes - 8u));
-      p += 8u;
-      for (uint64_t i = 0; i < frames; i++) {
-        gcomp_write_le32(p, table[i * 3u + 0u]);
-        gcomp_write_le32(p + 4u, table[i * 3u + 1u]);
-        p += 8u;
-        if (checksum) {
-          gcomp_write_le32(p, table[i * 3u + 2u]);
-          p += 4u;
-        }
-      }
-      gcomp_write_le32(p, (uint32_t)frames);
-      p[4] = checksum ? GCOMP_SEEK_DESC_CHECKSUM : 0u;
-      gcomp_write_le32(p + 5u, GCOMP_SEEK_FOOTER_MAGIC);
-      written += (size_t)table_bytes;
+    size_t table_written = 0;
+    status = gcomp_seek_table_write(
+        &table, out + written, output_capacity - written, &table_written);
+    if (status == GCOMP_OK) {
+      written += table_written;
     }
   }
 
   gcomp_options_destroy(frame_options);
-  gcomp_free(alloc, table);
+  gcomp_seek_table_free(&table);
 
   if (status != GCOMP_OK) {
     *output_size_out = 0;

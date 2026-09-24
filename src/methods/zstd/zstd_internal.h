@@ -57,6 +57,7 @@
 #include "../../core/fastcopy.h"
 #include "../../core/registry_internal.h"
 #include <ghoti.io/cutil/safemath.h>
+#include "../../core/seek_table.h"
 #include "../../core/stream_internal.h"
 #include <ghoti.io/compress/errors.h>
 #include <ghoti.io/compress/limits.h>
@@ -550,6 +551,35 @@ typedef struct {
 
   gcomp_memory_tracker_t mem_tracker;
   uint64_t max_memory_bytes;
+
+  // ─────────────────────────────────────────────────────────────────────
+  // Seekable streaming state (zstd.seekable)
+  // ─────────────────────────────────────────────────────────────────────
+  //
+  // A seekable file is independent frames followed by a seek table, and each
+  // frame declares its own decompressed size so the file stays indexable even
+  // if the table is ignored. Declaring that size means knowing it before the
+  // frame is written, so input is accumulated to seek_frame_size and then
+  // encoded whole - the same shape as parallel mode, for the same reason.
+  //
+  // One frame's compressed bytes at a time sit in seek_out and are handed to
+  // the caller across as many calls as it takes; the seek table goes through
+  // the same buffer at finish.
+  bool seekable;               ///< zstd.seekable is on.
+  uint64_t seek_frame_size;    ///< Decompressed bytes per frame.
+  gcomp_seek_table_t seek_table;
+  gcomp_options_t * seek_frame_options; ///< Per-frame options; seekable off.
+
+  uint8_t * seek_in;           ///< Input awaiting a frame.
+  size_t seek_in_cap;
+  size_t seek_in_len;
+
+  uint8_t * seek_out;          ///< A finished frame, or the table.
+  size_t seek_out_cap;
+  size_t seek_out_len;
+  size_t seek_out_pos;         ///< How much of it the caller has taken.
+
+  bool seek_table_staged;      ///< The table has been put in seek_out.
 
   // Finish state
   bool finish_called;

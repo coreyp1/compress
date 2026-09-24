@@ -85,6 +85,9 @@
 
 #include <ghoti.io/compress/macros.h>
 #include "zstd_internal.h"
+// gcomp_encode_buffer/gcomp_encode_bound: seekable mode encodes each frame as a
+// complete one-shot stream rather than reimplementing frame construction.
+#include <ghoti.io/compress/compress.h>
 #include "zstd_ldm.h"
 #include "zstd_parallel.h"
 #include <string.h>
@@ -156,6 +159,272 @@ static bool zstd_emit_staged(const uint8_t * src, size_t * pos, size_t len,
     }
   }
   return *pos >= len;
+}
+
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// Seekable streaming mode (zstd.seekable)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// gcomp_seekable_write_buffer() needs the whole input at once. This produces
+// the identical file from a stream: independent frames of
+// zstd.seekable_frame_size decompressed bytes, each declaring that size in its
+// own header, then the seek table as a skippable frame.
+//
+// Input is accumulated to a frame's worth before anything is encoded, because
+// a frame cannot declare a size that is not yet known, and that redundancy
+// between the headers and the table is the point of the format - it is what
+// makes a file indexable when the table is lost or ignored.
+//
+// The table itself is built and written by src/core/seek_table.c, the same code
+// gcomp_seekable_write_buffer() uses, so the two writers cannot drift.
+//
+
+/**
+ * @brief Hand out whatever is staged in seek_out.
+ *
+ * @return true once it has all gone.
+ */
+static bool zstd_seek_drain(
+    zstd_encoder_state_t * state, gcomp_buffer_t * output) {
+  return zstd_emit_staged(
+      state->seek_out, &state->seek_out_pos, state->seek_out_len, output);
+}
+
+/**
+ * @brief Make sure seek_out can hold @p need bytes, and is empty.
+ */
+static gcomp_status_t zstd_seek_out_reserve(
+    zstd_encoder_state_t * state, size_t need) {
+  if (state->seek_out_cap < need) {
+    uint8_t * grown =
+        gcomp_realloc(state->allocator, state->seek_out, need ? need : 1u);
+    if (!grown) {
+      return GCOMP_ERR_MEMORY;
+    }
+    state->seek_out = grown;
+    state->seek_out_cap = need;
+  }
+  state->seek_out_len = 0;
+  state->seek_out_pos = 0;
+  return GCOMP_OK;
+}
+
+/**
+ * @brief Encode what is in seek_in as one complete frame, and record it.
+ *
+ * Staged in seek_out; the caller drains it. Does nothing when there is no
+ * input, so a flush with nothing buffered does not write an empty frame -
+ * which would be a table entry describing zero bytes and a reader's problem
+ * rather than ours.
+ */
+static gcomp_status_t zstd_seek_emit_frame(
+    gcomp_encoder_t * encoder, zstd_encoder_state_t * state) {
+  if (state->seek_in_len == 0) {
+    return GCOMP_OK;
+  }
+
+  // Each frame declares its own decompressed size.
+  gcomp_status_t status = gcomp_options_set_uint64(state->seek_frame_options,
+      "zstd.content_size", (uint64_t)state->seek_in_len);
+  if (status != GCOMP_OK) {
+    return gcomp_encoder_set_error(
+        encoder, status, "could not set the frame's declared size");
+  }
+
+  size_t bound = 0;
+  status = gcomp_encode_bound(encoder->registry, "zstd",
+      state->seek_frame_options, state->seek_in_len, &bound);
+  if (status != GCOMP_OK) {
+    return gcomp_encoder_set_error(
+        encoder, status, "could not size a seekable frame");
+  }
+  status = zstd_seek_out_reserve(state, bound);
+  if (status != GCOMP_OK) {
+    return gcomp_encoder_set_error(
+        encoder, status, "could not stage a seekable frame");
+  }
+
+  size_t produced = 0;
+  status = gcomp_encode_buffer(encoder->registry, "zstd",
+      state->seek_frame_options, state->seek_in, state->seek_in_len,
+      state->seek_out, state->seek_out_cap, &produced);
+  if (status != GCOMP_OK) {
+    return gcomp_encoder_set_error(
+        encoder, status, "could not encode a seekable frame");
+  }
+
+  status = gcomp_seek_table_append(&state->seek_table, (uint64_t)produced,
+      (uint64_t)state->seek_in_len, state->seek_in, state->seek_in_len);
+  if (status != GCOMP_OK) {
+    return gcomp_encoder_set_error(encoder, status,
+        "could not record a seekable frame in the seek table");
+  }
+
+  state->seek_out_len = produced;
+  state->seek_out_pos = 0;
+  state->seek_in_len = 0;
+  return GCOMP_OK;
+}
+
+/**
+ * @brief update() in seekable mode.
+ *
+ * Staged output is always handed out before any more is made, because seek_out
+ * holds one frame: encoding another before the first has gone would lose it.
+ * That is the defect this library has already shipped once - an encoder that
+ * dropped staged output - so the order is not an accident.
+ */
+static gcomp_status_t zstd_seek_update(gcomp_encoder_t * encoder,
+    zstd_encoder_state_t * state, gcomp_buffer_t * input,
+    gcomp_buffer_t * output) {
+  const uint8_t * in = (const uint8_t *)input->data;
+
+  for (;;) {
+    if (!zstd_seek_drain(state, output)) {
+      return GCOMP_OK; // Output is full; the caller comes back.
+    }
+
+    const size_t available = input->size - input->used;
+    if (available == 0) {
+      return GCOMP_OK;
+    }
+
+    size_t room = state->seek_in_cap - state->seek_in_len;
+    size_t take = (available < room) ? available : room;
+    if (take > 0) {
+      memcpy(state->seek_in + state->seek_in_len, in + input->used, take);
+      state->seek_in_len += take;
+      input->used += take;
+      room -= take;
+    }
+
+    if (room > 0) {
+      return GCOMP_OK; // Input exhausted, frame not yet full.
+    }
+
+    const gcomp_status_t status = zstd_seek_emit_frame(encoder, state);
+    if (status != GCOMP_OK) {
+      state->stage = ZSTD_ENC_STAGE_ERROR;
+      return status;
+    }
+  }
+}
+
+/**
+ * @brief flush() in seekable mode: end the frame here.
+ *
+ * Both flush modes do the same thing, and there is nothing to choose between
+ * them: every frame in a seekable file is already independent, so a sync flush
+ * cannot keep history across the boundary even if it wanted to. Ending the
+ * frame is what makes everything consumed so far decodable, which is what both
+ * modes promise.
+ *
+ * A flush that lands mid-frame therefore costs ratio, exactly as it does in
+ * ordinary streaming, and additionally makes a shorter frame - so a caller that
+ * flushes every few bytes gets a table with many tiny entries. That is the
+ * caller's trade to make; it is documented rather than prevented.
+ */
+static gcomp_status_t zstd_seek_flush(gcomp_encoder_t * encoder,
+    zstd_encoder_state_t * state, gcomp_buffer_t * output) {
+  if (!zstd_seek_drain(state, output)) {
+    return GCOMP_ERR_LIMIT;
+  }
+  const gcomp_status_t status = zstd_seek_emit_frame(encoder, state);
+  if (status != GCOMP_OK) {
+    state->stage = ZSTD_ENC_STAGE_ERROR;
+    return status;
+  }
+  if (!zstd_seek_drain(state, output)) {
+    return GCOMP_ERR_LIMIT;
+  }
+  return GCOMP_OK;
+}
+
+/**
+ * @brief finish() in seekable mode: last frame, then the seek table.
+ */
+static gcomp_status_t zstd_seek_finish(gcomp_encoder_t * encoder,
+    zstd_encoder_state_t * state, gcomp_buffer_t * output) {
+  if (!zstd_seek_drain(state, output)) {
+    return GCOMP_ERR_LIMIT;
+  }
+
+  if (state->seek_in_len > 0) {
+    const gcomp_status_t status = zstd_seek_emit_frame(encoder, state);
+    if (status != GCOMP_OK) {
+      state->stage = ZSTD_ENC_STAGE_ERROR;
+      return status;
+    }
+    if (!zstd_seek_drain(state, output)) {
+      return GCOMP_ERR_LIMIT;
+    }
+  }
+
+  if (!state->seek_table_staged) {
+    const uint64_t need = gcomp_seek_table_bytes(&state->seek_table);
+    if (need > (uint64_t)SIZE_MAX) {
+      state->stage = ZSTD_ENC_STAGE_ERROR;
+      return gcomp_encoder_set_error(
+          encoder, GCOMP_ERR_LIMIT, "the seek table does not fit in memory");
+    }
+    gcomp_status_t status = zstd_seek_out_reserve(state, (size_t)need);
+    if (status != GCOMP_OK) {
+      state->stage = ZSTD_ENC_STAGE_ERROR;
+      return gcomp_encoder_set_error(
+          encoder, status, "could not stage the seek table");
+    }
+    size_t written = 0;
+    status = gcomp_seek_table_write(
+        &state->seek_table, state->seek_out, state->seek_out_cap, &written);
+    if (status != GCOMP_OK) {
+      state->stage = ZSTD_ENC_STAGE_ERROR;
+      return gcomp_encoder_set_error(
+          encoder, status, "could not write the seek table");
+    }
+    state->seek_out_len = written;
+    state->seek_out_pos = 0;
+    state->seek_table_staged = true;
+  }
+
+  if (!zstd_seek_drain(state, output)) {
+    return GCOMP_ERR_LIMIT;
+  }
+  state->stage = ZSTD_ENC_STAGE_DONE;
+  return GCOMP_OK;
+}
+
+/// Release what seekable mode allocated. Safe to call twice.
+static void zstd_seek_teardown(zstd_encoder_state_t * state) {
+  gcomp_seek_table_free(&state->seek_table);
+  gcomp_free(state->allocator, state->seek_in);
+  state->seek_in = NULL;
+  state->seek_in_cap = 0;
+  state->seek_in_len = 0;
+  gcomp_free(state->allocator, state->seek_out);
+  state->seek_out = NULL;
+  state->seek_out_cap = 0;
+  state->seek_out_len = 0;
+  state->seek_out_pos = 0;
+  if (state->seek_frame_options) {
+    gcomp_options_destroy(state->seek_frame_options);
+    state->seek_frame_options = NULL;
+  }
+  state->seek_table_staged = false;
+}
+
+/**
+ * @brief Drop the accumulated frames so a reset starts a new file.
+ */
+static gcomp_status_t zstd_seek_rearm(zstd_encoder_state_t * state) {
+  const int checksum = state->seek_table.checksum;
+  gcomp_seek_table_free(&state->seek_table);
+  state->seek_in_len = 0;
+  state->seek_out_len = 0;
+  state->seek_out_pos = 0;
+  state->seek_table_staged = false;
+  return gcomp_seek_table_init(
+      &state->seek_table, state->allocator, checksum, 0);
 }
 
 /**
@@ -680,6 +949,11 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
   uint64_t ldm_min_match = ZSTD_LDM_MIN_MATCH_DEFAULT;
   uint64_t ldm_hash_log = 0;
   uint64_t ldm_hash_rate_log = ZSTD_LDM_HASH_RATE_LOG_DEFAULT;
+  int seekable_enabled = 0;
+  // The schema's defaults, restated because these are read with
+  // gcomp_options_get_*() which leaves the variable alone when the key is absent.
+  uint64_t seekable_frame_size = 1048576u;
+  int seekable_checksum = 1;
 
   if (options) {
     gcomp_options_get_int64(options, "zstd.level", &level);
@@ -693,6 +967,11 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
     gcomp_options_get_uint64(options, "threads.count", &num_threads);
     gcomp_options_get_uint64(options, "zstd.job_size", &job_size);
     gcomp_options_get_bool(options, "zstd.long", &ldm_enabled);
+    gcomp_options_get_bool(options, "zstd.seekable", &seekable_enabled);
+    gcomp_options_get_uint64(
+        options, "zstd.seekable_frame_size", &seekable_frame_size);
+    gcomp_options_get_bool(
+        options, "zstd.seekable_checksum", &seekable_checksum);
     gcomp_options_get_uint64(options, "zstd.ldm_min_match", &ldm_min_match);
     gcomp_options_get_uint64(options, "zstd.ldm_hash_log", &ldm_hash_log);
     gcomp_options_get_uint64(
@@ -720,6 +999,73 @@ gcomp_status_t zstd_encoder_init(gcomp_registry_t * registry,
         "scan would have to run over the whole input before the jobs split "
         "it");
     goto cleanup;
+  }
+
+  // Seekable streaming mode.
+  if (seekable_enabled) {
+    // Parallel mode also batches input into independent frames, with its own
+    // job_size deciding where the boundaries fall. Making the two agree means
+    // reconciling job_size with seekable_frame_size and building the table from
+    // job results in order; that is a real change to the parallel result path
+    // rather than a flag, so the combination is refused rather than silently
+    // producing a file whose frame boundaries are not the ones asked for.
+    if (num_threads > 1u) {
+      status = GCOMP_ERR_UNSUPPORTED;
+      gcomp_encoder_set_error(encoder, status,
+          "zstd.seekable is not yet supported with threads.count > 1; the "
+          "frame boundaries would be decided by zstd.job_size rather than by "
+          "zstd.seekable_frame_size");
+      goto cleanup;
+    }
+    // A caller that declares the whole stream's size is describing one frame's
+    // content, which is not what this writes. Refusing says so; honouring it
+    // would put a wrong size in every frame header.
+    if (content_size_present) {
+      status = GCOMP_ERR_INVALID_ARG;
+      gcomp_encoder_set_error(encoder, status,
+          "zstd.content_size cannot be set with zstd.seekable: each frame "
+          "declares its own size, and this encoder computes them");
+      goto cleanup;
+    }
+
+    state->seekable = true;
+    state->seek_frame_size = seekable_frame_size;
+
+    if (seekable_frame_size > (uint64_t)SIZE_MAX) {
+      status = GCOMP_ERR_LIMIT;
+      gcomp_encoder_set_error(encoder, status,
+          "zstd.seekable_frame_size does not fit in memory");
+      goto cleanup;
+    }
+    state->seek_in = gcomp_malloc(state->allocator, (size_t)seekable_frame_size);
+    if (!state->seek_in) {
+      status = GCOMP_ERR_MEMORY;
+      goto cleanup;
+    }
+    state->seek_in_cap = (size_t)seekable_frame_size;
+
+    status = gcomp_seek_table_init(
+        &state->seek_table, state->allocator, seekable_checksum ? 1 : 0, 0);
+    if (status != GCOMP_OK) {
+      goto cleanup;
+    }
+
+    // Per-frame options: the caller's, with seekable off so the recursive
+    // encode of one frame is an ordinary single-frame encode rather than
+    // another seekable writer.
+    if (options) {
+      status = gcomp_options_clone(options, &state->seek_frame_options);
+    }
+    else {
+      status = gcomp_options_create(&state->seek_frame_options);
+    }
+    if (status != GCOMP_OK) {
+      goto cleanup;
+    }
+    status = gcomp_options_set_bool(state->seek_frame_options, "zstd.seekable", 0);
+    if (status != GCOMP_OK) {
+      goto cleanup;
+    }
   }
 
   // Store threading options
@@ -1196,6 +1542,8 @@ void zstd_encoder_destroy(gcomp_encoder_t * encoder) {
   zstd_encoder_state_t * state = encoder->method_state;
   const gcomp_allocator_t * alloc = state->allocator;
 
+  zstd_seek_teardown(state);
+
   if (state->mf_window) {
     gcomp_memory_track_free(&state->mem_tracker, state->mf_window_capacity);
     gcomp_free(alloc, state->mf_window);
@@ -1287,6 +1635,11 @@ gcomp_status_t zstd_encoder_update(gcomp_encoder_t * encoder,
   }
   if (state->stage == ZSTD_ENC_STAGE_DONE) {
     return GCOMP_OK;
+  }
+
+  // Seekable mode batches into whole frames of its own, like parallel mode.
+  if (state->seekable) {
+    return zstd_seek_update(encoder, state, input, output);
   }
 
   // Parallel mode: use dedicated parallel update path
@@ -1579,6 +1932,11 @@ gcomp_status_t zstd_encoder_flush(gcomp_encoder_t * encoder,
         "zstd encoder cannot flush after finish");
   }
 
+  if (state->seekable) {
+    (void)mode; // Both modes end the frame; see zstd_seek_flush().
+    return zstd_seek_flush(encoder, state, output);
+  }
+
   if (state->parallel_ctx) {
     // Parallel mode makes a whole frame per job, so a flush ends the frame in
     // hand and the next input starts another.  That is the same concatenated
@@ -1723,6 +2081,10 @@ gcomp_status_t zstd_encoder_finish(
 
   state->finish_called = true;
 
+  if (state->seekable) {
+    return zstd_seek_finish(encoder, state, output);
+  }
+
   // Parallel mode: use dedicated parallel finish path
   if (state->parallel_ctx) {
     return zstd_encoder_finish_parallel(encoder, state, output);
@@ -1850,6 +2212,19 @@ gcomp_status_t zstd_encoder_reset(gcomp_encoder_t * encoder) {
   state->total_input_bytes = 0;
   state->finish_called = false;
   state->blocks_finished = false;
+
+  // Seekable mode: the next stream is a new file, so the frames recorded for
+  // the last one must go. Keeping them would append this stream's frames to the
+  // previous table and describe a file that does not exist -- the same shape of
+  // bug a726438 fixed in the parallel encoder, where reset left the held job's
+  // overlap behind.
+  if (state->seekable) {
+    status = zstd_seek_rearm(state);
+    if (status != GCOMP_OK) {
+      return gcomp_encoder_set_error(
+          encoder, status, "could not re-arm the seek table");
+    }
+  }
 
   // Reset repeat offsets
   state->rep_offset_1 = ZSTD_REP_OFFSET_1_INIT;

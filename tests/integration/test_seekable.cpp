@@ -24,6 +24,7 @@
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
 #include <ghoti.io/compress/seekable.h>
+#include <ghoti.io/compress/stream.h>
 #include <gtest/gtest.h>
 
 #include <cstdint>
@@ -1011,6 +1012,410 @@ TEST(Seekable, TruncationsAgreeBetweenSources) {
       << "no truncation opened successfully, so the agreement is vacuous";
   EXPECT_LT(opened, file.size() - 1u)
       << "every truncation opened, so no rejection path was compared";
+}
+
+/**
+ * @brief The streaming encoder writes a seekable file the reader accepts.
+ *
+ * gcomp_seekable_write_buffer() needs the whole input at once. `zstd.seekable`
+ * on the encoder produces the same file from a stream, which is the case that
+ * matters for anything that does not have its input in memory - a log being
+ * appended to, a pipe, an upload.
+ *
+ * Driven through deliberately awkward chunk sizes, because the whole risk in a
+ * streaming writer is the seams: a frame boundary that falls inside one call's
+ * input, or an output buffer too small to take a staged frame in one go.
+ */
+TEST(Seekable, TheStreamingEncoderWritesSeekableFiles) {
+  const std::vector<uint8_t> in = make_data(300000);
+
+  for (uint64_t frame_size : {(uint64_t)1024, (uint64_t)65536,
+           (uint64_t)100000, (uint64_t)1000000}) {
+    for (int checksum : {0, 1}) {
+      for (size_t in_chunk : {(size_t)1, (size_t)7, (size_t)4096,
+               (size_t)300000}) {
+        for (size_t out_chunk : {(size_t)1, (size_t)64, (size_t)1u << 20}) {
+          gcomp_options_t * o = nullptr;
+          ASSERT_EQ(gcomp_options_create(&o), GCOMP_OK);
+          ASSERT_EQ(gcomp_options_set_bool(o, "zstd.seekable", 1), GCOMP_OK);
+          ASSERT_EQ(gcomp_options_set_uint64(
+                        o, "zstd.seekable_frame_size", frame_size),
+              GCOMP_OK);
+          ASSERT_EQ(
+              gcomp_options_set_bool(o, "zstd.seekable_checksum", checksum),
+              GCOMP_OK);
+
+          gcomp_encoder_t * enc = nullptr;
+          ASSERT_EQ(gcomp_encoder_create(gcomp_registry_default(), "zstd", o, &enc), GCOMP_OK)
+              << "frame " << frame_size << " checksum " << checksum;
+          gcomp_options_destroy(o);
+
+          std::vector<uint8_t> file;
+          std::vector<uint8_t> scratch(out_chunk);
+
+          size_t offset = 0;
+          while (offset < in.size()) {
+            size_t take = in_chunk;
+            if (take > in.size() - offset) {
+              take = in.size() - offset;
+            }
+            gcomp_buffer_t ib = {
+                (void *)(in.data() + offset), take, 0};
+            // Keep going until this chunk is consumed; a small output buffer
+            // means several passes per chunk.
+            while (ib.used < ib.size) {
+              gcomp_buffer_t ob = {scratch.data(), scratch.size(), 0};
+              const gcomp_status_t st =
+                  gcomp_encoder_update(enc, &ib, &ob);
+              ASSERT_EQ(st, GCOMP_OK)
+                  << "frame " << frame_size << " in_chunk " << in_chunk
+                  << " out_chunk " << out_chunk << ": "
+                  << gcomp_status_to_string(st);
+              file.insert(file.end(), scratch.begin(),
+                  scratch.begin() + (long)ob.used);
+              if (ob.used == 0 && ib.used == 0) {
+                FAIL() << "update made no progress: frame " << frame_size
+                       << " in_chunk " << in_chunk << " out_chunk "
+                       << out_chunk;
+              }
+            }
+            offset += ib.used;
+          }
+
+          // finish() returns GCOMP_ERR_LIMIT until it has handed everything
+          // over, which with a one-byte buffer is a great many calls.
+          for (;;) {
+            gcomp_buffer_t ob = {scratch.data(), scratch.size(), 0};
+            const gcomp_status_t st = gcomp_encoder_finish(enc, &ob);
+            file.insert(file.end(), scratch.begin(),
+                scratch.begin() + (long)ob.used);
+            if (st == GCOMP_OK) {
+              break;
+            }
+            ASSERT_EQ(st, GCOMP_ERR_LIMIT)
+                << "frame " << frame_size << ": "
+                << gcomp_status_to_string(st);
+            ASSERT_GT(ob.used, size_t{0}) << "finish made no progress";
+          }
+          gcomp_encoder_destroy(enc);
+
+          // It has a table, the right number of frames, and every read agrees
+          // with the input.
+          gcomp_seekable_t * sk = nullptr;
+          ASSERT_EQ(gcomp_seekable_open_buffer(nullptr, "zstd", nullptr,
+                        file.data(), file.size(), &sk),
+              GCOMP_OK)
+              << "frame " << frame_size << " checksum " << checksum
+              << " in_chunk " << in_chunk << " out_chunk " << out_chunk;
+          EXPECT_TRUE(gcomp_seekable_has_table(sk));
+          const uint64_t want_frames =
+              ((uint64_t)in.size() + frame_size - 1u) / frame_size;
+          EXPECT_EQ((uint64_t)gcomp_seekable_frame_count(sk), want_frames)
+              << "frame " << frame_size << " in_chunk " << in_chunk;
+          check_reads_against(sk, in);
+          gcomp_seekable_close(sk);
+
+          // And it is an ordinary zstd stream: a plain decode of the whole
+          // file returns the input, because the seek table is a skippable
+          // frame that any decoder steps over.
+          {
+            std::vector<uint8_t> plain(in.size() + 64u);
+            size_t got = 0;
+            gcomp_options_t * d = nullptr;
+            ASSERT_EQ(gcomp_options_create(&d), GCOMP_OK);
+            ASSERT_EQ(gcomp_options_set_bool(d, "zstd.concat", 1), GCOMP_OK);
+            ASSERT_EQ(gcomp_decode_buffer(nullptr, "zstd", d, file.data(),
+                          file.size(), plain.data(), plain.size(), &got),
+                GCOMP_OK)
+                << "frame " << frame_size;
+            gcomp_options_destroy(d);
+            ASSERT_EQ(got, in.size());
+            EXPECT_EQ(std::memcmp(plain.data(), in.data(), in.size()), 0);
+          }
+
+          if (::testing::Test::HasFatalFailure()) {
+            return;
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * @brief The streaming writer and the buffer writer produce the same file.
+ *
+ * Not merely "both readable" - byte-identical. They are two writers of one
+ * format, which is the arrangement that drifts, and the shared seek-table code
+ * in src/core/seek_table.c is only worth having if this holds. If a field ever
+ * moves in one and not the other, this is what says so.
+ *
+ * It is exact because both make frames of the same size out of the same bytes
+ * with the same options, and a zstd frame is a deterministic function of those.
+ */
+TEST(Seekable, StreamingAndBufferWritersAgreeExactly) {
+  for (size_t n : {size_t{0}, size_t{1}, size_t{1023}, size_t{1024},
+           size_t{1025}, size_t{65536}, size_t{300000}}) {
+    const std::vector<uint8_t> in = make_data(n);
+    for (uint64_t frame_size : {(uint64_t)1024, (uint64_t)65536}) {
+      for (int checksum : {0, 1}) {
+        const std::vector<uint8_t> by_buffer =
+            write_seekable(in, frame_size, checksum);
+
+        gcomp_options_t * o = nullptr;
+        ASSERT_EQ(gcomp_options_create(&o), GCOMP_OK);
+        ASSERT_EQ(gcomp_options_set_bool(o, "zstd.seekable", 1), GCOMP_OK);
+        ASSERT_EQ(
+            gcomp_options_set_uint64(o, "zstd.seekable_frame_size", frame_size),
+            GCOMP_OK);
+        ASSERT_EQ(gcomp_options_set_bool(o, "zstd.seekable_checksum", checksum),
+            GCOMP_OK);
+        gcomp_encoder_t * enc = nullptr;
+        ASSERT_EQ(gcomp_encoder_create(gcomp_registry_default(), "zstd", o, &enc), GCOMP_OK);
+        gcomp_options_destroy(o);
+
+        std::vector<uint8_t> by_stream;
+        std::vector<uint8_t> scratch(1u << 16);
+        if (n > 0) {
+          gcomp_buffer_t ib = {(void *)in.data(), in.size(), 0};
+          while (ib.used < ib.size) {
+            gcomp_buffer_t ob = {scratch.data(), scratch.size(), 0};
+            ASSERT_EQ(gcomp_encoder_update(enc, &ib, &ob), GCOMP_OK);
+            by_stream.insert(by_stream.end(), scratch.begin(),
+                scratch.begin() + (long)ob.used);
+          }
+        }
+        for (;;) {
+          gcomp_buffer_t ob = {scratch.data(), scratch.size(), 0};
+          const gcomp_status_t st = gcomp_encoder_finish(enc, &ob);
+          by_stream.insert(by_stream.end(), scratch.begin(),
+              scratch.begin() + (long)ob.used);
+          if (st == GCOMP_OK) {
+            break;
+          }
+          ASSERT_EQ(st, GCOMP_ERR_LIMIT);
+        }
+        gcomp_encoder_destroy(enc);
+
+        ASSERT_EQ(by_stream.size(), by_buffer.size())
+            << "n=" << n << " frame=" << frame_size << " checksum=" << checksum
+            << ": the streaming writer produced " << by_stream.size()
+            << " bytes and the buffer writer " << by_buffer.size();
+        EXPECT_EQ(std::memcmp(by_stream.data(), by_buffer.data(),
+                      by_buffer.size()),
+            0)
+            << "n=" << n << " frame=" << frame_size << " checksum=" << checksum;
+        if (::testing::Test::HasFatalFailure()) {
+          return;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * @brief A flush ends the frame, so the seams follow the flushes.
+ *
+ * This is what makes the mode usable for something being appended to: flush
+ * after each record and a reader can seek to it, rather than waiting for a
+ * frame's worth of data to accumulate.
+ *
+ * Both flush modes do the same thing here and that is asserted rather than
+ * assumed: in a file of independent frames there is no history for a sync flush
+ * to keep, so there is nothing for the two modes to differ about.
+ */
+TEST(Seekable, AFlushEndsASeekableFrame) {
+  for (gcomp_flush_t mode : {GCOMP_FLUSH_SYNC, GCOMP_FLUSH_FULL}) {
+    // Three records, each far smaller than the frame size, flushed after each.
+    const std::vector<size_t> records = {1000, 5, 20000};
+    std::vector<uint8_t> all;
+    std::vector<uint8_t> file;
+
+    gcomp_options_t * o = nullptr;
+    ASSERT_EQ(gcomp_options_create(&o), GCOMP_OK);
+    ASSERT_EQ(gcomp_options_set_bool(o, "zstd.seekable", 1), GCOMP_OK);
+    ASSERT_EQ(gcomp_options_set_uint64(
+                  o, "zstd.seekable_frame_size", (uint64_t)1u << 20),
+        GCOMP_OK);
+    gcomp_encoder_t * enc = nullptr;
+    ASSERT_EQ(gcomp_encoder_create(gcomp_registry_default(), "zstd", o, &enc), GCOMP_OK);
+    gcomp_options_destroy(o);
+
+    std::vector<uint8_t> scratch(1u << 16);
+    for (size_t len : records) {
+      const std::vector<uint8_t> rec = make_data(len);
+      all.insert(all.end(), rec.begin(), rec.end());
+
+      gcomp_buffer_t ib = {(void *)rec.data(), rec.size(), 0};
+      while (ib.used < ib.size) {
+        gcomp_buffer_t ob = {scratch.data(), scratch.size(), 0};
+        ASSERT_EQ(gcomp_encoder_update(enc, &ib, &ob), GCOMP_OK);
+        file.insert(
+            file.end(), scratch.begin(), scratch.begin() + (long)ob.used);
+      }
+      for (;;) {
+        gcomp_buffer_t ob = {scratch.data(), scratch.size(), 0};
+        const gcomp_status_t st = gcomp_encoder_flush(enc, &ob, mode);
+        file.insert(
+            file.end(), scratch.begin(), scratch.begin() + (long)ob.used);
+        if (st == GCOMP_OK) {
+          break;
+        }
+        ASSERT_EQ(st, GCOMP_ERR_LIMIT) << gcomp_status_to_string(st);
+      }
+    }
+    for (;;) {
+      gcomp_buffer_t ob = {scratch.data(), scratch.size(), 0};
+      const gcomp_status_t st = gcomp_encoder_finish(enc, &ob);
+      file.insert(file.end(), scratch.begin(), scratch.begin() + (long)ob.used);
+      if (st == GCOMP_OK) {
+        break;
+      }
+      ASSERT_EQ(st, GCOMP_ERR_LIMIT);
+    }
+    gcomp_encoder_destroy(enc);
+
+    gcomp_seekable_t * sk = nullptr;
+    ASSERT_EQ(gcomp_seekable_open_buffer(
+                  nullptr, "zstd", nullptr, file.data(), file.size(), &sk),
+        GCOMP_OK);
+    // One frame per flush, and no empty frame from the flush-then-finish at the
+    // end: a flush with nothing buffered must not write a zero-byte frame.
+    EXPECT_EQ(gcomp_seekable_frame_count(sk), records.size())
+        << "mode " << (int)mode
+        << ": one frame per flush, and none for the empty finish";
+    EXPECT_EQ(gcomp_seekable_size(sk), (uint64_t)all.size());
+    check_reads_against(sk, all);
+    gcomp_seekable_close(sk);
+  }
+}
+
+/**
+ * @brief A redundant flush writes nothing, and reset starts a new file.
+ */
+TEST(Seekable, StreamingEncoderEdgeCases) {
+  std::vector<uint8_t> scratch(1u << 16);
+
+  // An encoder that is finished with no input at all: a valid file with a table
+  // describing no frames.
+  {
+    gcomp_options_t * o = nullptr;
+    ASSERT_EQ(gcomp_options_create(&o), GCOMP_OK);
+    ASSERT_EQ(gcomp_options_set_bool(o, "zstd.seekable", 1), GCOMP_OK);
+    gcomp_encoder_t * enc = nullptr;
+    ASSERT_EQ(gcomp_encoder_create(gcomp_registry_default(), "zstd", o, &enc), GCOMP_OK);
+    gcomp_options_destroy(o);
+
+    // Flushing with nothing buffered must produce no frame.
+    gcomp_buffer_t fb = {scratch.data(), scratch.size(), 0};
+    ASSERT_EQ(gcomp_encoder_flush(enc, &fb, GCOMP_FLUSH_SYNC), GCOMP_OK);
+    EXPECT_EQ(fb.used, size_t{0})
+        << "a flush with nothing buffered wrote " << fb.used << " bytes";
+
+    gcomp_buffer_t ob = {scratch.data(), scratch.size(), 0};
+    ASSERT_EQ(gcomp_encoder_finish(enc, &ob), GCOMP_OK);
+    gcomp_encoder_destroy(enc);
+
+    std::vector<uint8_t> file(scratch.begin(), scratch.begin() + (long)ob.used);
+    gcomp_seekable_t * sk = nullptr;
+    ASSERT_EQ(gcomp_seekable_open_buffer(
+                  nullptr, "zstd", nullptr, file.data(), file.size(), &sk),
+        GCOMP_OK);
+    EXPECT_TRUE(gcomp_seekable_has_table(sk));
+    EXPECT_EQ(gcomp_seekable_frame_count(sk), size_t{0});
+    EXPECT_EQ(gcomp_seekable_size(sk), (uint64_t)0);
+    gcomp_seekable_close(sk);
+  }
+
+  // reset() must drop the frames of the stream that just ended. Keeping them
+  // would append the next stream's frames to the previous table and describe a
+  // file that does not exist.
+  {
+    gcomp_options_t * o = nullptr;
+    ASSERT_EQ(gcomp_options_create(&o), GCOMP_OK);
+    ASSERT_EQ(gcomp_options_set_bool(o, "zstd.seekable", 1), GCOMP_OK);
+    ASSERT_EQ(
+        gcomp_options_set_uint64(o, "zstd.seekable_frame_size", 1024u),
+        GCOMP_OK);
+    gcomp_encoder_t * enc = nullptr;
+    ASSERT_EQ(gcomp_encoder_create(gcomp_registry_default(), "zstd", o, &enc), GCOMP_OK);
+    gcomp_options_destroy(o);
+
+    std::vector<std::vector<uint8_t>> streams;
+    for (int pass = 0; pass < 2; pass++) {
+      const std::vector<uint8_t> in = make_data(pass == 0 ? 5000 : 3000);
+      std::vector<uint8_t> file;
+      gcomp_buffer_t ib = {(void *)in.data(), in.size(), 0};
+      while (ib.used < ib.size) {
+        gcomp_buffer_t ob = {scratch.data(), scratch.size(), 0};
+        ASSERT_EQ(gcomp_encoder_update(enc, &ib, &ob), GCOMP_OK);
+        file.insert(
+            file.end(), scratch.begin(), scratch.begin() + (long)ob.used);
+      }
+      for (;;) {
+        gcomp_buffer_t ob = {scratch.data(), scratch.size(), 0};
+        const gcomp_status_t st = gcomp_encoder_finish(enc, &ob);
+        file.insert(
+            file.end(), scratch.begin(), scratch.begin() + (long)ob.used);
+        if (st == GCOMP_OK) {
+          break;
+        }
+        ASSERT_EQ(st, GCOMP_ERR_LIMIT);
+      }
+
+      gcomp_seekable_t * sk = nullptr;
+      ASSERT_EQ(gcomp_seekable_open_buffer(
+                    nullptr, "zstd", nullptr, file.data(), file.size(), &sk),
+          GCOMP_OK)
+          << "pass " << pass;
+      EXPECT_EQ(gcomp_seekable_size(sk), (uint64_t)in.size()) << "pass " << pass;
+      const size_t want = (in.size() + 1023u) / 1024u;
+      EXPECT_EQ(gcomp_seekable_frame_count(sk), want)
+          << "pass " << pass
+          << ": the table should describe only this stream's frames";
+      check_reads_against(sk, in);
+      gcomp_seekable_close(sk);
+      streams.push_back(file);
+
+      if (pass == 0) {
+        ASSERT_EQ(gcomp_encoder_reset(enc), GCOMP_OK);
+      }
+    }
+    gcomp_encoder_destroy(enc);
+  }
+}
+
+/**
+ * @brief What zstd.seekable refuses, and why it is refused rather than ignored.
+ */
+TEST(Seekable, StreamingSeekableRefusesWhatItCannotDo) {
+  // threads.count > 1: parallel mode decides frame boundaries by job_size, so
+  // the file would not have the frames that were asked for.
+  {
+    gcomp_options_t * o = nullptr;
+    ASSERT_EQ(gcomp_options_create(&o), GCOMP_OK);
+    ASSERT_EQ(gcomp_options_set_bool(o, "zstd.seekable", 1), GCOMP_OK);
+    ASSERT_EQ(gcomp_options_set_uint64(o, "threads.count", 4u), GCOMP_OK);
+    gcomp_encoder_t * enc = nullptr;
+    EXPECT_EQ(gcomp_encoder_create(gcomp_registry_default(), "zstd", o, &enc),
+        GCOMP_ERR_UNSUPPORTED);
+    EXPECT_EQ(enc, nullptr);
+    gcomp_options_destroy(o);
+  }
+
+  // zstd.content_size describes one frame's content, and this writes many.
+  {
+    gcomp_options_t * o = nullptr;
+    ASSERT_EQ(gcomp_options_create(&o), GCOMP_OK);
+    ASSERT_EQ(gcomp_options_set_bool(o, "zstd.seekable", 1), GCOMP_OK);
+    ASSERT_EQ(gcomp_options_set_uint64(o, "zstd.content_size", 1000u),
+        GCOMP_OK);
+    gcomp_encoder_t * enc = nullptr;
+    EXPECT_EQ(gcomp_encoder_create(gcomp_registry_default(), "zstd", o, &enc),
+        GCOMP_ERR_INVALID_ARG);
+    EXPECT_EQ(enc, nullptr);
+    gcomp_options_destroy(o);
+  }
 }
 
 int main(int argc, char ** argv) {

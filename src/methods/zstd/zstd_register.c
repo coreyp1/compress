@@ -104,6 +104,23 @@ static const gcomp_option_schema_t g_zstd_option_schemas[] = {
         "Enable xxHash64 content checksum", // help
         NULL, // allowed
     },
+    // zstd.seekable - Write a seekable file from the streaming encoder
+    {
+        "zstd.seekable",  // key
+        GCOMP_OPT_BOOL,   // type
+        1,                // has_default
+        {.b = false},     // default_value
+        0,                // has_min
+        0,                // has_max
+        0,                // min_int
+        0,                // max_int
+        0,                // min_uint
+        0,                // max_uint
+        // Only meaningful on an encoder. gcomp_seekable_write_buffer() writes
+        // the same file when the whole input is in hand; this is for a stream.
+        "Write independent frames and a seek table; flush ends a frame", // help
+        NULL, // allowed
+    },
     // zstd.seekable_frame_size - Frame length when writing a seekable file
     {
         "zstd.seekable_frame_size",  // key
@@ -370,6 +387,7 @@ static const gcomp_option_schema_t g_zstd_option_schemas[] = {
 static const char * const g_zstd_option_keys[] = {
     "zstd.level",
     "zstd.checksum",
+    "zstd.seekable",
     "zstd.seekable_frame_size",
     "zstd.seekable_checksum",
     "zstd.window_log",
