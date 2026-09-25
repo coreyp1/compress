@@ -710,8 +710,13 @@ const BlockSizeCase kBlockSizes[] = {
 //
 
 TEST_F(Lz4SpecOracleTest, OracleIsActuallyAvailable) {
-  // If this fails, python3 is missing and nothing in this file is comparing
-  // our output against anything. Said out loud rather than skipped.
+  // If this fails, python3 is missing and none of the spec-based tests in this
+  // file are comparing our output against anything. Said out loud rather than
+  // skipped.
+  //
+  // This covers the *specification* reference only. The tests that compare
+  // against the real implementation need liblz4 as well, and have their own
+  // sentinel below - one assertion cannot answer for two references.
   std::vector<uint8_t> probe = proseLike(200, 1u);
   std::string in = tempPath(".raw");
   std::string out = tempPath(".lz4");
@@ -1052,6 +1057,35 @@ bool realLz4Decode(const std::vector<uint8_t> & frame,
   lib.freeDctx(ctx);
   out->resize(ok ? produced : 0);
   return ok;
+}
+
+/**
+ * @brief Say so if the real implementation was never asked.
+ *
+ * Thirteen tests in this file compare against liblz4 rather than against the
+ * specification reference, and each skips when the library will not load.  The
+ * spec tests do still run in that case, so this is narrower than the sentinel
+ * above - what is lost is every claim of the form "the real implementation
+ * reads what we write", which nothing else in the suite makes.
+ *
+ * liblz4 is loaded by name at runtime, so an installed library with no
+ * development package is enough and pkg-config is never consulted: a machine
+ * can look like it has no liblz4 and run every one of these tests.
+ *
+ * Measured rather than assumed.  With liblz4.so.1 hidden in a mount namespace
+ * this binary skipped thirteen tests, reported no failure, and exited 0.
+ */
+TEST_F(Lz4SpecOracleTest, RealImplementationIsActuallyAvailable) {
+  if (const char * skip = std::getenv("GCOMP_SKIP_ORACLE_TESTS")) {
+    if (skip[0] == '1') {
+      GTEST_SKIP() << "Oracle tests disabled via GCOMP_SKIP_ORACLE_TESTS";
+    }
+  }
+  ASSERT_TRUE(realLz4().ok())
+      << "liblz4 could not be loaded, so nothing in this file checked that the "
+         "real implementation reads the frames we write. Install the runtime "
+         "library, or set GCOMP_SKIP_ORACLE_TESTS=1 to say the gap is "
+         "intentional.";
 }
 
 TEST_F(Lz4SpecOracleTest, RealLz4_ReadsOurFrames) {

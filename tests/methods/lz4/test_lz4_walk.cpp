@@ -735,6 +735,16 @@ bool foreign_encode(const ForeignShape & shape, const std::vector<uint8_t> & in,
   return true;
 }
 
+/**
+ * @brief Whether this run asked for no oracle tests.
+ *
+ * The same switch the other oracle suites read; README.md documents it.
+ */
+bool skip_oracle() {
+  const char * e = std::getenv("GCOMP_SKIP_ORACLE_TESTS");
+  return e && std::string(e) == "1";
+}
+
 } // namespace
 
 /**
@@ -898,4 +908,28 @@ TEST(Lz4Walk, ChunkingDoesNotChangeTheWalkOfAForeignFrame) {
       }
     }
   }
+}
+
+/**
+ * @brief Say so if no foreign bytes were ever walked.
+ *
+ * Every test in this section needs liblz4 and skips without it, and a skipped
+ * test reads exactly like one that was never written.  With the library
+ * missing, the whole section - the only part of this file that walks a frame
+ * another implementation wrote - disappears and the binary still exits 0.
+ * Nothing above covers the claim in its place: those tests walk our own
+ * encoder's output, which is the round trip this section exists to escape.
+ *
+ * Measured rather than assumed.  With liblz4.so.1 hidden in a mount namespace
+ * this binary skipped three tests, reported no failure, and exited 0.
+ */
+TEST(Lz4Walk, OracleIsActuallyAvailable) {
+  if (skip_oracle()) {
+    GTEST_SKIP() << "Oracle tests disabled via GCOMP_SKIP_ORACLE_TESTS";
+  }
+  ASSERT_TRUE(realLz4f().ok())
+      << "liblz4 could not be loaded, so nothing in this file walked a frame "
+         "another implementation wrote. Only the runtime library is needed - "
+         "no development package, and pkg-config is never consulted - or set "
+         "GCOMP_SKIP_ORACLE_TESTS=1 to say the gap is intentional.";
 }
