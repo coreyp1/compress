@@ -105,6 +105,18 @@ make check-oracle      # the fourteen oracle suites, against the pinned set
 make oracle-version    # print every reference and its version
 ```
 
+A second, unreleased zstd is pinned beside the gating one for the reading a
+single reference cannot give - whether a disagreement is what upstream changed or
+what we got wrong:
+
+```bash
+make oracle-build-next && make check-oracle-next
+```
+
+It currently agrees byte for byte across 128 configurations, so it is a tripwire
+rather than a live second opinion; `documentation/testing/oracles.md` has the
+measurement.
+
 Every version is recorded in `tools/oracle/containers/IMAGES` and checked at run
 time, so a run states what answered rather than naming a set of tool names. In
 there a **skip is a failure**: the references are present by construction, so a

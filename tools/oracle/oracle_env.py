@@ -94,6 +94,10 @@ PROBE = {
     "zlib": (["zlib-version"], "zlib "),
     "gzip": (["gzip-version"], "gzip "),
     "pyzstd": (["pyzstd-version"], "pyzstd "),
+    # The alias target. Same probe script: the image puts its zstd in
+    # /usr/local/bin, which precedes /usr/bin, so `zstd --version` reports the
+    # built one without the probe knowing anything about it.
+    "zstd-next": (["zstd-version"], "zstd "),
 }
 
 # What a host-mode run asks instead, when there is no image to run a probe in.
@@ -113,6 +117,9 @@ HOST_PROBE = {
         "gzip --version 2>&1 | sed -n '1s/^gzip \\([0-9][0-9.]*\\).*/gzip \\1/p'"],
     "pyzstd": ["python3", "-c", "import pyzstd;"
         "print('pyzstd', pyzstd.__version__, 'zstd', pyzstd.zstd_version)"],
+    # No zstd-next: a host has one zstd, and a probe that reported it under both
+    # names would make an aliased host run look like a two-version reading when
+    # it is one version answering twice. ensure() refuses instead.
 }
 
 _pins = None

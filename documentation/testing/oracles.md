@@ -87,6 +87,51 @@ cannot, for two measured reasons:
 The binaries are built on the host, against the host's own compiler, and only
 *run* inside. This image pins the references; it does not pin the build.
 
+## A second zstd, ahead of the release
+
+`zstd-next` is a second pin for the same questions, and it is **not gating**:
+`unicode`'s python/python-next shape, where one reference is a release and the
+other is ahead of it, and a disagreement from the second is a finding to triage
+rather than a failure to fix.
+
+There is no newer release to point it at - upstream's latest is v1.5.7, which is
+what Debian 13 carries and what the gating pin already names - so "next" means
+the development branch, pinned to a commit rather than a branch, and it reports
+itself as **v1.6.0**. That is the one place where building from source earns its
+keep here: Debian will never carry two zstds. It is also why the same argument did
+*not* apply to the pins expiring, where a dated snapshot was the better answer.
+
+The image overlays the `refs` one, so every other reference is byte-identical to
+the gating run and only zstd's answers can differ - which is what makes a
+disagreement attributable. It does not move pyzstd's zstd, which is compiled into
+`backports.zstd` and stays at 1.5.7.
+
+```bash
+make oracle-build-next   # builds refs, then this on top of it
+make check-oracle-next   # the same fourteen suites, against v1.6.0
+```
+
+**What it is worth today, measured rather than assumed.** All 164 tests pass
+against v1.6.0, and each version reads what the other writes. But a clean run
+only means something if the two references differ, so that was checked: across
+**128 configurations** - four input shapes (prose, incompressible, zeros, a
+repeat beyond the ordinary match window), four sizes from 100 B to 3 MB, and
+eight option sets including `-22 --ultra`, `--long=27` and `-T4` - the two
+produce **byte-identical output in every one**. The binaries themselves differ
+(different SHA-256, different size, different `--version`, `--help` and `-b`
+output), and the comparison was controlled by checking that it does report `-1`
+against `-9` as different.
+
+So the honest reading: **v1.6.0 has not changed the encoder's output for anything
+this suite asks**, and the pin is currently a tripwire rather than a live second
+opinion. That is itself the answer to "will the next zstd move our ratios" - it
+does not - and the day upstream does change something, this is what sees it
+before the release lands rather than after.
+
+It is deliberately not in CI. It needs a source build from a network clone on
+every run, and an advisory reference whose disagreement is not a failure does not
+belong in a gate that must be green to merge.
+
 ## Using it
 
 ```bash

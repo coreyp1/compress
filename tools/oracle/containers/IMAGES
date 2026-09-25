@@ -62,10 +62,30 @@ zlib	localhost/ghoti-compress-oracle-refs:deb13-2	zlib 1.3.1	RFC 1950 and RFC 19
 gzip	localhost/ghoti-compress-oracle-refs:deb13-2	gzip 1.13	RFC 1952 member structure, through the CLI
 pyzstd	localhost/ghoti-compress-oracle-refs:deb13-2	pyzstd 0.19.1 zstd 1.5.7	The seekable format (SeekableZstdFile) and dictionary training
 
-# Not here yet, and each is a reading rather than an afternoon:
-#   zstd-next   a newer zstd CLI beside this one, so that a disagreement can be
-#               read as "what upstream changed" rather than "what we got wrong";
-#               this is `unicode`'s python/python-next shape and the reason its
-#               ALIAS mechanism is kept below with nothing using it
+# The second reading, and it is not a gating pin. `unicode`'s python/python-next
+# shape: one reference that is a release and one ahead of it, whose disagreements
+# are findings to triage rather than failures to fix.
+#
+# **There is no newer release to point at.** Upstream's latest is v1.5.7, exactly
+# what Debian 13 carries and what the line above pins, so "next" means the
+# development branch - 399 commits and 47 changed files under lib/ ahead of
+# v1.5.7, reporting itself as **v1.6.0**. That is the one case where building from
+# source earns its keep: Debian will never carry two zstds. It is also why the
+# same argument did *not* apply to the expiry problem, where a dated snapshot was
+# the better answer and a source build would have fixed nothing.
+#
+# The pin is a commit rather than a branch, because a branch moves under you.
+#
+# It overlays the refs image, so every other reference is byte-identical to the
+# gating run and only zstd's answers can differ - which is what makes a
+# disagreement attributable. The one thing it does not move is pyzstd's zstd,
+# compiled into backports.zstd and still 1.5.7: an aliased run changes the CLI
+# and nothing else.
+#
+# Used by `make check-oracle-next`, which is
+#   GHOTI_ORACLE_ALIAS=zstd=zstd-next make check-oracle
+zstd-next	localhost/ghoti-compress-oracle-zstd-next:dev-01b7154	zstd 1.6.0	The same questions as zstd, at what the next release will be
+
+# Not here yet:
 #   lz4-cli     the lz4 CLI, for the frame-level questions the library API
 #               cannot be asked

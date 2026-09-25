@@ -2432,13 +2432,21 @@ ORACLE_TEST_NAMES := testZstd_oracle testZstd_walk testZstd_dict_format \
 	testOracle testSeekable testGolden_provenance
 ORACLE_TESTS := $(addprefix $(APP_DIR)/,$(addsuffix $(EXE_EXTENSION),$(ORACLE_TEST_NAMES)))
 
-.PHONY: oracle-build oracle-version check-oracle check-oracle-coverage oracle-help
+.PHONY: oracle-build oracle-build-next oracle-version check-oracle check-oracle-next
+.PHONY: check-oracle-coverage oracle-help
 
 oracle-build: ## Build the pinned oracle image from its Containerfile
 	@printf "\n### Building the oracle reference image ###\n"
 	podman build -t ghoti-compress-oracle-refs:deb13-2 \
 		-f $(ORACLE)/containers/refs/Containerfile \
 		$(ORACLE)/containers/refs
+
+oracle-build-next: ## Build the second zstd, the one ahead of the release
+oracle-build-next: oracle-build
+	@printf "\n### Building the zstd-next oracle image ###\n"
+	podman build -t ghoti-compress-oracle-zstd-next:dev-01b7154 \
+		-f $(ORACLE)/containers/zstd-next/Containerfile \
+		$(ORACLE)/containers/zstd-next
 
 oracle-version: ## Print which references would answer, and fail if any would not
 oracle-version:
@@ -2448,6 +2456,13 @@ check-oracle: ## Run every oracle test against the pinned references; a skip is 
 check-oracle: $(ORACLE_TESTS)
 	@printf "\n### Oracle tests, against pinned references ###\n"
 	@python3 $(ORACLE)/oracle_run.py $(ORACLE_TESTS)
+
+check-oracle-next: ## Run the oracle suites against the zstd ahead of the release
+check-oracle-next: $(ORACLE_TESTS)
+	@printf "\n### Oracle tests, against the next zstd ###\n"
+	@printf "### A disagreement here is a finding to triage, not a failure to fix: ###\n"
+	@printf "### this reference is unreleased, so it has not decided anything yet.  ###\n"
+	@GHOTI_ORACLE_ALIAS=zstd=zstd-next python3 $(ORACLE)/oracle_run.py $(ORACLE_TESTS)
 
 # The name every availability sentinel ends with. A variable so that the gate's
 # null case is reachable: `make check-oracle-coverage ORACLE_SENTINEL=NoSuchThing`
@@ -2486,6 +2501,9 @@ oracle-help: ## Explain the oracle targets and the pins
 	@printf "  make oracle-build     build the image (needed once, and when a pin moves)\n"
 	@printf "  make oracle-version   print every reference and its version\n"
 	@printf "  make check-oracle     run the %s oracle suites in the image\n" "$(words $(ORACLE_TEST_NAMES))"
+	@printf "\n  make oracle-build-next  build the second zstd, ahead of the release\n"
+	@printf "  make check-oracle-next  the same suites against it; a disagreement there\n"
+	@printf "                          is a finding to triage, not a failure to fix\n"
 	@printf "\nThe pins are in %s/containers/IMAGES.\n" "$(ORACLE)"
 	@printf "GHOTI_ORACLE_MODE=host uses this machine's own tools instead, and\n"
 	@printf "still checks them against those pins - which is how a drifting\n"

@@ -1,0 +1,91 @@
+# A second zstd, so that a disagreement can be read as "what upstream changed"
+# rather than "what we got wrong".
+#
+# notes/suite/CONTAINERS.md section 2.6, and `unicode`'s python/python-next pair
+# is the shape being copied: one gating pin that is a release, and a second one
+# that is ahead of it, whose disagreements are findings to triage rather than
+# failures to fix.
+#
+# **Why this is a source build and not another apt pin.** There is no newer
+# release to point at: upstream's latest is v1.5.7, which is exactly what Debian
+# 13 carries and what the `refs` image already pins. Debian will never carry two
+# zstds, so the only way to have a second one is to build it - which is the case
+# where building from source earns its keep, as against the expiry problem, where
+# a dated snapshot was the better answer and this would have fixed nothing.
+#
+# So "next" here means the development branch: 399 commits and 47 changed files
+# under lib/ ahead of v1.5.7 when this was written, which is what 1.5.8 or 1.6
+# will be. That makes it advisory rather than gating, for the same reason
+# `unicode`'s python-next is: an unreleased reference that disagrees has not
+# necessarily decided anything yet. What it buys is finding out *before* the
+# release lands that upstream has tightened its decoder against something we
+# emit, or started emitting something ours cannot read.
+#
+# The pin is a commit, not a branch. A branch moves under you; the whole point of
+# a pin is that raising it is an edit somebody makes on purpose.
+#
+# **It overlays the refs image rather than replacing it**, because what runs
+# inside is a test binary and a single binary consults several references. So
+# every other reference is byte-identical to the gating run and only zstd's
+# answers can differ - which is what makes a disagreement attributable. The one
+# thing this does *not* move is pyzstd's zstd: that is compiled into
+# backports.zstd and stays at 1.5.7, so an aliased run changes the CLI and
+# nothing else. containers/IMAGES says so on the line.
+
+FROM docker.io/library/debian@sha256:7792b1f7702a86946cd518db72b6a407302c3e9bc1635634368b878189e8221c AS build
+
+ARG SNAPSHOT=20260918T000000Z
+ARG ZSTD_COMMIT=01b7154f1172432f8abe9b3bb9909e14a1176b7d
+
+# The same dated snapshot as the refs image, for the same reason: an exact apt
+# version against the live archive stops resolving when the archive moves.
+RUN printf 'Types: deb\nURIs: http://snapshot.debian.org/archive/debian/%s\nSuites: trixie trixie-updates\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n\nTypes: deb\nURIs: http://snapshot.debian.org/archive/debian-security/%s\nSuites: trixie-security\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n' \
+      "$SNAPSHOT" "$SNAPSHOT" > /etc/apt/sources.list.d/debian.sources \
+    && printf 'Acquire::Check-Valid-Until "false";\n' \
+      > /etc/apt/apt.conf.d/99snapshot
+
+RUN apt-get update -qq \
+    && apt-get install -y --no-install-recommends \
+      ca-certificates=20250419 \
+      git=1:2.47.3-0+deb13u1 \
+      gcc=4:14.2.0-1 \
+      make=4.4.1-2 \
+      libc6-dev=2.41-12+deb13u4 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Fetching one commit rather than cloning the branch: GitHub serves a named
+# object, so this is a few megabytes instead of the whole history, and the
+# request itself names the pin.
+RUN git init -q /src \
+    && cd /src \
+    && git remote add origin https://github.com/facebook/zstd \
+    && git fetch -q --depth 1 origin "${ZSTD_COMMIT}" \
+    && git checkout -q FETCH_HEAD \
+    && git rev-parse HEAD
+
+# Only the CLI. No liblz4, liblzma or zlib support is configured, so this binary
+# reads and writes Zstandard and nothing else - which is all any oracle here asks
+# it for, and it keeps the build from needing three more pinned -dev packages.
+RUN make -C /src/programs -j"$(nproc)" zstd HAVE_ZLIB=0 HAVE_LZMA=0 HAVE_LZ4=0 \
+    && /src/programs/zstd --version
+
+# The whole reference set, with this zstd in front of Debian's on PATH.
+# /usr/local/bin precedes /usr/bin, so the existing zstd-version probe reports
+# this one without being changed.
+FROM localhost/ghoti-compress-oracle-refs:deb13-2
+
+COPY --from=build /src/programs/zstd /usr/local/bin/zstd
+
+# Said out loud at build time: an image whose only purpose is to carry a
+# different zstd should fail here rather than quietly be a copy of the refs one.
+RUN set -e; \
+    new=$(/usr/local/bin/zstd --version); \
+    old=$(/usr/bin/zstd --version); \
+    printf 'built:  %s\ndebian: %s\n' "$new" "$old"; \
+    if [ "$new" = "$old" ]; then \
+      echo "the built zstd reports the same version as Debian's; this image would be a second copy of the first" >&2; \
+      exit 1; \
+    fi
+
+ENTRYPOINT []
+CMD ["sh", "-c", "zstd-version; lz4-version; zlib-version; gzip-version; pyzstd-version"]
