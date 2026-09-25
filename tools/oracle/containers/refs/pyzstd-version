@@ -1,0 +1,12 @@
+#!/bin/sh
+# pyzstd's version *and* the zstd version it will answer with, on one line.
+#
+# Both, because they are two pins and only one of them is pyzstd's. pyzstd
+# 0.19.1 declares `backports-zstd>=1.0.0`, and below Python 3.14 that package
+# carries the zstd implementation compiled into it. So `pyzstd 0.19.1` alone
+# would be satisfied by an image whose actual zstd had moved underneath it, and
+# the seekable frames this oracle writes are written by that zstd. Naming it
+# here is what makes the open range fail the pin check instead of answering.
+exec python3 -c '
+import pyzstd
+print("pyzstd", pyzstd.__version__, "zstd", pyzstd.zstd_version)'

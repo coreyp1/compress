@@ -13,3 +13,7 @@ tasks
 # Fuzz testing (generated files)
 fuzz/corpus
 fuzz/findings
+
+# Python bytecode, from the oracle tooling under tools/oracle/. Spelled as
+# ../regex spells it.
+**/__pycache__

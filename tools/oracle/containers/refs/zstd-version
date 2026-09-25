@@ -1,0 +1,7 @@
+#!/bin/sh
+# The zstd CLI's own claim, not the image's tag.
+#
+# `zstd --version` prints a decorated banner - "*** Zstandard CLI (64-bit)
+# v1.5.7, by Yann Collet ***" - so the version is cut out of it here rather
+# than in a caller, where a change to the banner would read as a pin failure.
+exec zstd --version 2>&1 | sed -n 's/.*v\([0-9][0-9.]*\).*/zstd \1/p'

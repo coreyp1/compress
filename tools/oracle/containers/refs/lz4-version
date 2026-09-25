@@ -1,0 +1,14 @@
+#!/bin/sh
+# liblz4's own claim, asked the way the tests ask it.
+#
+# There is no lz4 CLI in this image and deliberately so: the oracles dlopen the
+# runtime library by name, and a CLI's version would be a different fact about
+# a different file. So this loads the same soname the tests load and calls
+# LZ4_versionString(), which is the library speaking for itself. dpkg-query
+# would name the package instead, which is one indirection further from what
+# answers.
+exec python3 -c '
+import ctypes
+lib = ctypes.CDLL("liblz4.so.1")
+lib.LZ4_versionString.restype = ctypes.c_char_p
+print("liblz4", lib.LZ4_versionString().decode())'

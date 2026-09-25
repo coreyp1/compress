@@ -87,83 +87,71 @@ make fuzz-help
 
 Findings are saved to `fuzz/findings/<target>/crashes/`. See `documentation/testing/fuzzing.md` for detailed documentation.
 
-### Oracle Testing (Optional)
+### Oracle Testing
 
-The library includes oracle tests that cross-validate our compression/decompression against external reference implementations. These tests require optional dependencies.
+The oracle tests are the part of the suite that is not self-referential: they
+compare this library's output against implementations nobody here wrote. Nine
+test files carry ten availability sentinels that **fail** when their reference
+is absent, because a skipped oracle test and an absent one are the same line in
+a summary. `GCOMP_SKIP_ORACLE_TESTS=1` is how a machine without them says so
+deliberately.
 
-Without these dependencies, the oracle tests will skip the external validation tests but still run internal validation. All core functionality tests run without optional dependencies.
-
-**Install all oracle dependencies at once:**
-```bash
-# CLI tools
-sudo apt install gzip lz4 zstd
-
-# Python modules
-pip3 install lz4 zstandard
-```
-
-#### Gzip Oracle
-
-Python's built-in `gzip` module is used (no extra install needed). The `gzip` CLI tool is typically pre-installed on Linux systems.
+**The recommended way to run them is against pinned references, in a
+container:**
 
 ```bash
-# Verify
-gzip --version
-python3 -c "import gzip; print('gzip module available')"
+make oracle-build      # once, and whenever a pin moves
+make check-oracle      # the nine oracle suites, against the pinned set
+make oracle-version    # print every reference and its version
 ```
 
-#### LZ4 Oracle
+Every version is recorded in `tools/oracle/containers/IMAGES` and checked at run
+time, so a run states what answered rather than naming a set of tool names. In
+there a **skip is a failure**: the references are present by construction, so a
+skip means a test could not reach one the image promises.
+`documentation/testing/oracles.md` is the full account, including what a
+container cannot pin.
 
-**CLI tools:**
-```bash
-sudo apt install lz4
-```
+**To run them against this machine's own tools instead**, the references are:
 
-**Python module:**
-```bash
-pip3 install lz4
-```
-
-**Verification:**
-```bash
-lz4 --version
-python3 -c "import lz4.frame; print(lz4.__version__)"
-```
-
-#### Zstd Oracle
-
-**CLI tools:**
-```bash
-sudo apt install zstd
-```
-
-**Python module:**
-```bash
-pip3 install zstandard
-```
-
-**Verification:**
-```bash
-zstd --version
-python3 -c "import zstandard; print(zstandard.__version__)"
-```
-
-#### Controlling Oracle Tests
-
-Oracle tests can be controlled with environment variables:
+| reference | what needs it | how it is reached |
+| --- | --- | --- |
+| `zstd` CLI | zstd frames, dictionaries, the seek table | `system()` |
+| `liblz4` runtime library | the LZ4 frame and block formats | `dlopen` by soname |
+| `gzip` / `gunzip` CLI | RFC 1952 member structure | `system()` |
+| python `zlib` module | RFC 1950 and RFC 1951 | `python3 -c` |
+| python `pyzstd` | the seekable format, dictionary training | `python3 -c` |
 
 ```bash
-# Skip all oracle tests
-GCOMP_SKIP_ORACLE_TESTS=1 make test
-
-# Enable verbose oracle test output
-GCOMP_ORACLE_VERBOSE=1 make test
+sudo apt install gzip zstd liblz4-1
+pip3 install pyzstd
 ```
+
+Two things that were wrong here for a long time and are worth stating, because
+both cost somebody a wrong conclusion:
+
+- **`liblz4` needs no development package.** The tests load it by name at run
+  time, so `pkg-config --modversion liblz4` failing says nothing about whether
+  they run. A survey of this workspace read that failure as fourteen skipping
+  tests; all fourteen were passing.
+- **Neither the `lz4` CLI nor the python `lz4` and `zstandard` modules are
+  used.** This section used to ask for all three. `pyzstd` is what the seekable
+  and dictionary-training oracles use, and it was not mentioned.
+
+Verify a host set with:
+
+```bash
+make oracle-version GHOTI_ORACLE_MODE=host
+```
+
+which prints each reference's version and fails if any does not match its pin -
+which is how a drifting reference is found rather than silently used.
 
 ### Continuous Integration
 
 Every push and pull request runs `.github/workflows/ci.yml`, which is nothing
-but the targets above, run in six jobs:
+but the targets above, run in eight jobs (the first is a matrix of two
+compilers):
 
 | Job | Runs |
 | --- | --- |
@@ -174,6 +162,8 @@ but the targets above, run in six jobs:
 | Valgrind | `make test-valgrind-quiet`, which fails on a leak |
 | Fuzz corpus replay | `make fuzz-replay AFL_CC=clang` over the tracked `fuzz/regression` corpus |
 | Coverage floor | `make coverage COVERAGE_MIN=...`, which fails if line coverage drops below the floor |
+| Oracles (pinned) | `make oracle-build`, `oracle-version`, `check-oracle` - the oracle suites against pinned reference versions |
+| Windows (MSYS2) | the everyday gate again, natively on `windows-latest` under MINGW64 |
 
 Two things there are not just a target being run:
 
@@ -189,11 +179,17 @@ Two things there are not just a target being run:
   ```
 
 - **The oracle references are installed by CI rather than left to chance.**
-  Eight test files assert that their reference implementation is actually
-  present (`OracleIsActuallyAvailable`), because a skipped oracle test and an
+  Nine test files carry ten sentinels asserting that their reference
+  implementation is actually present, because a skipped oracle test and an
   absent one look identical in the summary line - a run that compared nothing
   against anything would otherwise report success. `GCOMP_SKIP_ORACLE_TESTS=1`
-  is how a machine without them says so deliberately.
+  is how a machine without them says so deliberately. Ten rather than nine
+  because `test_lz4_spec_oracle.cpp` has two references and one sentinel cannot
+  answer for both; it shipped with one that covered only the specification half.
+
+  CI installs those references unpinned, which `make check-oracle` is the answer
+  to: it runs the same suites against the versions
+  `tools/oracle/containers/IMAGES` names.
 
 A campaign with `afl-fuzz` is not in CI: it needs a corpus that persists
 between runs to be worth anything, and the replay above is the part worth

@@ -1,0 +1,100 @@
+# Every reference this library compares itself against, pinned, in one image.
+#
+# notes/suite/CONTAINERS.md section 4a. What is different here from the other
+# libraries' oracle images, and why it is one image rather than four:
+#
+# **The references interlock, so they cannot be split.** `/usr/bin/zstd` links
+# `liblz4.so.1` (measured with ldd), so an image carrying a pinned zstd CLI and
+# no liblz4 has no working zstd CLI either. And `pyzstd` is asked the same
+# questions about the same format as the CLI, so if the two carried different
+# zstd versions a disagreement between them would be this image's fault rather
+# than a finding. One image is what makes "the reference set" a single fact.
+#
+# **What runs inside is a test binary, not a driver script.** The other
+# libraries' oracles are reached from Python drivers, so the image needs only
+# the reference. This library's oracles are inside gtest binaries - they call
+# `zstd` with system(), run `python3 -c` scripts, and dlopen liblz4 - so the
+# only way to pin `liblz4` at all is for the binary that loads it to be the
+# thing running in here. That is why this image carries libstdc++ and nothing
+# else of a toolchain: the binaries are built on the host, against the host's
+# own compiler, and only *run* here. This image pins the references, not the
+# build.
+#
+# Everything the build reads is pinned, because an image built here cannot be
+# pinned by digest - two builds of one Containerfile are not two copies of one
+# image (section 2.6). So the base is pinned by digest, Debian's packages by
+# full apt version, and the pip packages by exact version; and the run-time
+# version check in oracle_env.py is the real guarantee, which is why
+# check_pin() runs in both modes here as it does in `font`.
+#
+# The apt pins will eventually fail to resolve when the archive moves past
+# them. That is the intended failure: a bare `apt-get install zstd` would
+# quietly install a different reference and report our own output as changed.
+# snapshot.debian.org is the durable answer when it first happens; it is not
+# worth the weight before then.
+#
+# The same base digest as every other image in the suite, which is deliberate
+# twice over: one base to pull, and a glibc the host's own binaries can run
+# against - this machine is Devuan 6, which is Debian 13.
+FROM docker.io/library/debian@sha256:7792b1f7702a86946cd518db72b6a407302c3e9bc1635634368b878189e8221c
+
+# zstd      the CLI reference for the Zstandard method, and the seek table
+# libzstd1  what pyzstd's extension would bind if it linked one; pinned so that
+#           a future backports.zstd that links rather than bundles cannot bring
+#           a second zstd version in behind the pin
+# liblz4-1  the runtime library the LZ4 oracles dlopen. The -dev package is
+#           deliberately absent: the tests load it by name at run time, which
+#           is the whole reason a pkg-config probe reported it missing on the
+#           host while every one of those tests was passing
+# gzip      the CLI reference for the gzip method
+# python3   the interpreter that runs the zlib, gzip and pyzstd references; its
+#           zlib module is the RFC 1950 and RFC 1952 reference, and the version
+#           that decides an answer is the zlib it links, not the interpreter's
+RUN apt-get update -qq \
+    && apt-get install -y --no-install-recommends \
+      zstd=1.5.7+dfsg-1 \
+      libzstd1=1.5.7+dfsg-1 \
+      liblz4-1=1.10.0-4 \
+      gzip=1.13-1+deb13u1 \
+      python3=3.13.5-1 \
+      python3-pip=25.1.1+dfsg-1 \
+      ca-certificates=20250419 \
+      libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
+
+# pyzstd answers two questions nothing else here can: the seekable format
+# (SeekableZstdFile) and dictionary training (train_dict).
+#
+# **backports.zstd is pinned separately and that is not tidiness.** pyzstd
+# 0.19.1 declares `backports-zstd>=1.0.0`, and on Python below 3.14 that
+# package *is* the zstd - a C extension with its own libzstd compiled in,
+# linking nothing (`ldd` shows no libzstd). Pinning only pyzstd would leave the
+# implementation that actually answers floating on an open range, which is the
+# same defect as an unpinned apt install one layer down. The probe below prints
+# the zstd version pyzstd reports for exactly this reason, so a moved
+# dependency fails the pin check rather than quietly answering.
+#
+# A PyPI release is immutable, so an exact version is a real pin here in a way
+# an exact apt version is not.
+RUN pip install --no-cache-dir --no-compile --break-system-packages \
+      pyzstd==0.19.1 \
+      backports.zstd==1.7.0
+
+# The probes oracle_env.py runs, copied in rather than written with printf
+# inside a RUN: `font`'s first draft did that and its \x27 escapes reached the
+# file literally, which puts a quoting layer between a check and the fact it
+# checks.
+COPY zstd-version lz4-version zlib-version gzip-version pyzstd-version \
+     /usr/local/bin/
+RUN chmod +x /usr/local/bin/zstd-version /usr/local/bin/lz4-version \
+      /usr/local/bin/zlib-version /usr/local/bin/gzip-version \
+      /usr/local/bin/pyzstd-version
+
+# A locale, pinned, because `regex` lost 1,855 differential rows to an image
+# that had none (section 1.1). Nothing here is known to read it - these
+# references speak bytes - and that is the point: it should not be one more
+# thing that has to be right by accident.
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
+
+ENTRYPOINT []
+CMD ["sh", "-c", "zstd-version; lz4-version; zlib-version; gzip-version; pyzstd-version"]

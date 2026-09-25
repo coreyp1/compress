@@ -203,6 +203,52 @@ jobs:
         run: make fuzz-replay -j"$(nproc)" AFL_CC=clang PREFIX="$PREFIX"
 
   # ---------------------------------------------------------------------------
+  # The oracles, against pinned references rather than against the runner.
+  #
+  # Every other job here installs `zstd`, `liblz4` and `pyzstd` with whatever
+  # version the runner's archive happens to carry that week, and nothing records
+  # what that was - so a reference that changes an answer arrives as a failure
+  # in this library, and one that is already wrong for the comparison stays
+  # wrong quietly. This job runs the same nine oracle suites against the
+  # versions tools/oracle/containers/IMAGES names, and a skip in there is a
+  # failure rather than a fact about the machine.
+  #
+  # **This job will eventually go red for a reason that is not a code change.**
+  # The image pins Debian's packages by full apt version, and the archive keeps
+  # one version of a package: when it moves past a pin, the build fails to
+  # resolve it. That failure is deliberate - a bare `apt-get install zstd` would
+  # quietly compare against a different reference - and the fix is to raise the
+  # pin in the Containerfile and IMAGES together, having read what the new
+  # version changed. snapshot.debian.org is the durable answer if it becomes
+  # frequent; it is not worth the weight before then.
+  #
+  # The binaries are built on the runner and only *run* in the image, so this
+  # pins the references and not the build. Ubuntu's glibc is older than
+  # trixie's, which is the direction that works.
+  # ---------------------------------------------------------------------------
+  oracles:
+    name: Oracles (pinned references)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: compress
+
+      - uses: ./compress/.github/actions/setup
+
+      - name: Build the pinned reference image
+        working-directory: compress
+        run: make oracle-build
+
+      - name: Name every reference and its version
+        working-directory: compress
+        run: make oracle-version
+
+      - name: Run the oracle suites against the pinned set
+        working-directory: compress
+        run: make check-oracle -j"$(nproc)" PREFIX="$PREFIX"
+
+  # ---------------------------------------------------------------------------
   # A floor, so that coverage can only be argued upward. Raise it when the
   # number rises; do not lower it to make a branch pass.
   #

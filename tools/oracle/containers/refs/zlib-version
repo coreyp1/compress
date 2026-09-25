@@ -1,0 +1,7 @@
+#!/bin/sh
+# The zlib that answers, which is the one python3 links at run time.
+#
+# ZLIB_RUNTIME_VERSION rather than ZLIB_VERSION: the latter is what the module
+# was compiled against and the former is what is executing, and only the second
+# one decides whether a stream we produced round-trips.
+exec python3 -c 'import zlib; print("zlib", zlib.ZLIB_RUNTIME_VERSION)'

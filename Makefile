@@ -2397,6 +2397,60 @@ check-san-report:
 	fi
 	@printf "\033[0;32mAll %s sanitizer report shapes are recognised, no ordinary gtest line is, and both quiet runners scan for them.\033[0m\n" "$$(wc -l < $(BUILD_DIR)/san_report_control.txt)"
 
+# ---------------------------------------------------------------------------
+# Oracles, against pinned references
+# ---------------------------------------------------------------------------
+#
+# The suite's oracles run against whatever the machine has, which is a fact
+# about the machine rather than about this library: `zstd` 1.5.7 and `liblz4`
+# 1.10.0 here, an unrecorded pyzstd from pip, and nothing anywhere saying so.
+# These targets run the same binaries against the versions
+# tools/oracle/containers/IMAGES names. See notes/suite/CONTAINERS.md.
+#
+# Not in TEST_GATES, and deliberately, which is what every library that landed
+# this pattern also decided: `make test` must not need a container engine. What
+# this buys instead is a gate that can say which reference answered.
+
+ORACLE := tools/oracle
+
+# The binaries that consult a reference. Spelled out rather than globbed,
+# because the property that makes one of these an oracle - it compares against
+# something this project did not write - is not in its file name, and a glob
+# over tests/ would quietly stop covering a new one the day it is added without
+# the matching word in its path.
+ORACLE_TEST_NAMES := testZstd_oracle testZstd_walk testZstd_dict_format \
+	testGzip_oracle testZlib_oracle testLz4_spec_oracle testLz4_walk \
+	testOracle testSeekable
+ORACLE_TESTS := $(addprefix $(APP_DIR)/,$(addsuffix $(EXE_EXTENSION),$(ORACLE_TEST_NAMES)))
+
+.PHONY: oracle-build oracle-version check-oracle oracle-help
+
+oracle-build: ## Build the pinned oracle image from its Containerfile
+	@printf "\n### Building the oracle reference image ###\n"
+	podman build -t ghoti-compress-oracle-refs:deb13-1 \
+		-f $(ORACLE)/containers/refs/Containerfile \
+		$(ORACLE)/containers/refs
+
+oracle-version: ## Print which references would answer, and fail if any would not
+oracle-version:
+	@python3 $(ORACLE)/oracle_env.py
+
+check-oracle: ## Run every oracle test against the pinned references; a skip is a failure
+check-oracle: $(ORACLE_TESTS)
+	@printf "\n### Oracle tests, against pinned references ###\n"
+	@python3 $(ORACLE)/oracle_run.py $(ORACLE_TESTS)
+
+oracle-help: ## Explain the oracle targets and the pins
+	@printf "\nOracles run against pinned references in a container image.\n\n"
+	@printf "  make oracle-build     build the image (needed once, and when a pin moves)\n"
+	@printf "  make oracle-version   print every reference and its version\n"
+	@printf "  make check-oracle     run the %s oracle suites in the image\n" "$(words $(ORACLE_TEST_NAMES))"
+	@printf "\nThe pins are in %s/containers/IMAGES.\n" "$(ORACLE)"
+	@printf "GHOTI_ORACLE_MODE=host uses this machine's own tools instead, and\n"
+	@printf "still checks them against those pins - which is how a drifting\n"
+	@printf "reference is found rather than silently used.\n\n"
+
+
 test: ## Make and run the Unit tests
 test: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES) $(TEST_GATES)
 # The loop used to end with the test run itself, so the recipe exited with the
