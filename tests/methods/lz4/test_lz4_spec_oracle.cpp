@@ -28,6 +28,8 @@
 #include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/registry.h>
 #include <ghoti.io/compress/stream.h>
+#include "data/golden_vectors.h"
+
 #include <gtest/gtest.h>
 #include <ghoti.io/cutil/library.h>
 #include <algorithm>
@@ -2534,6 +2536,59 @@ TEST_F(Lz4SpecOracleTest, OurDecoder_ReadsRealLz4Frames) {
 }
 
 } // namespace
+
+/**
+ * @brief Do the committed golden vectors mean what their file says?
+ *
+ * `data/golden_vectors.h` says its vectors were "VERIFIED using Python's lz4
+ * library (version 4.4.5)", and `test_lz4_golden.cpp` checks this library's
+ * decoder against them. The whole value of that is that this project did not
+ * write the bytes - a vector from elsewhere can catch a misreading of the frame
+ * format that our encoder and decoder share, and nothing else can.
+ *
+ * **Nothing ever checked the sentence.** If a vector were in fact produced by
+ * this library, or typed out and never confirmed, then test_lz4_golden.cpp
+ * passing against it is a round trip wearing a disguise - it reads as an
+ * external check and is not one, and it passes either way.
+ *
+ * So each vector goes through liblz4 here and the answer is compared with the
+ * committed expectation. Nothing is regenerated and no fixture changes; a
+ * comment becomes a check. The same is done for deflate, gzip and zstd in
+ * tests/integration/test_golden_provenance.cpp - here rather than there because
+ * this is where the liblz4 loader lives, and two copies of that loader would
+ * drift.
+ *
+ * Note this is a different reference from the one the file names: liblz4 itself
+ * rather than the `lz4` Python binding, which is a wrapper around it. That is
+ * the stronger of the two and it is the one already pinned.
+ */
+TEST_F(Lz4SpecOracleTest, GoldenVectorsAreWhatTheirFileClaims) {
+  const RealLz4 & lib = realLz4();
+  if (!lib.ok()) {
+    GTEST_SKIP() << "liblz4 is not installed";
+  }
+  ASSERT_GT(lz4_golden_vectors_count, 0u) << "no golden vectors are present";
+
+  for (size_t i = 0; i < lz4_golden_vectors_count; i++) {
+    const lz4_golden_vector_t & vec = lz4_golden_vectors[i];
+    SCOPED_TRACE(vec.name);
+    const std::vector<uint8_t> frame(
+        vec.compressed, vec.compressed + vec.compressed_len);
+    std::vector<uint8_t> got;
+    std::string err;
+    ASSERT_TRUE(realLz4Decode(frame, &got, &err))
+        << "liblz4 refused these bytes (" << err << "), which the file says it "
+        << "verified. Either the vector is not what the comment claims, or it "
+        << "is corrupt.";
+    ASSERT_EQ(got.size(), vec.expected_len)
+        << "liblz4 decoded " << got.size() << " bytes and the committed "
+        << "expectation is " << vec.expected_len;
+    if (vec.expected_len > 0) {
+      EXPECT_EQ(std::memcmp(got.data(), vec.expected, vec.expected_len), 0)
+          << "liblz4 and the committed expectation disagree on the bytes";
+    }
+  }
+}
 
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);

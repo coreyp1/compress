@@ -460,6 +460,7 @@ TESTFLAGS_PC := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --l
 # mangle_path check-symbols is right to reject in a shipping library and
 # wrong to reject in an instrumented one. Spelled as text's TEST_GATES is.
 TEST_GATES ?= check-symbols check-clean-guard check-aliasing check-test-build check-stamps \
+	check-oracle-coverage \
 	check-san-report
 
 
@@ -2415,19 +2416,27 @@ ORACLE := tools/oracle
 
 # The binaries that consult a reference. Spelled out rather than globbed,
 # because the property that makes one of these an oracle - it compares against
-# something this project did not write - is not in its file name, and a glob
-# over tests/ would quietly stop covering a new one the day it is added without
-# the matching word in its path.
+# something this project did not write - is not in its file name: four of these
+# have no "oracle" in their path and one file called test_zlib_dictionary.cpp
+# is one.
+#
+# The list being written by hand is exactly why check-oracle-coverage exists.
+# The first version of it was short by four suites - testDeflate_oracle,
+# testLzw_spec_oracle, testRle_spec_oracle and testZlib_dictionary - because it
+# was built by reading the files that contain a GTEST_SKIP, and those four
+# carry an availability sentinel without one. A hand-written list of the things
+# that must be checked is a thing that must itself be checked.
 ORACLE_TEST_NAMES := testZstd_oracle testZstd_walk testZstd_dict_format \
-	testGzip_oracle testZlib_oracle testLz4_spec_oracle testLz4_walk \
-	testOracle testSeekable
+	testGzip_oracle testZlib_oracle testZlib_dictionary testLz4_spec_oracle \
+	testLz4_walk testDeflate_oracle testLzw_spec_oracle testRle_spec_oracle \
+	testOracle testSeekable testGolden_provenance
 ORACLE_TESTS := $(addprefix $(APP_DIR)/,$(addsuffix $(EXE_EXTENSION),$(ORACLE_TEST_NAMES)))
 
-.PHONY: oracle-build oracle-version check-oracle oracle-help
+.PHONY: oracle-build oracle-version check-oracle check-oracle-coverage oracle-help
 
 oracle-build: ## Build the pinned oracle image from its Containerfile
 	@printf "\n### Building the oracle reference image ###\n"
-	podman build -t ghoti-compress-oracle-refs:deb13-1 \
+	podman build -t ghoti-compress-oracle-refs:deb13-2 \
 		-f $(ORACLE)/containers/refs/Containerfile \
 		$(ORACLE)/containers/refs
 
@@ -2439,6 +2448,38 @@ check-oracle: ## Run every oracle test against the pinned references; a skip is 
 check-oracle: $(ORACLE_TESTS)
 	@printf "\n### Oracle tests, against pinned references ###\n"
 	@python3 $(ORACLE)/oracle_run.py $(ORACLE_TESTS)
+
+# The name every availability sentinel ends with. A variable so that the gate's
+# null case is reachable: `make check-oracle-coverage ORACLE_SENTINEL=NoSuchThing`
+# must fail with "measured nothing" rather than pass, which is the difference
+# between a gate that found no omissions and one that found no sentinels.
+ORACLE_SENTINEL ?= IsActuallyAvailable
+
+check-oracle-coverage: ## Fail if a suite carries an availability sentinel but is not in ORACLE_TEST_NAMES
+check-oracle-coverage: $(TEST_EXECUTABLES)
+	@printf "\n### Every suite with a reference is in the oracle gate ###\n"
+	@missing=""; found=0; \
+	for exe in $(TEST_EXECUTABLES); do \
+		n=$$("$$exe" --gtest_list_tests 2>/dev/null | grep -c '$(ORACLE_SENTINEL)' || true); \
+		if [ "$$n" -gt 0 ]; then \
+			found=$$((found + n)); \
+			case " $(ORACLE_TEST_NAMES) " in \
+				*" $$(basename $$exe) "*) ;; \
+				*) missing="$$missing $$(basename $$exe)";; \
+			esac; \
+		fi; \
+	done; \
+	if [ "$$found" -eq 0 ]; then \
+		printf "### no sentinel was found in any binary, so this gate measured nothing ###\n" >&2; \
+		exit 1; \
+	fi; \
+	if [ -n "$$missing" ]; then \
+		printf "### these carry an availability sentinel and are not in ORACLE_TEST_NAMES:%s ###\n" "$$missing" >&2; \
+		printf "### so \`make check-oracle\` does not run them, and their reference is pinned by nothing ###\n" >&2; \
+		exit 1; \
+	fi; \
+	printf "\033[0;32m%s sentinels across %s suites, every one of them in the oracle gate.\033[0m\n" \
+		"$$found" "$(words $(ORACLE_TEST_NAMES))"
 
 oracle-help: ## Explain the oracle targets and the pins
 	@printf "\nOracles run against pinned references in a container image.\n\n"

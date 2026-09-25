@@ -7,7 +7,7 @@ misreading of the specification that the encoder and decoder share.
 
 The oracle tests are the part that is not self-referential. They compare against
 implementations nobody here wrote: the `zstd` CLI, `liblz4`, `gzip`, Python's
-`zlib` module, and `pyzstd`. Nine test files carry **ten availability
+`zlib` module, and `pyzstd`. Fourteen test files carry **fifteen availability
 sentinels** (`OracleIsActuallyAvailable`, and `RealImplementationIsActuallyAvailable`
 where one file has two references) which *fail* when their reference is absent,
 because a skipped oracle test and an absent one are the same line in a summary.
@@ -40,6 +40,15 @@ need to be.
 `tools/oracle/containers/IMAGES` is the manifest: one line per reference, with
 the version it must claim when asked. All five lines name one image, built from
 `tools/oracle/containers/refs/Containerfile`.
+
+The base is pinned by digest, the pip packages by exact version, and Debian's
+packages by full apt version **against a dated snapshot** rather than the live
+archive - at the date the base image itself records in its own sources file. The
+archive keeps one version of a package and drops it when an update lands, so an
+exact version against the live archive resolves today and fails to resolve in
+some number of weeks; `snapshot.debian.org` keeps all of them. That also pins
+more than it names: the five packages are exact and everything they pull comes
+from one frozen archive state, so the whole transitive closure is reproducible.
 
 | reference | version | answers for |
 | --- | --- | --- |
@@ -83,7 +92,7 @@ The binaries are built on the host, against the host's own compiler, and only
 ```bash
 make oracle-build      # build the image: once, and whenever a pin moves
 make oracle-version    # print every reference and its version, or fail
-make check-oracle      # run the nine oracle suites against the pinned set
+make check-oracle      # run the fourteen oracle suites against the pinned set
 make oracle-help       # the short version of this page
 ```
 
@@ -121,18 +130,59 @@ reference that is present but unusable, and it needs nobody to have remembered
 to write a sentinel - which matters, because `test_lz4_spec_oracle.cpp` shipped
 a sentinel that answered for only one of its file's two references.
 
-## What a container cannot pin
+## The golden vectors, and what checking them was worth
 
 Four `golden_vectors.h` files - deflate, gzip, lz4 and zstd - hold committed
-bytes attributed to a reference in a comment: *"VERIFIED using Python's lz4
-library (version 4.4.5)"*, and a generation command written as
-`python3 -c "import lz4.frame; ..."`. The version is recorded and the command is
-an ellipsis, so the bytes cannot be regenerated from what is written, and no
-image can retroactively pin what produced them.
+compressed bytes and the output they should decode to. The decoder suites check
+this library against them, and the whole value of that is that this project did
+not write the bytes: a vector from elsewhere can catch a misreading of a format
+that our own encoder and decoder share.
 
-That is a **materialised** reference rather than a live one, and it wants its own
-piece of work: a real generator, run in a pinned image, proved to reproduce the
-committed bytes exactly. Until then those suites check this library against
-bytes whose provenance is a sentence. They are deliberately not in
-`ORACLE_TEST_NAMES`, which names only the binaries that consult a live
-reference.
+That value rested on a sentence in a comment, and **nothing checked the
+sentence**:
+
+| file | claims | now checked against |
+| --- | --- | --- |
+| deflate | "generated using Python's zlib module" | python `zlib`, raw stream |
+| gzip | "generated using Python's gzip/zlib modules" | python `gzip` |
+| lz4 | "VERIFIED using Python's lz4 library (version 4.4.5)" | `liblz4` itself |
+| zstd | "minimal valid Zstandard frames (RFC 8878 / zstd format spec)" | the `zstd` CLI |
+
+If a vector were in fact produced by this library, or typed out and never
+confirmed, a decoder suite passing against it is a round trip wearing a disguise
+- it reads as an external check and is not one, and it passes either way.
+
+`test_golden_provenance.cpp` hands every committed vector to its reference and
+compares with the committed expectation; lz4's are done in
+`test_lz4_spec_oracle.cpp`, where the `liblz4` loader already lives. Nothing is
+regenerated and no fixture changes. **All of them pass**, so the attributions
+are true.
+
+Three things worth knowing about that gate:
+
+- **zstd's file is the interesting one.** It names no tool at all - the frames
+  were read out of the specification by hand - so this is the first time
+  anything external has seen them, which makes it the most valuable of the four
+  rather than the weakest.
+- **lz4 is checked against a stronger reference than its file names.** The file
+  says the Python `lz4` binding; this uses `liblz4` itself, which is what that
+  binding wraps, and is the one already pinned.
+- **Two deflate vectors sit outside the table** because their expected output is
+  generated at run time. They are checked for decoding to the length the file
+  declares. They are in the gate because the compiler asked for them: the file
+  would not build without touching `golden_v8_compressed_ptr`, which only
+  `test_deflate_decoder.cpp` had ever referenced - an unused-variable error
+  pointing straight at the two vectors nothing was checking.
+
+**What this gate does not yet demonstrate.** Proved discriminating by planting a
+corrupted vector two ways - a broken CRC and a truncated trailer - and both
+turned it red. Both also turned the existing decoder suite red, so on today's
+code the two overlap. The case only this gate can settle is a committed vector
+that our decoder handles exactly as the file expects but the reference would
+reject; that cannot be planted without an actual defect, which is the point of
+having the gate rather than an argument against it. When the two disagree, this
+is the one that says which side is wrong.
+
+Regenerating the vectors is a different job and is not done: it matters only if
+more cases are wanted, and then the generator belongs in the pinned image so a
+fixture's bytes depend on a recorded version rather than on whoever ran it.

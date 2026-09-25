@@ -27,11 +27,26 @@
 # version check in oracle_env.py is the real guarantee, which is why
 # check_pin() runs in both modes here as it does in `font`.
 #
-# The apt pins will eventually fail to resolve when the archive moves past
-# them. That is the intended failure: a bare `apt-get install zstd` would
-# quietly install a different reference and report our own output as changed.
-# snapshot.debian.org is the durable answer when it first happens; it is not
-# worth the weight before then.
+# **The apt pins do not expire, because apt is pointed at a dated snapshot.**
+# The Debian archive keeps one version of a package and drops it when an update
+# lands, so an exact version resolves today and fails to resolve in some number
+# of weeks - and it fails by *not finding* the version, which is the intended
+# direction (a bare `apt-get install zstd` would quietly compare against a
+# different reference) but means a CI job going red for no code change.
+# snapshot.debian.org keeps every version that was ever published, so the pins
+# below resolve indefinitely.
+#
+# The date is not chosen: it is **the snapshot the base image itself records**,
+# in the comments of its own /etc/apt/sources.list.d/debian.sources. Taking it
+# from there rather than picking a recent date means every package installed
+# comes from the same archive state the base was built against, so the pins
+# cannot disagree with what is already in the image.
+#
+# Two mechanics that are easy to get wrong and were found by getting them wrong:
+# the URL must be **http**, because the slim base carries no CA certificates and
+# https fails with a certificate error that reads like a network fault - apt
+# verifies packages by signature either way; and Check-Valid-Until has to be off,
+# because a dated Release file is stale by design and apt refuses it otherwise.
 #
 # The same base digest as every other image in the suite, which is deliberate
 # twice over: one base to pull, and a glibc the host's own binaries can run
@@ -50,6 +65,14 @@ FROM docker.io/library/debian@sha256:7792b1f7702a86946cd518db72b6a407302c3e9bc16
 # python3   the interpreter that runs the zlib, gzip and pyzstd references; its
 #           zlib module is the RFC 1950 and RFC 1952 reference, and the version
 #           that decides an answer is the zlib it links, not the interpreter's
+# The snapshot the base records; override only to move every pin at once.
+ARG SNAPSHOT=20260918T000000Z
+
+RUN printf 'Types: deb\nURIs: http://snapshot.debian.org/archive/debian/%s\nSuites: trixie trixie-updates\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n\nTypes: deb\nURIs: http://snapshot.debian.org/archive/debian-security/%s\nSuites: trixie-security\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n' \
+      "$SNAPSHOT" "$SNAPSHOT" > /etc/apt/sources.list.d/debian.sources \
+    && printf 'Acquire::Check-Valid-Until "false";\n' \
+      > /etc/apt/apt.conf.d/99snapshot
+
 RUN apt-get update -qq \
     && apt-get install -y --no-install-recommends \
       zstd=1.5.7+dfsg-1 \

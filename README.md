@@ -90,8 +90,8 @@ Findings are saved to `fuzz/findings/<target>/crashes/`. See `documentation/test
 ### Oracle Testing
 
 The oracle tests are the part of the suite that is not self-referential: they
-compare this library's output against implementations nobody here wrote. Nine
-test files carry ten availability sentinels that **fail** when their reference
+compare this library's output against implementations nobody here wrote. Fourteen
+test files carry fifteen availability sentinels that **fail** when their reference
 is absent, because a skipped oracle test and an absent one are the same line in
 a summary. `GCOMP_SKIP_ORACLE_TESTS=1` is how a machine without them says so
 deliberately.
@@ -101,7 +101,7 @@ container:**
 
 ```bash
 make oracle-build      # once, and whenever a pin moves
-make check-oracle      # the nine oracle suites, against the pinned set
+make check-oracle      # the fourteen oracle suites, against the pinned set
 make oracle-version    # print every reference and its version
 ```
 
@@ -179,13 +179,15 @@ Two things there are not just a target being run:
   ```
 
 - **The oracle references are installed by CI rather than left to chance.**
-  Nine test files carry ten sentinels asserting that their reference
+  Fourteen test files carry fifteen sentinels asserting that their reference
   implementation is actually present, because a skipped oracle test and an
   absent one look identical in the summary line - a run that compared nothing
   against anything would otherwise report success. `GCOMP_SKIP_ORACLE_TESTS=1`
-  is how a machine without them says so deliberately. Ten rather than nine
+  is how a machine without them says so deliberately. Fifteen rather than fourteen
   because `test_lz4_spec_oracle.cpp` has two references and one sentinel cannot
   answer for both; it shipped with one that covered only the specification half.
+  `check-oracle-coverage` fails if a suite carries a sentinel and is not in the
+  oracle gate - it was added after the first hand-written list missed four.
 
   CI installs those references unpinned, which `make check-oracle` is the answer
   to: it runs the same suites against the versions

@@ -213,14 +213,15 @@ jobs:
   # versions tools/oracle/containers/IMAGES names, and a skip in there is a
   # failure rather than a fact about the machine.
   #
-  # **This job will eventually go red for a reason that is not a code change.**
-  # The image pins Debian's packages by full apt version, and the archive keeps
-  # one version of a package: when it moves past a pin, the build fails to
-  # resolve it. That failure is deliberate - a bare `apt-get install zstd` would
-  # quietly compare against a different reference - and the fix is to raise the
-  # pin in the Containerfile and IMAGES together, having read what the new
-  # version changed. snapshot.debian.org is the durable answer if it becomes
-  # frequent; it is not worth the weight before then.
+  # The pins do not expire. apt is pointed at snapshot.debian.org, at the date
+  # the base image records in its own sources file, so an exact version resolves
+  # indefinitely instead of until the archive drops it. Raising a pin is then a
+  # deliberate edit - the Containerfile and IMAGES together, having read what the
+  # new version changed - rather than something the calendar forces.
+  #
+  # The cost of that choice is a dependency on one service that is sometimes
+  # slow. If this job starts failing on fetches rather than on tests, that is
+  # where to look first, and the answer is a retry rather than a pin change.
   #
   # The binaries are built on the runner and only *run* in the image, so this
   # pins the references and not the build. Ubuntu's glibc is older than
