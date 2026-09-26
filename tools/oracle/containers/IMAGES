@@ -3,8 +3,7 @@
 # One line per reference, tab-separated: <name> <image-ref> <version> <what it
 # answers>.
 #
-# Two kinds of pin and they are not the same guarantee
-# (notes/suite/CONTAINERS.md section 2.6). A stock image is pinned by digest and
+# Two kinds of pin and they are not the same guarantee. A stock image is pinned by digest and
 # the digest is the whole guarantee. An image **built here** cannot be: two
 # builds of one Containerfile are not two copies of one image. What is pinned
 # instead is everything the build reads - the base by digest, Debian's packages

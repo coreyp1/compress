@@ -2406,7 +2406,7 @@ check-san-report:
 # about the machine rather than about this library: `zstd` 1.5.7 and `liblz4`
 # 1.10.0 here, an unrecorded pyzstd from pip, and nothing anywhere saying so.
 # These targets run the same binaries against the versions
-# tools/oracle/containers/IMAGES names. See notes/suite/CONTAINERS.md.
+# tools/oracle/containers/IMAGES names.
 #
 # Not in TEST_GATES, and deliberately, which is what every library that landed
 # this pattern also decided: `make test` must not need a container engine. What

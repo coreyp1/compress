@@ -90,10 +90,10 @@ make test
 sudo make install
 ```
 
-From the workspace:
+From the parent of a suite checkout:
 
 ```bash
-./bootstrap.sh
+./suite/install.sh
 export PKG_CONFIG_PATH="$PWD/.local/share/pkgconfig"
 make -C libs/compress test PREFIX="$PWD/.local"
 ```

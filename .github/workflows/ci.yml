@@ -275,8 +275,7 @@ jobs:
   # ---------------------------------------------------------------------------
   # Windows, natively, under MSYS2.
   #
-  # The port itself was done and verified by hand in September 2026
-  # (../../notes/suite/WINDOWS-NATIVE-BUILD.md): compress builds as a DLL under
+  # The port itself was done and verified by hand in September 2026: compress builds as a DLL under
   # MINGW64, installs, is consumed through pkg-config alone, and 110 of its 112
   # suites passed from a plain shell with nothing arranged by hand - the other
   # two being the pyzstd oracle-availability tests, correctly reporting that

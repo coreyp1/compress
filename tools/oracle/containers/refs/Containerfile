@@ -1,6 +1,6 @@
 # Every reference this library compares itself against, pinned, in one image.
 #
-# notes/suite/CONTAINERS.md section 4a. What is different here from the other
+# What is different here from the other
 # libraries' oracle images, and why it is one image rather than four:
 #
 # **The references interlock, so they cannot be split.** `/usr/bin/zstd` links

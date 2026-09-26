@@ -20,9 +20,9 @@ versions `containers/IMAGES` names, and the gate is not only that they pass:
   such reference", which is a fact about the machine. In a pinned image every
   reference is present by construction, so a skip means the binary could not
   reach something the image promises - and that reads identically to a green run
-  in every summary line. `notes/suite/CONTAINERS.md` section 2.5 calls this
-  failing closed; this is the same rule one layer in, where the thing that could
-  fail open is a `GTEST_SKIP` rather than a shell `exit 0`.
+  in every summary line. A skip that reads as a pass is failing open; this is
+  the same rule one layer in, where the thing that could fail open is a
+  `GTEST_SKIP` rather than a shell `exit 0`.
 
   The library's own sentinels (`OracleIsActuallyAvailable`, one per reference)
   already fail when a reference is absent. This is the independent check on the

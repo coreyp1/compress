@@ -11,7 +11,7 @@
 """How a reference is spelled, so that no tool here spells one itself.
 
 **Copied from `libs/font/tools/oracle/oracle_env.py`**, which copied it from
-`libs/unicode`, which landed the pattern from `notes/suite/CONTAINERS.md`. What
+`libs/unicode`, which landed the pattern. What
 is changed, and each of the three is forced by something about this library
 rather than chosen:
 
@@ -269,11 +269,10 @@ def version(name):
 def check_pin(name):
     """Raise unless the reference's version matches containers/IMAGES.
 
-    **In both modes**, following `font` rather than `unicode`: the rule in
-    `notes/suite/CONTAINERS.md` section 2.6 is that the run-time check is the
-    real guarantee for an image built here, and every image named here is built
-    here. `unicode` could relax it in host mode because all of its pins are
-    stock images pinned by digest.
+    **In both modes**, following `font` rather than `unicode`: the run-time
+    check is the real guarantee for an image built here, and every image named
+    here is built here. `unicode` could relax it in host mode because all of its
+    pins are stock images pinned by digest.
 
     The cost is that host mode fails on this machine, because its pyzstd is
     0.17.0 and the pin is 0.19.1. That is the honest outcome: a seekable-format

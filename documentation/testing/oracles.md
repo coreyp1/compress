@@ -27,7 +27,7 @@ behaviours. Two consequences, and the second is worse:
 - A reference that is *already* wrong for the comparison reads as correct
   forever, because nothing states what it was supposed to be.
 
-`pkg-config` made the second concrete. A survey of this workspace's oracles ran
+`pkg-config` made the second concrete. A survey of the libraries' oracles ran
 `pkg-config --modversion liblz4`, saw it fail, and concluded that fourteen LZ4
 oracle tests were skipping. They were all passing: `liblz4.so.1` was installed
 and every one of those tests loads it by name at run time with
@@ -74,7 +74,7 @@ Three of those version strings are deliberately not the name of a package:
 
 ### One image, not five
 
-Every other library in this workspace has an image per reference. This one
+Every other library in the suite has an image per reference. This one
 cannot, for two measured reasons:
 
 - `/usr/bin/zstd` links `liblz4.so.1`. An image with a pinned zstd CLI and no

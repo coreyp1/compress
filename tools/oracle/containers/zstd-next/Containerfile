@@ -1,10 +1,9 @@
 # A second zstd, so that a disagreement can be read as "what upstream changed"
 # rather than "what we got wrong".
 #
-# notes/suite/CONTAINERS.md section 2.6, and `unicode`'s python/python-next pair
-# is the shape being copied: one gating pin that is a release, and a second one
-# that is ahead of it, whose disagreements are findings to triage rather than
-# failures to fix.
+# `unicode`'s python/python-next pair is the shape being copied: one gating
+# pin that is a release, and a second one that is ahead of it, whose
+# disagreements are findings to triage rather than failures to fix.
 #
 # **Why this is a source build and not another apt pin.** There is no newer
 # release to point at: upstream's latest is v1.5.7, which is exactly what Debian
