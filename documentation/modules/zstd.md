@@ -1,4 +1,4 @@
-# Zstd method (Zstandard Framed Streams)
+# Zstd
 
 Zstandard compression and decompression for the Ghoti.io Compress library. The method name is `"zstd"` and supports stream encode and decode. This implementation follows the Zstandard compression format specification, providing high compression ratios with excellent decompression speed.
 

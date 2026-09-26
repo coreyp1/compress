@@ -1,4 +1,4 @@
-# Threading Support for Parallel Compression
+# Threading
 
 This document describes how compression methods in the Ghoti.io Compress library can implement parallel compression using the threading primitives provided by the sibling `cutil` library.
 

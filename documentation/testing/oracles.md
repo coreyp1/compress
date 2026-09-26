@@ -1,4 +1,4 @@
-# Oracles, and the references they ask
+# Oracles
 
 Most of this suite checks the library against itself: an encoder against its own
 decoder, a bound against what was written, a walk against the encoder that

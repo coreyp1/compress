@@ -1,4 +1,4 @@
-# Fuzz Testing Guide
+# Fuzzing
 
 This document describes how to use fuzz testing to find bugs, crashes, and edge cases in the compress library.
 

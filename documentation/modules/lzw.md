@@ -1,4 +1,4 @@
-# LZW method (Lempel–Ziv–Welch)
+# LZW
 
 LZW compression and decompression for the Ghoti.io Compress library. The method name is `"lzw"` and supports stream encode and decode.
 

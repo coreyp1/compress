@@ -1,4 +1,4 @@
-# Wrapper Methods
+# Wrapper methods
 
 This document describes the pattern for implementing wrapper compression methods that wrap an underlying compression algorithm and add format-specific headers, trailers, and checksums.
 

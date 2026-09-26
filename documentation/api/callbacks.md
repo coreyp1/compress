@@ -1,4 +1,4 @@
-# Callback API
+# Callbacks
 
 The callback API provides a convenient way to process compression streams using read/write callbacks instead of managing buffers directly. This is useful for file I/O, network streams, or any scenario where data sources/sinks are best represented as callbacks.
 

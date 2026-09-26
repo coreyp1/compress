@@ -1,4 +1,4 @@
-# Zstd specification compliance
+# Zstd compliance
 
 This document summarizes how the Ghoti.io Compress zstd implementation aligns with the Zstandard specification (RFC 8878 and upstream spec). It lists what is implemented, what is intentionally unsupported or limited, and any known gaps.
 

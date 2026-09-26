@@ -1,4 +1,4 @@
-# RLE method (Run-Length Encoding)
+# RLE
 
 Run-Length Encoding (RLE) for the Ghoti.io Compress library. The method name is `"rle"` and supports stream encode and decode. RLE is a simple lossless scheme that replaces runs of identical bytes with a short control token plus the repeated byte. The library does not define a canonical container; stream interpretation is **profile-driven**. Two reference profiles are provided: **PackBits** (TIFF / Apple MacPaint) and **TGA** (Truevision Targa).
 

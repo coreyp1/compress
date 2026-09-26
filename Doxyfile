@@ -340,6 +340,10 @@ EXTENSION_MAPPING      =
 
 MARKDOWN_SUPPORT       = YES
 
+# GitHub-style heading ids, so a link written (#before-you-call-it) resolves.
+# The default, autotoc_mdN, does not match the anchors in the markdown.
+MARKDOWN_ID_STYLE      = GITHUB
+
 # When the TOC_INCLUDE_HEADINGS tag is set to a non-zero value, all headings up
 # to that level are automatically included in the table of contents, even if
 # they do not have an id attribute.
@@ -861,7 +865,7 @@ WARN_LOGFILE           =
 # spaces. See also FILE_PATTERNS and EXTENSION_MAPPING
 # Note: If this tag is empty the current directory is searched.
 
-INPUT                  = include src documentation README.md examples
+INPUT                  = include src documentation README.md CONTRIBUTING.md examples
 
 # This tag can be used to specify the character encoding of the source files
 # that doxygen parses. Internally doxygen uses the UTF-8 encoding. Doxygen uses

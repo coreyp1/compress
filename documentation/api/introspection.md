@@ -1,4 +1,4 @@
-# Asking the library about a stream
+# Introspection
 
 Four functions that answer questions a caller has to settle *before* it can
 compress or decompress safely:

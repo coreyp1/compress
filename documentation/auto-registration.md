@@ -1,4 +1,4 @@
-# Auto-Registration
+# Auto-registration
 
 The Ghoti.io Compress library supports automatic registration of compression methods with the default registry. When the library is loaded (before `main()` executes), built-in methods like `deflate` are automatically registered and ready to use.
 

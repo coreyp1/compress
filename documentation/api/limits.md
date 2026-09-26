@@ -1,4 +1,4 @@
-# Safety Limits API
+# Safety limits
 
 The Ghoti.io Compress library provides configurable safety limits to protect against resource exhaustion from malicious or malformed compressed data.
 

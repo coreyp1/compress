@@ -1,4 +1,4 @@
-# Reading part of a compressed file
+# Partial reads
 
 A compressed stream is read from the beginning. To get the byte at offset
 900 MB you decode the 900 MB in front of it, because a back-reference may point

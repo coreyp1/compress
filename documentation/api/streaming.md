@@ -1,4 +1,4 @@
-# Streaming API
+# Streaming
 
 The Ghoti.io Compress library provides a streaming API for incremental compression and decompression. This allows processing data in chunks without loading entire files into memory.
 

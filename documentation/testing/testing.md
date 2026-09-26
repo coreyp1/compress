@@ -1,4 +1,4 @@
-# Testing Guide
+# Running tests
 
 This document describes how to run tests for the compress library, including unit tests, memory checking with valgrind, and sanitizer builds.
 

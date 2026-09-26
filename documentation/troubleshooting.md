@@ -1,4 +1,4 @@
-# Troubleshooting Guide
+# Troubleshooting
 
 This guide covers common issues encountered when using the Ghoti.io Compress library and their solutions.
 

@@ -1,4 +1,4 @@
-# LZ4 method (LZ4 Frame Format)
+# LZ4
 
 LZ4 Frame Format compression and decompression for the Ghoti.io Compress library. The method name is `"lz4"` and supports stream encode and decode. This implementation follows the LZ4 Frame Format specification, which provides framing around LZ4 block compression with optional checksums and metadata.
 

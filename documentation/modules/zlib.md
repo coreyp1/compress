@@ -1,4 +1,4 @@
-# zlib Module (RFC 1950)
+# zlib
 
 The zlib container: two header bytes, a DEFLATE stream, and a four-byte
 Adler-32 of the uncompressed data.

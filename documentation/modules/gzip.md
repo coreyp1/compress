@@ -1,4 +1,4 @@
-# Gzip method (RFC 1952)
+# Gzip
 
 GZIP compression and decompression for the Ghoti.io Compress library. The method name is `"gzip"` and supports stream encode and decode. Gzip is a wrapper format around the DEFLATE algorithm (RFC 1951), adding a header with metadata and a trailer with CRC32 checksum and original file size.
 

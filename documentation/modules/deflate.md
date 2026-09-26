@@ -1,4 +1,4 @@
-# Deflate method (RFC 1951)
+# Deflate
 
 Raw DEFLATE compression and decompression for the Ghoti.io Compress library. The method name is `"deflate"` and supports stream encode and decode.
 

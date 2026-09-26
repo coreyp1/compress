@@ -1,4 +1,4 @@
-# Building the Compress Library
+# Building
 
 This document describes how to build the Compress library from source.
 

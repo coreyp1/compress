@@ -1,257 +1,155 @@
-# Ghoti.io Compress Library
+# Ghoti.io Compress
 
-Cross-platform C library implementing streaming compression with no external dependencies.
+Streaming compression in C. Checksums (CRC-32, Adler-32, xxHash) and a
+method registry sit beside the methods.
 
-## Overview
+## Methods
 
-The `compress` library provides:
-- Streaming compression and decompression for files, memory buffers, and pipes/sockets
-- Support for multiple compression methods (deflate, gzip, zlib, lz4, lzw, rle, zstd)
-- Parallel encoding via `threads.count` for zstd (concatenated frames) and LZ4
-  (one frame, byte-identical to single-threaded output)
-- `gcomp_encoder_flush()` for protocol framing: hand the peer everything
-  consumed so far without ending the stream (sync and full modes, every method)
-- Global default registry and explicit registries for compression methods
-- Key/value option system for rich configuration
-- Intelligent safety defaults with overridable resource limits
+This is what the library implements. Each method is written here against
+libc.
 
-## Dependencies
+- Deflate (RFC 1951), zlib (RFC 1950) and gzip (RFC 1952).
+- LZ4, LZW, RLE and zstd.
 
-- `cutil` - Ghoti.io core utilities.  Parallel compression is built on its
-  `GCU_Pool` (worker threads) and `GCU_Sequencer` (reorder buffer), used
-  together in `src/core/parallel_block.c`: the pool decides when a block is
-  compressed, the sequencer decides what order the finished blocks are
-  written in.  This library had its own copy of both and no longer does.
+## Before you call it
 
-No third-party dependencies: every compression method is implemented from
-scratch against libc.
+- `GCOMP_ERR_LIMIT` means the output buffer is full and the stream is not finished. Call again with more room. `GCOMP_OK` from a finish means the stream is complete.
+- Encoded bytes do not depend on how small that buffer was.
+- `gcomp_encoder_flush()` hands a peer everything consumed so far without ending the stream.
+- `gcomp_registry_default()` already holds the seven methods. A caller can build a registry of its own.
 
-## Building
+| Method | What it means here |
+| --- | --- |
+| `"deflate"` | RFC 1951. |
+| `"zlib"` | RFC 1950. |
+| `"gzip"` | RFC 1952. |
+| `"lz4"` | `threads.count` encodes blocks in parallel. That output is byte-identical to the single-threaded stream. |
+| `"lzw"`, `"rle"` | The same registry, the same buffer rule. |
+| `"zstd"` | `threads.count` encodes blocks in parallel. `seekable.h` is random access into a seekable frame. |
+
+## Examples
+
+```c
+#include <ghoti.io/compress/compress.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(void) {
+  const char * message = "Hello, Compression!";
+  size_t message_len = strlen(message);
+  gcomp_registry_t * registry = gcomp_registry_default();
+
+  size_t compressed_capacity = message_len + 256;
+  uint8_t * compressed = malloc(compressed_capacity);
+  size_t compressed_size = 0;
+  gcomp_status_t status = gcomp_encode_buffer(registry, "deflate", NULL,
+      message, message_len, compressed, compressed_capacity, &compressed_size);
+  if (status != GCOMP_OK) {
+    fprintf(stderr, "%s\n", gcomp_status_to_string(status));
+    free(compressed);
+    return 1;
+  }
+
+  uint8_t * plain = malloc(message_len);
+  size_t plain_size = 0;
+  status = gcomp_decode_buffer(registry, "deflate", NULL,
+      compressed, compressed_size, plain, message_len, &plain_size);
+  free(compressed);
+  free(plain);
+  return status == GCOMP_OK ? 0 : 1;
+}
+```
+
+It prints nothing. A zero exit status is the round trip succeeding.
+`examples/gzip_file.c` compresses a file. `examples/chunked_streaming.c`
+feeds a stream through a fixed output buffer.
+
+## Compile and link
+
+Once the library is installed, pkg-config carries the include path, the
+library, and its dependencies:
+
+```bash
+cc -o show show.c $(pkg-config --cflags --libs ghoti.io-compress-0)
+```
+
+The module name ends in the major version, `-0` for this release, so two
+majors can be installed side by side. A build made with `make BRANCH=-dev`
+installs `ghoti.io-compress-dev` instead.
+
+## Building the library
+
+[cutil](https://github.com/Ghoti-io/cutil) must already be installed where
+pkg-config can see it. A dependency it cannot find is a hard error naming
+the fix. No other library implements a method.
 
 ```bash
 make
-```
-
-## Testing
-
-```bash
 make test
-```
-
-### Running Tests with Valgrind
-
-```bash
-make test-valgrind
-```
-
-### Benchmarks
-
-Micro-benchmarks for throughput and behavior are built with:
-
-```bash
-make bench
-```
-
-Run them (set `LD_LIBRARY_PATH` to the build `apps` directory first):
-
-- **bench_deflate** – Deflate encode/decode throughput by data type and level; scaling check.
-- **bench_lzw** – LZW encoder lookup modes (linear vs hash); reports encode throughput.
-
-See `make bench` output for the exact run commands for your platform.
-
-### Fuzz Testing
-
-The library includes fuzz testing infrastructure using [AFL++](https://github.com/AFLplusplus/AFLplusplus) to find edge cases and security issues.
-
-**Prerequisites:**
-```bash
-sudo apt install afl++
-```
-
-**Running fuzz tests:**
-```bash
-# Generate seed corpus from test vectors
-make fuzz-corpus
-
-# Build fuzz harnesses with AFL instrumentation
-make fuzz-build
-
-# Run a fuzzer (Ctrl+C to stop)
-make fuzz-decoder    # Test decoder with random compressed data
-make fuzz-encoder    # Test encoder with random input
-make fuzz-roundtrip  # Encode then decode, verify match
-
-# Show help and available targets
-make fuzz-help
-```
-
-Findings are saved to `fuzz/findings/<target>/crashes/`. See `documentation/testing/fuzzing.md` for detailed documentation.
-
-### Oracle Testing
-
-The oracle tests are the part of the suite that is not self-referential: they
-compare this library's output against implementations nobody here wrote. Fourteen
-test files carry fifteen availability sentinels that **fail** when their reference
-is absent, because a skipped oracle test and an absent one are the same line in
-a summary. `GCOMP_SKIP_ORACLE_TESTS=1` is how a machine without them says so
-deliberately.
-
-**The recommended way to run them is against pinned references, in a
-container:**
-
-```bash
-make oracle-build      # once, and whenever a pin moves
-make check-oracle      # the fourteen oracle suites, against the pinned set
-make oracle-version    # print every reference and its version
-```
-
-A second, unreleased zstd is pinned beside the gating one for the reading a
-single reference cannot give - whether a disagreement is what upstream changed or
-what we got wrong:
-
-```bash
-make oracle-build-next && make check-oracle-next
-```
-
-It currently agrees byte for byte across 128 configurations, so it is a tripwire
-rather than a live second opinion; `documentation/testing/oracles.md` has the
-measurement.
-
-Every version is recorded in `tools/oracle/containers/IMAGES` and checked at run
-time, so a run states what answered rather than naming a set of tool names. In
-there a **skip is a failure**: the references are present by construction, so a
-skip means a test could not reach one the image promises.
-`documentation/testing/oracles.md` is the full account, including what a
-container cannot pin.
-
-**To run them against this machine's own tools instead**, the references are:
-
-| reference | what needs it | how it is reached |
-| --- | --- | --- |
-| `zstd` CLI | zstd frames, dictionaries, the seek table | `system()` |
-| `liblz4` runtime library | the LZ4 frame and block formats | `dlopen` by soname |
-| `gzip` / `gunzip` CLI | RFC 1952 member structure | `system()` |
-| python `zlib` module | RFC 1950 and RFC 1951 | `python3 -c` |
-| python `pyzstd` | the seekable format, dictionary training | `python3 -c` |
-
-```bash
-sudo apt install gzip zstd liblz4-1
-pip3 install pyzstd
-```
-
-Two things that were wrong here for a long time and are worth stating, because
-both cost somebody a wrong conclusion:
-
-- **`liblz4` needs no development package.** The tests load it by name at run
-  time, so `pkg-config --modversion liblz4` failing says nothing about whether
-  they run. A survey of this workspace read that failure as fourteen skipping
-  tests; all fourteen were passing.
-- **Neither the `lz4` CLI nor the python `lz4` and `zstandard` modules are
-  used.** This section used to ask for all three. `pyzstd` is what the seekable
-  and dictionary-training oracles use, and it was not mentioned.
-
-Verify a host set with:
-
-```bash
-make oracle-version GHOTI_ORACLE_MODE=host
-```
-
-which prints each reference's version and fails if any does not match its pin -
-which is how a drifting reference is found rather than silently used.
-
-### Continuous Integration
-
-Every push and pull request runs `.github/workflows/ci.yml`, which is nothing
-but the targets above, run in eight jobs (the first is a matrix of two
-compilers):
-
-| Job | Runs |
-| --- | --- |
-| Build and test (gcc) | `make`, `check-symbols`, `test`, `examples`, `install`, `tools/check-install.sh` |
-| Build and test (clang) | the same, with `CC=clang CXX=clang++` |
-| ASan + UBSan | `make test-asan` |
-| ThreadSanitizer | `make test-tsan`, in its own build tree |
-| Valgrind | `make test-valgrind-quiet`, which fails on a leak |
-| Fuzz corpus replay | `make fuzz-replay AFL_CC=clang` over the tracked `fuzz/regression` corpus |
-| Coverage floor | `make coverage COVERAGE_MIN=...`, which fails if line coverage drops below the floor |
-| Oracles (pinned) | `make oracle-build`, `oracle-version`, `check-oracle` - the oracle suites against pinned reference versions |
-| Windows (MSYS2) | the everyday gate again, natively on `windows-latest` under MINGW64 |
-
-Two things there are not just a target being run:
-
-- **`tools/check-install.sh`** compiles a program that knows nothing but the
-  module name, links it with whatever `pkg-config` hands back, runs it, and
-  round-trips a buffer through every method. The tests link the static archive
-  with `--whole-archive` and include headers straight out of `include/`, so
-  nothing else checks what a consumer of the *installed* library actually gets.
-  It can be run by hand against any prefix:
-
-  ```bash
-  tools/check-install.sh /path/to/prefix
-  ```
-
-- **The oracle references are installed by CI rather than left to chance.**
-  Fourteen test files carry fifteen sentinels asserting that their reference
-  implementation is actually present, because a skipped oracle test and an
-  absent one look identical in the summary line - a run that compared nothing
-  against anything would otherwise report success. `GCOMP_SKIP_ORACLE_TESTS=1`
-  is how a machine without them says so deliberately. Fifteen rather than fourteen
-  because `test_lz4_spec_oracle.cpp` has two references and one sentinel cannot
-  answer for both; it shipped with one that covered only the specification half.
-  `check-oracle-coverage` fails if a suite carries a sentinel and is not in the
-  oracle gate - it was added after the first hand-written list missed four.
-
-  CI installs those references unpinned, which `make check-oracle` is the answer
-  to: it runs the same suites against the versions
-  `tools/oracle/containers/IMAGES` names.
-
-A campaign with `afl-fuzz` is not in CI: it needs a corpus that persists
-between runs to be worth anything, and the replay above is the part worth
-running on every change. The campaigns themselves are documented in
-`documentation/testing/fuzzing.md`.
-
-`make fuzz-corpus` seeds every method - each of `fuzz/corpus/<method>_decoder`,
-`_encoder` and `_roundtrip`, with deflate's being the unprefixed ones - and
-then fails if any campaign target names a directory it did not fill. It reads
-that list out of the Makefile rather than keeping a second copy, because the
-two had already drifted: LZ4 and zstd had no seeds at all and gzip's roundtrip
-directory was created empty, so those campaigns fell back to a single
-hand-written frame apiece without saying so.
-
-## Installation
-
-```bash
 sudo make install
 ```
 
-## Usage
+From the workspace:
 
-See the examples directory for usage examples.
+```bash
+./bootstrap.sh
+export PKG_CONFIG_PATH="$PWD/.local/share/pkgconfig"
+make -C libs/compress test PREFIX="$PWD/.local"
+```
+
+`make test` is the suite. `make help` lists the rest, including
+`make test-asan` and `make test-valgrind`.
+
+| Target | What it does |
+| --- | --- |
+| `make examples` | The programs under `examples/` |
+| `make bench` | Throughput micro-benchmarks |
+| `make test-tsan` | The concurrency tests under ThreadSanitizer |
+| `make fuzz-help` | AFL++ harnesses. Needs `afl++` installed |
+| `make check-oracle` | Differentials against pinned reference tools, in a container |
+| `make oracle-build` | Build that container |
+| `make docs` | The Doxygen manual, into `./docs` |
+
+## The API
+
+Everything is prefixed `gcomp_` / `GCOMP_`, under `<ghoti.io/compress/...>`.
+`<ghoti.io/compress/compress.h>` is the umbrella.
+
+- **`registry.h`** — methods by name.
+- **`stream.h`** — incremental encode and decode, flush, and finish. `gcomp_encode_buffer()` and `gcomp_decode_buffer()` are the one-shot forms.
+- **`options.h`** — a key/value option set: level, window, threads, and the per-method knobs.
+- **`limits.h`** — caps on memory and expansion. Defaults are set; override them for untrusted input.
+- **`gzip.h`**, **`zlib.h`**, **`deflate.h`**, **`lz4.h`**, **`lzw.h`**, **`rle.h`**, **`zstd.h`** — one method, for a caller who wants it by name rather than through the registry.
+- **`seekable.h`** — random access into a zstd seekable frame.
+- **`crc32.h`**, **`adler32.h`**, **`xxhash32.h`**, **`xxhash64.h`** — the checksums.
+- **`allocator.h`** — `gcomp_allocator_t`, which is cutil's `GCU_Allocator`.
+
+[Methods](#methods) is what is implemented.
+[Before you call it](#before-you-call-it) is what that changes about a call.
+
+## Dependencies
+
+Found through pkg-config, and the installed `.pc` file names it, so a
+program that links `ghoti.io-compress-0` links this too.
+
+- [ghoti.io-cutil](https://github.com/Ghoti-io/cutil) — the allocator, the thread pool and the sequencer that parallel compression is built on.
 
 ## Documentation
 
-- [Modules](@ref modules) - Detailed documentation for library modules
-- [Examples](@ref examples) - Example programs demonstrating library usage
-- [Function Index](@ref functions_index) - Complete API reference
+| Page | What it settles |
+| --- | --- |
+| [documentation/architecture.md](documentation/architecture.md) | How a stream, a method and the registry fit together |
+| [documentation/threading.md](documentation/threading.md) | Parallel block compression |
+| [documentation/testing/fuzzing.md](documentation/testing/fuzzing.md) | The AFL++ harnesses |
+| [documentation/testing/oracles.md](documentation/testing/oracles.md) | The reference tools and how to run them |
 
-## Macros and Utilities
+`make docs` builds the manual.
 
-The library provides cross-compiler macros in `include/ghoti.io/compress/macros.h`:
+## Status
 
-- `GCOMP_MAYBE_UNUSED(X)` - Mark unused function parameters
-- `GCOMP_DEPRECATED` - Mark deprecated functions
-- `GCOMP_API` - Mark functions for library export
-- `GCOMP_ARRAY_SIZE(a)` - Get compile-time array size
-- `GCOMP_BIT(x)` - Create bitmask with bit x set
-
-Example:
-```c
-#include <ghoti.io/compress/macros.h>
-
-void my_function(int GCOMP_MAYBE_UNUSED(param)) {
-    // param is intentionally unused
-}
-```
+All seven methods encode and decode, including through a bounded output
+buffer.
 
 ## License
 

@@ -1,4 +1,4 @@
-# Error Codes
+# Error codes
 
 This document describes all error codes returned by the Compress library, when they occur, and how to handle them.
 
